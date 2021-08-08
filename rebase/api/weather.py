@@ -40,6 +40,13 @@ def resample(df, resolution):
 class Weather():
 
     @classmethod
+    def get(cls, params):
+        path = '/weather/v2/query'
+        response = api_request.get(path, params=params)
+        return response.json()
+
+
+    @classmethod
     def historical(cls, params, resolution=None):
         path = '/weather/v1/get_nwp'
         json_params = json.dumps(params)
@@ -67,7 +74,7 @@ class Weather():
     @classmethod
     def operational(cls, params, resolution=None):
         path = '/weather/v1/get_latest_nwp'
-        json_params = json.dumps(params)        
+        json_params = json.dumps(params)
 
         response = api_request.get(path, params={'query_params': json_params})
         if response.status_code != 200:
