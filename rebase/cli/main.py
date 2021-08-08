@@ -51,27 +51,28 @@ def init():
 
 
 def update_params_file(param_list):
-    with open('params.yaml', 'r') as f:
-        params = yaml.safe_load(f)
-        # Recursively merges params likes this:
-        # train.learning_rate=0.2
-        # into this:
-        # {..., 'train': {'learning_rate': 0.2, ...}, ...}
-        def update(d, keys, v):
-            k = keys[0]
-            if len(keys) == 1:
-                d[k] = v
-                return d
-            return {**d, k: update(d[k], keys[1:], v)}
+    if param_list:
+        with open('params.yaml', 'r') as f:
+            params = yaml.safe_load(f)
+            # Recursively merges params likes this:
+            # train.learning_rate=0.2
+            # into this:
+            # {..., 'train': {'learning_rate': 0.2, ...}, ...}
+            def update(d, keys, v):
+                k = keys[0]
+                if len(keys) == 1:
+                    d[k] = v
+                    return d
+                return {**d, k: update(d[k], keys[1:], v)}
 
-        for p in param_list:
-            parts = p.split('=')
-            value = ast.literal_eval(parts[-1])
-            keys = parts[0].split('.')
-            params = update(params, keys, value)
+            for p in param_list:
+                parts = p.split('=')
+                value = ast.literal_eval(parts[-1])
+                keys = parts[0].split('.')
+                params = update(params, keys, value)
 
-    with open('params.yaml', 'w') as f:
-        yaml.dump(params, f, sort_keys=False)
+        with open('params.yaml', 'w') as f:
+            yaml.dump(params, f, sort_keys=False)
 
 
 

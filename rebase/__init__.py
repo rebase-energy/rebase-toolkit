@@ -11,3 +11,4 @@ except Exception as e:
 	print(f"Exception while initializing cache: {e}")
 
 from rebase.api import *
+from rebase.cli import *
