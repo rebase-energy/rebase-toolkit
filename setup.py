@@ -12,7 +12,7 @@ setup(
     long_description=open('README.md').read(),
     entry_points={
         'console_scripts': [
-            'rebase=main:main'
+            'rebase=rebase.cli.main:main'
         ]
     }
 )
