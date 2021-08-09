@@ -3,7 +3,7 @@ import yaml
 import pkgutil
 import os
 import ast
-
+import mlflow
 
 template_files = [
     'src/evaluate.py',
@@ -77,8 +77,12 @@ def update_params_file(param_list):
 
 
 
-def run(param_list):
+def run(param_list, tag):
     update_params_file(param_list)
+    #with mlflow.start_run() as run:
+    #if tag:
+    #    mlflow.set_tag('hyperparam_search', tag)
+    #os.system('dvc repro')
     os.system('mlflow run --no-conda .')
 
 
@@ -90,6 +94,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('command')
     parser.add_argument('-p', action='append')
+    parser.add_argument('-t')
 
     args = parser.parse_args()
 
@@ -99,4 +104,4 @@ def main():
     elif args.command == 'hyperopt':
         hyperparam_search()
     elif args.command == 'run':
-        run(args.p)
+        run(args.p, args.t)
