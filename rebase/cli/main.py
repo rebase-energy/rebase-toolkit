@@ -4,6 +4,9 @@ import pkgutil
 import os
 import ast
 import mlflow
+import json
+import rebase.util.api_request as api_request
+import rebase as rb
 
 template_files = [
     'src/evaluate.py',
@@ -88,6 +91,16 @@ def run(param_list, tag):
 
 def hyperparam_search():
     print("Starting hyperparam search")
+    with open('hyperparams.yaml', 'r') as f:
+        hyperparams = yaml.safe_load(f)
+        data = {
+            'hyperparams': hyperparams['train']
+        }
+
+    r = api_request.post('platform/v1/model/hpsearch', data=json.dumps(data))
+    print("Status", r.status_code)
+    data = r.json()
+    print('hpsearch id: {}'.format(data['hp_id']))
 
 def main():
 
@@ -101,7 +114,7 @@ def main():
 
     if args.command == 'init':
         init()
-    elif args.command == 'hyperopt':
+    elif args.command == 'hpsearch':
         hyperparam_search()
     elif args.command == 'run':
         run(args.p, args.t)
