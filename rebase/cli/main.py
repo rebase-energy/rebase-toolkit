@@ -129,6 +129,10 @@ def run(run_args):
     parser.add_argument('-t', action='append')   
     args = parser.parse_args(run_args)
 
+    retcode, output = run_command('dvc pull', return_output=True)
+    if retcode != 0:
+        raise RuntimeError(f"DVC pull failed: {output}")
+    
     params_str = " ".join([f"-S {format_dvc_param(pstr)}" for pstr in args.p])
     tags_str = ";".join([format_dvc_tag(tstr) for tstr in args.t]) if args.t is not None else ""
     try:
