@@ -133,7 +133,7 @@ def run(run_args):
     if retcode != 0:
         raise RuntimeError(f"DVC pull failed: {output}")
     
-    params_str = " ".join([f"-S {format_dvc_param(pstr)}" for pstr in args.p])
+    params_str = " ".join([f"-S {format_dvc_param(pstr)}" for pstr in args.p]) if args.p else ""
     tags_str = ";".join([format_dvc_tag(tstr) for tstr in args.t]) if args.t is not None else ""
     try:
         with open("MLProject", "w") as f:
