@@ -150,13 +150,13 @@ def run(run_args):
         os.remove("MLProject")        
 
 
-def hpsearch():
+def hpsearch(cmd_args):
     print("Starting hyperparam search")
     current_dir = os.getcwd()
     repo_name = os.path.basename(current_dir)
     run_id = generatea_run_id()
     run_name = f"hps-{run_id[:5]}"
-    run_command("git commit -a -m 'HP:{run_name}'")
+    run_command(f"git commit -a -m 'HP:{run_name}'")
     retc, output = run_command("git config --get remote.origin.url", return_output=True)
     if retc != 0:
         raise RuntimeError(f"Could not extract git repo url: {output}")
@@ -165,9 +165,10 @@ def hpsearch():
     with open('hyperparams.yaml', 'r') as f:
         hyperparams = yaml.safe_load(f)
         data = {
-            'hyperparams': hyperparams['train'],
+            'hyperparams': hyperparams,
             'git_remote_url': git_remote_url,
             'repo_name': repo_name,
+            'run_name': run_name,
             'api_key': rb.api_key
         }
 
