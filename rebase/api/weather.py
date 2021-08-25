@@ -51,6 +51,7 @@ class Weather():
         path = '/weather/v1/get_nwp'
         json_params = json.dumps(params)
         params_hash = hashlib.md5(json_params.encode('utf-8')).hexdigest()
+        os.makedirs(rb.cache_dir, exist_ok=True)
         cache_file = '{}/{}.pickle'.format(rb.cache_dir, params_hash)
 
         df = get_cached_weather(cache_file)
