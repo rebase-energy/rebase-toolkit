@@ -130,7 +130,7 @@ def run(run_args):
     args = parser.parse_args(run_args)
 
     params_str = " ".join([f"-S {format_dvc_param(pstr)}" for pstr in args.p])
-    tags_str = ";".join([format_dvc_tag(tstr) for tstr in args.t])
+    tags_str = ";".join([format_dvc_tag(tstr) for tstr in args.t]) if args.t is not None else ""
     try:
         with open("MLProject", "w") as f:
             f.writelines([f"name: {args.name}\n",
