@@ -1,1 +1,3 @@
-from .main import *
+import click
+
+from .commands import *
