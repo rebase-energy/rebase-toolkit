@@ -26,7 +26,6 @@ def init(project: str = None,
 
     proj_config = project_init(project)
 
-    print(proj_config)
     for k, v in proj_config['envs'].items():
         os.environ[k] = v
 
@@ -57,6 +56,9 @@ def init_proj_dir(project_dir):
         run_commands([f"git init",
                       f"dvc init",
                       f"dvc remote add --default rebase {proj_config['data_location']}"])
+
+        run_commands([f"git config user.email \"RbUser@rebase.energy\"",
+                      f"git config user.name \"RbUser\""])
 
 @contextmanager
 def repo_chdir():
