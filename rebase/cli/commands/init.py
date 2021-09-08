@@ -52,13 +52,21 @@ def init_proj_dir(project_dir):
     os.makedirs(project_dir, exist_ok=True)
 
     proj_config = context["config"]
+    print("Init project dir...")
     with repo_chdir():
         run_commands([f"git init",
                       f"dvc init",
                       f"dvc remote add --default rebase {proj_config['data_location']}"])
 
-        run_commands([f"git config user.email \"RbUser@rebase.energy\"",
-                      f"git config user.name \"RbUser\""])
+        user_email = os.environ.get('RB_EMAIL')
+        user_name = os.environ.get('RB_USERNAME')
+        if user_email is None or user_name is None:
+            user_email = "RbUser@rebase.energy" 
+            user_email = "RbUser"
+
+        run_commands([f"git config user.email \"{user_email}\"",
+                      f"git config user.name \"{user_name}\""])
+        print("git and dvc initialised...")
 
 @contextmanager
 def repo_chdir():
