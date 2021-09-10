@@ -17,18 +17,22 @@ def init(project: str = None,
          context: dict = None,
          artifact_location: str = None
 ) -> None:
-    print("Initializing")
+    print("Initializing...")
+
+    # get internal rebase context
     if context is None:
         context = current_context()
 
+    # setup rebase project
     if project is None:
         raise ValueError("Missing project name")
 
     proj_config = project_init(project)
-
+    print(f"Project config: \n{proj_config}")
     for k, v in proj_config['envs'].items():
         os.environ[k] = v
 
+    # setup mlflow experiment
     current_dir = os.getcwd()
     if project_dir is None:
         project_dir = f"{current_dir}/{project}"
@@ -37,6 +41,8 @@ def init(project: str = None,
         experiment_id = mlflow.create_experiment(experiment, artifact_location=artifact_location or proj_config['artifact_location'])
     else:
         experiment_id = existing_experiment.experiment_id
+
+    # set info in rebase internal context
     context['project'] = project
     context['config'] = proj_config
     context['experiment'] = { 'name': experiment,
@@ -46,14 +52,16 @@ def init(project: str = None,
     if not os.path.exists(project_dir):
         init_proj_dir(project_dir)
 
-
 def init_proj_dir(project_dir):
     context = current_context()
     os.makedirs(project_dir, exist_ok=True)
 
     proj_config = context["config"]
+
     print("Init project dir...")
-    with repo_chdir():
+    with repo_chdir() as repo_dir:
+        #if not os.path.isdir('.git'):
+        #    raise OSError("
         run_commands([f"git init",
                       f"dvc init",
                       f"dvc remote add --default rebase {proj_config['data_location']}"])
@@ -70,11 +78,15 @@ def init_proj_dir(project_dir):
 
 @contextmanager
 def repo_chdir():
+    """
+    Ctx manager to perform commands in the directory of the data repo.
+    """
     context = current_context()
     saved_dir = os.getcwd()
+    repo_dir = context["path"]
     try:
-        os.chdir(context["path"])
-        yield
+        os.chdir(repo_dir)
+        yield repo_dir 
     finally:
         os.chdir(saved_dir)
 
