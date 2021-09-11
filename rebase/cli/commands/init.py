@@ -17,7 +17,7 @@ def init(project: str = None,
          context: dict = None,
          artifact_location: str = None
 ) -> None:
-    print("Initializing...")
+    print("Initializing..")
 
     # get internal rebase context
     if context is None:
@@ -211,6 +211,7 @@ def log_model(model, name=None):
 def publish_model(model, name):
     """
     Publish model artifact into model registry
+    Appends version if already existing.
     """
     if not isinstance(name, str):
         raise ValueError("Name is required to be a string")
@@ -254,4 +255,4 @@ def save_pickle(obj, path, name=None):
 def init_cmd(*args, **kwargs):
     return init(*args, **kwargs)
 
-__all__ = ['init', 'init_cmd', 'stage', 'add_dependency', 'load_pickle', 'save_pickle', 'log_model']
+__all__ = ['init', 'init_cmd', 'stage', 'add_dependency', 'load_pickle', 'save_pickle', 'log_model', 'publish_model']
