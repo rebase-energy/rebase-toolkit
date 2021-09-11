@@ -6,7 +6,7 @@ import hashlib
 import yaml
 import shlex
 
-def generatea_run_id():
+def generate_run_id():
     return str(uuid.uuid4()).replace('-', '')
 
 def run_command(command, return_output=False):

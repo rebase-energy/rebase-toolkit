@@ -12,6 +12,16 @@ class Stage(object):
 		self.params = params
 		self.dependencies = {}
 		self.outputs = {}
+        self.curr_run = None
+
+    def set_current_run(self, run_name):
+        self.curr_run = run_name
+
+    def clear_run():
+        self.curr_run = None
+
+    def get_run():
+        return self.curr_run
 
 	def save_dependencies(self):
 		self.saved_deps = copy.deepcopy(self.dependencies)

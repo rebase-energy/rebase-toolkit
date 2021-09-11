@@ -6,7 +6,7 @@ import logging
 from shutil import copyfile
 from contextlib import contextmanager
 
-from ..utils import run_commands, generatea_run_id, dict_to_yaml_file
+from ..utils import run_commands, generate_run_id, dict_to_yaml_file
 from ..context import current_context
 from ..errors import *
 from ...api.sdk import project_init
@@ -160,10 +160,11 @@ def stage(name, params=None, log_run=False):
     try:
         stage = context.current_stage()
         stage.clear_dependencies()
-        run_name = f"r-{generatea_run_id()[:5]}"
+        run_name = f"r-{generate_run_id()[:5]}"
         if log_run:            
             mlflow.autolog()
             mlflow.start_run(run_name=run_name, experiment_id=context['experiment']['id'])    
+            stage.set_current_run(run_name)
 
         yield stage
 
@@ -190,6 +191,7 @@ def stage(name, params=None, log_run=False):
     finally:
         if log_run:
             mlflow.end_run()
+            stage.clear_run()
         context.set_stage(prev_stage.name, prev_stage.params)
 
 
@@ -204,6 +206,19 @@ def load_pickle(path, name=None):
 def log_model(model, name=None):
     file_path = save_pickle(model, name, name=name)
     mlflow.log_artifact(file_path)
+    return file_path
+
+def publish_model(model, name):
+    """
+    Publish model artifact into model registry
+    """
+    if not isinstance(name, str):
+        raise ValueError("Name is required to be a string")
+
+    file_path = log_model(model, name)
+    context = current_context()
+    model_uri = "runs:/{}/{}".format(context.get_run(), file_path)
+    mlflow.register_model(model_uri, name)
 
 def save_pickle(obj, path, name=None): 
     context = current_context()
