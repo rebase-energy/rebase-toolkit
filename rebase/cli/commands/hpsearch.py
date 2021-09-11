@@ -9,7 +9,7 @@ def hpsearch():
     print("Starting hyperparam search")
     current_dir = os.getcwd()
     repo_name = os.path.basename(current_dir)
-    run_id = generatea_run_id()
+    run_id = generate_run_id()
     run_name = f"hps-{run_id[:5]}"
     run_command(f"git commit -a -m 'HP:{run_name}'")
     retc, output = run_command("git config --get remote.origin.url", return_output=True)

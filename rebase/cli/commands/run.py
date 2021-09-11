@@ -3,7 +3,7 @@ import os
 import mlflow
 import logging
 
-from ..utils import run_command, generatea_run_id
+from ..utils import run_command, generate_run_id
 
 
 # template_files = [
@@ -64,7 +64,7 @@ def run(name: str = None,
 ) -> None:
     current_dir = os.getcwd()
     repo_name = os.path.basename(current_dir)
-    run_id = generatea_run_id()
+    run_id = generate_run_id()
     run_name = "exp-"+run_id[:5]
 
     retcode, output = run_command('dvc pull', return_output=True)
