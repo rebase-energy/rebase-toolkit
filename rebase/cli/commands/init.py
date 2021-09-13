@@ -163,8 +163,11 @@ def stage(name, params=None, log_run=False):
         run_name = f"r-{generate_run_id()[:5]}"
         if log_run:            
             mlflow.autolog()
-            mlflow.start_run(run_name=run_name, experiment_id=context['experiment']['id'])    
-            stage.set_current_run(run_name)
+            run_obj = mlflow.start_run(run_name=run_name, experiment_id=context['experiment']['id'])    
+            mlflow_run_id = run_obj.info.run_id
+            mlflow_artifact_uri = run_obj.info.artifact_uri
+            context.set_current_run(mlflow_run_id) # TODO: change method name
+            context.artifact_uri = mlflow_artifact_uri # TODO: implement get/set
 
         yield stage
 
@@ -191,7 +194,8 @@ def stage(name, params=None, log_run=False):
     finally:
         if log_run:
             mlflow.end_run()
-            stage.clear_run()
+            context.clear_run()
+            context.artifact_uri = None
         context.set_stage(prev_stage.name, prev_stage.params)
 
 
@@ -208,6 +212,7 @@ def log_model(model, name=None):
     mlflow.log_artifact(file_path)
     return file_path
 
+#def publish_model(model, destination, name):
 def publish_model(model, name):
     """
     Publish model artifact into model registry
@@ -216,9 +221,15 @@ def publish_model(model, name):
     if not isinstance(name, str):
         raise ValueError("Name is required to be a string")
 
-    file_path = log_model(model, name)
+    #file_path = log_model(model, name)
+    
     context = current_context()
-    model_uri = "runs:/{}/{}".format(context.get_run(), file_path)
+    mlflow_run_id = context.get_run()
+    artifact_uri = context.artifact_uri
+    print("MLFLOW RUN: ", mlflow_run_id)
+    print("ARTIFCAT URI: ", artifact_uri)
+    #context['experiment']['id']
+    model_uri = "runs:/{}/{}".format(mlflow_run_id, artifact_uri)
     mlflow.register_model(model_uri, name)
 
 def save_pickle(obj, path, name=None): 

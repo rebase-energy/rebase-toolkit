@@ -11,16 +11,6 @@ class Stage(object):
         self.params = params
         self.dependencies = {}
         self.outputs = {}
-        self.curr_run = None
-
-    def set_current_run(self, run_name):
-        self.curr_run = run_name
-
-    def clear_run():
-        self.curr_run = None
-
-    def get_run():
-        return self.curr_run
 
     def save_dependencies(self):
         self.saved_deps = copy.deepcopy(self.dependencies)
@@ -63,6 +53,17 @@ class Context(dict):
     def __init__(self, *args, **kwargs):
         self.stages = {}
         self.set_stage("root")        
+        self.curr_run = None
+        self.artifact_uri = None
+
+    def set_current_run(self, run_name):
+        self.curr_run = run_name
+
+    def clear_run(self):
+        self.curr_run = None
+
+    def get_run(self):
+        return self.curr_run
 
     def set_stage(self, name, params=None):
         if name not in self.stages:
