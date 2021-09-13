@@ -111,7 +111,7 @@ class Site():
 
 
     @classmethod
-    def forecast(cls, site_id, type='prioritized'):
+    def forecast(cls, site_id, start_date=None, end_date=None, type='prioritized'):
         """Get the latest forecast for a site
 
         Args:
@@ -152,8 +152,12 @@ class Site():
         """
         path = '{}/site/forecast/latest/{}'.format(cls.base_path, site_id)
         params = {
-            'type': type,
+            'type': type
         }
+        if start_date is not None and end_date is not None:
+            params['start_date'] = start_date
+            params['end_date'] = end_date
+        
         response = api_request.get(path, params=params)
         if response.status_code == 200:
             data = response.json()
