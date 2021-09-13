@@ -213,22 +213,21 @@ def log_model(model, name=None):
     return file_path
 
 #def publish_model(model, destination, name):
-def publish_model(model, name):
+def publish_model(name):
     """
     Publish model artifact into model registry
     Appends version if already existing.
     """
     if not isinstance(name, str):
         raise ValueError("Name is required to be a string")
-
-    #file_path = log_model(model, name)
     
     context = current_context()
     mlflow_run_id = context.get_run()
     artifact_uri = context.artifact_uri
-    print("MLFLOW RUN: ", mlflow_run_id)
-    print("ARTIFCAT URI: ", artifact_uri)
+    #print("MLFLOW RUN: ", mlflow_run_id)
+    #print("ARTIFCAT URI: ", artifact_uri)
     #context['experiment']['id']
+
     model_uri = "runs:/{}/{}".format(mlflow_run_id, artifact_uri)
     mlflow.register_model(model_uri, name)
 
