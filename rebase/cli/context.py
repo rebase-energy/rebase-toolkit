@@ -30,7 +30,7 @@ class Stage(object):
 
     def add_dependency(self, path, name=None, meta=None, externals=None, **kwargs):
         self._add_dep(self.dependencies, path, name=name, meta=meta, **kwargs)
-    
+
     def add_output(self, path, name=None, meta=None, **kwargs):
         self._add_dep(self.outputs, path, name=name, meta=meta, **kwargs)
 
@@ -52,7 +52,7 @@ class Context(dict):
 
     def __init__(self, *args, **kwargs):
         self.stages = {}
-        self.set_stage("root")        
+        self.set_stage("root")
         self.curr_run = None
         self.artifact_uri = None
 
@@ -88,7 +88,7 @@ class Context(dict):
                 dvc_stage["params"] = sorted(list(stage.params.keys()))
             dvc['stages'][stage_name] = dvc_stage
         return dvc
-    
+
     @staticmethod
     def current():
         global g_current_context

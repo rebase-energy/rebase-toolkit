@@ -6,18 +6,18 @@ import logging
 from shutil import copyfile
 from contextlib import contextmanager
 
-from ..utils import run_commands, generate_run_id, dict_to_yaml_file
+from ..utils import run_commands,run_command, generate_run_id, dict_to_yaml_file
 from ..context import current_context
 from ..errors import *
 from ...api.sdk import project_init
 
-def init(project: str = None, 
-         experiment: str = None,         
+def init(project: str = None,
+         experiment: str = None,
          project_dir: str = None,
          context: dict = None,
          artifact_location: str = None
 ) -> None:
-    print("Initializing..")
+    print("Initializing....")
 
     # get internal rebase context
     if context is None:
@@ -33,6 +33,7 @@ def init(project: str = None,
         os.environ[k] = v
 
     # setup mlflow experiment
+    print("Setting up environments...")
     current_dir = os.getcwd()
     if project_dir is None:
         project_dir = f"{current_dir}/{project}"
@@ -46,11 +47,10 @@ def init(project: str = None,
     context['project'] = project
     context['config'] = proj_config
     context['experiment'] = { 'name': experiment,
-                              'id': experiment_id}    
+                              'id': experiment_id}
     context['path'] = project_dir
-    
-    if not os.path.exists(project_dir):
-        init_proj_dir(project_dir)
+
+    init_proj_dir(project_dir)
 
 def init_proj_dir(project_dir):
     context = current_context()
@@ -60,17 +60,32 @@ def init_proj_dir(project_dir):
 
     print("Init project dir...")
     with repo_chdir() as repo_dir:
-        #if not os.path.isdir('.git'):
-        #    raise OSError("
-        run_commands([f"git init",
-                      f"dvc init",
-                      f"dvc remote add --default rebase {proj_config['data_location']}"])
+        # check if inside git repo
+        _, git_repo = run_command("git rev-parse --is-inside-work-tree",
+                                  return_output=True)
+
+        if not 'true' in git_repo.lower():
+            raise OSError("Not inside git repo...")
+
+        dvc_inited = os.path.isdir(".dvc")
+
+        if not dvc_inited:
+        # check if dvc repo
+            run_commands([#f"git init",
+                          f"dvc init --subdir",
+                          #f"git add .dvc*",
+                          #f"git commit -m 'dvc init '",
+                          f"dvc remote add --default rebase {proj_config['data_location']}"])
+
+            # commit .dvc files if new repo
+            run_commands([f"git add .dvc*",
+                          f"git commit -m 'dvc init {project_dir}'"])
 
         user_email = os.environ.get('RB_EMAIL')
         user_name = os.environ.get('RB_USERNAME')
         if user_email is None or user_name is None:
-            user_email = "RbUser@rebase.energy" 
-            user_email = "RbUser"
+            user_email = "RbUser@rebase.energy"
+            user_name = "RbUser"
 
         run_commands([f"git config user.email \"{user_email}\"",
                       f"git config user.name \"{user_name}\""])
@@ -86,62 +101,83 @@ def repo_chdir():
     repo_dir = context["path"]
     try:
         os.chdir(repo_dir)
-        yield repo_dir 
+        yield repo_dir
     finally:
         os.chdir(saved_dir)
 
 
-def add_dependency(path: str, name: str = None, externals: str = "ref_direct"):
+def add_dependency(path: str, name: str = None,
+                    externals: str = "ref_direct", remote = False):
     context = current_context()
     stage = context.current_stage()
 
     if name is None:
-        name = path
-        
-    file_path_abs = os.path.abspath(path)
+        raise ValueError("No dependency name set!")
+
     dvc_add_flags = ""
     copy_file = False
 
-    if not os.path.samefile(os.path.commonpath([
-                                file_path_abs, 
-                                os.path.abspath(context['path']),
-                            ]), os.path.abspath(context['path'])):
-        logging.info(f"Dependency {path} is outside the repo. Action: {externals}")
-        dir_name = os.path.dirname(file_path_abs)
-        remote_name = os.path.basename(dir_name)
+    if remote:
+        # TODO: what for ref_direct and raise???
+        dep_file = path # external path, e.g url
+    else:
+        # fix correct file paths
+        file_path_abs = os.path.abspath(path)
+        if not os.path.samefile(os.path.commonpath([
+                                    file_path_abs,
+                                    os.path.abspath(context['path']),
+                                ]), os.path.abspath(context['path'])):
+            logging.info(f"Dependency {path} is outside the repo. Action: {externals}")
+            dir_name = os.path.dirname(file_path_abs)
+            remote_name = os.path.basename(dir_name)
 
-        if externals == "ref_direct":
-            with repo_chdir():       
-    #             output = run_commands([f"bash -c \"echo $(dvc remote list | awk \'{{print $1}}\')\""], return_output=True)[0][1]
-    #             logging.info(output.split("\n"))
-    #             remote_exists = remote_name in output.split("\n")
-    # #            logging.info(f"bash -c 'dvc remote list output | awk \'{{print $1}}\' | grep {remote_name}'")
-    #             if not remote_exists:
-    #                 run_commands([f"dvc remote add {remote_name} {dir_name}"])
-    #             else:
-    #                 logging.info(f"Remote {remote_name} already exists.")
-                #dep_file = f"/{remote_name}/{file_rel_to_remote}"
-                dep_file = file_path_abs
-                dvc_add_flags = "--external"
-        elif externals == "copy":            
-            dep_file = name
-            copy_file = True
-        elif externals == "raise":
-            raise ExternalsDisabledError()
-    else:        
-        dep_file = os.path.relpath(file_path_abs, context['path'])        
-    
-    if stage.get_dependency_by_path(dep_file) is None:        
-        with repo_chdir():       
-            if copy_file:
-                dest_file = os.path.join(context['path'], dep_file)
-                file_dir = os.path.dirname(dest_file)
-                os.makedirs(file_dir, exist_ok=True)
-                copyfile(file_path_abs, dest_file)
+            if externals == "ref_direct":
+                with repo_chdir():
+        #             output = run_commands([f"bash -c \"echo $(dvc remote list | awk \'{{print $1}}\')\""], return_output=True)[0][1]
+        #             logging.info(output.split("\n"))
+        #             remote_exists = remote_name in output.split("\n")
+        # #            logging.info(f"bash -c 'dvc remote list output | awk \'{{print $1}}\' | grep {remote_name}'")
+        #             if not remote_exists:
+        #                 run_commands([f"dvc remote add {remote_name} {dir_name}"])
+        #             else:
+        #                 logging.info(f"Remote {remote_name} already exists.")
+                    #dep_file = f"/{remote_name}/{file_rel_to_remote}"
+                    dep_file = file_path_abs
+                    dvc_add_flags = "--external"
+            elif externals == "copy":
+                dep_file = name
+                copy_file = True
+            elif externals == "raise":
+                raise ExternalsDisabledError()
+        else:
+            dep_file = os.path.relpath(file_path_abs, context['path'])
 
-            run_commands([f"dvc add {dvc_add_flags} {dep_file}"])
+    if stage.get_dependency_by_path(dep_file) is None:
+        with repo_chdir():
+            if not remote:
+                if copy_file:
+                    dest_file = os.path.join(context['path'], dep_file)
+                    file_dir = os.path.dirname(dest_file)
+                    os.makedirs(file_dir, exist_ok=True)
+                    copyfile(file_path_abs, dest_file)
+
+                run_commands([f"dvc add {dvc_add_flags} {dep_file}"])
+            else:
+                local_name = os.path.basename(path)
+                try:
+                    run_commands([f"dvc import-url {dvc_add_flags} {dep_file}"])
+                except:
+                    if not local_name in os.listdir("."):
+                        raise OSError("Dvc import-url failed...")
+                # error
+                local_path_abs = os.getcwd() + '/' + local_name
 
         stage.add_dependency(dep_file, name=name)
+
+        if remote:
+            return local_path_abs
+        else:
+            return path
     else:
         logging.info(f"Depencency {dep_file} already exists")
 
@@ -161,9 +197,9 @@ def stage(name, params=None, log_run=False):
         stage = context.current_stage()
         stage.clear_dependencies()
         run_name = f"r-{generate_run_id()[:5]}"
-        if log_run:            
+        if log_run:
             mlflow.autolog()
-            run_obj = mlflow.start_run(run_name=run_name, experiment_id=context['experiment']['id'])    
+            run_obj = mlflow.start_run(run_name=run_name, experiment_id=context['experiment']['id'])
             mlflow_run_id = run_obj.info.run_id
             mlflow_artifact_uri = run_obj.info.artifact_uri
             context.set_current_run(mlflow_run_id) # TODO: change method name
@@ -171,7 +207,7 @@ def stage(name, params=None, log_run=False):
 
         yield stage
 
-        with repo_chdir(): 
+        with repo_chdir():
             dvc_pipeline = context.generate_dvc_pipeline()
             dict_to_yaml_file(dvc_pipeline, "dvc.yaml")
             if params:
@@ -201,7 +237,7 @@ def stage(name, params=None, log_run=False):
 
 def load_pickle(path, name=None):
     context = current_context()
-    stage = context.current_stage()    
+    stage = context.current_stage()
     file_path = os.path.join(context['path'], path)
     stage.add_dependency(path, name=name)
     with open(file_path, "rb") as f:
@@ -220,7 +256,7 @@ def publish_model(name):
     """
     if not isinstance(name, str):
         raise ValueError("Name is required to be a string")
-    
+
     context = current_context()
     mlflow_run_id = context.get_run()
     artifact_uri = context.artifact_uri
@@ -231,7 +267,7 @@ def publish_model(name):
     model_uri = "runs:/{}/{}".format(mlflow_run_id, artifact_uri)
     mlflow.register_model(model_uri, name)
 
-def save_pickle(obj, path, name=None): 
+def save_pickle(obj, path, name=None):
     context = current_context()
     stage = context.current_stage()
     rel_dest_file = os.path.join(context['path'], path)
@@ -246,10 +282,10 @@ def save_pickle(obj, path, name=None):
     return rel_dest_file
     # temp_file_fd, temp_filename = tempfile.mkstemp()
     # dest_file = os.path.join(context['data_folder'], name)
-    # try:      
+    # try:
     #   with open(dest_file) as f:
     #       cloudpickle.dump(obj, f)
-        
+
     #   fhasn = file_hash(temp_filename)
     #   dest_file = os.path.join(context['data_folder'], f"{fhasn}.pkl")
     #   if not os.path.exists(dest_file):
