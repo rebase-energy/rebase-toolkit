@@ -199,11 +199,14 @@ def stage(name, params=None, log_run=False):
         run_name = f"r-{generate_run_id()[:5]}"
         if log_run:
             mlflow.autolog()
-            run_obj = mlflow.start_run(run_name=run_name, experiment_id=context['experiment']['id'])
+            run_obj = mlflow.start_run(
+                run_name=run_name,
+                experiment_id=context['experiment']['id']
+            )
             mlflow_run_id = run_obj.info.run_id
             mlflow_artifact_uri = run_obj.info.artifact_uri
             context.set_current_run(mlflow_run_id) # TODO: change method name
-            context.artifact_uri = mlflow_artifact_uri # TODO: implement get/set
+            context.artifact_uri = mlflow_artifact_uri
 
         yield stage
 
@@ -248,7 +251,6 @@ def log_model(model, name=None):
     mlflow.log_artifact(file_path)
     return file_path
 
-#def publish_model(model, destination, name):
 def publish_model(name):
     """
     Publish model artifact into model registry
@@ -266,6 +268,38 @@ def publish_model(name):
 
     model_uri = "runs:/{}/{}".format(mlflow_run_id, artifact_uri)
     mlflow.register_model(model_uri, name)
+
+def load_model(run_name, model_uri=None):
+    """
+    Get loaded model artifact from run name
+    """
+    if not isinstance(run_name, str):
+        raise ValueError("'run_name' is required to be a string")
+
+    if model_uri is None:
+        context = current_context()
+        runs_list = mlflow_run_from_name(run_name)
+        if len(runs_list) == 0:
+            raise ValueError(f"No runs found for name '{run_name}'")
+        if len(runs_list) > 1:
+            raise ValueError(f"Multiple runs found for name '{run_name}'")
+
+        run_id = runs_list[0].info.run_id
+        model_uri = f"runs:/{run_id}/model"
+
+    return mlflow.pyfunc.load_model(model_uri)
+
+def mlflow_run_from_name(run_name):
+    """
+    Returns: list of mlflow.entities.Run
+    """
+    context = current_context()
+    experiment_id = context['experiment']['id']
+    return mlflow.search_runs(
+        experiment_ids=[experiment_id],
+        filter_string=f'tags.mlflow.runName = "{run_name}"',
+        output_format = "list"
+    )
 
 def save_pickle(obj, path, name=None):
     context = current_context()
@@ -301,4 +335,4 @@ def save_pickle(obj, path, name=None):
 def init_cmd(*args, **kwargs):
     return init(*args, **kwargs)
 
-__all__ = ['init', 'init_cmd', 'stage', 'add_dependency', 'load_pickle', 'save_pickle', 'log_model', 'publish_model']
+__all__ = ['init', 'init_cmd', 'stage', 'add_dependency', 'load_pickle', 'save_pickle', 'log_model', 'publish_model', 'load_model']
