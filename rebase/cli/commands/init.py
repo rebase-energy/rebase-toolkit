@@ -81,8 +81,8 @@ def init_proj_dir(project_dir):
             run_commands([f"git add .dvc*",
                           f"git commit -m 'dvc init {project_dir}'"])
 
-        user_email = os.environ.get('RB_EMAIL')
-        user_name = os.environ.get('RB_USERNAME')
+        user_email = os.environ.get('GIT_EMAIL')
+        user_name = os.environ.get('GIT_USERNAME')
         if user_email is None or user_name is None:
             user_email = "RbUser@rebase.energy"
             user_name = "RbUser"
@@ -106,28 +106,36 @@ def repo_chdir():
         os.chdir(saved_dir)
 
 
-def add_dependency(path: str, name: str = None,
-                    externals: str = "ref_direct", remote = False):
+def add_dependency(location: str, repo: str = None, out: str = None,
+                    externals: str = "ref_direct", remote: bool = False):
+    """
+    TODO: Add some documentation, this function does a lot
+    """
     context = current_context()
     stage = context.current_stage()
 
-    if name is None:
-        raise ValueError("No dependency name set!")
+    # deconstruct path???
+    # dvc import https://github.com/worldyn/rebase-test.git price-forecast/outs/train.pkl --rev v1 --out outs/train.pkl
 
     dvc_add_flags = ""
     copy_file = False
 
+    if out is None and not remote:
+        out = location
+    elif out is None and remote:
+        out = "."
+
     if remote:
         # TODO: what for ref_direct and raise???
-        dep_file = path # external path, e.g url
+        dep_file = out # external path, e.g url
     else:
         # fix correct file paths
-        file_path_abs = os.path.abspath(path)
+        file_path_abs = os.path.abspath(location)
         if not os.path.samefile(os.path.commonpath([
                                     file_path_abs,
                                     os.path.abspath(context['path']),
                                 ]), os.path.abspath(context['path'])):
-            logging.info(f"Dependency {path} is outside the repo. Action: {externals}")
+            logging.info(f"Dependency {location} is outside the repo. Action: {externals}")
             dir_name = os.path.dirname(file_path_abs)
             remote_name = os.path.basename(dir_name)
 
@@ -145,7 +153,7 @@ def add_dependency(path: str, name: str = None,
                     dep_file = file_path_abs
                     dvc_add_flags = "--external"
             elif externals == "copy":
-                dep_file = name
+                dep_file = out
                 copy_file = True
             elif externals == "raise":
                 raise ExternalsDisabledError()
@@ -154,30 +162,28 @@ def add_dependency(path: str, name: str = None,
 
     if stage.get_dependency_by_path(dep_file) is None:
         with repo_chdir():
-            if not remote:
-                if copy_file:
-                    dest_file = os.path.join(context['path'], dep_file)
-                    file_dir = os.path.dirname(dest_file)
-                    os.makedirs(file_dir, exist_ok=True)
-                    copyfile(file_path_abs, dest_file)
+            # create output dir if it doesn't exist
+            if copy_file or remote:
+                dest_file = os.path.join(context['path'], dep_file)
+                file_dir = os.path.dirname(dest_file)
+                os.makedirs(file_dir, exist_ok=True)
 
+            if copy_file and not remote:
+                copyfile(file_path_abs, dest_file)
+
+            # add the dependency
+            if not remote:
                 run_commands([f"dvc add {dvc_add_flags} {dep_file}"])
             else:
-                local_name = os.path.basename(path)
                 try:
-                    run_commands([f"dvc import-url {dvc_add_flags} {dep_file}"])
+                    run_commands([f"dvc import-url {dvc_add_flags} {location} {dep_file}"])
                 except:
-                    if not local_name in os.listdir("."):
+                    if not os.path.exists(out):
                         raise OSError("Dvc import-url failed...")
-                # error
-                local_path_abs = os.getcwd() + '/' + local_name
+            dep_file_abs = os.path.abspath(dep_file)
+        stage.add_dependency(dep_file, name=out)
 
-        stage.add_dependency(dep_file, name=name)
-
-        if remote:
-            return local_path_abs
-        else:
-            return path
+        return dep_file_abs
     else:
         logging.info(f"Depencency {dep_file} already exists")
 
@@ -196,7 +202,7 @@ def stage(name, params=None, log_run=False):
     try:
         stage = context.current_stage()
         stage.clear_dependencies()
-        run_name = f"r-{generate_run_id()[:5]}"
+        run_name = f"r-{generate_run_id()[:7]}"
         if log_run:
             mlflow.autolog()
             run_obj = mlflow.start_run(
@@ -269,10 +275,15 @@ def publish_model(name):
     model_uri = "runs:/{}/{}".format(mlflow_run_id, artifact_uri)
     mlflow.register_model(model_uri, name)
 
-def load_model(run_name, model_uri=None):
+def load_model(run_name, repo = None, model_uri=None):
     """
     Get loaded model artifact from run name
+    If repo is not set then assumes model is
+    fetched from run in current mlflow experiment.
     """
+
+    ### TODO: get from repo
+
     if not isinstance(run_name, str):
         raise ValueError("'run_name' is required to be a string")
 
@@ -287,14 +298,21 @@ def load_model(run_name, model_uri=None):
         run_id = runs_list[0].info.run_id
         model_uri = f"runs:/{run_id}/model"
 
-    return mlflow.pyfunc.load_model(model_uri)
+    model = mlflow.pyfunc.load_model(model_uri)
+    flavors = list(model.metadata.flavors.keys())
+    return model
 
-def mlflow_run_from_name(run_name):
+def mlflow_run_from_name(run_name, experiment_id = None):
     """
     Returns: list of mlflow.entities.Run
     """
-    context = current_context()
-    experiment_id = context['experiment']['id']
+    if not isinstance(run_name, str):
+        raise ValueError("'run_name' is required to be a string")
+
+    if experiment_id is None:
+        context = current_context()
+        experiment_id = context['experiment']['id']
+
     return mlflow.search_runs(
         experiment_ids=[experiment_id],
         filter_string=f'tags.mlflow.runName = "{run_name}"',
