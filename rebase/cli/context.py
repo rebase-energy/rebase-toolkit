@@ -22,17 +22,20 @@ class Stage(object):
         self.outputs = {}
 
     def _add_dep(self, dep_dict, path, name=None, meta=None, **kwargs):
-        dep_dict[name] = { 'name': name or path,
-                           'path': path,
-                           'meta': meta or {},
-                           **kwargs
-                         }
+        dep_dict[name or path] = { 'name': name or path,
+                                    'path': path,
+                                    'meta': meta or {},
+                                    **kwargs
+                                  }
 
     def add_dependency(self, path, name=None, meta=None, externals=None, **kwargs):
         self._add_dep(self.dependencies, path, name=name, meta=meta, **kwargs)
 
     def add_output(self, path, name=None, meta=None, **kwargs):
         self._add_dep(self.outputs, path, name=name, meta=meta, **kwargs)
+
+    def get_outputs(self):
+        return self.outputs
 
     def get_dependency(self, name):
         return self.dependencies.get(name, None)
@@ -80,6 +83,7 @@ class Context(dict):
                 continue
 
             stage = self.stages[stage_name]
+            
             dvc_stage = {
                 "cmd": f"echo \"{stage_name}.py not implemented\"",
                 "deps": sorted([d['path'] for k, d in stage.dependencies.items()]),

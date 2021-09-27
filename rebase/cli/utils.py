@@ -11,7 +11,7 @@ def generate_run_id():
 
 def run_command(command, return_output=False):
     command_list = shlex.split(command)
-           
+
     try:
         logging.info("Running: \"{}\"".format(command))
         result = subprocess.run(command_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE);
@@ -25,7 +25,7 @@ def run_commands(commands, stop_on_failure=True, return_output=False, raise_erro
     for cmd in commands:
         retcode, result = run_command(cmd, return_output=True)
         if not return_output:
-            result = None    
+            result = None
         results.append((retcode, result))
         if stop_on_failure and retcode != 0:
             if raise_error:
@@ -51,4 +51,8 @@ def file_hash(file):
 
 def dict_to_yaml_file(d: dict, file_path: str):
     with open(file_path, 'w') as outfile:
-        yaml.dump(d, outfile, default_flow_style=False)  
+        yaml.dump(d, outfile, default_flow_style=False)
+
+def yaml_to_dict(file_path: str):
+    with open(file_path, 'r') as f:
+        return yaml.load(f)

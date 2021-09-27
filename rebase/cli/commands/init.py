@@ -6,7 +6,7 @@ import logging
 from shutil import copyfile
 from contextlib import contextmanager
 
-from ..utils import run_commands,run_command, generate_run_id, dict_to_yaml_file
+from ..utils import run_commands,run_command, generate_run_id, dict_to_yaml_file, yaml_to_dict
 from ..context import current_context
 from ..errors import *
 from ...api.sdk import project_init
@@ -106,7 +106,7 @@ def repo_chdir():
         os.chdir(saved_dir)
 
 
-def add_dependency(location: str, repo: str = None, out: str = None,
+def add_dependency(location: str, out: str = None,
                     externals: str = "ref_direct", remote: bool = False):
     """
     TODO: Add some documentation, this function does a lot
@@ -173,7 +173,9 @@ def add_dependency(location: str, repo: str = None, out: str = None,
 
             # add the dependency
             if not remote:
-                run_commands([f"dvc add {dvc_add_flags} {dep_file}"])
+                retc, output = run_commands([f"dvc add {dvc_add_flags} {dep_file}"], return_output=True)
+                if retc != 0:
+                    print(f"dvc add error: {output}")
             else:
                 try:
                     run_commands([f"dvc import-url {dvc_add_flags} {location} {dep_file}"])
@@ -202,6 +204,14 @@ def stage(name, params=None, log_run=False):
     try:
         stage = context.current_stage()
         stage.clear_dependencies()
+
+        if os.path.isfile('dvc.yaml'):
+            dvc_yaml = yaml_to_dict('dvc.yaml')
+            if 'stages' in dvc_yaml and name in dvc_yaml['stages']:
+                retc, output = run_commands([f'dvc pull {name}'], raise_error=False, return_output=True)[0]
+                if retc != 0:
+                    logging.error(f"Dvc - error pulling from '{name}' : {output}")
+
         run_name = f"r-{generate_run_id()[:7]}"
         if log_run:
             mlflow.autolog()
@@ -217,6 +227,12 @@ def stage(name, params=None, log_run=False):
         yield stage
 
         with repo_chdir():
+            # add dvc files for outputs
+            #for k, d in stage.outputs.items():
+            #    out_path = d['path']
+            #    full_out_path = os.path.join(context['path'], out_path)
+            #    run_commands([f'dvc add {full_out_path}'])
+
             dvc_pipeline = context.generate_dvc_pipeline()
             dict_to_yaml_file(dvc_pipeline, "dvc.yaml")
             if params:
@@ -241,6 +257,7 @@ def stage(name, params=None, log_run=False):
             mlflow.end_run()
             context.clear_run()
             context.artifact_uri = None
+
         context.set_stage(prev_stage.name, prev_stage.params)
 
 
@@ -322,13 +339,13 @@ def mlflow_run_from_name(run_name, experiment_id = None):
 def save_pickle(obj, path, name=None):
     context = current_context()
     stage = context.current_stage()
+
     rel_dest_file = os.path.join(context['path'], path)
     file_dir = os.path.dirname(rel_dest_file)
     os.makedirs(file_dir, exist_ok=True)
     with open(rel_dest_file, "wb") as f:
         cloudpickle.dump(obj, f)
-    # with repo_chdir():
-    #     run_commands([f"dvc add {rel_dest_file}"])
+
     stage.add_output(path, name=name)
 
     return rel_dest_file
@@ -345,7 +362,10 @@ def save_pickle(obj, path, name=None):
     # finally:
     #   os.close(temp_file_fd)
 
-
+def restore(stage: str):
+    with repo_chdir():
+        _, out = run_command(f'dvc pull {stage}',return_output=True)
+        print(out)
 
 @click.command(name="init")
 @click.option("--project", "-p", "project")
@@ -353,4 +373,4 @@ def save_pickle(obj, path, name=None):
 def init_cmd(*args, **kwargs):
     return init(*args, **kwargs)
 
-__all__ = ['init', 'init_cmd', 'stage', 'add_dependency', 'load_pickle', 'save_pickle', 'log_model', 'publish_model', 'load_model']
+__all__ = ['init', 'init_cmd', 'stage', 'add_dependency', 'load_pickle', 'save_pickle', 'log_model', 'publish_model', 'load_model', 'restore']
