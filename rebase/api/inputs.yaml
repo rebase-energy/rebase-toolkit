@@ -1,0 +1,9 @@
+pv:
+  data: generation
+
+battery:
+  min_level:
+    rename: battery_min_level
+    optional: false
+  capacity:
+    rename: battery_capacity

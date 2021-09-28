@@ -1,7 +1,6 @@
 import rebase.util.api_request as api_request
 import json
 import pandas as pd
-import requests
 
 class SiteTemplate():
 
@@ -157,7 +156,7 @@ class Site():
         if start_date is not None and end_date is not None:
             params['start_date'] = start_date
             params['end_date'] = end_date
-        
+
         response = api_request.get(path, params=params)
         if response.status_code == 200:
             data = response.json()
