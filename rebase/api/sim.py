@@ -476,7 +476,7 @@ class Task:
                     df = comp.data.reset_index()
                     upload_data = {'demand': df.to_dict(orient='list')}
 
-        resp = api_request.post(url, data=json.dumps({}))
+        resp = api_request.post(url, data=json.dumps({'tag': mc.tag}))
         if resp.status_code == 200:
             data = resp.json()
             mc.id = data['id']
