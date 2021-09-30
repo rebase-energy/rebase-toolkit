@@ -205,13 +205,19 @@ def stage(name, params=None, log_run=False):
         stage = context.current_stage()
         stage.clear_dependencies()
 
-        if os.path.isfile('dvc.yaml'):
-            dvc_yaml = yaml_to_dict('dvc.yaml')
-            if 'stages' in dvc_yaml and name in dvc_yaml['stages']:
-                retc, output = run_commands([f'dvc pull {name}'], raise_error=False, return_output=True)[0]
-                if retc != 0:
-                    logging.error(f"Dvc - error pulling from '{name}' : {output}")
 
+        with repo_chdir():
+            retc, output = run_commands([f'dvc checkout'], raise_error=False, return_output=True)[0]
+        """
+            if os.path.isfile('dvc.yaml'):
+                dvc_yaml = yaml_to_dict('dvc.yaml')
+                if 'stages' in dvc_yaml and name in dvc_yaml['stages']:
+                    retc, output = run_commands([f'dvc pull {name}'], raise_error=False, return_output=True)[0]
+                    if retc == 0:
+                        logging.error(f"Dvc - pulled deps from '{name}' : {output}")
+                    else:
+                        logging.error(f"Dvc - error pulling from '{name}' : {output}")
+        """
         run_name = f"r-{generate_run_id()[:7]}"
         if log_run:
             mlflow.autolog()
@@ -238,10 +244,20 @@ def stage(name, params=None, log_run=False):
             if params:
                 dict_to_yaml_file(params, "params.yaml")
 
-            retc, output = run_commands([f'dvc commit -f'], raise_error=False, return_output=True)[0]
+            deps = ""
+            outs = ""
+            for dep in dvc_pipeline['stages'][name]['deps']:
+                deps += f"-d {dep} "
+            for out in dvc_pipeline['stages'][name]['outs']:
+                outs += f"-o {out} "
+
+            retc, output = run_commands([f'dvc run -n {name} {deps} {outs} --no-exec --force echo \"{name}.py not implemented\"',
+                                         f'dvc commit -f'],
+                                         raise_error=False,
+                                         return_output=True)[0]
             if retc == 0:
                 retc, output = run_commands([f'git add .',
-                                             f'git commit -m "run_name:{run_name}"'], raise_error=False, return_output=True)[-1]
+                                             f'git commit -m "{run_name}"'], raise_error=False, return_output=True)[-1]
                 if retc == 1:
                     logging.info("Git - nothing to commit")
                 elif retc != 0:
@@ -367,10 +383,26 @@ def restore(stage: str):
         _, out = run_command(f'dvc pull {stage}',return_output=True)
         print(out)
 
+def log_param(key: str ,value: any):
+    mlflow.log_param(key, value)
+
+def log_metric(key: str ,value: float, step: int =None):
+    mlflow.log_metric(key, value, step)
+
+def log_params(params_dict):
+    mlflow.log_params(params_dict)
+
+def log_metrics(metrics_dict, step: int = None):
+    mlflow.log_metrics(metrics_dict, step)
+
 @click.command(name="init")
 @click.option("--project", "-p", "project")
 @click.option("--experiment", "-e", "experiment")
 def init_cmd(*args, **kwargs):
     return init(*args, **kwargs)
 
-__all__ = ['init', 'init_cmd', 'stage', 'add_dependency', 'load_pickle', 'save_pickle', 'log_model', 'publish_model', 'load_model', 'restore']
+__all__ = [
+    'init', 'init_cmd', 'stage', 'add_dependency', 'load_pickle',
+    'save_pickle', 'log_model', 'publish_model', 'load_model',
+    'restore', 'log_param', 'log_metric', 'log_params', 'log_metrics'
+]
