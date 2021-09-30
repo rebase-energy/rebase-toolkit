@@ -299,7 +299,8 @@ def stage(name, params=None, log_run=False, run_name=None):
             # new branch
             run_commands([f'git checkout -b tmp',
                           f'git checkout {curr_branch}',
-                          f'git rebase tmp'],raise_error=False, return_output=True)
+                          f'git rebase tmp',
+                          f'dvc checkout'],raise_error=False, return_output=True)
             # merge with new branch
             # delete new branch
 
