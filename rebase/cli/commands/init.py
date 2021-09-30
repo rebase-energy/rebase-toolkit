@@ -106,11 +106,12 @@ def repo_chdir():
         os.chdir(saved_dir)
 
 
-def add_dependency(location: str, out: str = None,
-                    externals: str = "ref_direct", remote: bool = False):
+def add_dependency(location: str, out: str = None, externals: str = "ref_direct",
+                    repo: str = None, remote: bool = False, revision: str = None):
     """
     TODO: Add some documentation, this function does a lot
     """
+    # dvc import https://github.com/worldyn/rebase-test.git price-forecast/ins/test.csv --rev v15 -o minfil.csv
     context = current_context()
     stage = context.current_stage()
 
@@ -124,6 +125,9 @@ def add_dependency(location: str, out: str = None,
         out = location
     elif out is None and remote:
         out = "."
+
+    if repo is not None:
+        remote = True
 
     if remote:
         # TODO: what for ref_direct and raise???
@@ -178,10 +182,15 @@ def add_dependency(location: str, out: str = None,
                     print(f"dvc add error: {output}")
             else:
                 try:
-                    run_commands([f"dvc import-url {dvc_add_flags} {location} {dep_file}"])
+                    if repo is not None:
+                        rev_str = f"--rev {revision}" if revision is not None else ""
+
+                        run_commands([f"dvc import {dvc_add_flags} {rev_str} {repo} {location} -o {dep_file}"])
+                    else:
+                        run_commands([f"dvc import-url {dvc_add_flags} {location} {dep_file}"])
                 except:
                     if not os.path.exists(out):
-                        raise OSError("Dvc import-url failed...")
+                        raise OSError("Dvc import failed...")
             dep_file_abs = os.path.abspath(dep_file)
         stage.add_dependency(dep_file, name=out)
 
