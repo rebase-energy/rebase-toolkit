@@ -206,7 +206,7 @@ def add_dependency(location: str, out: str = None, externals: str = "ref_direct"
 #     return stage.get_dependency_by_path(name)
 
 @contextmanager
-def stage(name, params=None, log_run=False):
+def stage(name, params=None, log_run=False, run_name=None):
     context = current_context()
     prev_stage = context.current_stage()
     context.set_stage(name, params=params)
@@ -216,6 +216,14 @@ def stage(name, params=None, log_run=False):
 
 
         with repo_chdir():
+            if run_name is not None:
+                # git rev-parse HEAD
+                curr_branch = run_command("git rev-parse --abbrev-ref HEAD",
+                                      return_output=True)[1].strip()
+                run_commit = run_command("git log --oneline | grep {run_name}",
+                                      return_output=True)[1].strip().split()[0]
+                retc, output = run_commands([f'git checkout {run_commit}'], raise_error=False, return_output=True)[0]
+
             retc, output = run_commands([f'dvc checkout'], raise_error=False, return_output=True)[0]
         """
             if os.path.isfile('dvc.yaml'):
@@ -282,6 +290,18 @@ def stage(name, params=None, log_run=False):
             mlflow.end_run()
             context.clear_run()
             context.artifact_uri = None
+
+        if run_name is not None:
+            # put new commit into branch?
+            # git checkout -b tmp
+            # git checkout curr_branch
+
+            # new branch
+            run_commands([f'git checkout -b tmp',
+                          f'git checkout {curr_branch}',
+                          f'git rebase tmp'],raise_error=False, return_output=True)
+            # merge with new branch
+            # delete new branch
 
         context.set_stage(prev_stage.name, prev_stage.params)
 
