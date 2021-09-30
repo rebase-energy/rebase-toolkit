@@ -352,13 +352,9 @@ def load_model(run_name, repo = None, model_uri=None):
 
     if model_uri is None:
         context = current_context()
-        runs_list = mlflow_run_from_name(run_name)
-        if len(runs_list) == 0:
-            raise ValueError(f"No runs found for name '{run_name}'")
-        if len(runs_list) > 1:
-            raise ValueError(f"Multiple runs found for name '{run_name}'")
+        run = mlflow_run_from_name(run_name)
 
-        run_id = runs_list[0].info.run_id
+        run_id = run.info.run_id
         model_uri = f"runs:/{run_id}/model"
 
     model = mlflow.pyfunc.load_model(model_uri)
@@ -367,7 +363,7 @@ def load_model(run_name, repo = None, model_uri=None):
 
 def mlflow_run_from_name(run_name, experiment_id = None):
     """
-    Returns: list of mlflow.entities.Run
+    Returns: mlflow.entities.Run
     """
     if not isinstance(run_name, str):
         raise ValueError("'run_name' is required to be a string")
@@ -376,11 +372,16 @@ def mlflow_run_from_name(run_name, experiment_id = None):
         context = current_context()
         experiment_id = context['experiment']['id']
 
-    return mlflow.search_runs(
+    runs_list = mlflow.search_runs(
         experiment_ids=[experiment_id],
         filter_string=f'tags.mlflow.runName = "{run_name}"',
         output_format = "list"
     )
+    if len(runs_list) == 0:
+        raise ValueError(f"No runs found for name '{run_name}'")
+    if len(runs_list) > 1:
+        raise ValueError(f"Multiple runs found for name '{run_name}'")
+    return runs_list[0]
 
 def save_pickle(obj, path, name=None):
     context = current_context()
@@ -455,6 +456,20 @@ def list(experiment_id: str, key: str = None, type: str = "metric"):
         print(f"- run {ri.run_id} {val_str}")
     return run_dict
 
+def info(experiment_id: str, run_name: str):
+    """
+    Print info about run
+    """
+    run = mlflow_run_from_name(run_name, experiment_id)
+    ri = run.info
+    rd = run.data
+    print(f"- run {run_name}, exp {experiment_id}")
+    print(f"internal mlflow run id: {ri.run_id}")
+    print(f"status: {mlflow.entities.RunStatus.status(ri.status)}")
+    print(f"metrics: \n{rd.metrics}")
+    print(f"params: \n{rd.params}")
+
+
 @click.command(name="init")
 @click.option("--project", "-p", "project")
 @click.option("--experiment", "-e", "experiment")
@@ -465,5 +480,5 @@ __all__ = [
     'init', 'init_cmd', 'stage', 'add_dependency', 'load_pickle',
     'save_pickle', 'log_model', 'publish_model', 'load_model',
     'restore', 'log_param', 'log_metric', 'log_params', 'log_metrics',
-    'list'
+    'list', 'info'
 ]
