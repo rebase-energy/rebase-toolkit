@@ -425,6 +425,36 @@ def log_params(params_dict):
 def log_metrics(metrics_dict, step: int = None):
     mlflow.log_metrics(metrics_dict, step)
 
+def list(experiment_id: str, key: str = None, type: str = "metric"):
+    """
+    Prints runs for an experiment, and returns list of IDs
+    Can be ordered by a metric or param, saved in the runs.
+
+    type: "metric" or "param"
+    :param str experiment_id: id of experiment (mlflow)
+    :param str key: name of param/metric to sort runs by
+    :param str type: type of key, either 'metric' or 'param'
+    :return: dict: run_id => mlflow run object
+    """
+    if type != "metric" and type != "param":
+        raise ValueError("Type must be either 'metric' or 'param'")
+
+    order_by = [f"{type}.{key} DESC"] if key is not None else None
+    run_dict = []
+
+    for ri in mlflow.list_run_infos(experiment_id, order_by=order_by):
+        val_str = ""
+        run = mlflow.get_run(ri.run_id)
+        run_dict[ri.run_id] = run
+        if key is not None:
+            rdict = getattr(run.data, type)
+            if key in rdict:
+                val = rdict[key]
+                val_str = f", {type}.{key} {val}"
+
+        print(f"- run {ri.run_id} {val_str}")
+    return run_dict
+
 @click.command(name="init")
 @click.option("--project", "-p", "project")
 @click.option("--experiment", "-e", "experiment")
@@ -434,5 +464,6 @@ def init_cmd(*args, **kwargs):
 __all__ = [
     'init', 'init_cmd', 'stage', 'add_dependency', 'load_pickle',
     'save_pickle', 'log_model', 'publish_model', 'load_model',
-    'restore', 'log_param', 'log_metric', 'log_params', 'log_metrics'
+    'restore', 'log_param', 'log_metric', 'log_params', 'log_metrics',
+    'list'
 ]
