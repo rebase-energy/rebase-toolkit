@@ -105,6 +105,21 @@ def repo_chdir():
     finally:
         os.chdir(saved_dir)
 
+@contextmanager
+def mlflow_ctx(experiment):
+    """
+    Ctx manager to perform commands with mlflow for an experiment
+    """
+    try:
+        existing_experiment = mlflow.get_experiment_by_name(experiment)
+        if existing_experiment is None:
+            raise ValueError("Experiment doesn't exist")
+        else:
+            experiment_id = existing_experiment.experiment_id
+        yield experiment_id
+    finally:
+        pass
+
 
 def add_dependency(location: str, out: str = None, externals: str = "ref_direct",
                     repo: str = None, remote: bool = False, revision: str = None):
@@ -206,7 +221,7 @@ def add_dependency(location: str, out: str = None, externals: str = "ref_direct"
 #     return stage.get_dependency_by_path(name)
 
 @contextmanager
-def stage(name, params=None, log_run=False, run_name=None):
+def stage(name, params=None, log_run=False, ctx_run_name=None):
     context = current_context()
     prev_stage = context.current_stage()
     context.set_stage(name, params=params)
@@ -214,15 +229,15 @@ def stage(name, params=None, log_run=False, run_name=None):
         stage = context.current_stage()
         stage.clear_dependencies()
 
-
+        logging.info("Restoring context...")
         with repo_chdir():
-            if run_name is not None:
-                # git rev-parse HEAD
-                curr_branch = run_command("git rev-parse --abbrev-ref HEAD",
-                                      return_output=True)[1].strip()
-                run_commit = run_command("git log --oneline | grep {run_name}",
+            curr_branch = run_command("git rev-parse --abbrev-ref HEAD",
+                                  return_output=True)[1].strip()
+            if ctx_run_name is not None:
+
+                ctx_commit = run_command(f"git log --oneline --grep='{ctx_run_name}'",
                                       return_output=True)[1].strip().split()[0]
-                retc, output = run_commands([f'git checkout {run_commit}'], raise_error=False, return_output=True)[0]
+                retc, output = run_commands([f'git checkout {ctx_commit}'], raise_error=False, return_output=True)[0]
 
             retc, output = run_commands([f'dvc checkout'], raise_error=False, return_output=True)[0]
         """
@@ -291,18 +306,17 @@ def stage(name, params=None, log_run=False, run_name=None):
             context.clear_run()
             context.artifact_uri = None
 
-        if run_name is not None:
-            # put new commit into branch?
-            # git checkout -b tmp
-            # git checkout curr_branch
-
-            # new branch
-            run_commands([f'git checkout -b tmp',
-                          f'git checkout {curr_branch}',
-                          f'git rebase tmp',
-                          f'dvc checkout'],raise_error=False, return_output=True)
-            # merge with new branch
-            # delete new branch
+        if ctx_run_name is not None:
+            logging.info("Git - restoring to current branch")
+            with repo_chdir():
+                retl = run_commands([f'git checkout -B tmp_rb',
+                              f'git checkout {curr_branch}',
+                              f'git rebase tmp_rb',
+                              f'dvc checkout',
+                              f'git branch -D tmp_rb'],raise_error=False, return_output=True)
+                for (retc, output) in retl:
+                    if retc != 0:
+                        logging.error(f"Git/DVC - error in restoring to current branch: {output}")
 
         context.set_stage(prev_stage.name, prev_stage.params)
 
@@ -426,7 +440,8 @@ def log_params(params_dict):
 def log_metrics(metrics_dict, step: int = None):
     mlflow.log_metrics(metrics_dict, step)
 
-def list(experiment_id: str, key: str = None, type: str = "metric"):
+def list(experiment: str, key: str = None, type: str = "metrics",
+        return_runs: bool = False, max_results = 10):
     """
     Prints runs for an experiment, and returns list of IDs
     Can be ordered by a metric or param, saved in the runs.
@@ -435,26 +450,36 @@ def list(experiment_id: str, key: str = None, type: str = "metric"):
     :param str experiment_id: id of experiment (mlflow)
     :param str key: name of param/metric to sort runs by
     :param str type: type of key, either 'metric' or 'param'
-    :return: dict: run_id => mlflow run object
+    :param return_runs: decide if to return a dictionary with runs
+    :param max_results: pagination max number 
+    :return: if return_runs = True then dict: run_id => mlflow run object
     """
-    if type != "metric" and type != "param":
-        raise ValueError("Type must be either 'metric' or 'param'")
+    with mlflow_ctx(experiment) as experiment_id:
+        if type != "metrics" and type != "params":
+            raise ValueError("Type must be either 'metrics' or 'params'")
 
-    order_by = [f"{type}.{key} DESC"] if key is not None else None
-    run_dict = []
+        order_by = [f"{type}.{key} DESC"] if key is not None else None
+        run_dict = {}
 
-    for ri in mlflow.list_run_infos(experiment_id, order_by=order_by):
-        val_str = ""
-        run = mlflow.get_run(ri.run_id)
-        run_dict[ri.run_id] = run
-        if key is not None:
-            rdict = getattr(run.data, type)
-            if key in rdict:
-                val = rdict[key]
-                val_str = f", {type}.{key} {val}"
+        for ri in mlflow.list_run_infos(experiment_id, order_by=order_by, max_results = max_results):
+            val_str = ""
+            run = mlflow.get_run(ri.run_id)
 
-        print(f"- run {ri.run_id} {val_str}")
-    return run_dict
+            run_name_str = ''
+            if 'mlflow.runName' in run.data.tags:
+                run_name_str = 'name ' + run.data.tags['mlflow.runName'] + ', '
+
+            if return_runs:
+                run_dict[ri.run_id] = run
+            if key is not None:
+                rdict = getattr(run.data, type)
+                if key in rdict:
+                    val = rdict[key]
+                    val_str = f", {type}.{key} {val}"
+
+            print(f"- {run_name_str}runid {ri.run_id}, {val_str} ")
+        if return_runs:
+            return run_dict
 
 def info(experiment_id: str, run_name: str):
     """
