@@ -451,7 +451,7 @@ def list(experiment: str, key: str = None, type: str = "metrics",
     :param str key: name of param/metric to sort runs by
     :param str type: type of key, either 'metric' or 'param'
     :param return_runs: decide if to return a dictionary with runs
-    :param max_results: pagination max number 
+    :param max_results: pagination max number
     :return: if return_runs = True then dict: run_id => mlflow run object
     """
     with mlflow_ctx(experiment) as experiment_id:
@@ -481,18 +481,19 @@ def list(experiment: str, key: str = None, type: str = "metrics",
         if return_runs:
             return run_dict
 
-def info(experiment_id: str, run_name: str):
+def info(experiment: str, run_name: str):
     """
     Print info about run
     """
-    run = mlflow_run_from_name(run_name, experiment_id)
-    ri = run.info
-    rd = run.data
-    print(f"- run {run_name}, exp {experiment_id}")
-    print(f"internal mlflow run id: {ri.run_id}")
-    print(f"status: {mlflow.entities.RunStatus.status(ri.status)}")
-    print(f"metrics: \n{rd.metrics}")
-    print(f"params: \n{rd.params}")
+    with mlflow_ctx(experiment) as experiment_id:
+        run = mlflow_run_from_name(run_name, experiment_id)
+        ri = run.info
+        rd = run.data
+        print(f"- run {run_name}, exp {experiment_id}")
+        print(f"internal mlflow run id: {ri.run_id}")
+        print(f"status: {ri.status}")
+        print(f"metrics: \n{rd.metrics}")
+        print(f"params: \n{rd.params}")
 
 
 @click.command(name="init")
