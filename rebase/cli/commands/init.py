@@ -334,7 +334,7 @@ def log_model(model, name=None):
     mlflow.log_artifact(file_path)
     return file_path
 
-def publish_model(name):
+def publish_model(name: str, run_name: str = None):
     """
     Publish model artifact into model registry
     Appends version if already existing.
@@ -343,14 +343,22 @@ def publish_model(name):
         raise ValueError("Name is required to be a string")
 
     context = current_context()
-    mlflow_run_id = context.get_run()
-    artifact_uri = context.artifact_uri
-    #print("MLFLOW RUN: ", mlflow_run_id)
-    #print("ARTIFCAT URI: ", artifact_uri)
-    #context['experiment']['id']
+    curr_experiment = context['experiment']['name']
+    with mlflow_ctx(curr_experiment) as experiment_id:
+        if run_name is None:
+            mlflow_run_id = context.get_run()
+            artifact_uri = context.artifact_uri
+        else:
+            run = mlflow_run_from_name(run_name, experiment_id)
+            mlflow_run_id = run.info.run_id
+            artifact_uri = run.info.artifact_uri
 
-    model_uri = "runs:/{}/{}".format(mlflow_run_id, artifact_uri)
-    mlflow.register_model(model_uri, name)
+        #print("MLFLOW RUN: ", mlflow_run_id)
+        #print("ARTIFCAT URI: ", artifact_uri)
+        #context['experiment']['id']
+
+        model_uri = "runs:/{}/{}".format(mlflow_run_id, artifact_uri)
+        mlflow.register_model(model_uri, name)
 
 def load_model(run_name, repo = None, model_uri=None):
     """
