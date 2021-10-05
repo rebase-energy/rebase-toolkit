@@ -170,6 +170,46 @@ class Site():
             }
 
 
+    @classmethod
+    def production(cls, site_id, start_date=None, end_date=None, resolution="1H"):
+        """Get the historical production for a site
+
+        Args:
+            site_id (str): id of the site
+           
+        Returns:
+            dict:
+            Returns a dataframe with production data
+
+            Example::
+
+                >>> site_id = '4ab82692-3944-4069-9cbb-f9c59513c1c3'
+                >>> data = rb.Site.production(site_id)
+                >>> print(data)
+                                                power_kw
+                    valid_time
+                    2020-10-14 00:00:00+00:00       77.3
+                    2020-10-14 00:15:00+00:00       86.1
+                    ...                             ...
+                    2020-10-17 23:30:00+00:00       87.0
+                    2020-10-17 23:45:00+00:00       86.6
+        """
+        path = '{}/site/production/{}'.format(cls.base_path, site_id)
+       
+        if start_date is not None and end_date is not None:
+            params['date_start'] = start_date
+            params['date_end'] = end_date
+
+        if resolution is not None:
+            params['resolution'] = resolution
+        
+        response = api_request.get(path, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            df = pd.DataFrame(data={'power_kw': data['power_kw']}, index=pd.to_datetime(data['valid_time']))
+            df.index.name = 'valid_time'
+            return df
+            
 
     @classmethod
     def list(cls):
