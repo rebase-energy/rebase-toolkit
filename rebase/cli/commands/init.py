@@ -83,8 +83,8 @@ def init_proj_dir(project_dir, git_init):
                           f"dvc remote add --default rebase {proj_config['data_location']}"])
 
             # commit .dvc files if new repo
-            run_commands([f"git add .dvc*",
-                          f"git commit -m 'dvc init {project_dir}'"])
+            run_commands([f"git add {current_dir}/.dvc*",
+                          f"git commit -m 'dvc init'"])
 
         user_email = os.environ.get('GIT_EMAIL')
         user_name = os.environ.get('GIT_USERNAME')
