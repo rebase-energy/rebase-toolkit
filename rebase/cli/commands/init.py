@@ -14,6 +14,7 @@ from ...api.sdk import project_init
 def init(project: str = None,
          experiment: str = None,
          project_dir: str = None,
+         git_init: bool = False,
          context: dict = None,
          artifact_location: str = None
 ) -> None:
@@ -28,7 +29,7 @@ def init(project: str = None,
         raise ValueError("Missing project name")
 
     proj_config = project_init(project)
-    print(f"Project config: \n{proj_config}")
+
     for k, v in proj_config['envs'].items():
         os.environ[k] = v
 
@@ -50,22 +51,26 @@ def init(project: str = None,
                               'id': experiment_id}
     context['path'] = project_dir
 
-    init_proj_dir(project_dir)
+    init_proj_dir(project_dir, git_init)
 
-def init_proj_dir(project_dir):
+def init_proj_dir(project_dir, git_init):
     context = current_context()
     os.makedirs(project_dir, exist_ok=True)
 
     proj_config = context["config"]
+    current_dir = os.getcwd()
 
     print("Init project dir...")
     with repo_chdir() as repo_dir:
         # check if inside git repo
-        _, git_repo = run_command("git rev-parse --is-inside-work-tree",
-                                  return_output=True)
+        if not git_init:
+            _, git_repo = run_command("git rev-parse --is-inside-work-tree",
+                                      return_output=True)
 
-        if not 'true' in git_repo.lower():
-            raise OSError("Not inside git repo...")
+            if not 'true' in git_repo.lower():
+                raise OSError("Not inside git repo...")
+        else:
+            run_commands([f"git init {current_dir}"])
 
         dvc_inited = os.path.isdir(".dvc")
 
@@ -352,10 +357,6 @@ def publish_model(name: str, run_name: str = None):
             run = mlflow_run_from_name(run_name, experiment_id)
             mlflow_run_id = run.info.run_id
             artifact_uri = run.info.artifact_uri
-
-        #print("MLFLOW RUN: ", mlflow_run_id)
-        #print("ARTIFCAT URI: ", artifact_uri)
-        #context['experiment']['id']
 
         model_uri = "runs:/{}/{}".format(mlflow_run_id, artifact_uri)
         mlflow.register_model(model_uri, name)
