@@ -28,6 +28,14 @@ def init(project: str = None,
     if project is None:
         raise ValueError("Missing project name")
 
+    # logging
+    import logging
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logging.getLogger(
+        "azure.core.pipeline.policies.http_logging_policy"
+    ).setLevel(logging.WARNING)
+
     proj_config = project_init(project)
 
     for k, v in proj_config['envs'].items():
@@ -83,7 +91,7 @@ def init_proj_dir(project_dir, git_init):
                           f"dvc remote add --default rebase {proj_config['data_location']}"])
 
             # commit .dvc files if new repo
-            run_commands([f"git add {current_dir}/.dvc*",
+            run_commands([f"git add {context['path']}/.dvc*",
                           f"git commit -m 'dvc init'"])
 
         user_email = os.environ.get('GIT_EMAIL')
@@ -192,12 +200,12 @@ def add_dependency(location: str, out: str = None, externals: str = "ref_direct"
                 file_dir = os.path.dirname(dest_file)
                 os.makedirs(file_dir, exist_ok=True)
 
-            if copy_file and not remote:
+            if copy_file and not remote and not os.path.exists(dest_file):
                 copyfile(file_path_abs, dest_file)
 
             # add the dependency
             if not remote:
-                retc, output = run_commands([f"dvc add {dvc_add_flags} {dep_file}"], return_output=True)
+                retc, output = run_commands([f"dvc add {dvc_add_flags} {dep_file}"], return_output=True)[0]
                 if retc != 0:
                     print(f"dvc add error: {output}")
             else:
@@ -306,6 +314,7 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
             else:
                 logging.error(f"Dvc - error commiting changes: {output}")
     finally:
+        logging.info("Run - ending ...")
         if log_run:
             mlflow.end_run()
             context.clear_run()
@@ -419,6 +428,7 @@ def save_pickle(obj, path, name=None):
     stage.add_output(path, name=name)
 
     return rel_dest_file
+
     # temp_file_fd, temp_filename = tempfile.mkstemp()
     # dest_file = os.path.join(context['data_folder'], name)
     # try:
@@ -431,6 +441,18 @@ def save_pickle(obj, path, name=None):
     #       copyfile(temp_filename, dest_file)
     # finally:
     #   os.close(temp_file_fd)
+
+def track_output(path, name=None):
+    context = current_context()
+    stage = context.current_stage()
+
+    rel_dest_file = os.path.join(context['path'], path)
+    if os.path.isfile(rel_dest_file):
+        if path not in stage.outputs and name not in stage.outputs:
+            stage.add_output(path, name=name)
+    else:
+        raise ValueError(f"Path {rel_dest_file} does not exist!")
+
 
 def restore(stage: str):
     with repo_chdir():
