@@ -1,10 +1,12 @@
 import click
 import mlflow
 import os
+from os.path import isfile, isdir
 import cloudpickle
 import logging
 from shutil import copyfile
 from contextlib import contextmanager
+import sys
 
 from ..utils import run_commands,run_command, generate_run_id, dict_to_yaml_file, yaml_to_dict
 from ..context import current_context
@@ -80,19 +82,36 @@ def init_proj_dir(project_dir, git_init):
         else:
             run_commands([f"git init {current_dir}"])
 
-        dvc_inited = os.path.isdir(".dvc")
-
+        dvc_inited = os.path.isdir(f"{context['path']}/.dvc")
         if not dvc_inited:
-        # check if dvc repo
+            # check if dvc repo
             run_commands([#f"git init",
                           f"dvc init --subdir",
                           #f"git add .dvc*",
                           #f"git commit -m 'dvc init '",
                           f"dvc remote add --default rebase {proj_config['data_location']}"])
 
-            # commit .dvc files if new repo
-            run_commands([f"git add {context['path']}/.dvc*",
-                          f"git commit -m 'dvc init'"])
+            # remove cached files (ok if fails because then they're not cached)
+            try:
+                run_commands([f"git rm -rf {context['path']}/.dvc {context['path']}/.dvcignore"])
+            except:
+                pass
+
+            # commit .dvc files if new repo, keep trying until dvc files exist
+            try_iter = 0
+            while True:
+                logging.info(f"Save .dvc files (attempt {try_iter})...")
+                if isdir(f"{context['path']}/.dvc"):
+                    try:
+                        run_commands(
+                            [f"git add {context['path']}/.dvc",
+                            f"git commit -m 'dvc init'"]
+                        )
+                    except Exception as e:
+                        err = sys.exc_info()
+                        print(f"Couldn't git commit dvc files. \n{err[0]},{err[1]},{err[2]}")
+                    break
+                try_iter += 1
 
         user_email = os.environ.get('GIT_EMAIL')
         user_name = os.environ.get('GIT_USERNAME')
