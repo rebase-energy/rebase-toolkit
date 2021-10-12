@@ -80,7 +80,7 @@ def init_proj_dir(project_dir, git_init):
             if not 'true' in git_repo.lower():
                 raise OSError("Not inside git repo...")
         else:
-            run_commands([f"git init {current_dir}"])
+            run_commands([f"git init {current_dir} -b master"])
 
         dvc_inited = os.path.isdir(f"{context['path']}/.dvc")
         if not dvc_inited:
