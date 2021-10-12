@@ -93,9 +93,19 @@ def init_proj_dir(project_dir, git_init):
 
             # remove cached files (ok if fails because then they're not cached)
             try:
-                run_commands([f"git rm -rf {context['path']}/.dvc {context['path']}/.dvcignore"])
+                run_commands([f"git rm -rf {context['path']}/.dvc"])
             except:
                 pass
+
+            # git user data so that we can commit with an identity
+            user_email = os.environ.get('GIT_EMAIL')
+            user_name = os.environ.get('GIT_USERNAME')
+            if user_email is None or user_name is None:
+                user_email = "RbUser@rebase.energy"
+                user_name = "RbUser"
+
+            run_commands([f"git config user.email \"{user_email}\"",
+                          f"git config user.name \"{user_name}\""])
 
             # commit .dvc files if new repo, keep trying until dvc files exist
             try_iter = 0
@@ -113,14 +123,6 @@ def init_proj_dir(project_dir, git_init):
                     break
                 try_iter += 1
 
-        user_email = os.environ.get('GIT_EMAIL')
-        user_name = os.environ.get('GIT_USERNAME')
-        if user_email is None or user_name is None:
-            user_email = "RbUser@rebase.energy"
-            user_name = "RbUser"
-
-        run_commands([f"git config user.email \"{user_email}\"",
-                      f"git config user.name \"{user_name}\""])
         print("git and dvc initialised...")
 
 @contextmanager
