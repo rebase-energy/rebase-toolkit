@@ -110,7 +110,7 @@ def init_proj_dir(project_dir, git_init):
             # commit .dvc files if new repo, keep trying until dvc files exist
             try_iter = 0
             while True:
-                logging.info(f"Save .dvc files (attempt {try_iter})...")
+                logging.info(f"Saving .dvc dir (attempt #{try_iter})...")
                 if isdir(f"{context['path']}/.dvc"):
                     try:
                         run_commands(
