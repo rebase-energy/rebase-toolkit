@@ -1,9 +1,13 @@
 import copy
+import pickle
+from .utils import run_commands,run_command
 
 g_current_context = None
 
-def  current_context():
-    return Context.current()
+def current_context(init=False):
+    if init:
+        return Context.current()
+    return Context.load()
 
 class Stage(object):
     def __init__(self, name, params=None, *args, **kwargs):
@@ -50,9 +54,7 @@ class Stage(object):
         else:
             return deps[0]
 
-
 class Context(dict):
-
     def __init__(self, *args, **kwargs):
         self.stages = {}
         self.set_stage("root")
@@ -76,6 +78,24 @@ class Context(dict):
     def current_stage(self):
         return self._current_stage
 
+    def save(self):
+        _, git_path = run_command("git rev-parse --show-toplevel",
+                                  return_output=True)
+        with open(f'{git_path.strip()}/.context.pkl', 'wb+') as f:
+            pickle.dump(self, f)
+
+    @staticmethod
+    def load():
+        _, git_path = run_command("git rev-parse --show-toplevel",
+                                  return_output=True)
+        git_path = git_path.strip()
+        ctx_path = f'{git_path}/.context.pkl'
+        try:
+            with open(ctx_path, 'rb') as f:
+                return pickle.load(f)
+        except:
+            raise OSError(f"{ctx_path} could not be loaded. Make sure you ran rb init")
+
     def generate_dvc_pipeline(self):
         dvc = {'stages': {}}
         for stage_name in sorted(list(self.stages.keys())):
@@ -83,7 +103,7 @@ class Context(dict):
                 continue
 
             stage = self.stages[stage_name]
-            
+
             dvc_stage = {
                 "cmd": f"echo \"{stage_name}.py not implemented\"",
                 "deps": sorted([d['path'] for k, d in stage.dependencies.items()]),

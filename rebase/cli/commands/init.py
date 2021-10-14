@@ -7,9 +7,10 @@ import logging
 from shutil import copyfile
 from contextlib import contextmanager
 import sys
+import yaml
 
 from ..utils import run_commands,run_command, generate_run_id, dict_to_yaml_file, yaml_to_dict
-from ..context import current_context
+from ..context import current_context, Context, Stage
 from ..errors import *
 from ...api.sdk import project_init
 
@@ -24,7 +25,7 @@ def init(project: str = None,
 
     # get internal rebase context
     if context is None:
-        context = current_context()
+        context = current_context(init=True)
 
     # setup rebase project
     if project is None:
@@ -61,17 +62,16 @@ def init(project: str = None,
                               'id': experiment_id}
     context['path'] = project_dir
 
-    init_proj_dir(project_dir, git_init)
+    init_proj_dir(project_dir, git_init, context)
 
-def init_proj_dir(project_dir, git_init):
-    context = current_context()
+def init_proj_dir(project_dir, git_init, context):
     os.makedirs(project_dir, exist_ok=True)
 
     proj_config = context["config"]
     current_dir = os.getcwd()
 
     print("Init project dir...")
-    with repo_chdir() as repo_dir:
+    with repo_chdir(context) as repo_dir:
         # check if inside git repo
         if not git_init:
             _, git_repo = run_command("git rev-parse --is-inside-work-tree",
@@ -82,13 +82,12 @@ def init_proj_dir(project_dir, git_init):
         else:
             run_commands([f"git init {current_dir}"])
 
+        context.save()
+
         dvc_inited = os.path.isdir(f"{context['path']}/.dvc")
         if not dvc_inited:
             # check if dvc repo
-            run_commands([#f"git init",
-                          f"dvc init --subdir",
-                          #f"git add .dvc*",
-                          #f"git commit -m 'dvc init '",
+            run_commands([f"dvc init --subdir",
                           f"dvc remote add --default rebase {proj_config['data_location']}"])
 
             # remove cached files (ok if fails because then they're not cached)
@@ -126,11 +125,12 @@ def init_proj_dir(project_dir, git_init):
         print("git and dvc initialised...")
 
 @contextmanager
-def repo_chdir():
+def repo_chdir(context=None):
     """
     Ctx manager to perform commands in the directory of the data repo.
     """
-    context = current_context()
+    if context is None:
+        context = current_context()
     saved_dir = os.getcwd()
     repo_dir = context["path"]
     try:
@@ -265,6 +265,13 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
 
         logging.info("Restoring context...")
         with repo_chdir():
+            if params is None:
+                with open("params.yaml", "r") as stream:
+                    try:
+                        stage.params = yaml.safe_load(stream)[name]
+                    except yaml.YAMLError as e:
+                        print(e)
+
             curr_branch = run_command("git rev-parse --abbrev-ref HEAD",
                                   return_output=True)[1].strip()
             if ctx_run_name is not None:
