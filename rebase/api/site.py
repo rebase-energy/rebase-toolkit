@@ -2,6 +2,7 @@ import rebase.util.api_request as api_request
 import json
 import pandas as pd
 import requests
+import logging
 
 class SiteTemplate():
 
@@ -196,19 +197,22 @@ class Site():
         """
         path = '{}/site/production/{}'.format(cls.base_path, site_id)
        
+        params = {}        
         if start_date is not None and end_date is not None:
             params['date_start'] = start_date
             params['date_end'] = end_date
-
         if resolution is not None:
             params['resolution'] = resolution
         
         response = api_request.get(path, params=params)
+        
         if response.status_code == 200:
             data = response.json()
             df = pd.DataFrame(data={'power_kw': data['power_kw']}, index=pd.to_datetime(data['valid_time']))
             df.index.name = 'valid_time'
             return df
+        else:
+            print(response.content.decode('utf-8'))
             
 
     @classmethod
