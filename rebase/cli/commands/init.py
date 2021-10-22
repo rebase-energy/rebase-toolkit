@@ -25,7 +25,7 @@ def init(project: str = None,
 
     # get internal rebase context
     if context is None:
-        context = current_context(init=True)
+        context = current_context()
 
     # setup rebase project
     if project is None:
@@ -84,6 +84,8 @@ def init_proj_dir(project_dir, git_init, context):
 
         context.save()
 
+        # TODO: add context to gitignore
+
         dvc_inited = os.path.isdir(f"{context['path']}/.dvc")
         if not dvc_inited:
             # check if dvc repo
@@ -107,8 +109,7 @@ def init_proj_dir(project_dir, git_init, context):
                           f"git config user.name \"{user_name}\""])
 
             # commit .dvc files if new repo, keep trying until dvc files exist
-            try_iter = 0
-            while True:
+            for try_iter in range(5):
                 logging.info(f"Saving .dvc dir (attempt #{try_iter})...")
                 if isdir(f"{context['path']}/.dvc"):
                     try:
@@ -120,7 +121,6 @@ def init_proj_dir(project_dir, git_init, context):
                         err = sys.exc_info()
                         print(f"Couldn't git commit dvc files. \n{err[0]},{err[1]},{err[2]}")
                     break
-                try_iter += 1
 
         print("git and dvc initialised...")
 
@@ -160,12 +160,9 @@ def add_dependency(location: str, out: str = None, externals: str = "ref_direct"
     """
     TODO: Add some documentation, this function does a lot
     """
-    # dvc import https://github.com/worldyn/rebase-test.git price-forecast/ins/test.csv --rev v15 -o minfil.csv
     context = current_context()
     stage = context.current_stage()
-
-    # deconstruct path???
-    # dvc import https://github.com/worldyn/rebase-test.git price-forecast/outs/train.pkl --rev v1 --out outs/train.pkl
+    print(f"iSTAGES: {context.stages}")
 
     dvc_add_flags = ""
     copy_file = False
@@ -241,13 +238,15 @@ def add_dependency(location: str, out: str = None, externals: str = "ref_direct"
                     if not os.path.exists(out):
                         raise OSError("Dvc import failed...")
             dep_file_abs = os.path.abspath(dep_file)
-        stage.add_dependency(dep_file, name=out)
-
-        return dep_file_abs
+            dep_file = dep_file_abs
+        #stage.add_dependency(dep_file, name=out)
+        #return dep_file_abs
     else:
         logging.info(f"Depencency {dep_file} already exists")
 
+    stage.add_dependency(dep_file, name=out)
     return dep_file
+
 
 # def dep(path: str) -> str:
 #     context = current_context()
@@ -256,7 +255,7 @@ def add_dependency(location: str, out: str = None, externals: str = "ref_direct"
 
 @contextmanager
 def stage(name, params=None, log_run=False, ctx_run_name=None):
-    context = current_context()
+    context = current_context(from_file=True)
     prev_stage = context.current_stage()
     context.set_stage(name, params=params)
     try:
@@ -303,20 +302,19 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
             context.set_current_run(mlflow_run_id) # TODO: change method name
             context.artifact_uri = mlflow_artifact_uri
 
+        print(f"before yield STAGES: {context.stages}")
+        #yield stage
         yield stage
 
-        with repo_chdir():
+        #context = current_context()
+        print(f"after yield STAGE: {context.stages}")
+        with repo_chdir(context):
             # add dvc files for outputs
             #for k, d in stage.outputs.items():
             #    out_path = d['path']
             #    full_out_path = os.path.join(context['path'], out_path)
             #    run_commands([f'dvc add {full_out_path}'])
-
-            dvc_pipeline = context.generate_dvc_pipeline()
-            dict_to_yaml_file(dvc_pipeline, "dvc.yaml")
-            if params:
-                dict_to_yaml_file(params, "params.yaml")
-
+            """
             deps = ""
             outs = ""
             for dep in dvc_pipeline['stages'][name]['deps']:
@@ -328,6 +326,17 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
                                          f'dvc commit -f'],
                                          raise_error=False,
                                          return_output=True)[0]
+            """
+            context = current_context()
+            stage = context.current_stage()
+            #context.set_stage(name, params=params)
+            context.stages[name] = stage
+
+            dvc_pipeline = context.generate_dvc_pipeline()
+            dict_to_yaml_file(dvc_pipeline, "dvc.yaml")
+            if params:
+                dict_to_yaml_file(params, "params.yaml")
+
             if retc == 0:
                 retc, output = run_commands([f'git add .',
                                              f'git commit -m "{run_name}"'], raise_error=False, return_output=True)[-1]
@@ -350,7 +359,7 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
 
         if ctx_run_name is not None:
             logging.info("Git - restoring to current branch")
-            with repo_chdir():
+            with repo_chdir(context):
                 retl = run_commands([f'git checkout -B tmp_rb',
                               f'git checkout {curr_branch}',
                               f'git rebase tmp_rb',
@@ -361,6 +370,7 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
                         logging.error(f"Git/DVC - error in restoring to current branch: {output}")
 
         context.set_stage(prev_stage.name, prev_stage.params)
+        context.save()
 
 
 def load_pickle(path, name=None):

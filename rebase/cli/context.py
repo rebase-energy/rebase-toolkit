@@ -4,8 +4,13 @@ from .utils import run_commands,run_command
 
 g_current_context = None
 
-def current_context(init=False):
-    if init:
+def current_context(from_file=False):
+    """
+    Get the current context.
+    from_file = True, then restore ctx from file
+    .context.pkl instead of memory
+    """
+    if not from_file:
         return Context.current()
     return Context.load()
 
