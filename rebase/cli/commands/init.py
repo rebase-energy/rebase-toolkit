@@ -133,7 +133,6 @@ def add_dependency(location: str, out: str = None, externals: str = "ref_direct"
     """
     context = current_context()
     stage = context.current_stage()
-    print(f"iSTAGES: {context.stages}")
 
     dvc_add_flags = ""
     copy_file = False

@@ -75,9 +75,10 @@ def run(name: str = None,
         run_id = generate_run_id()
         run_name = "r-"+run_id[:7]
 
-        retcode, output = run_command('dvc pull', return_output=True)
-        if retcode != 0:
-            raise RuntimeError(f"DVC pull failed: {output}")
+        try:
+            retcode, output = run_command('dvc pull', return_output=True)
+        except e:
+            print(f"DVC pull failed: {e}")
 
         params_str = " ".join([f"-S {format_dvc_param(pstr)}" for pstr in parameters]) if parameters else ""
         tags_str = ";".join([format_dvc_tag(tstr) for tstr in tags]) if tags is not None else ""
@@ -86,14 +87,12 @@ def run(name: str = None,
             dvc_cmd = f"dvc exp run -f -n {name} {params_str} \n"
             # TODO: what about the separate branch?
         else:
-            dvc_cmd = f"dvc repro {name}\n"
+            dvc_cmd = f"dvc repro -f {name}\n"
 
         try:
-            tracking_uri = mlflow.get_tracking_uri()
-            print(f"TRACKING URI: {tracking_uri}")
-            mlflow.set_tracking_uri(context['envs']['MLFLOW_TRACKING_URI'])
+            tracking_uri = context['envs']['MLFLOW_TRACKING_URI']
+            mlflow.set_tracking_uri(tracking_uri)
             mlflow.set_experiment(context['experiment']['name'])
-            print(f"EXP NAME: {context['experiment']['name']}")
 
             with open("MLProject", "w") as f:
                 f.writelines([f"name: {name}\n",
@@ -109,6 +108,8 @@ def run(name: str = None,
             mlflow_run_id = mrun.run_id
             logging.info(f"MLFlow run-id: {mlflow_run_id}")
         finally:
+            retcode, output = run_command(f'dvc commit {name}', return_output=True)
+
             os.remove("MLProject")
 
 @click.command(name="run")

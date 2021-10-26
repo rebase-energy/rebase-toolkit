@@ -40,7 +40,6 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
         logging.info("Restoring context...")
         with repo_chdir():
             if params is None:
-                print(f"CURR DIR: {os.getcwd()}")
                 with open("params.yaml", "r") as stream:
                     try:
                         stage.params = yaml.safe_load(stream)[name]
@@ -83,31 +82,15 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
             context.set_current_run(mlflow_run_id) # TODO: change method name
             context.artifact_uri = mlflow_artifact_uri
 
-        print(f"before yield STAGES: {context.stages}")
-        #yield stage
         yield stage
 
-        #context = current_context()
-        print(f"after yield STAGE: {context.stages}")
         with repo_chdir(context):
             # add dvc files for outputs
             #for k, d in stage.outputs.items():
             #    out_path = d['path']
             #    full_out_path = os.path.join(context['path'], out_path)
             #    run_commands([f'dvc add {full_out_path}'])
-            """
-            deps = ""
-            outs = ""
-            for dep in dvc_pipeline['stages'][name]['deps']:
-                deps += f"-d {dep} "
-            for out in dvc_pipeline['stages'][name]['outs']:
-                outs += f"-o {out} "
 
-            retc, output = run_commands([f'dvc run -n {name} {deps} {outs} --no-exec --force echo \"{name}.py not implemented\"',
-                                         f'dvc commit -f'],
-                                         raise_error=False,
-                                         return_output=True)[0]
-            """
             context = current_context()
             stage = context.current_stage()
             #context.set_stage(name, params=params)
@@ -120,24 +103,25 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
                 except yaml.YAMLError as e:
                     prev_dvc_pipeline = None
 
-            """
             dvc_pipeline = context.generate_dvc_pipeline(prev_dvc_pipeline)
             dict_to_yaml_file(dvc_pipeline, "dvc.yaml")
-            """
+
             if params:
                 dict_to_yaml_file(params, "params.yaml")
 
             print("COMMIT")
             if retc == 0:
                 retc, output = run_commands([f'git add .',
-                                             f'git commit -m "{run_name}"'], raise_error=True, return_output=True)[-1]
+                                             f'git commit -m "{run_name}"'], raise_error=False, return_output=True)[-1]
+
                 print("COMMITED")
                 if retc == 1:
                     logging.info("Git - nothing to commit")
                 elif retc != 0:
                     logging.error(f"Git - error commiting changes: {output}")
                 else:
-                    retc, output = run_commands([f'dvc push'], raise_error=False, return_output=True)[-1]
+                    retc, output = run_commands([f'dvc push'],
+                                                 raise_error=False, return_output=True)[-1]
                     if retc != 0:
                         logging.error(f"Dvc push failed with output: {output}")
             else:

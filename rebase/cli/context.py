@@ -121,33 +121,37 @@ class Context(dict):
 
             stage = self.stages[stage_name]
 
-            """
             if stage_name in dvc['stages']:
                 dvc_stage = dvc['stages'][stage_name]
-                # set to avoid going through lists twice in loop below
-                dvc_stage['deps'] = set(dvc_stage['deps'])
-                dvc_stage['outs'] = set(dvc_stage['outs'])
 
-                for k,d in stage.dependencies.items():
-                    if d['path'] not in dvc_stage['deps']:
-                        dvc_stage['deps'].append(d['path'])
-                dvc_stage['deps'] = sorted(list(dvc_stage['deps']))
+                # deps
+                if 'deps' in dvc_stage:
+                    dvc_stage['deps'] = set(dvc_stage['deps'])
+                    for k,d in stage.dependencies.items():
+                        if d['path'] not in dvc_stage['deps']:
+                            dvc_stage['deps'].add(d['path'])
+                    dvc_stage['deps'] = sorted(list(dvc_stage['deps']))
+                else:
+                    dvc_stage['deps'] = sorted([d['path'] for k, d in stage.dependencies.items()])
 
-                for k,d in stage.outputs.items():
-                    if d['path'] not in dvc_stage['outs']:
-                        dvc_stage['outs'].append(d['path'])
-                dvc_stage['outs'] = sorted(list(dvc_stage['outs']))
-                # remove params?
-
+                # outs
+                if 'outs' in dvc_stage:
+                    dvc_stage['outs'] = set(dvc_stage['outs'])
+                    for k,d in stage.outputs.items():
+                        if d['path'] not in dvc_stage['outs']:
+                            dvc_stage['outs'].add(d['path'])
+                    dvc_stage['outs'] = sorted(list(dvc_stage['outs']))
+                else:
+                    dvc_stage['outs'] = sorted([d['path'] for k, d in stage.outputs.items()])
             else:
-            """
-            dvc_stage = {
-                "cmd": f"echo \"{stage_name}.py not implemented\"",
-                "deps": sorted([d['path'] for k, d in stage.dependencies.items()]),
-                "outs": sorted([d['path'] for k, d in stage.outputs.items()])
-            }
+                dvc_stage = {
+                    "cmd": f"echo \"specify 'python yourpath/{stage_name}.py' here\"",
+                    "deps": sorted([d['path'] for k, d in stage.dependencies.items()]),
+                    "outs": sorted([d['path'] for k, d in stage.outputs.items()])
+                }
             if stage.params:
-                dvc_stage["params"] = sorted(list(stage.params.keys()))
+                dvc_stage["params"] = sorted([f"{stage_name}.{k}" for k in stage.params.keys()])
+                #dvc_stage["params"] = sorted(list(stage.params.keys()))
 
             dvc['stages'][stage_name] = dvc_stage
         return dvc
