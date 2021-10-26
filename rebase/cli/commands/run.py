@@ -2,8 +2,11 @@ import click
 import os
 import mlflow
 import logging
+import ast
 
 from ..utils import run_command, generate_run_id
+from ..context import current_context, Context, Stage
+from ..stage_contexts import *
 
 
 # template_files = [
@@ -58,39 +61,56 @@ def format_dvc_tag(tag_str):
     parts = tag_str.split('=')
     return f"mlflow.set_tag(\"{parts[0]}\", \"{parts[-1]}\")"
 
-def run(name: str = None, 
-		parameters: list = [], 
-		tags: list =[]
+def run(name: str = None,
+		parameters: list = [],
+		tags: list =[],
+        hyperparam: bool = False
 ) -> None:
+    context = current_context(from_file=True)
+
     current_dir = os.getcwd()
     repo_name = os.path.basename(current_dir)
-    run_id = generate_run_id()
-    run_name = "exp-"+run_id[:5]
 
-    retcode, output = run_command('dvc pull', return_output=True)
-    if retcode != 0:
-        raise RuntimeError(f"DVC pull failed: {output}")
-    
-    params_str = " ".join([f"-S {format_dvc_param(pstr)}" for pstr in parameters]) if parameters else ""
-    tags_str = ";".join([format_dvc_tag(tstr) for tstr in tags]) if tags is not None else ""
-    try:
-        with open("MLProject", "w") as f:
-            f.writelines([f"name: {name}\n",
-                          f"entry_points:\n",
-                          f"  main:\n",
-                          f"    command: python -c 'import mlflow;mlflow.set_tag(\"mlflow.runName\", \"{name}\");{tags_str}'; "+
-                                f"dvc exp run -n {name} {params_str} \n"
-                         ])       
-        mrun = mlflow.run(".", use_conda=False)
-        mlflow_run_id = mrun.run_id 
-        logging.info(f"MLFlow run-id: {mlflow_run_id}")    
-    finally:
-        os.remove("MLProject")     
+    with repo_chdir(context):
+        run_id = generate_run_id()
+        run_name = "r-"+run_id[:7]
+
+        retcode, output = run_command('dvc pull', return_output=True)
+        if retcode != 0:
+            raise RuntimeError(f"DVC pull failed: {output}")
+
+        params_str = " ".join([f"-S {format_dvc_param(pstr)}" for pstr in parameters]) if parameters else ""
+        tags_str = ";".join([format_dvc_tag(tstr) for tstr in tags]) if tags is not None else ""
+        if hyperparam:
+            print("Using dvc exp run for hyperparam tuning...")
+            dvc_cmd = f"dvc exp run -f -n {name} {params_str} \n"
+            # TODO: what about the separate branch?
+        else:
+            dvc_cmd = f"dvc repro {name}\n"
+
+        try:
+            tracking_uri = mlflow.get_tracking_uri()
+            print(f"TRACKING URI: {tracking_uri}")
+            with open("MLProject", "w") as f:
+                f.writelines([f"name: {name}\n",
+                              f"entry_points:\n",
+                              f"  main:\n",
+                              f"    command: python -c 'import mlflow;\
+                                                        mlflow.set_tracking_uri(\"{tracking_uri}\");\
+                                                        mlflow.set_tag(\"mlflow.runName\", \"{name}\");\
+                                                        {tags_str}'; "+ dvc_cmd
+                             ])
+            mrun = mlflow.run(".", use_conda=False)
+            mlflow_run_id = mrun.run_id
+            logging.info(f"MLFlow run-id: {mlflow_run_id}")
+        finally:
+            os.remove("MLProject")
 
 @click.command(name="run")
 @click.option("--name", "-n", "name", default=None)
 @click.option("--parameter", "-p", "parameters", multiple=True)
 @click.option("--tag", "-t", "tags", multiple=True)
+@click.option('--hyperparam','-h', default=False)
 def run_cmd(*args, **kwargs):
 	return run(*args, **kwargs)
 

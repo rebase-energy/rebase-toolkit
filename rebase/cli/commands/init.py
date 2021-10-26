@@ -11,6 +11,7 @@ import yaml
 
 from ..utils import run_commands,run_command, generate_run_id, dict_to_yaml_file, yaml_to_dict
 from ..context import current_context, Context, Stage
+from ..stage_contexts import *
 from ..errors import *
 from ...api.sdk import project_init
 
@@ -21,7 +22,7 @@ def init(project: str = None,
          context: dict = None,
          artifact_location: str = None
 ) -> None:
-    print("Initializing....")
+    print("Initializing.......")
 
     # get internal rebase context
     if context is None:
@@ -40,9 +41,11 @@ def init(project: str = None,
     ).setLevel(logging.WARNING)
 
     proj_config = project_init(project)
+    print(f"CONFIG {proj_config}")
 
     for k, v in proj_config['envs'].items():
         os.environ[k] = v
+        context['envs'][k] = v
 
     # setup mlflow experiment
     print("Setting up environments...")
@@ -62,6 +65,7 @@ def init(project: str = None,
                               'id': experiment_id}
     context['path'] = project_dir
 
+    context.save()
     init_proj_dir(project_dir, git_init, context)
 
 def init_proj_dir(project_dir, git_init, context):
@@ -81,8 +85,6 @@ def init_proj_dir(project_dir, git_init, context):
                 raise OSError("Not inside git repo...")
         else:
             run_commands([f"git init {current_dir}"])
-
-        context.save()
 
         # TODO: add context to gitignore
 
@@ -123,37 +125,6 @@ def init_proj_dir(project_dir, git_init, context):
                     break
 
         print("git and dvc initialised...")
-
-@contextmanager
-def repo_chdir(context=None):
-    """
-    Ctx manager to perform commands in the directory of the data repo.
-    """
-    if context is None:
-        context = current_context()
-    saved_dir = os.getcwd()
-    repo_dir = context["path"]
-    try:
-        os.chdir(repo_dir)
-        yield repo_dir
-    finally:
-        os.chdir(saved_dir)
-
-@contextmanager
-def mlflow_ctx(experiment):
-    """
-    Ctx manager to perform commands with mlflow for an experiment
-    """
-    try:
-        existing_experiment = mlflow.get_experiment_by_name(experiment)
-        if existing_experiment is None:
-            raise ValueError("Experiment doesn't exist")
-        else:
-            experiment_id = existing_experiment.experiment_id
-        yield experiment_id
-    finally:
-        pass
-
 
 def add_dependency(location: str, out: str = None, externals: str = "ref_direct",
                     repo: str = None, remote: bool = False, revision: str = None):
@@ -237,6 +208,7 @@ def add_dependency(location: str, out: str = None, externals: str = "ref_direct"
                 except:
                     if not os.path.exists(out):
                         raise OSError("Dvc import failed...")
+            stage.add_dependency(dep_file, name=out)
             dep_file_abs = os.path.abspath(dep_file)
             dep_file = dep_file_abs
         #stage.add_dependency(dep_file, name=out)
@@ -244,134 +216,7 @@ def add_dependency(location: str, out: str = None, externals: str = "ref_direct"
     else:
         logging.info(f"Depencency {dep_file} already exists")
 
-    stage.add_dependency(dep_file, name=out)
     return dep_file
-
-
-# def dep(path: str) -> str:
-#     context = current_context()
-#     stage = context.current_stage()
-#     return stage.get_dependency_by_path(name)
-
-@contextmanager
-def stage(name, params=None, log_run=False, ctx_run_name=None):
-    context = current_context(from_file=True)
-    prev_stage = context.current_stage()
-    context.set_stage(name, params=params)
-    try:
-        stage = context.current_stage()
-        stage.clear_dependencies()
-
-        logging.info("Restoring context...")
-        with repo_chdir():
-            if params is None:
-                with open("params.yaml", "r") as stream:
-                    try:
-                        stage.params = yaml.safe_load(stream)[name]
-                    except yaml.YAMLError as e:
-                        print(e)
-
-            curr_branch = run_command("git rev-parse --abbrev-ref HEAD",
-                                  return_output=True)[1].strip()
-            if ctx_run_name is not None:
-
-                ctx_commit = run_command(f"git log --oneline --grep='{ctx_run_name}'",
-                                      return_output=True)[1].strip().split()[0]
-                retc, output = run_commands([f'git checkout {ctx_commit}'], raise_error=False, return_output=True)[0]
-
-            retc, output = run_commands([f'dvc checkout'], raise_error=False, return_output=True)[0]
-        """
-            if os.path.isfile('dvc.yaml'):
-                dvc_yaml = yaml_to_dict('dvc.yaml')
-                if 'stages' in dvc_yaml and name in dvc_yaml['stages']:
-                    retc, output = run_commands([f'dvc pull {name}'], raise_error=False, return_output=True)[0]
-                    if retc == 0:
-                        logging.error(f"Dvc - pulled deps from '{name}' : {output}")
-                    else:
-                        logging.error(f"Dvc - error pulling from '{name}' : {output}")
-        """
-        run_name = f"r-{generate_run_id()[:7]}"
-        if log_run:
-            mlflow.autolog()
-            run_obj = mlflow.start_run(
-                run_name=run_name,
-                experiment_id=context['experiment']['id']
-            )
-            mlflow_run_id = run_obj.info.run_id
-            mlflow_artifact_uri = run_obj.info.artifact_uri
-            context.set_current_run(mlflow_run_id) # TODO: change method name
-            context.artifact_uri = mlflow_artifact_uri
-
-        print(f"before yield STAGES: {context.stages}")
-        #yield stage
-        yield stage
-
-        #context = current_context()
-        print(f"after yield STAGE: {context.stages}")
-        with repo_chdir(context):
-            # add dvc files for outputs
-            #for k, d in stage.outputs.items():
-            #    out_path = d['path']
-            #    full_out_path = os.path.join(context['path'], out_path)
-            #    run_commands([f'dvc add {full_out_path}'])
-            """
-            deps = ""
-            outs = ""
-            for dep in dvc_pipeline['stages'][name]['deps']:
-                deps += f"-d {dep} "
-            for out in dvc_pipeline['stages'][name]['outs']:
-                outs += f"-o {out} "
-
-            retc, output = run_commands([f'dvc run -n {name} {deps} {outs} --no-exec --force echo \"{name}.py not implemented\"',
-                                         f'dvc commit -f'],
-                                         raise_error=False,
-                                         return_output=True)[0]
-            """
-            context = current_context()
-            stage = context.current_stage()
-            #context.set_stage(name, params=params)
-            context.stages[name] = stage
-
-            dvc_pipeline = context.generate_dvc_pipeline()
-            dict_to_yaml_file(dvc_pipeline, "dvc.yaml")
-            if params:
-                dict_to_yaml_file(params, "params.yaml")
-
-            if retc == 0:
-                retc, output = run_commands([f'git add .',
-                                             f'git commit -m "{run_name}"'], raise_error=False, return_output=True)[-1]
-                if retc == 1:
-                    logging.info("Git - nothing to commit")
-                elif retc != 0:
-                    logging.error(f"Git - error commiting changes: {output}")
-                else:
-                    retc, output = run_commands([f'dvc push'], raise_error=False, return_output=True)[-1]
-                    if retc != 0:
-                        logging.error(f"Dvc push failed with output: {output}")
-            else:
-                logging.error(f"Dvc - error commiting changes: {output}")
-    finally:
-        logging.info("Run - ending ...")
-        if log_run:
-            mlflow.end_run()
-            context.clear_run()
-            context.artifact_uri = None
-
-        if ctx_run_name is not None:
-            logging.info("Git - restoring to current branch")
-            with repo_chdir(context):
-                retl = run_commands([f'git checkout -B tmp_rb',
-                              f'git checkout {curr_branch}',
-                              f'git rebase tmp_rb',
-                              f'dvc checkout',
-                              f'git branch -D tmp_rb'],raise_error=False, return_output=True)
-                for (retc, output) in retl:
-                    if retc != 0:
-                        logging.error(f"Git/DVC - error in restoring to current branch: {output}")
-
-        context.set_stage(prev_stage.name, prev_stage.params)
-        context.save()
-
 
 def load_pickle(path, name=None):
     context = current_context()
@@ -572,7 +417,7 @@ def init_cmd(*args, **kwargs):
     return init(*args, **kwargs)
 
 __all__ = [
-    'init', 'init_cmd', 'stage', 'add_dependency', 'load_pickle',
+    'init', 'init_cmd', 'add_dependency', 'load_pickle',
     'save_pickle', 'log_model', 'publish_model', 'load_model',
     'restore', 'log_param', 'log_metric', 'log_params', 'log_metrics',
     'list', 'info'

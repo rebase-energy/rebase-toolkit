@@ -1,6 +1,7 @@
 import copy
 import pickle
 from .utils import run_commands,run_command
+import os
 
 g_current_context = None
 
@@ -10,9 +11,7 @@ def current_context(from_file=False):
     from_file = True, then restore ctx from file
     .context.pkl instead of memory
     """
-    if not from_file:
-        return Context.current()
-    return Context.load()
+    return Context.current(from_file=from_file)
 
 class Stage(object):
     def __init__(self, name, params=None, *args, **kwargs):
@@ -65,6 +64,7 @@ class Context(dict):
         self.set_stage("root")
         self.curr_run = None
         self.artifact_uri = None
+        self['envs'] = {}
 
     def set_current_run(self, run_name):
         self.curr_run = run_name
@@ -89,8 +89,16 @@ class Context(dict):
         with open(f'{git_path.strip()}/.context.pkl', 'wb+') as f:
             pickle.dump(self, f)
 
+    def load_env(self):
+        """
+        Set process environment variables from ctx
+        """
+        for k,v in g_current_context['envs'].items():
+            os.environ[k] = v
+
     @staticmethod
     def load():
+        global g_current_context
         _, git_path = run_command("git rev-parse --show-toplevel",
                                   return_output=True)
         git_path = git_path.strip()
@@ -101,26 +109,56 @@ class Context(dict):
         except:
             raise OSError(f"{ctx_path} could not be loaded. Make sure you ran rb init")
 
-    def generate_dvc_pipeline(self):
-        dvc = {'stages': {}}
+    def generate_dvc_pipeline(self, prev_dvc = None):
+        if prev_dvc is None or 'stages' not in prev_dvc:
+            dvc = {'stages': {}}
+        else:
+            dvc = prev_dvc
+
         for stage_name in sorted(list(self.stages.keys())):
             if stage_name == "root":
                 continue
 
             stage = self.stages[stage_name]
 
+            """
+            if stage_name in dvc['stages']:
+                dvc_stage = dvc['stages'][stage_name]
+                # set to avoid going through lists twice in loop below
+                dvc_stage['deps'] = set(dvc_stage['deps'])
+                dvc_stage['outs'] = set(dvc_stage['outs'])
+
+                for k,d in stage.dependencies.items():
+                    if d['path'] not in dvc_stage['deps']:
+                        dvc_stage['deps'].append(d['path'])
+                dvc_stage['deps'] = sorted(list(dvc_stage['deps']))
+
+                for k,d in stage.outputs.items():
+                    if d['path'] not in dvc_stage['outs']:
+                        dvc_stage['outs'].append(d['path'])
+                dvc_stage['outs'] = sorted(list(dvc_stage['outs']))
+                # remove params?
+
+            else:
+            """
             dvc_stage = {
                 "cmd": f"echo \"{stage_name}.py not implemented\"",
                 "deps": sorted([d['path'] for k, d in stage.dependencies.items()]),
-                "outs": sorted([d['path'] for k, d in stage.outputs.items()])}
+                "outs": sorted([d['path'] for k, d in stage.outputs.items()])
+            }
             if stage.params:
                 dvc_stage["params"] = sorted(list(stage.params.keys()))
+
             dvc['stages'][stage_name] = dvc_stage
         return dvc
 
     @staticmethod
-    def current():
+    def current(from_file=False):
         global g_current_context
+
+        if from_file:
+            g_current_context = Context.load()
+            g_current_context.load_env()
 
         if g_current_context is None:
             g_current_context = Context()
