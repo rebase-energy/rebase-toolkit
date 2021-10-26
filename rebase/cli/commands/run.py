@@ -91,12 +91,17 @@ def run(name: str = None,
         try:
             tracking_uri = mlflow.get_tracking_uri()
             print(f"TRACKING URI: {tracking_uri}")
+            mlflow.set_tracking_uri(context['envs']['MLFLOW_TRACKING_URI'])
+            mlflow.set_experiment(context['experiment']['name'])
+            print(f"EXP NAME: {context['experiment']['name']}")
+
             with open("MLProject", "w") as f:
                 f.writelines([f"name: {name}\n",
                               f"entry_points:\n",
                               f"  main:\n",
                               f"    command: python -c 'import mlflow;\
                                                         mlflow.set_tracking_uri(\"{tracking_uri}\");\
+                                                        mlflow.set_experiment(\"{context['experiment']['name']}\");\
                                                         mlflow.set_tag(\"mlflow.runName\", \"{name}\");\
                                                         {tags_str}'; "+ dvc_cmd
                              ])
