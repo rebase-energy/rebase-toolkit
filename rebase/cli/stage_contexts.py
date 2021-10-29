@@ -8,7 +8,7 @@ from contextlib import contextmanager
 import sys
 import yaml
 
-from .utils import run_commands,run_command, generate_run_id, dict_to_yaml_file, yaml_to_dict
+from .utils import run_commands,run_command, generate_run_id, dict_to_yaml_file, yaml_to_dict,is_notebook
 from .context import current_context, Context, Stage
 from .errors import *
 from ..api.sdk import project_init
@@ -33,6 +33,7 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
     context = current_context(from_file=True)
     prev_stage = context.current_stage()
     context.set_stage(name, params=params)
+    print("INSIDE stage ctx")
     try:
         stage = context.current_stage()
         stage.clear_dependencies()
@@ -96,36 +97,55 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
             #context.set_stage(name, params=params)
             #context.stages[name] = stage
 
+            # track outputs with dvc
+            """
+            print("ADDING OUTPUTS WITH DVC")
+            for k,d in stage.outputs.items():
+                retc, output = run_commands([f"dvc add {d['path']}"], return_output=True)[0]
+                if retc != 0:
+                    print(f"dvc add error for outputs: {output}")
+                else:
+                    print(f"dvc added {d['path']}")
+            """
+
             # get previous dvc pipeline from yaml file
+            print("GENERATE pipeline")
             with open("dvc.yaml", "r") as stream:
                 try:
                     prev_dvc_pipeline = yaml.safe_load(stream)
                 except yaml.YAMLError as e:
                     prev_dvc_pipeline = None
 
+            # TODO generate with dvc run instead!!!!
             dvc_pipeline = context.generate_dvc_pipeline(prev_dvc_pipeline)
             dict_to_yaml_file(dvc_pipeline, "dvc.yaml")
 
             if params:
                 dict_to_yaml_file(params, "params.yaml")
 
-            print("COMMIT")
-            if retc == 0:
-                retc, output = run_commands([f'git add .',
-                                             f'git commit -m "{run_name}"'], raise_error=False, return_output=True)[-1]
-
-                print("COMMITED")
+            # if notebook then git commit and dvc push
+            if is_notebook:
+                pass
+                print("INSIDE notebook 2")
+                """
+                retc, output = run_commands(
+                    [f'git add .',
+                    f'git commit -m "{run_name}"'], raise_error=False, return_output=True
+                )[-1]
                 if retc == 1:
                     logging.info("Git - nothing to commit")
                 elif retc != 0:
+                    print("NOT COMMIT notebook")
                     logging.error(f"Git - error commiting changes: {output}")
                 else:
+                    print("COMMITED notebook")
                     retc, output = run_commands([f'dvc push'],
                                                  raise_error=False, return_output=True)[-1]
                     if retc != 0:
                         logging.error(f"Dvc push failed with output: {output}")
+                """
             else:
-                logging.error(f"Dvc - error commiting changes: {output}")
+                print("NOT INSIDE notebook 2")
     finally:
         logging.info("Run - ending ...")
         print("ENDING RUN")
@@ -135,6 +155,7 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
             context.artifact_uri = None
 
         if ctx_run_name is not None:
+            # todo: when not notebook???
             logging.info("Git - restoring to current branch")
             with repo_chdir(context):
                 retl = run_commands([f'git checkout -B tmp_rb',

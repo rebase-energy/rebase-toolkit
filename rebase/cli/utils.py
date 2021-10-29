@@ -56,3 +56,14 @@ def dict_to_yaml_file(d: dict, file_path: str):
 def yaml_to_dict(file_path: str):
     with open(file_path, 'r') as f:
         return yaml.load(f)
+
+def is_notebook():
+    try:
+        from IPython import get_ipython
+        if 'IPKernelApp' not in get_ipython().config:  # pragma: no cover
+            return False
+    except ImportError:
+        return False
+    except AttributeError:
+        return False
+    return True

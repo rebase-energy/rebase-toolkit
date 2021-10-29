@@ -4,7 +4,7 @@ import mlflow
 import logging
 import ast
 
-from ..utils import run_command, generate_run_id
+from ..utils import *
 from ..context import current_context, Context, Stage
 from ..stage_contexts import *
 
@@ -87,7 +87,7 @@ def run(name: str = None,
             dvc_cmd = f"dvc exp run -f -n {name} {params_str} \n"
             # TODO: what about the separate branch?
         else:
-            dvc_cmd = f"dvc repro -f {name}\n"
+            dvc_cmd = f"dvc repro -f --no-run-cache {name}\n"
 
         try:
             tracking_uri = context['envs']['MLFLOW_TRACKING_URI']
@@ -107,8 +107,30 @@ def run(name: str = None,
             mrun = mlflow.run(".", use_conda=False)
             mlflow_run_id = mrun.run_id
             logging.info(f"MLFlow run-id: {mlflow_run_id}")
+
         finally:
+            print("END rebase run 2")
             retcode, output = run_command(f'dvc commit {name}', return_output=True)
+            #if not is_notebook:
+            retc, output = run_commands(
+                [f'git add .',
+                f'git commit -m "{run_name}"'], raise_error=False, return_output=True
+            )[-1]
+            if retc == 1:
+                logging.info("Git - nothing to commit")
+            elif retc != 0:
+                print("NOT COMMIT run")
+                logging.error(f"Git - error commiting changes: {output}")
+            else:
+                print("COMMITED run")
+                #### TODO
+                """
+                retc, output = run_commands([f'dvc push'],
+                                             raise_error=False, return_output=True)[-1]
+                if retc != 0:
+                    logging.error(f"Dvc push failed with output: {output}")
+                """
+
 
             os.remove("MLProject")
 
