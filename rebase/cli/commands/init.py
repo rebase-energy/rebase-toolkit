@@ -353,13 +353,14 @@ def log_params(params_dict):
 def log_metrics(metrics_dict, step: int = None):
     mlflow.log_metrics(metrics_dict, step)
 
+# todo: add multiple keys, and specify list of runs
 def list(experiment: str, key: str = None, type: str = "metrics",
         return_runs: bool = False, max_results = 10):
     """
     Prints runs for an experiment, and returns list of IDs
     Can be ordered by a metric or param, saved in the runs.
 
-    type: "metric" or "param"
+    type: "metrics" or "params"
     :param str experiment_id: id of experiment (mlflow)
     :param str key: name of param/metric to sort runs by
     :param str type: type of key, either 'metric' or 'param'

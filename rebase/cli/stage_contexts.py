@@ -116,7 +116,7 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
                 except yaml.YAMLError as e:
                     prev_dvc_pipeline = None
 
-            # TODO generate with dvc run instead!!!!
+            # TODO: generate with dvc run --no-exec instead to make the outputs tracked
             dvc_pipeline = context.generate_dvc_pipeline(prev_dvc_pipeline)
             dict_to_yaml_file(dvc_pipeline, "dvc.yaml")
 
