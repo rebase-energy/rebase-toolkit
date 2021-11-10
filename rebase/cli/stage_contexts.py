@@ -1,6 +1,6 @@
 import mlflow
 import os
-from os.path import isfile, isdir
+from os.path import isfile, isdir, exists
 import cloudpickle
 import logging
 from shutil import copyfile
@@ -110,11 +110,14 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
 
             # get previous dvc pipeline from yaml file
             print("GENERATE pipeline")
-            with open("dvc.yaml", "r") as stream:
-                try:
-                    prev_dvc_pipeline = yaml.safe_load(stream)
-                except yaml.YAMLError as e:
-                    prev_dvc_pipeline = None
+            if exists('dvc.yaml'):
+                with open("dvc.yaml", "r") as stream:
+                    try:
+                        prev_dvc_pipeline = yaml.safe_load(stream)
+                    except yaml.YAMLError as e:
+                        prev_dvc_pipeline = None
+            else:
+                prev_dvc_pipeline = None
 
             # TODO: generate with dvc run --no-exec instead to make the outputs tracked
             dvc_pipeline = context.generate_dvc_pipeline(prev_dvc_pipeline)
