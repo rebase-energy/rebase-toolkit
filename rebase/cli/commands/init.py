@@ -64,9 +64,10 @@ def init(project: str = None,
     context['experiment'] = { 'name': experiment,
                               'id': experiment_id}
     context['path'] = project_dir
-
-    context.save()
+    
     init_proj_dir(project_dir, git_init, context)
+    
+    context.save()
 
 def init_proj_dir(project_dir, git_init, context):
     os.makedirs(project_dir, exist_ok=True)
@@ -100,15 +101,16 @@ def init_proj_dir(project_dir, git_init, context):
             except:
                 pass
 
-            # git user data so that we can commit with an identity
-            user_email = os.environ.get('GIT_EMAIL')
-            user_name = os.environ.get('GIT_USERNAME')
-            if user_email is None or user_name is None:
-                user_email = "RbUser@rebase.energy"
-                user_name = "RbUser"
+            if git_init:
+                # git user data so that we can commit with an identity
+                user_email = os.environ.get('GIT_EMAIL')
+                user_name = os.environ.get('GIT_USERNAME')
+                if user_email is None or user_name is None:
+                    user_email = "RbUser@rebase.energy"
+                    user_name = "RbUser"
 
-            run_commands([f"git config user.email \"{user_email}\"",
-                          f"git config user.name \"{user_name}\""])
+                run_commands([f"git config user.email \"{user_email}\"",
+                              f"git config user.name \"{user_name}\""])
 
             # commit .dvc files if new repo, keep trying until dvc files exist
             for try_iter in range(5):
