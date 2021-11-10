@@ -66,7 +66,7 @@ def init(project: str = None,
     context['path'] = project_dir
     
     init_proj_dir(project_dir, git_init, context)
-    
+
     context.save()
 
 def init_proj_dir(project_dir, git_init, context):
@@ -87,6 +87,16 @@ def init_proj_dir(project_dir, git_init, context):
         else:
             run_commands([f"git init {current_dir}"])
 
+            # git user data so that we can commit with an identity
+            user_email = os.environ.get('GIT_EMAIL')
+            user_name = os.environ.get('GIT_USERNAME')
+            if user_email is None or user_name is None:
+                user_email = "RbUser@rebase.energy"
+                user_name = "RbUser"
+
+            run_commands([f"git config user.email \"{user_email}\"",
+                          f"git config user.name \"{user_name}\""])
+
         # TODO: add context to gitignore
 
         dvc_inited = os.path.isdir(f"{context['path']}/.dvc")
@@ -100,18 +110,7 @@ def init_proj_dir(project_dir, git_init, context):
                 run_commands([f"git rm -rf {context['path']}/.dvc"])
             except:
                 pass
-
-            if git_init:
-                # git user data so that we can commit with an identity
-                user_email = os.environ.get('GIT_EMAIL')
-                user_name = os.environ.get('GIT_USERNAME')
-                if user_email is None or user_name is None:
-                    user_email = "RbUser@rebase.energy"
-                    user_name = "RbUser"
-
-                run_commands([f"git config user.email \"{user_email}\"",
-                              f"git config user.name \"{user_name}\""])
-
+          
             # commit .dvc files if new repo, keep trying until dvc files exist
             for try_iter in range(5):
                 logging.info(f"Saving .dvc dir (attempt #{try_iter})...")
