@@ -128,9 +128,8 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
 
             # if notebook then git commit and dvc push
             if is_notebook:
-                pass
-                print("INSIDE notebook 2")
-                """
+                print("INSIDE notebook")
+
                 retc, output = run_commands(
                     [f'git add .',
                     f'git commit -m "{run_name}"'], raise_error=False, return_output=True
@@ -146,9 +145,8 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
                                                  raise_error=False, return_output=True)[-1]
                     if retc != 0:
                         logging.error(f"Dvc push failed with output: {output}")
-                """
             else:
-                print("NOT INSIDE notebook 2")
+                print("NOT INSIDE notebook")
     finally:
         logging.info("Run - ending ...")
         print("ENDING RUN")
