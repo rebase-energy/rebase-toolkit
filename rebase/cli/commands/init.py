@@ -1,13 +1,14 @@
 import click
 import mlflow
 import os
-from os.path import isfile, isdir
+from os.path import isfile, isdir, exists
 import cloudpickle
 import logging
 from shutil import copyfile
 from contextlib import contextmanager
 import sys
 import yaml
+import time
 
 from ..utils import run_commands,run_command, generate_run_id, dict_to_yaml_file, yaml_to_dict
 from ..context import current_context, Context, Stage
@@ -45,13 +46,13 @@ def init(project: str = None,
 
     for k, v in proj_config['envs'].items():
         os.environ[k] = v
-        context['envs'][k] = v
+        context['envs'][k] = v     
 
     # setup mlflow experiment
     print("Setting up environments...")
     current_dir = os.getcwd()
     if project_dir is None:
-        project_dir = f"{current_dir}/{project}"
+        project_dir = current_dir
     existing_experiment = mlflow.get_experiment_by_name(experiment)
     if existing_experiment is None:
         experiment_id = mlflow.create_experiment(experiment, artifact_location=artifact_location or proj_config['artifact_location'])
@@ -97,33 +98,22 @@ def init_proj_dir(project_dir, git_init, context):
             run_commands([f"git config user.email \"{user_email}\"",
                           f"git config user.name \"{user_name}\""])
 
-        # TODO: add context to gitignore
-
+        # retc, output = run_commands(["git check-ignore .context.pkl MLProject"], raise_error=False, return_output=True)[0]
+        # new_ignores = output.split('\n')
+        # new_ignores = [ni for ni in new_ignores if exists(ni)]
+        # if len(new_ignores) > 0:
+        #     print(f"Adding ignores: {new_ignores}")            
+        #     with open(".gitignore", "a") as f:
+        #         f.writelines(new_ignores)
+    
         dvc_inited = os.path.isdir(f"{context['path']}/.dvc")
         if not dvc_inited:
             # check if dvc repo
             run_commands([f"dvc init --subdir",
                           f"dvc remote add --default rebase {proj_config['data_location']}"])
 
-            # remove cached files (ok if fails because then they're not cached)
-            try:
-                run_commands([f"git rm -rf {context['path']}/.dvc"])
-            except:
-                pass
-          
-            # commit .dvc files if new repo, keep trying until dvc files exist
-            for try_iter in range(5):
-                logging.info(f"Saving .dvc dir (attempt #{try_iter})...")
-                if isdir(f"{context['path']}/.dvc"):
-                    try:
-                        run_commands(
-                            [f"git add {context['path']}/.dvc",
-                            f"git commit -m 'dvc init'"]
-                        )
-                    except Exception as e:
-                        err = sys.exc_info()
-                        print(f"Couldn't git commit dvc files. \n{err[0]},{err[1]},{err[2]}")
-                    break
+            time.sleep(2)
+            run_commands(["git commit -m 'dvc init'"])
 
         print("git and dvc initialised...")
 

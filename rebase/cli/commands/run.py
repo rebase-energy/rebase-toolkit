@@ -87,7 +87,7 @@ def run(name: str = None,
             dvc_cmd = f"dvc exp run -f -n {name} {params_str} \n"
             # TODO: what about the separate branch?
         else:
-            dvc_cmd = f"dvc repro -f --no-run-cache {name}\n"
+            dvc_cmd = f"dvc repro \n"
 
         try:
             tracking_uri = context['envs']['MLFLOW_TRACKING_URI']
@@ -107,8 +107,12 @@ def run(name: str = None,
             mrun = mlflow.run(".", use_conda=False)
             mlflow_run_id = mrun.run_id
             logging.info(f"MLFlow run-id: {mlflow_run_id}")
+        except Exception as e:
+            print(e)
+            os.remove("MLProject")
+        else:
+            os.remove("MLProject")
 
-        finally:
             print("END rebase run 2")
             retcode, output = run_command(f'dvc commit {name}', return_output=True)
             #if not is_notebook:
@@ -123,22 +127,18 @@ def run(name: str = None,
                 logging.error(f"Git - error commiting changes: {output}")
             else:
                 print("COMMITED run")
-                #### TODO
-                """
+
                 retc, output = run_commands([f'dvc push'],
                                              raise_error=False, return_output=True)[-1]
                 if retc != 0:
                     logging.error(f"Dvc push failed with output: {output}")
-                """
 
-
-            os.remove("MLProject")
 
 @click.command(name="run")
 @click.option("--name", "-n", "name", default=None)
 @click.option("--parameter", "-p", "parameters", multiple=True)
 @click.option("--tag", "-t", "tags", multiple=True)
-@click.option('--hyperparam','-h', default=False)
+@click.option('--hyperparam','-hp', default=False)
 def run_cmd(*args, **kwargs):
 	return run(*args, **kwargs)
 

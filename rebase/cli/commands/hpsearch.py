@@ -1,11 +1,15 @@
 import click
 import os
 import yaml
+import json
 
 from ...util import api_request
-from ..utils import run_command
+from ..utils import run_command, generate_run_id
+import rebase as rb
 
 def hpsearch():
+    context = current_context(from_file=True)
+
     print("Starting hyperparam search")
     current_dir = os.getcwd()
     repo_name = os.path.basename(current_dir)
@@ -24,6 +28,8 @@ def hpsearch():
             'git_remote_url': git_remote_url,
             'repo_name': repo_name,
             'run_name': run_name,
+            'project_name': context['project'],
+            'experiment_name': context['experiment']['name'],
             'api_key': rb.api_key
         }
 

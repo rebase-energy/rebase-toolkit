@@ -28,6 +28,15 @@ def repo_chdir(context=None):
     finally:
         os.chdir(saved_dir)
 
+def merge_collection_args(stage_name, collection, stored_collection_name, stored_dvc, arg):
+    args_list = []
+    if stored_dvc is not None and stage_name in stored_dvc['stages']:
+        stored_stage = stored_dvc['stages'][stage_name]
+        args_list = stored_stage[stored_collection_name]
+    else:
+        args_list = []
+    return "".join(f"{arg}{v}" for v in args_list)
+
 @contextmanager
 def stage(name, params=None, log_run=False, ctx_run_name=None):
     context = current_context(from_file=True)
@@ -40,12 +49,21 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
 
         logging.info("Restoring context...")
         with repo_chdir():
-            if params is None:
-                with open("params.yaml", "r") as stream:
-                    try:
-                        stage.params = yaml.safe_load(stream)[name]
-                    except yaml.YAMLError as e:
-                        print(e)
+            if exists('params.yaml'):
+                try:
+                    with open('params.yaml', 'r') as stream:
+                        all_params = yaml.safe_load(stream)
+                except yaml.YAMLError as e:
+                    print(e)
+            else:
+                all_params = { name: {} }
+
+            if params is not None:
+                all_params[name].update(params)
+            if name not in all_params:
+                all_params[name] = {}
+
+            stage.params = all_params[name]
 
             curr_branch = run_command("git rev-parse --abbrev-ref HEAD",
                                   return_output=True)[1].strip()
@@ -96,18 +114,7 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
             stage = context.current_stage()
             #context.set_stage(name, params=params)
             #context.stages[name] = stage
-
-            # track outputs with dvc
-            """
-            print("ADDING OUTPUTS WITH DVC")
-            for k,d in stage.outputs.items():
-                retc, output = run_commands([f"dvc add {d['path']}"], return_output=True)[0]
-                if retc != 0:
-                    print(f"dvc add error for outputs: {output}")
-                else:
-                    print(f"dvc added {d['path']}")
-            """
-
+          
             # get previous dvc pipeline from yaml file
             print("GENERATE pipeline")
             if exists('dvc.yaml'):
@@ -119,12 +126,22 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
             else:
                 prev_dvc_pipeline = None
 
-            # TODO: generate with dvc run --no-exec instead to make the outputs tracked
-            dvc_pipeline = context.generate_dvc_pipeline(prev_dvc_pipeline)
-            dict_to_yaml_file(dvc_pipeline, "dvc.yaml")
+            deps_arg = merge_collection_args(name, stage.dependencies, "deps", prev_dvc_pipeline, " -d ")
+            outs_arg = merge_collection_args(name, stage.outputs, "outs", prev_dvc_pipeline, " -o ")
+            params_arg = "-p " + merge_collection_args(name, stage.params, "params", prev_dvc_pipeline, ",")
+            if prev_dvc_pipeline is not None and name in prev_dvc_pipeline['stages']:
+                command_arg = prev_dvc_pipeline['stages'][name].get('cmd', "")
+            else:
+                command_arg = f"echo \"python yourpath/{name}.py\""
+            retc, output = run_commands([f"dvc run -f -n {name} {deps_arg} {outs_arg} {params_arg} --no-exec '{command_arg}'"], return_output=True)[0]
+            if retc != 0:
+                print(f"dvc run error for outputs: {output}")            
 
-            if params:
-                dict_to_yaml_file(params, "params.yaml")
+            # TODO: generate with dvc run --no-exec instead to make the outputs tracked
+            # dvc_pipeline = context.generate_dvc_pipeline(prev_dvc_pipeline)
+            # dict_to_yaml_file(dvc_pipeline, "dvc.yaml")
+
+            dict_to_yaml_file(all_params, "params.yaml")
 
             # if notebook then git commit and dvc push
             if is_notebook:
