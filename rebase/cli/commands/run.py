@@ -8,50 +8,6 @@ from ..utils import *
 from ..context import current_context, Context, Stage
 from ..stage_contexts import *
 
-
-# template_files = [
-#     'src/evaluate.py',
-#     'src/featurize.py',
-#     'src/prepare.py',
-#     'src/train.py',
-#     'dvc.yaml',
-#     'params.yaml'
-# ]
-
-
-# def copy_template(file_name):
-#     data = pkgutil.get_data(__name__, "rebase/template/{}".format(file_name))
-#     with open('{}'.format(file_name), 'wb') as f:
-#         f.write(data)
-
-# def setup_template():
-
-#     os.system('dvc init')
-
-#     content = {
-#         'name': 'test',
-#         'entry_points': {
-#             'main': {
-#                 'command': 'dvc repro'
-#             }
-#         }
-#     }
-#     with open('MLproject', 'w') as f:
-#         yaml.dump(content, f, sort_keys=False)
-
-#     if not os.path.isdir('src'):
-#         os.mkdir('src')
-
-#     for file_name in template_files:
-#         copy_template(file_name)
-
-# # def init():
-# #     print("Initializing")
-
-# #     setup_template()
-# #     print("Created template files in src/")
-
-
 def format_dvc_param(param_str):
     parts = param_str.split('=')
     value = ast.literal_eval(parts[-1])
@@ -78,12 +34,12 @@ def run(name: str = None,
         try:
             retcode, output = run_command('dvc pull', return_output=True)
         except e:
-            print(f"DVC pull failed: {e}")
+            logging.error(f"DVC pull failed: {e}")
 
         params_str = " ".join([f"-S {format_dvc_param(pstr)}" for pstr in parameters]) if parameters else ""
         tags_str = ";".join([format_dvc_tag(tstr) for tstr in tags]) if tags is not None else ""
         if hyperparam:
-            print("Using dvc exp run for hyperparam tuning...")
+            logging.info("Using dvc exp run for hyperparam tuning...")
             dvc_cmd = f"dvc exp run -f -n {name} {params_str} \n"
             # TODO: what about the separate branch?
         else:
@@ -108,30 +64,35 @@ def run(name: str = None,
             mlflow_run_id = mrun.run_id
             logging.info(f"MLFlow run-id: {mlflow_run_id}")
         except Exception as e:
-            print(e)
+            logging.error(e)
             os.remove("MLProject")
         else:
             os.remove("MLProject")
 
-            print("END rebase run 2")
             retcode, output = run_command(f'dvc commit {name}', return_output=True)
-            #if not is_notebook:
-            retc, output = run_commands(
-                [f'git add .',
-                f'git commit -m "{run_name}"'], raise_error=False, return_output=True
-            )[-1]
-            if retc == 1:
-                logging.info("Git - nothing to commit")
-            elif retc != 0:
-                print("NOT COMMIT run")
-                logging.error(f"Git - error commiting changes: {output}")
-            else:
-                print("COMMITED run")
 
-                retc, output = run_commands([f'dvc push'],
-                                             raise_error=False, return_output=True)[-1]
-                if retc != 0:
-                    logging.error(f"Dvc push failed with output: {output}")
+            # retc, output = run_commands([f'dvc push'],
+            #                              raise_error=False, return_output=True)[-1]
+            # if retc != 0:
+            #     logging.error(f"Dvc push failed with output: {output}")
+
+            # #if not is_notebook:
+            # retc, output = run_commands(
+            #     [f'git add .',
+            #     f'git commit -m "{run_name}"'], raise_error=False, return_output=True
+            # )[-1]
+            # if retc == 1:
+            #     logging.info("Git - nothing to commit")
+            # elif retc != 0:
+            #     print("NOT COMMIT run")
+            #     logging.error(f"Git - error commiting changes: {output}")
+            # else:
+            #     print("COMMITED run")
+
+            #     retc, output = run_commands([f'dvc push'],
+            #                                  raise_error=False, return_output=True)[-1]
+            #     if retc != 0:
+            #         logging.error(f"Dvc push failed with output: {output}")
 
 
 @click.command(name="run")

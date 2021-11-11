@@ -22,8 +22,16 @@ def init(project: str = None,
          git_init: bool = False,
          context: dict = None,
          artifact_location: str = None
-) -> None:
-    print("Initializing.......")
+) -> None:    
+    # logging
+    import logging
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logging.getLogger(
+        "azure.core.pipeline.policies.http_logging_policy"
+    ).setLevel(logging.WARNING)
+    
+    logging.info("Initializing.......")
 
     # get internal rebase context
     if context is None:
@@ -33,14 +41,6 @@ def init(project: str = None,
     if project is None:
         raise ValueError("Missing project name")
 
-    # logging
-    import logging
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    logging.getLogger(
-        "azure.core.pipeline.policies.http_logging_policy"
-    ).setLevel(logging.WARNING)
-
     proj_config = project_init(project)
 
     for k, v in proj_config['envs'].items():
@@ -48,7 +48,7 @@ def init(project: str = None,
         context['envs'][k] = v     
 
     # setup mlflow experiment
-    print("Setting up environments...")
+    logging.info("Setting up environments...")
     current_dir = os.getcwd()
     if project_dir is None:
         project_dir = current_dir
@@ -67,7 +67,26 @@ def init(project: str = None,
     
     init_proj_dir(project_dir, git_init, context)
 
+    restore_context_from_configs()
+
     context.save()
+
+def restore_context_from_configs():
+    dvc_pipeline = yaml_to_dict('dvc.yaml', default={})
+    params = yaml_to_dict('params.yaml', default={})
+    context = current_context()
+
+    for stage_name, stage in dvc_pipeline.get('stages', {}).items():
+        stage_params = params.get(stage_name, {})
+        valid_params = {}
+        for p in stage.get('params', []):            
+            valid_params[p] = params.get(p, None)
+        ctx_stage = Stage(stage_name, params=valid_params)        
+        for d in stage.get('deps', []):
+            ctx_stage.add_dependency(d)
+        for o in stage.get('outs', []):
+            ctx_stage.add_output(o)
+        context.stages[stage_name] = ctx_stage
 
 def init_proj_dir(project_dir, git_init, context):
     os.makedirs(project_dir, exist_ok=True)
@@ -75,7 +94,7 @@ def init_proj_dir(project_dir, git_init, context):
     proj_config = context["config"]
     current_dir = os.getcwd()
 
-    print("Init project dir...")
+    logging.info("Init project dir...")
     with repo_chdir(context) as repo_dir:
         # check if inside git repo
         if not git_init:
@@ -108,13 +127,13 @@ def init_proj_dir(project_dir, git_init, context):
         dvc_inited = os.path.isdir(f"{context['path']}/.dvc")
         if not dvc_inited:
             # check if dvc repo
-            run_commands([f"dvc init --subdir",
+            run_commands([f"dvc init",
                           f"dvc remote add --default rebase {proj_config['data_location']}"])
 
-            time.sleep(2)
-            run_commands(["git commit -m 'dvc init'"])
+            # time.sleep(2)
+            # run_commands(["git commit -m 'dvc init'"])
 
-        print("git and dvc initialised...")
+        logging.info("git and dvc initialised...")
 
 def add_dependency(location: str, out: str = None, externals: str = "ref_direct",
                     repo: str = None, remote: bool = False, revision: str = None):
@@ -185,7 +204,7 @@ def add_dependency(location: str, out: str = None, externals: str = "ref_direct"
             if not remote:
                 retc, output = run_commands([f"dvc add {dvc_add_flags} {dep_file}"], return_output=True)[0]
                 if retc != 0:
-                    print(f"dvc add error: {output}")
+                    logging.error(f"dvc add error: {output}")
             else:
                 try:
                     if repo is not None:
@@ -203,7 +222,7 @@ def add_dependency(location: str, out: str = None, externals: str = "ref_direct"
         #stage.add_dependency(dep_file, name=out)
         #return dep_file_abs
     else:
-        logging.info(f"Depencency {dep_file} already exists")
+        logging.info(f"Dependency {dep_file} already exists")
 
     return dep_file
 
@@ -329,7 +348,7 @@ def track_output(path, name=None):
 def restore(stage: str):
     with repo_chdir():
         _, out = run_command(f'dvc pull {stage}',return_output=True)
-        print(out)
+        logging.info(out)
 
 def log_param(key: str ,value: any):
     mlflow.log_param(key, value)
@@ -381,7 +400,7 @@ def list(experiment: str, key: str = None, type: str = "metrics",
                     val = rdict[key]
                     val_str = f", {type}.{key} {val}"
 
-            print(f"- {run_name_str}runid {ri.run_id}, {val_str} ")
+            logging.info(f"- {run_name_str}runid {ri.run_id}, {val_str} ")
         if return_runs:
             return run_dict
 

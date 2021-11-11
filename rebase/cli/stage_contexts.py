@@ -8,7 +8,12 @@ from contextlib import contextmanager
 import sys
 import yaml
 
-from .utils import run_commands,run_command, generate_run_id, dict_to_yaml_file, yaml_to_dict,is_notebook
+from .utils import (run_commands,run_command, 
+                    generate_run_id, 
+                    dict_to_yaml_file, 
+                    yaml_to_dict,
+                    is_notebook,
+                    git_get_current_branch)
 from .context import current_context, Context, Stage
 from .errors import *
 from ..api.sdk import project_init
@@ -31,11 +36,19 @@ def repo_chdir(context=None):
 def merge_collection_args(stage_name, collection, stored_collection_name, stored_dvc, arg):
     args_list = []
     if stored_dvc is not None and stage_name in stored_dvc['stages']:
-        stored_stage = stored_dvc['stages'][stage_name]
-        args_list = stored_stage[stored_collection_name]
+        stored_stage = stored_dvc['stages'][stage_name]        
+        args_list = stored_stage.get(stored_collection_name, [])
+        if args_list is None:
+            args_list = []
     else:
         args_list = []
+
+    for c in collection:
+        if c not in args_list:
+            args_list.append(c)
+
     return "".join(f"{arg}{v}" for v in args_list)
+
 
 @contextmanager
 def stage(name, params=None, log_run=False, ctx_run_name=None):
@@ -45,7 +58,7 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
     print("INSIDE stage ctx")
     try:
         stage = context.current_stage()
-        stage.clear_dependencies()
+        #stage.clear_dependencies()
 
         logging.info("Restoring context...")
         with repo_chdir():
@@ -65,15 +78,14 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
 
             stage.params = all_params[name]
 
-            curr_branch = run_command("git rev-parse --abbrev-ref HEAD",
-                                  return_output=True)[1].strip()
+            curr_branch = git_get_current_branch()
             if ctx_run_name is not None:
 
                 ctx_commit = run_command(f"git log --oneline --grep='{ctx_run_name}'",
                                       return_output=True)[1].strip().split()[0]
                 retc, output = run_commands([f'git checkout {ctx_commit}'], raise_error=False, return_output=True)[0]
 
-            retc, output = run_commands([f'dvc checkout'], raise_error=False, return_output=True)[0]
+            # retc, output = run_commands([f'dvc checkout'], raise_error=False, return_output=True)[0]
         """
             if os.path.isfile('dvc.yaml'):
                 dvc_yaml = yaml_to_dict('dvc.yaml')
@@ -83,12 +95,12 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
                         logging.error(f"Dvc - pulled deps from '{name}' : {output}")
                     else:
                         logging.error(f"Dvc - error pulling from '{name}' : {output}")
-        """
-        run_name = f"r-{generate_run_id()[:7]}"
+        """        
         if log_run:
             mlflow.autolog()
             run_obj = mlflow.active_run()
             if run_obj is None:
+                run_name = f"r-{generate_run_id()[:7]}"
                 run_obj = mlflow.start_run(
                     run_name=run_name,
                     experiment_id=context['experiment']['id']
@@ -116,7 +128,7 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
             #context.stages[name] = stage
           
             # get previous dvc pipeline from yaml file
-            print("GENERATE pipeline")
+            logging.info("GENERATE pipeline")
             if exists('dvc.yaml'):
                 with open("dvc.yaml", "r") as stream:
                     try:
@@ -126,16 +138,16 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
             else:
                 prev_dvc_pipeline = None
 
-            deps_arg = merge_collection_args(name, stage.dependencies, "deps", prev_dvc_pipeline, " -d ")
-            outs_arg = merge_collection_args(name, stage.outputs, "outs", prev_dvc_pipeline, " -o ")
-            params_arg = "-p " + merge_collection_args(name, stage.params, "params", prev_dvc_pipeline, ",")
+            deps_arg = merge_collection_args(name, [d['path'] for d in stage.dependencies.values()], "deps", prev_dvc_pipeline, " -d ")
+            outs_arg = merge_collection_args(name, [o['path'] for o in stage.outputs.values()], "outs", prev_dvc_pipeline, " -o ")
+            params_arg = "-p " + merge_collection_args(name, [f'{name}.{p}' for p in stage.params.keys()], "params", prev_dvc_pipeline, ",")
             if prev_dvc_pipeline is not None and name in prev_dvc_pipeline['stages']:
                 command_arg = prev_dvc_pipeline['stages'][name].get('cmd', "")
             else:
                 command_arg = f"echo \"python yourpath/{name}.py\""
             retc, output = run_commands([f"dvc run -f -n {name} {deps_arg} {outs_arg} {params_arg} --no-exec '{command_arg}'"], return_output=True)[0]
             if retc != 0:
-                print(f"dvc run error for outputs: {output}")            
+                logging.error(f"dvc run error for outputs: {output}")            
 
             # TODO: generate with dvc run --no-exec instead to make the outputs tracked
             # dvc_pipeline = context.generate_dvc_pipeline(prev_dvc_pipeline)
@@ -143,30 +155,29 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
 
             dict_to_yaml_file(all_params, "params.yaml")
 
-            # if notebook then git commit and dvc push
-            if is_notebook:
-                print("INSIDE notebook")
+            # # if notebook then git commit and dvc push
+            # if is_notebook:
+            #     print("INSIDE notebook")
 
-                retc, output = run_commands(
-                    [f'git add .',
-                    f'git commit -m "{run_name}"'], raise_error=False, return_output=True
-                )[-1]
-                if retc == 1:
-                    logging.info("Git - nothing to commit")
-                elif retc != 0:
-                    print("NOT COMMIT notebook")
-                    logging.error(f"Git - error commiting changes: {output}")
-                else:
-                    print("COMMITED notebook")
-                    retc, output = run_commands([f'dvc push'],
-                                                 raise_error=False, return_output=True)[-1]
-                    if retc != 0:
-                        logging.error(f"Dvc push failed with output: {output}")
-            else:
-                print("NOT INSIDE notebook")
+            #     retc, output = run_commands(
+            #         [f'git add .',
+            #         f'git commit -m "{run_name}"'], raise_error=False, return_output=True
+            #     )[-1]
+            #     if retc == 1:
+            #         logging.info("Git - nothing to commit")
+            #     elif retc != 0:
+            #         print("NOT COMMIT notebook")
+            #         logging.error(f"Git - error commiting changes: {output}")
+            #     else:
+            #         print("COMMITED notebook")
+            #         retc, output = run_commands([f'dvc push'],
+            #                                      raise_error=False, return_output=True)[-1]
+            #         if retc != 0:
+            #             logging.error(f"Dvc push failed with output: {output}")
+            # else:
+            #     print("NOT INSIDE notebook")
     finally:
         logging.info("Run - ending ...")
-        print("ENDING RUN")
         if log_run:
             mlflow.end_run()
             context.clear_run()
@@ -187,7 +198,7 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
 
         context.set_stage(prev_stage.name, prev_stage.params)
         context.save()
-        print("END RUN")
+        logging.info("Context saved")        
 
 @contextmanager
 def mlflow_ctx(experiment):

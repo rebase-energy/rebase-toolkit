@@ -5,6 +5,9 @@ import uuid
 import hashlib
 import yaml
 import shlex
+from contextlib import contextmanager
+import logging
+import os
 
 def generate_run_id():
     return str(uuid.uuid4()).replace('-', '')
@@ -53,9 +56,16 @@ def dict_to_yaml_file(d: dict, file_path: str):
     with open(file_path, 'w') as outfile:
         yaml.dump(d, outfile, default_flow_style=False)
 
-def yaml_to_dict(file_path: str):
-    with open(file_path, 'r') as f:
-        return yaml.load(f)
+def yaml_to_dict(file_path: str, default=None, raise_error=True):
+    if os.path.exists(file_path):
+        with open(file_path, 'r') as f:
+            try:
+                return yaml.safe_load(f)
+            except yaml.YAMLError as e:
+                logging.error(e)
+                return default
+    else:
+        return default
 
 def is_notebook():
     try:
@@ -67,3 +77,32 @@ def is_notebook():
     except AttributeError:
         return False
     return True
+
+
+@contextmanager
+def git_temp_branch(temporary_branch, create=False):
+    """
+    Ctx manager to perform commands in the another git branch
+    """
+    saved_branch = git_get_current_branch()
+    try:
+        create_flag = "-b" if create else ""
+        retc, output = run_command(f"git checkout {create_flag} {temporary_branch}", return_output=True)
+        if retc == 0:
+            logging.info(f"Switched to branch {temporary_branch}")
+
+            yield git_temp_branch
+        else:
+            raise ValueError(f"Failed to switch to branch {temporary_branch}: {output}")
+    finally:
+        current_branch = git_get_current_branch()
+        if saved_branch != current_branch:
+            retc, output = run_command(f"git checkout {saved_branch}", return_output=True)
+            if retc != 0:
+                logging.error(f"Failed to switch branch back to {saved_branch}: {output}")
+    
+
+def git_get_current_branch():
+    curr_branch = run_command("git rev-parse --abbrev-ref HEAD",
+                      return_output=True)[1].strip()
+    return curr_branch
