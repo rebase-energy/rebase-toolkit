@@ -42,7 +42,6 @@ def init(project: str = None,
     ).setLevel(logging.WARNING)
 
     proj_config = project_init(project)
-    print(f"CONFIG {proj_config}")
 
     for k, v in proj_config['envs'].items():
         os.environ[k] = v

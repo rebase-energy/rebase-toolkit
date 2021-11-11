@@ -138,7 +138,7 @@ def run(name: str = None,
 @click.option("--name", "-n", "name", default=None)
 @click.option("--parameter", "-p", "parameters", multiple=True)
 @click.option("--tag", "-t", "tags", multiple=True)
-@click.option('--hyperparam','-hp', default=False)
+@click.option('--hyperparam','-hp', "hyperparam", is_flag=True)
 def run_cmd(*args, **kwargs):
 	return run(*args, **kwargs)
 
