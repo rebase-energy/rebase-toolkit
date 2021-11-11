@@ -5,9 +5,10 @@ import json
 
 from ...util import api_request
 from ..utils import run_command, generate_run_id
+from ..context import current_context
 import rebase as rb
 
-def hpsearch():
+def hpsearch(n_workers=4):
     context = current_context(from_file=True)
 
     print("Starting hyperparam search")
@@ -30,7 +31,8 @@ def hpsearch():
             'run_name': run_name,
             'project_name': context['project'],
             'experiment_name': context['experiment']['name'],
-            'api_key': rb.api_key
+            'api_key': rb.api_key,
+            'n_workers': n_workers
         }
 
     r = api_request.post('platform/v1/model/hpsearch', data=json.dumps(data))
@@ -39,6 +41,7 @@ def hpsearch():
     print('hpsearch id: {}'.format(data['hp_id']))
 
 @click.command(name="hpsearch")
+@click.option("--workers", "-w", "n_workers", default=4, type=int)
 def hpsearch_cmd(*args, **kwargs):
     return hpsearch(*args, **kwargs)
 
