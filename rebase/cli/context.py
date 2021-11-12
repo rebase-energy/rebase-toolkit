@@ -9,7 +9,7 @@ def current_context(from_file=False):
     """
     Get the current context.
     from_file = True, then restore ctx from file
-    .context.pkl instead of memory
+    .context instead of memory
     """
     return Context.current(from_file=from_file)
 
@@ -86,7 +86,7 @@ class Context(dict):
     def save(self):
         _, git_path = run_command("git rev-parse --show-toplevel",
                                   return_output=True)
-        with open(f'{git_path.strip()}/.context.pkl', 'wb+') as f:
+        with open(f'{git_path.strip()}/.context', 'wb+') as f:
             pickle.dump(self, f)
 
     def load_env(self):
@@ -102,7 +102,7 @@ class Context(dict):
         _, git_path = run_command("git rev-parse --show-toplevel",
                                   return_output=True)
         git_path = git_path.strip()
-        ctx_path = f'{git_path}/.context.pkl'
+        ctx_path = f'{git_path}/.context'
         try:
             with open(ctx_path, 'rb') as f:
                 return pickle.load(f)

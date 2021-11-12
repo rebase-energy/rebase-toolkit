@@ -114,15 +114,13 @@ def init_proj_dir(project_dir, git_init, context):
                 user_name = "RbUser"
 
             run_commands([f"git config user.email \"{user_email}\"",
-                          f"git config user.name \"{user_name}\""])
+                          f"git config user.name \"{user_name}\""])            
 
-        # retc, output = run_commands(["git check-ignore .context.pkl MLProject"], raise_error=False, return_output=True)[0]
-        # new_ignores = output.split('\n')
-        # new_ignores = [ni for ni in new_ignores if exists(ni)]
-        # if len(new_ignores) > 0:
-        #     print(f"Adding ignores: {new_ignores}")            
-        #     with open(".gitignore", "a") as f:
-        #         f.writelines(new_ignores)
+        retc, _ = run_command("git check-ignore -q .context")
+        if retc == 1:
+            logging.info("Updating .gitignore")
+            with open(".gitignore", "a") as f:
+                f.write('.context\n')
     
         dvc_inited = os.path.isdir(f"{context['path']}/.dvc")
         if not dvc_inited:
@@ -130,8 +128,9 @@ def init_proj_dir(project_dir, git_init, context):
             run_commands([f"dvc init",
                           f"dvc remote add --default rebase {proj_config['data_location']}"])
 
-            # time.sleep(2)
-            # run_commands(["git commit -m 'dvc init'"])
+            if git_init:
+                time.sleep(2)
+                run_commands(["git commit -a -m 'Initial commit'"])
 
         logging.info("git and dvc initialised...")
 
@@ -219,8 +218,6 @@ def add_dependency(location: str, out: str = None, externals: str = "ref_direct"
             stage.add_dependency(dep_file, name=out)
             dep_file_abs = os.path.abspath(dep_file)
             dep_file = dep_file_abs
-        #stage.add_dependency(dep_file, name=out)
-        #return dep_file_abs
     else:
         logging.info(f"Dependency {dep_file} already exists")
 

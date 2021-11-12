@@ -85,21 +85,25 @@ def git_temp_branch(temporary_branch, create=False):
     Ctx manager to perform commands in the another git branch
     """
     saved_branch = git_get_current_branch()
-    try:
-        create_flag = "-b" if create else ""
-        retc, output = run_command(f"git checkout {create_flag} {temporary_branch}", return_output=True)
-        if retc == 0:
-            logging.info(f"Switched to branch {temporary_branch}")
+    if saved_branch == temporary_branch:
+        logging.info("Temp branch same as current. No branch created")
+        yield saved_branch
+    else:
+        try:
+            create_flag = "-b" if create else ""
+            retc, output = run_command(f"git checkout {create_flag} {temporary_branch}", return_output=True)
+            if retc == 0:
+                logging.info(f"Switched to branch {temporary_branch}")
 
-            yield git_temp_branch
-        else:
-            raise ValueError(f"Failed to switch to branch {temporary_branch}: {output}")
-    finally:
-        current_branch = git_get_current_branch()
-        if saved_branch != current_branch:
-            retc, output = run_command(f"git checkout {saved_branch}", return_output=True)
-            if retc != 0:
-                logging.error(f"Failed to switch branch back to {saved_branch}: {output}")
+                yield temporary_branch
+            else:
+                raise ValueError(f"Failed to switch to branch {temporary_branch}: {output}")
+        finally:
+            current_branch = git_get_current_branch()
+            if saved_branch != current_branch:
+                retc, output = run_command(f"git checkout {saved_branch}", return_output=True)
+                if retc != 0:
+                    logging.error(f"Failed to switch branch back to {saved_branch}: {output}")
     
 
 def git_get_current_branch():

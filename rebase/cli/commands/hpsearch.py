@@ -5,7 +5,7 @@ import json
 import logging
 
 from ...util import api_request
-from ..utils import run_command, run_commands, generate_run_id, git_temp_branch
+from ..utils import run_command, run_commands, generate_run_id, git_temp_branch, git_get_current_branch
 from ..context import current_context
 import rebase as rb
 
