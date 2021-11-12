@@ -5,13 +5,17 @@ import uuid
 import hashlib
 import yaml
 import shlex
+from contextlib import contextmanager
+import logging
+import os
+import pwd
 
-def generatea_run_id():
+def generate_run_id():
     return str(uuid.uuid4()).replace('-', '')
 
 def run_command(command, return_output=False):
     command_list = shlex.split(command)
-           
+
     try:
         logging.info("Running: \"{}\"".format(command))
         result = subprocess.run(command_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE);
@@ -25,7 +29,7 @@ def run_commands(commands, stop_on_failure=True, return_output=False, raise_erro
     for cmd in commands:
         retcode, result = run_command(cmd, return_output=True)
         if not return_output:
-            result = None    
+            result = None
         results.append((retcode, result))
         if stop_on_failure and retcode != 0:
             if raise_error:
@@ -51,4 +55,63 @@ def file_hash(file):
 
 def dict_to_yaml_file(d: dict, file_path: str):
     with open(file_path, 'w') as outfile:
-        yaml.dump(d, outfile, default_flow_style=False)  
+        yaml.dump(d, outfile, default_flow_style=False)
+
+def yaml_to_dict(file_path: str, default=None, raise_error=True):
+    if os.path.exists(file_path):
+        with open(file_path, 'r') as f:
+            try:
+                return yaml.safe_load(f)
+            except yaml.YAMLError as e:
+                logging.error(e)
+                return default
+    else:
+        return default
+
+def is_notebook():
+    try:
+        from IPython import get_ipython
+        if 'IPKernelApp' not in get_ipython().config:  # pragma: no cover
+            return False
+    except ImportError:
+        return False
+    except AttributeError:
+        return False
+    return True
+
+
+@contextmanager
+def git_temp_branch(temporary_branch, create=False):
+    """
+    Ctx manager to perform commands in the another git branch
+    """
+    saved_branch = git_get_current_branch()
+    if saved_branch == temporary_branch:
+        logging.info("Temp branch same as current. No branch created")
+        yield saved_branch
+    else:
+        try:
+            create_flag = "-b" if create else ""
+            retc, output = run_command(f"git checkout {create_flag} {temporary_branch}", return_output=True)
+            if retc == 0:
+                logging.info(f"Switched to branch {temporary_branch}")
+
+                yield temporary_branch
+            else:
+                raise ValueError(f"Failed to switch to branch {temporary_branch}: {output}")
+        finally:
+            current_branch = git_get_current_branch()
+            if saved_branch != current_branch:
+                retc, output = run_command(f"git checkout {saved_branch}", return_output=True)
+                if retc != 0:
+                    logging.error(f"Failed to switch branch back to {saved_branch}: {output}")
+    
+
+def git_get_current_branch():
+    curr_branch = run_command("git rev-parse --abbrev-ref HEAD",
+                      return_output=True)[1].strip()
+    return curr_branch
+
+
+def get_username():
+    return pwd.getpwuid( os.getuid() )[ 0 ]
