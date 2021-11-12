@@ -19,6 +19,7 @@ def format_dvc_tag(tag_str):
 
 def run(name: str = None,
 		parameters: list = [],
+        user: str = None,
 		tags: list =[],
         hyperparam: bool = False
 ) -> None:
@@ -26,6 +27,9 @@ def run(name: str = None,
 
     current_dir = os.getcwd()
     repo_name = os.path.basename(current_dir)
+
+    if user is None:
+        user = get_username()
 
     with repo_chdir(context):
         run_id = generate_run_id()
@@ -58,6 +62,7 @@ def run(name: str = None,
                                                         mlflow.set_tracking_uri(\"{tracking_uri}\");\
                                                         mlflow.set_experiment(\"{context['experiment']['name']}\");\
                                                         mlflow.set_tag(\"mlflow.runName\", \"{name}\");\
+                                                        mlflow.set_tag(\"mlflow.user\", \"{user}\");\
                                                         {tags_str}'; "+ dvc_cmd
                              ])
             mrun = mlflow.run(".", use_conda=False)
@@ -97,6 +102,7 @@ def run(name: str = None,
 
 @click.command(name="run")
 @click.option("--name", "-n", "name", default=None)
+@click.option("--user", "-u", "user", default=None)
 @click.option("--parameter", "-p", "parameters", multiple=True)
 @click.option("--tag", "-t", "tags", multiple=True)
 @click.option('--hyperparam','-hp', "hyperparam", is_flag=True)

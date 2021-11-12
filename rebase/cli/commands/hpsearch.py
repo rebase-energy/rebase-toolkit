@@ -5,19 +5,20 @@ import json
 import logging
 
 from ...util import api_request
-from ..utils import run_command, run_commands, generate_run_id, git_temp_branch, git_get_current_branch
+from ..utils import run_command, run_commands, generate_run_id, git_temp_branch, git_get_current_branch, get_username
 from ..context import current_context
 import rebase as rb
 
-def hpsearch(n_workers=4):
+def hpsearch(run_name=None, n_workers=4):
     context = current_context(from_file=True)
 
     logging.info(f"Starting hyperparam search: project: {context['project']}, experiment: {context['experiment']['name']}")
 
     current_dir = os.getcwd()
-    repo_name = os.path.basename(current_dir)
-    run_id = generate_run_id()
-    run_name = f"hps-{run_id[:5]}"
+    repo_name = os.path.basename(current_dir)    
+    if run_name is None:
+        run_id = generate_run_id()
+        run_name = f"hps-{run_id[:5]}"
     branch_name = f'HP-{run_name}'
 
     with git_temp_branch(branch_name, create=True) as new_branch:
@@ -43,6 +44,7 @@ def hpsearch(n_workers=4):
             'branch_name': branch_name,
             'repo_name': repo_name,
             'run_name': run_name,
+            'user': get_username(),
             'project_name': context['project'],
             'experiment_name': context['experiment']['name'],
             'api_key': rb.api_key,
@@ -56,6 +58,7 @@ def hpsearch(n_workers=4):
 
 @click.command(name="hpsearch")
 @click.option("--workers", "-w", "n_workers", default=4, type=int)
+@click.option("--name", "-n", "run_name", default=None, type=str)
 def hpsearch_cmd(*args, **kwargs):
     return hpsearch(*args, **kwargs)
 

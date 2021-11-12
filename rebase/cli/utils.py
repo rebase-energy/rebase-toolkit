@@ -8,6 +8,7 @@ import shlex
 from contextlib import contextmanager
 import logging
 import os
+import pwd
 
 def generate_run_id():
     return str(uuid.uuid4()).replace('-', '')
@@ -110,3 +111,7 @@ def git_get_current_branch():
     curr_branch = run_command("git rev-parse --abbrev-ref HEAD",
                       return_output=True)[1].strip()
     return curr_branch
+
+
+def get_username():
+    return pwd.getpwuid( os.getuid() )[ 0 ]
