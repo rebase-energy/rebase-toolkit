@@ -139,8 +139,11 @@ def stage(name, params=None, log_run=False, ctx_run_name=None):
                 prev_dvc_pipeline = None
 
             deps_arg = merge_collection_args(name, [d['path'] for d in stage.dependencies.values()], "deps", prev_dvc_pipeline, " -d ")
-            outs_arg = merge_collection_args(name, [o['path'] for o in stage.outputs.values()], "outs", prev_dvc_pipeline, " -o ")
-            params_arg = "-p " + merge_collection_args(name, [f'{name}.{p}' for p in stage.params.keys()], "params", prev_dvc_pipeline, ",")
+            outs_arg = merge_collection_args(name, [o['path'] for o in stage.outputs.values()], "outs", prev_dvc_pipeline, " -o ")        
+            if stage.params is not None and len(stage.params.keys()) > 0:
+                params_arg = "-p " + merge_collection_args(name, [f'{name}.{p}' for p in stage.params.keys()], "params", prev_dvc_pipeline, ",")
+            else:
+                params_arg = ""
             if prev_dvc_pipeline is not None and name in prev_dvc_pipeline['stages']:
                 command_arg = prev_dvc_pipeline['stages'][name].get('cmd', "")
             else:
