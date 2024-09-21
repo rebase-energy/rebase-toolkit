@@ -1,4 +1,4 @@
-from setuptools import setup, find_packages
+from setuptools import setup
 from distutils.util import convert_path
 
 main_ns = {}
@@ -8,8 +8,8 @@ with open(ver_path) as ver_file:
 
 setup(
     name='rebase-toolkit',
-    url='https://github.com/rebaseenergy/rebase-sdk',
-    packages=find_packages(exclude=["*tests*", "*debug*","*docs*"]),
+    url='https://github.com/rebaseenergy/rebase-toolkit',
+    packages=['rebase'],
     install_requires=['requests>=2.20.0', 'pandas>=1.0.0', 'dill', 'PyYAML', 'dvc[azure]', 'mlflow', 'joblib', 'click'],
     include_package_data=True,
     version=main_ns['__version__'],

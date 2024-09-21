@@ -7,3 +7,6 @@ cache_dir = './cache'
 
 from rebase.api import *
 from rebase.cli import *
+from rebase.sweeps import *
+from rebase.sweeps_1 import *
+from rebase.sweeps_2 import *
