@@ -1,5 +1,8 @@
 **debug
 env
+.venv
+.ruff_cache
+.pytest_cache
 **__pycache__
 **credentials
 **cache
