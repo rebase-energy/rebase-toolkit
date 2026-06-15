@@ -12,10 +12,25 @@ from rebase.client import (
     Workflow,
     configure,
 )
+from rebase.config import DEFAULT_API_URL
+from rebase.public import (
+    deploy,
+    function,
+    get_function,
+    get_workflow,
+    project,
+    projects,
+    step,
+    update_workspace,
+    workflow,
+    workspace,
+)
+from rebase.version import __version__
 
 __all__ = [
     "Client",
     "Cron",
+    "DEFAULT_API_URL",
     "Function",
     "Image",
     "Project",
@@ -24,7 +39,18 @@ __all__ = [
     "Run",
     "Step",
     "Workflow",
+    "__version__",
     "configure",
     "data",
+    "deploy",
+    "function",
+    "get_function",
+    "get_workflow",
     "modeling",
+    "project",
+    "projects",
+    "step",
+    "update_workspace",
+    "workspace",
+    "workflow",
 ]

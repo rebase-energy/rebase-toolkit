@@ -6,40 +6,69 @@ The toolkit is intentionally small by default: it contains the API-key client, S
 
 ## Install
 
+During early development, install directly from GitHub into a clean `uv` environment:
+
 ```bash
-pip install git+ssh://git@github.com/rebase-energy/rebase-toolkit.git
+uv venv .venv
+source .venv/bin/activate
+uv pip install "rebase-toolkit @ git+ssh://git@github.com/rebase-energy/rebase-toolkit.git@master"
+```
+
+Install from a branch by replacing `master` with the branch name:
+
+```bash
+uv pip install --upgrade "rebase-toolkit @ git+ssh://git@github.com/rebase-energy/rebase-toolkit.git@my-branch"
+```
+
+Once the package is published to PyPI:
+
+```bash
+pip install rebase-toolkit
 ```
 
 For local development:
 
 ```bash
-pip install -e ".[dev]"
+uv sync --dev
+```
+
+To smoke-test a fresh install from this checkout before pushing:
+
+```bash
+scripts/smoke_uv_install.sh local
+```
+
+To smoke-test a GitHub ref:
+
+```bash
+REBASE_TOOLKIT_GIT_REF=master scripts/smoke_uv_install.sh github
 ```
 
 Optional data/modeling packages:
 
 ```bash
-pip install "rebase-toolkit[data]"
-pip install "rebase-toolkit[modeling]"
-pip install "rebase-toolkit[all]"
+uv pip install "rebase-toolkit[data]"
+uv pip install "rebase-toolkit[modeling]"
+uv pip install "rebase-toolkit[all]"
 ```
 
 ## Configure
 
 ```bash
-export REBASE_API_KEY="rbw_..."
-export REBASE_API_URL="https://<your-rebase-platform-api>"
+rebase setup
 ```
 
-You can also configure the client in Python:
+The setup command asks for a Rebase API key and stores it in `~/.rebase/config.json`. The hosted Rebase API URL is built into the SDK, so normal user code does not need an API URL or API key argument.
 
-```python
-import rebase as rb
+You can select a named local profile when needed:
 
-rb.configure(
-    api_key="rbw_...",
-    api_url="https://<your-rebase-platform-api>",
-)
+```bash
+rebase setup --profile prod
+```
+
+```bash
+rebase workspace list
+rebase workspace switch prod
 ```
 
 ## Minimal Function
@@ -47,7 +76,7 @@ rb.configure(
 ```python
 import rebase as rb
 
-project = rb.Project("first-user")
+project = rb.project("first-user")
 
 
 @project.function()
@@ -66,7 +95,7 @@ print(run.result(timeout=120))
 ```python
 import rebase as rb
 
-project = rb.Project("forecasting")
+project = rb.project("forecasting")
 
 
 @project.step()

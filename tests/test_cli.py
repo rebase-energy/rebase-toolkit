@@ -1,7 +1,8 @@
+import json
 from pathlib import Path
 
 from rebase.cli import deploy_file, main
-from rebase.client import Project, Workflow
+from rebase.client import Client, Project, Workflow
 
 
 def test_deploy_file_deploys_top_level_project(monkeypatch, tmp_path: Path) -> None:
@@ -103,4 +104,115 @@ def test_main_prints_deployed_targets(monkeypatch, tmp_path: Path, capsys) -> No
 
     assert main(["deploy", str(workflow_file)]) == 0
 
-    assert capsys.readouterr().out == "Deployed project energy-forecasting (project-id)\n"
+    output = capsys.readouterr().out
+    assert "Deployed Targets" in output
+    assert "project" in output
+    assert "energy-forecasting" in output
+    assert "project-id" in output
+
+
+def test_setup_stores_api_key(monkeypatch, tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    monkeypatch.setattr("getpass.getpass", lambda prompt: "rbw_secret")
+    monkeypatch.setattr(Client, "get_workspace", lambda self: {"id": "workspace-id", "name": "ACME"})
+
+    assert main(["setup", "--profile", "test"]) == 0
+
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data == {
+        "default_profile": "test",
+        "profiles": {
+            "test": {
+                "api_key": "rbw_secret",
+                "workspace_id": "workspace-id",
+                "workspace_name": "ACME",
+            }
+        },
+    }
+    output = capsys.readouterr().out
+    assert "Saved Rebase credentials for profile 'test'" in output
+    assert str(config_path) in output
+
+
+def test_setup_can_skip_verification(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+
+    assert main(["setup", "--api-key", "rbw_secret", "--no-verify"]) == 0
+
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data["profiles"]["default"]["api_key"] == "rbw_secret"
+
+
+def test_workspace_lists_profiles(monkeypatch, tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    config_path.write_text(
+        json.dumps(
+            {
+                "default_profile": "prod",
+                "profiles": {
+                    "dev": {"api_key": "rbw_dev", "workspace_name": "Development"},
+                    "prod": {"api_key": "rbw_prod", "workspace_name": "Production"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["workspace", "list"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Workspace Profiles" in output
+    assert "dev" in output
+    assert "Development" in output
+    assert "prod" in output
+    assert "Production" in output
+    assert "*" in output
+
+
+def test_workspace_use_changes_default_profile(monkeypatch, tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    config_path.write_text(
+        json.dumps(
+            {
+                "default_profile": "dev",
+                "profiles": {
+                    "dev": {"api_key": "rbw_dev"},
+                    "prod": {"api_key": "rbw_prod"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["workspace", "use", "prod"]) == 0
+
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data["default_profile"] == "prod"
+    assert capsys.readouterr().out == "Switched workspace profile to 'prod'\n"
+
+
+def test_workspace_switch_changes_default_profile(monkeypatch, tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    config_path.write_text(
+        json.dumps(
+            {
+                "default_profile": "dev",
+                "profiles": {
+                    "dev": {"api_key": "rbw_dev"},
+                    "prod": {"api_key": "rbw_prod"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["workspace", "switch", "prod"]) == 0
+
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data["default_profile"] == "prod"
+    assert capsys.readouterr().out == "Switched workspace profile to 'prod'\n"

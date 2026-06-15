@@ -3,6 +3,7 @@ from typing import Any
 import pytest
 
 import rebase as rb
+from rebase.config import DEFAULT_API_URL, write_profile
 
 
 class FakeResponse:
@@ -37,18 +38,36 @@ def test_client_sends_bearer_token(monkeypatch) -> None:
     }
 
 
-def test_client_reads_platform_environment_aliases(monkeypatch) -> None:
-    monkeypatch.setenv("REBASE_PLATFORM_API_KEY", "rbw_platform")
-    monkeypatch.setenv("REBASE_PLATFORM_API_URL", "https://platform.example.com")
-    monkeypatch.delenv("REBASE_API_KEY", raising=False)
-    monkeypatch.delenv("REBASE_API_URL", raising=False)
-    monkeypatch.delenv("REBASE_WORKFLOWS_API_KEY", raising=False)
-    monkeypatch.delenv("REBASE_WORKFLOWS_API_URL", raising=False)
+def test_client_uses_hosted_api_url_by_default(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(tmp_path / "missing-config.json"))
 
     client = rb.Client()
 
-    assert client.api_key == "rbw_platform"
-    assert client.api_url == "https://platform.example.com"
+    assert client.api_key is None
+    assert client.api_url == DEFAULT_API_URL
+
+
+def test_client_reads_api_key_from_local_profile(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    write_profile(api_key="rbw_profile", profile="default", path=config_path)
+
+    client = rb.Client()
+
+    assert client.api_key == "rbw_profile"
+    assert client.api_url == DEFAULT_API_URL
+
+
+def test_client_can_select_named_profile(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    write_profile(api_key="rbw_default", profile="default", path=config_path)
+    write_profile(api_key="rbw_prod", profile="prod", path=config_path)
+
+    client = rb.Client(profile="prod")
+
+    assert client.api_key == "rbw_prod"
+    assert client.api_url == DEFAULT_API_URL
 
 
 def test_workflow_deploy_updates_existing_workflow_version(monkeypatch) -> None:

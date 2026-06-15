@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 import inspect
 import json
-import os
 import re
 import subprocess
 import textwrap
@@ -16,7 +15,7 @@ from typing import Any, Self
 
 import requests
 
-DEFAULT_API_URL = "http://127.0.0.1:8080"
+from rebase.config import DEFAULT_API_URL, load_profile
 
 _default_client: Client | None = None
 _trace_stack: list[_WorkflowTrace] = []
@@ -136,9 +135,9 @@ def _image_spec_for(
     return Image.python().to_dict()
 
 
-def configure(*, api_key: str | None = None, api_url: str | None = None) -> None:
+def configure(*, api_key: str | None = None, api_url: str | None = None, profile: str | None = None) -> None:
     global _default_client
-    _default_client = Client(api_key=api_key, api_url=api_url)
+    _default_client = Client(api_key=api_key, api_url=api_url, profile=profile)
 
 
 def default_client() -> Client:
@@ -427,20 +426,19 @@ def _git_metadata_for(fn: Callable[..., Any]) -> dict[str, Any]:
 
 
 class Client:
-    def __init__(self, *, api_key: str | None = None, api_url: str | None = None) -> None:
-        self.api_key = (
-            api_key
-            or os.getenv("REBASE_API_KEY")
-            or os.getenv("REBASE_PLATFORM_API_KEY")
-            or os.getenv("REBASE_WORKFLOWS_API_KEY")
-        )
-        self.api_url = (
-            api_url
-            or os.getenv("REBASE_API_URL")
-            or os.getenv("REBASE_PLATFORM_API_URL")
-            or os.getenv("REBASE_WORKFLOWS_API_URL")
-            or DEFAULT_API_URL
-        ).rstrip("/")
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        api_url: str | None = None,
+        profile: str | None = None,
+    ) -> None:
+        profile_data = load_profile(profile)
+        configured_api_key = profile_data.get("api_key")
+        configured_api_url = profile_data.get("api_url")
+        self.api_key = api_key or (configured_api_key if isinstance(configured_api_key, str) else None)
+        profile_api_url = configured_api_url if isinstance(configured_api_url, str) else None
+        self.api_url = (api_url or profile_api_url or DEFAULT_API_URL).rstrip("/")
 
     def request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any] | list[dict[str, Any]]:
         headers = dict(kwargs.pop("headers", {}))

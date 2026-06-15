@@ -772,7 +772,10 @@ name = "rebase-toolkit"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
+    { name = "click" },
     { name = "requests" },
+    { name = "rich" },
+    { name = "typer" },
 ]
 
 [package.optional-dependencies]
@@ -796,11 +799,14 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "click", specifier = ">=8.4.1" },
     { name = "emflow", marker = "extra == 'all'", git = "ssh://git@github.com/rebase-energy/emflow.git" },
     { name = "emflow", marker = "extra == 'modeling'", git = "ssh://git@github.com/rebase-energy/emflow.git" },
     { name = "energydatamodel", marker = "extra == 'all'", git = "ssh://git@github.com/rebase-energy/EnergyDataModel.git" },
     { name = "energydatamodel", marker = "extra == 'data'", git = "ssh://git@github.com/rebase-energy/EnergyDataModel.git" },
     { name = "requests", specifier = ">=2.32.0" },
+    { name = "rich", specifier = ">=15.0.0" },
+    { name = "typer", specifier = ">=0.25.1" },
 ]
 provides-extras = ["data", "modeling", "all"]
 
