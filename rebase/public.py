@@ -4,6 +4,8 @@ from collections.abc import Callable
 from typing import Any, overload
 
 from rebase.client import (
+    DEFAULT_FUNCTION_BACKEND,
+    DEFAULT_WORKFLOW_BACKEND,
     Client,
     Function,
     FunctionBackend,
@@ -13,7 +15,10 @@ from rebase.client import (
     Schedule,
     Step,
     Workflow,
+    WorkflowBackend,
 )
+
+DEFAULT_PROJECT_NAME = "default"
 
 
 def project(
@@ -39,11 +44,11 @@ def project(
 def function(
     fn: None = None,
     *,
-    project: str,
+    project: str | None = None,
     name: str | None = None,
     description: str | None = None,
     default_parameters: dict[str, Any] | None = None,
-    backend: FunctionBackend = "modal",
+    backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
     dependencies: list[str] | tuple[str, ...] | None = None,
     image: Image | dict[str, Any] | None = None,
     min_instances: int | None = None,
@@ -56,11 +61,11 @@ def function(
 def function(
     fn: Callable[..., Any],
     *,
-    project: str,
+    project: str | None = None,
     name: str | None = None,
     description: str | None = None,
     default_parameters: dict[str, Any] | None = None,
-    backend: FunctionBackend = "modal",
+    backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
     dependencies: list[str] | tuple[str, ...] | None = None,
     image: Image | dict[str, Any] | None = None,
     min_instances: int | None = None,
@@ -72,11 +77,11 @@ def function(
 def function(
     fn: Callable[..., Any] | None = None,
     *,
-    project: str,
+    project: str | None = None,
     name: str | None = None,
     description: str | None = None,
     default_parameters: dict[str, Any] | None = None,
-    backend: FunctionBackend = "modal",
+    backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
     dependencies: list[str] | tuple[str, ...] | None = None,
     image: Image | dict[str, Any] | None = None,
     min_instances: int | None = None,
@@ -87,7 +92,7 @@ def function(
         return Function(
             callable_,
             name=name,
-            project=project,
+            project=project or DEFAULT_PROJECT_NAME,
             description=description,
             default_parameters=default_parameters,
             backend=backend,
@@ -107,10 +112,11 @@ def function(
 def step(
     fn: None = None,
     *,
-    project: str,
+    project: str | None = None,
     name: str | None = None,
     description: str | None = None,
     default_parameters: dict[str, Any] | None = None,
+    backend: FunctionBackend = "prefect",
     dependencies: list[str] | tuple[str, ...] | None = None,
     image: Image | dict[str, Any] | None = None,
     min_instances: int | None = None,
@@ -127,10 +133,11 @@ def step(
 def step(
     fn: Callable[..., Any],
     *,
-    project: str,
+    project: str | None = None,
     name: str | None = None,
     description: str | None = None,
     default_parameters: dict[str, Any] | None = None,
+    backend: FunctionBackend = "prefect",
     dependencies: list[str] | tuple[str, ...] | None = None,
     image: Image | dict[str, Any] | None = None,
     min_instances: int | None = None,
@@ -146,10 +153,11 @@ def step(
 def step(
     fn: Callable[..., Any] | None = None,
     *,
-    project: str,
+    project: str | None = None,
     name: str | None = None,
     description: str | None = None,
     default_parameters: dict[str, Any] | None = None,
+    backend: FunctionBackend = "prefect",
     dependencies: list[str] | tuple[str, ...] | None = None,
     image: Image | dict[str, Any] | None = None,
     min_instances: int | None = None,
@@ -164,9 +172,10 @@ def step(
         return Step(
             callable_,
             name=name,
-            project=project,
+            project=project or DEFAULT_PROJECT_NAME,
             description=description,
             default_parameters=default_parameters,
+            backend=backend,
             dependencies=dependencies,
             image=image,
             min_instances=min_instances,
@@ -187,11 +196,12 @@ def step(
 def workflow(
     fn: None = None,
     *,
-    project: str,
+    project: str | None = None,
     name: str | None = None,
     description: str | None = None,
     schedule: Schedule | None = None,
     default_parameters: dict[str, Any] | None = None,
+    backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
     enabled: bool = True,
 ) -> Callable[[Callable[..., Any]], Workflow]: ...
 
@@ -200,11 +210,12 @@ def workflow(
 def workflow(
     fn: Callable[..., Any],
     *,
-    project: str,
+    project: str | None = None,
     name: str | None = None,
     description: str | None = None,
     schedule: Schedule | None = None,
     default_parameters: dict[str, Any] | None = None,
+    backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
     enabled: bool = True,
 ) -> Workflow: ...
 
@@ -212,21 +223,23 @@ def workflow(
 def workflow(
     fn: Callable[..., Any] | None = None,
     *,
-    project: str,
+    project: str | None = None,
     name: str | None = None,
     description: str | None = None,
     schedule: Schedule | None = None,
     default_parameters: dict[str, Any] | None = None,
+    backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
     enabled: bool = True,
 ) -> Callable[[Callable[..., Any]], Workflow] | Workflow:
     def decorator(callable_: Callable[..., Any]) -> Workflow:
         return Workflow(
             callable_,
             name=name,
-            project=project,
+            project=project or DEFAULT_PROJECT_NAME,
             description=description,
             schedule=schedule,
             default_parameters=default_parameters,
+            backend=backend,
             enabled=enabled,
         )
 

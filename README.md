@@ -66,6 +66,13 @@ You can select a named local profile when needed:
 rebase setup --profile prod
 ```
 
+For local development against the internal workflow API, port-forward the API and store that URL in the profile:
+
+```bash
+kubectl -n rebase-workflows port-forward svc/workflow-mvp-api 8080:8080
+rebase setup --api-url http://127.0.0.1:8080
+```
+
 ```bash
 rebase workspace list
 rebase workspace switch prod
@@ -122,6 +129,18 @@ Deploy a file from the command line:
 
 ```bash
 rebase deploy workflow.py
+```
+
+Run a function from local source and force the Cloud Run backend:
+
+```bash
+rebase run functions.py::add --backend cloud_run --param a=2 --param b=3
+```
+
+If the file contains exactly one Rebase function, the function name can be omitted:
+
+```bash
+rebase run functions.py --parameters-json '{"a": 2, "b": 3}'
 ```
 
 ## Dependencies

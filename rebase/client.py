@@ -15,7 +15,7 @@ from typing import Any, Self
 
 import requests
 
-from rebase.config import DEFAULT_API_URL, load_profile
+from rebase.config import DEFAULT_SERVER_URL, load_profile
 
 _default_client: Client | None = None
 _trace_stack: list[_WorkflowTrace] = []
@@ -61,6 +61,9 @@ class Cron:
 
 Schedule = Cron | dict[str, Any]
 FunctionBackend = str
+DEFAULT_FUNCTION_BACKEND: FunctionBackend = "cloud_run"
+WorkflowBackend = str
+DEFAULT_WORKFLOW_BACKEND: WorkflowBackend = "prefect_cloud_run_service"
 DEFAULT_PYTHON_VERSION = "3.13"
 
 
@@ -68,6 +71,14 @@ def _validate_function_backend(backend: FunctionBackend) -> FunctionBackend:
     if backend not in {"modal", "prefect", "prefect_cloud", "cloud_run", "cloud_run_shared"}:
         raise ValueError(
             "function backend must be 'modal', 'prefect', 'prefect_cloud', 'cloud_run', or 'cloud_run_shared'"
+        )
+    return backend
+
+
+def _validate_workflow_backend(backend: WorkflowBackend) -> WorkflowBackend:
+    if backend not in {"prefect", "prefect_cloud_run_jobs", "prefect_cloud_run_service"}:
+        raise ValueError(
+            "workflow backend must be 'prefect', 'prefect_cloud_run_jobs', or 'prefect_cloud_run_service'"
         )
     return backend
 
@@ -295,7 +306,8 @@ def _binding_node_keys(binding: dict[str, Any]) -> set[str]:
 
 
 class _WorkflowTrace:
-    def __init__(self) -> None:
+    def __init__(self, *, ephemeral: bool = False) -> None:
+        self.ephemeral = ephemeral
         self.nodes: list[dict[str, Any]] = []
         self._node_keys: set[str] = set()
 
@@ -303,13 +315,13 @@ class _WorkflowTrace:
         step_name = str(step.name)
         if step.fn is None:
             raise RebaseWorkflowError(f"Step {step_name!r} cannot be used in a workflow without local source.")
-        if step.id is None:
+        if not self.ephemeral and step.id is None:
             raise RebaseWorkflowError(
                 f"Step {step_name!r} has not been deployed yet. Deploy the Project so steps are registered "
                 "before workflows are compiled."
             )
         function_version_id = step.data.get("current_version_id")
-        if function_version_id is None:
+        if not self.ephemeral and function_version_id is None:
             raise RebaseWorkflowError(f"Step {step_name!r} has no current function version after deployment.")
 
         signature = inspect.signature(step.fn)
@@ -322,21 +334,29 @@ class _WorkflowTrace:
 
         node_key = _node_key_for(step_name, self._node_keys)
         self._node_keys.add(node_key)
-        self.nodes.append(
-            {
-                "node_key": node_key,
-                "name": step_name,
-                "function_id": step.id,
-                "function_version_id": function_version_id,
-                "entrypoint": step.entrypoint,
-                "input_bindings": input_bindings,
-                "upstream_node_keys": sorted(upstream_node_keys),
-                "retry_policy": {"retries": step.retries},
-                "timeout_seconds": step.timeout_seconds,
-                "cache_policy": {"enabled": step.cache},
-                "resource_policy": step.resources,
-            }
-        )
+        node = {
+            "node_key": node_key,
+            "name": step_name,
+            "function_id": step.id,
+            "function_version_id": function_version_id,
+            "entrypoint": step.entrypoint,
+            "input_bindings": input_bindings,
+            "upstream_node_keys": sorted(upstream_node_keys),
+            "retry_policy": {"retries": step.retries},
+            "timeout_seconds": step.timeout_seconds,
+            "cache_policy": {"enabled": step.cache},
+            "resource_policy": step.resources,
+        }
+        if self.ephemeral:
+            node.update(
+                {
+                    "source_code": step.source_code,
+                    "default_parameters": step.default_parameters,
+                    "execution_backend": step.execution_backend,
+                    "image_spec": step.image_spec,
+                }
+            )
+        self.nodes.append(node)
         return StepPromise(node_key)
 
 
@@ -438,7 +458,7 @@ class Client:
         configured_api_url = profile_data.get("api_url")
         self.api_key = api_key or (configured_api_key if isinstance(configured_api_key, str) else None)
         profile_api_url = configured_api_url if isinstance(configured_api_url, str) else None
-        self.api_url = (api_url or profile_api_url or DEFAULT_API_URL).rstrip("/")
+        self.api_url = (api_url or profile_api_url or DEFAULT_SERVER_URL).rstrip("/")
 
     def request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any] | list[dict[str, Any]]:
         headers = dict(kwargs.pop("headers", {}))
@@ -619,7 +639,7 @@ class Client:
         entrypoint: str,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        execution_backend: FunctionBackend = "modal",
+        execution_backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
         image_spec: dict[str, Any] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
@@ -770,6 +790,7 @@ class Client:
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
         required_parameters: list[str] | None = None,
+        execution_backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
         enabled: bool = True,
         project: str | None = None,
         source_mode: str | None = None,
@@ -799,6 +820,7 @@ class Client:
                 "schedule": schedule,
                 "default_parameters": default_parameters or {},
                 "required_parameters": required_parameters or [],
+                "execution_backend": execution_backend,
                 "enabled": enabled,
                 "source_mode": source_mode,
                 "repo_owner": repo_owner,
@@ -828,6 +850,7 @@ class Client:
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
         required_parameters: list[str] | None = None,
+        execution_backend: WorkflowBackend | None = None,
         enabled: bool | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
@@ -849,6 +872,7 @@ class Client:
                 "entrypoint": entrypoint,
                 "default_parameters": default_parameters,
                 "required_parameters": required_parameters,
+                "execution_backend": execution_backend,
                 "enabled": enabled,
                 "source_mode": source_mode,
                 "repo_owner": repo_owner,
@@ -873,6 +897,46 @@ class Client:
 
     def run_workflow(self, workflow_id: str, parameters: dict[str, Any] | None = None) -> Run:
         response = self.request("POST", f"/workflows/{workflow_id}/runs", json={"parameters": parameters or {}})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected run response")
+        return Run(response["id"], client=self, data=response)
+
+    def run_ephemeral(
+        self,
+        *,
+        target_type: str,
+        project: str,
+        name: str,
+        source_code: str,
+        entrypoint: str,
+        default_parameters: dict[str, Any] | None = None,
+        parameters: dict[str, Any] | None = None,
+        execution_backend: str,
+        image_spec: dict[str, Any] | None = None,
+        step_graph: dict[str, Any] | None = None,
+        required_parameters: list[str] | None = None,
+        cloud_run_min_instances: int | None = None,
+        cloud_run_concurrency: int | None = None,
+    ) -> Run:
+        response = self.request(
+            "POST",
+            "/runs/ephemeral",
+            json={
+                "target_type": target_type,
+                "project": project,
+                "name": name,
+                "source_code": source_code,
+                "entrypoint": entrypoint,
+                "default_parameters": default_parameters or {},
+                "parameters": parameters or {},
+                "execution_backend": execution_backend,
+                "image_spec": image_spec,
+                "step_graph": step_graph,
+                "required_parameters": required_parameters or [],
+                "cloud_run_min_instances": cloud_run_min_instances,
+                "cloud_run_concurrency": cloud_run_concurrency,
+            },
+        )
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected run response")
         return Run(response["id"], client=self, data=response)
@@ -954,7 +1018,7 @@ class Project:
         name: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        backend: FunctionBackend = "modal",
+        backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         min_instances: int | None = None,
@@ -987,6 +1051,7 @@ class Project:
         name: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
+        backend: FunctionBackend = "prefect",
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         min_instances: int | None = None,
@@ -1004,6 +1069,7 @@ class Project:
                 project=self.name,
                 description=description,
                 default_parameters=default_parameters,
+                backend=backend,
                 dependencies=dependencies,
                 image=image,
                 min_instances=min_instances,
@@ -1028,6 +1094,7 @@ class Project:
         description: str | None = None,
         schedule: Schedule | None = None,
         default_parameters: dict[str, Any] | None = None,
+        backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
         enabled: bool = True,
     ) -> Callable[[Callable[..., Any]], Workflow]:
         def decorator(fn: Callable[..., Any]) -> Workflow:
@@ -1038,6 +1105,7 @@ class Project:
                 description=description,
                 schedule=schedule,
                 default_parameters=default_parameters,
+                backend=backend,
                 enabled=enabled,
                 client=self._client,
             )
@@ -1056,7 +1124,7 @@ class Function:
         project: str,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        backend: FunctionBackend = "modal",
+        backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         min_instances: int | None = None,
@@ -1077,7 +1145,9 @@ class Function:
         self.source_code: str | None = None
         self.entrypoint: str | None = None
         self.default_parameters = default_parameters or {}
-        self.execution_backend: FunctionBackend = data.get("execution_backend", "modal") if data else "modal"
+        self.execution_backend: FunctionBackend = (
+            data.get("execution_backend", DEFAULT_FUNCTION_BACKEND) if data else DEFAULT_FUNCTION_BACKEND
+        )
         self.image_spec: dict[str, Any] | None = data.get("image_spec") if data else None
         self.image_fingerprint: str | None = data.get("image_fingerprint") if data else None
         self.cloud_run_min_instances: int | None = data.get("cloud_run_min_instances") if data else None
@@ -1172,6 +1242,28 @@ class Function:
     def run(self, **parameters: Any) -> Run:
         return self.spawn(**parameters)
 
+    def ephemeral_run(self, **parameters: Any) -> Run:
+        if self.source_code is None or self.entrypoint is None:
+            raise RebaseWorkflowError("cannot run an ephemeral function without local source")
+        return self._client.run_ephemeral(
+            target_type="function",
+            project=self.project,
+            name=str(self.name),
+            source_code=self.source_code,
+            entrypoint=self.entrypoint,
+            default_parameters=self.default_parameters,
+            parameters=parameters,
+            execution_backend=self.execution_backend,
+            image_spec=self.image_spec,
+            cloud_run_min_instances=self.cloud_run_min_instances,
+            cloud_run_concurrency=self.cloud_run_concurrency,
+        )
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self.fn is None:
+            raise RebaseWorkflowError("remote function handles cannot be called locally; use .remote(...)")
+        return self.fn(*args, **kwargs)
+
 
 class Step(Function):
     def __init__(
@@ -1182,7 +1274,7 @@ class Step(Function):
         project: str,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        backend: FunctionBackend = "modal",
+        backend: FunctionBackend = "prefect",
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         min_instances: int | None = None,
@@ -1233,7 +1325,9 @@ class Step(Function):
         trace = _current_trace()
         if trace is not None:
             return trace.record_step(self, args, kwargs)
-        return self.submit(*args, **kwargs).result()
+        if self.fn is None:
+            raise RebaseWorkflowError("remote step handles cannot be called locally; use .remote(...)")
+        return self.fn(*args, **kwargs)
 
     def submit(self, *args: Any, **kwargs: Any) -> Run:
         return self.spawn(**self._parameters_from_call(args, kwargs))
@@ -1249,6 +1343,7 @@ class Workflow:
         description: str | None = None,
         schedule: Schedule | None = None,
         default_parameters: dict[str, Any] | None = None,
+        backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
         enabled: bool = True,
         client: Client | None = None,
         workflow_id: str | None = None,
@@ -1272,6 +1367,9 @@ class Workflow:
             else (data.get("schedule") if data else None)
         )
         self.default_parameters = default_parameters or {}
+        self.execution_backend: WorkflowBackend = (
+            data.get("execution_backend", DEFAULT_WORKFLOW_BACKEND) if data else DEFAULT_WORKFLOW_BACKEND
+        )
         self.required_parameters: list[str] = list(data.get("required_parameters", [])) if data else []
         self.source_metadata: dict[str, Any] = {}
 
@@ -1282,6 +1380,7 @@ class Workflow:
             inferred_defaults = _defaults_for(fn, target="Workflow")
             self.required_parameters = _required_parameters_for(fn, target="Workflow")
             self.default_parameters = {**inferred_defaults, **(default_parameters or {})}
+            self.execution_backend = _validate_workflow_backend(backend)
             self.source_code = _source_for(fn, target="workflow")
             self.entrypoint = fn.__name__
             self.source_metadata = _git_metadata_for(fn)
@@ -1325,14 +1424,14 @@ class Workflow:
             parameters[name] = _WorkflowParameter(name)
         return parameters
 
-    def _build_step_graph(self) -> dict[str, Any] | None:
+    def _build_step_graph(self, *, ephemeral: bool = False) -> dict[str, Any] | None:
         if self.fn is None:
             return None
         if inspect.iscoroutinefunction(self.fn):
             if self._references_step():
                 raise RebaseWorkflowError("Step workflows must be synchronous in the SDK graph compiler.")
             return None
-        trace = _WorkflowTrace()
+        trace = _WorkflowTrace(ephemeral=ephemeral)
         _trace_stack.append(trace)
         try:
             result = self.fn(**self._trace_arguments())
@@ -1384,6 +1483,7 @@ class Workflow:
                 schedule=self.schedule,
                 default_parameters=self.default_parameters,
                 required_parameters=self.required_parameters,
+                execution_backend=self.execution_backend,
                 enabled=self.enabled,
                 **self.source_metadata,
             )
@@ -1403,6 +1503,7 @@ class Workflow:
             schedule=self.schedule,
             default_parameters=self.default_parameters,
             required_parameters=self.required_parameters,
+            execution_backend=self.execution_backend,
             enabled=self.enabled,
             **self.source_metadata,
         )
@@ -1423,6 +1524,27 @@ class Workflow:
 
     def run(self, **parameters: Any) -> Run:
         return self.spawn(**parameters)
+
+    def ephemeral_run(self, **parameters: Any) -> Run:
+        if self.source_code is None or self.entrypoint is None:
+            raise RebaseWorkflowError("cannot run an ephemeral workflow without local source")
+        return self._client.run_ephemeral(
+            target_type="workflow",
+            project=self.project or "default",
+            name=str(self.name),
+            source_code=self.source_code,
+            entrypoint=self.entrypoint,
+            default_parameters=self.default_parameters,
+            parameters=parameters,
+            execution_backend=self.execution_backend,
+            step_graph=self._build_step_graph(ephemeral=True),
+            required_parameters=self.required_parameters,
+        )
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self.fn is None:
+            raise RebaseWorkflowError("remote workflow handles cannot be called locally; use .remote(...)")
+        return self.fn(*args, **kwargs)
 
 
 class Run:

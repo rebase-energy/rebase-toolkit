@@ -3,7 +3,7 @@ from typing import Any
 import pytest
 
 import rebase as rb
-from rebase.config import DEFAULT_API_URL, write_profile
+from rebase.config import DEFAULT_API_URL, DEFAULT_SERVER_URL, write_profile
 
 
 class FakeResponse:
@@ -45,6 +45,8 @@ def test_client_uses_hosted_api_url_by_default(monkeypatch, tmp_path) -> None:
 
     assert client.api_key is None
     assert client.api_url == DEFAULT_API_URL
+    assert client.api_url == DEFAULT_SERVER_URL
+    assert rb.DEFAULT_SERVER_URL == DEFAULT_SERVER_URL
 
 
 def test_client_reads_api_key_from_local_profile(monkeypatch, tmp_path) -> None:
@@ -56,6 +58,17 @@ def test_client_reads_api_key_from_local_profile(monkeypatch, tmp_path) -> None:
 
     assert client.api_key == "rbw_profile"
     assert client.api_url == DEFAULT_API_URL
+
+
+def test_client_reads_api_url_from_local_profile(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    write_profile(api_key="rbw_profile", api_url="http://127.0.0.1:8080", profile="default", path=config_path)
+
+    client = rb.Client()
+
+    assert client.api_key == "rbw_profile"
+    assert client.api_url == "http://127.0.0.1:8080"
 
 
 def test_client_can_select_named_profile(monkeypatch, tmp_path) -> None:
@@ -102,6 +115,7 @@ def test_workflow_deploy_updates_existing_workflow_version(monkeypatch) -> None:
     assert observed["entrypoint"] == "forecast"
     assert observed["source_code"].startswith("def forecast")
     assert observed["step_graph"] is None
+    assert observed["execution_backend"] == rb.DEFAULT_WORKFLOW_BACKEND
 
 
 def test_update_workflow_omits_step_graph_unless_explicit(monkeypatch) -> None:
@@ -145,6 +159,36 @@ def test_workflow_deploy_registers_function_source(monkeypatch) -> None:
     assert observed["entrypoint"] == "add"
     assert "def add(left: float = 0, right: float = 0) -> dict:" in observed["source_code"]
     assert observed["default_parameters"] == {"left": 0, "right": 0}
+    assert observed["execution_backend"] == rb.DEFAULT_WORKFLOW_BACKEND
+    assert workflow.execution_backend == rb.DEFAULT_WORKFLOW_BACKEND
+
+
+def test_workflow_can_use_prefect_cloud_run_jobs_backend(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "list_workflows", lambda: [])
+    monkeypatch.setattr(client, "register_workflow", lambda **kwargs: observed.update(kwargs) or {"id": "workflow-id"})
+
+    def forecast(site_id: str = "site-001") -> dict:
+        return {"site_id": site_id}
+
+    workflow = rb.Workflow(
+        forecast,
+        name="cloud-run-forecast",
+        backend="prefect_cloud_run_jobs",
+        client=client,
+    ).deploy()
+
+    assert workflow.execution_backend == "prefect_cloud_run_jobs"
+    assert observed["execution_backend"] == "prefect_cloud_run_jobs"
+
+
+def test_workflow_rejects_unknown_backend() -> None:
+    def forecast() -> dict:
+        return {"status": "ok"}
+
+    with pytest.raises(ValueError, match="workflow backend"):
+        rb.Workflow(forecast, project="energy", backend="unknown")
 
 
 def test_workflow_explicit_defaults_override_function_defaults(monkeypatch) -> None:
@@ -189,7 +233,8 @@ def test_project_deploy_registers_function_source(monkeypatch) -> None:
     assert "@project.function" not in observed["source_code"]
     assert "def normalize_weather(site_id: str, horizon_hours: int = 24) -> dict:" in observed["source_code"]
     assert observed["default_parameters"] == {"horizon_hours": 24}
-    assert observed["execution_backend"] == "modal"
+    assert observed["execution_backend"] == "cloud_run"
+    assert normalize_weather.execution_backend == rb.DEFAULT_FUNCTION_BACKEND
 
 
 def test_project_function_can_use_prefect_backend(monkeypatch) -> None:
@@ -415,6 +460,8 @@ def test_project_deploy_registers_step_workflow_graph(monkeypatch) -> None:
     project.deploy()
 
     assert [item["name"] for item in observed_functions] == ["load-weather", "build-forecast"]
+    assert [item["execution_backend"] for item in observed_functions] == ["prefect", "prefect"]
+    assert observed_workflow["execution_backend"] == rb.DEFAULT_WORKFLOW_BACKEND
     graph = observed_workflow["step_graph"]
     assert graph["schema_version"] == 1
     assert graph["engine"] == "prefect"
@@ -559,3 +606,94 @@ def test_run_lists_step_runs(monkeypatch) -> None:
     run = rb.Run("run-id", client=client)
 
     assert run.steps() == [{"id": "step-run-id", "workflow_run_id": "run-id", "node_key": "load_weather"}]
+
+
+def test_decorated_targets_call_local_python_without_cloud(monkeypatch) -> None:
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "run_ephemeral", lambda **kwargs: pytest.fail("local calls should not use cloud"))
+    project = rb.Project("hello", client=client)
+
+    @project.function()
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    @project.step()
+    def load_name(name: str) -> dict:
+        return {"name": name}
+
+    @project.step()
+    def package(payload: dict) -> dict:
+        return {"message": f"Hello, {payload['name']}!"}
+
+    @project.workflow()
+    def hello(name: str) -> dict:
+        return package(load_name(name))
+
+    assert add(1, 2) == 3
+    assert load_name("Rebase") == {"name": "Rebase"}
+    assert hello("Rebase") == {"message": "Hello, Rebase!"}
+
+
+def test_function_ephemeral_run_sends_source_without_deploy(monkeypatch) -> None:
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    observed: dict[str, Any] = {}
+
+    def fake_run_ephemeral(**kwargs: Any) -> rb.Run:
+        observed.update(kwargs)
+        return rb.Run("run-id", client=client, data={"id": "run-id", "status": "submitted"})
+
+    monkeypatch.setattr(client, "run_ephemeral", fake_run_ephemeral)
+    monkeypatch.setattr(rb.Function, "deploy", lambda self, **kwargs: pytest.fail("ephemeral run should not deploy"))
+
+    def add(a: int, b: int) -> dict:
+        return {"sum": a + b}
+
+    function = rb.Function(add, project="math", name="add", client=client)
+    run = function.ephemeral_run(a=1, b=2)
+
+    assert run.id == "run-id"
+    assert observed["target_type"] == "function"
+    assert observed["project"] == "math"
+    assert observed["name"] == "add"
+    assert observed["entrypoint"] == "add"
+    assert observed["parameters"] == {"a": 1, "b": 2}
+    assert observed["execution_backend"] == "cloud_run"
+    assert "def add(a: int, b: int) -> dict:" in observed["source_code"]
+
+
+def test_workflow_ephemeral_run_embeds_step_sources_without_deploy(monkeypatch) -> None:
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    observed: dict[str, Any] = {}
+
+    def fake_run_ephemeral(**kwargs: Any) -> rb.Run:
+        observed.update(kwargs)
+        return rb.Run("run-id", client=client, data={"id": "run-id", "status": "submitted"})
+
+    monkeypatch.setattr(client, "run_ephemeral", fake_run_ephemeral)
+    monkeypatch.setattr(rb.Workflow, "deploy", lambda self, **kwargs: pytest.fail("ephemeral run should not deploy"))
+    project = rb.Project("hello", client=client)
+
+    @project.step()
+    def load_name(name: str = "World") -> dict:
+        return {"name": name}
+
+    @project.step()
+    def package(payload: dict) -> dict:
+        return {"message": f"Hello, {payload['name']}!"}
+
+    @project.workflow(name="hello-workflow")
+    def hello(name: str = "World") -> dict:
+        return package(load_name(name))
+
+    run = hello.ephemeral_run(name="Rebase")
+
+    assert run.id == "run-id"
+    assert observed["target_type"] == "workflow"
+    assert observed["project"] == "hello"
+    assert observed["name"] == "hello-workflow"
+    assert observed["parameters"] == {"name": "Rebase"}
+    assert observed["execution_backend"] == rb.DEFAULT_WORKFLOW_BACKEND
+    nodes = observed["step_graph"]["nodes"]
+    assert [node["name"] for node in nodes] == ["load-name", "package"]
+    assert all(node["function_version_id"] is None for node in nodes)
+    assert all("source_code" in node and node["source_code"] for node in nodes)

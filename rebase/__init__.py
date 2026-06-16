@@ -1,5 +1,7 @@
 from rebase import data, modeling
 from rebase.client import (
+    DEFAULT_FUNCTION_BACKEND,
+    DEFAULT_WORKFLOW_BACKEND,
     Client,
     Cron,
     Function,
@@ -10,9 +12,10 @@ from rebase.client import (
     Run,
     Step,
     Workflow,
+    WorkflowBackend,
     configure,
 )
-from rebase.config import DEFAULT_API_URL
+from rebase.config import DEFAULT_API_URL, DEFAULT_SERVER_URL
 from rebase.public import (
     deploy,
     function,
@@ -30,7 +33,10 @@ from rebase.version import __version__
 __all__ = [
     "Client",
     "Cron",
+    "DEFAULT_FUNCTION_BACKEND",
+    "DEFAULT_WORKFLOW_BACKEND",
     "DEFAULT_API_URL",
+    "DEFAULT_SERVER_URL",
     "Function",
     "Image",
     "Project",
@@ -39,6 +45,7 @@ __all__ = [
     "Run",
     "Step",
     "Workflow",
+    "WorkflowBackend",
     "__version__",
     "configure",
     "data",

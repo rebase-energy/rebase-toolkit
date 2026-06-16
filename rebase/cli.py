@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import getpass
+import importlib
 import importlib.util
+import json
 import sys
 from collections.abc import Iterable
 from pathlib import Path
@@ -10,22 +12,73 @@ from typing import Annotated, Any
 
 import click
 import typer
+import typer.rich_utils as typer_rich
 from rich import box
 from rich.console import Console
 from rich.table import Table
+from rich.theme import Theme
 
-from rebase.client import Client, Function, Project, RebaseWorkflowError, Step, Workflow
+from rebase.client import Client, Function, FunctionBackend, Project, RebaseWorkflowError, Step, Workflow
 from rebase.config import (
-    DEFAULT_API_URL,
     DEFAULT_PROFILE,
+    DEFAULT_SERVER_URL,
     list_profiles,
     selected_profile_name,
     set_default_profile,
     write_profile,
 )
 
-console = Console(highlight=False, soft_wrap=True)
-error_console = Console(stderr=True, highlight=False, soft_wrap=True)
+BRAND_MAIN_GREEN = "#0D9373"
+BRAND_BRIGHT_GREEN = "#03C497"
+BRAND_MEDIUM_GRAY = "#656565"
+BRAND_CORAL_RED = "#E46962"
+BRAND_AMBER = "#FBAE40"
+BRAND_SLATE_BLUE = "#3F6E91"
+
+REBASE_THEME = Theme(
+    {
+        "rebase.active": f"bold {BRAND_BRIGHT_GREEN}",
+        "rebase.border": f"dim {BRAND_MEDIUM_GRAY}",
+        "rebase.error": BRAND_CORAL_RED,
+        "rebase.info": BRAND_SLATE_BLUE,
+        "rebase.muted": BRAND_MEDIUM_GRAY,
+        "rebase.success": BRAND_MAIN_GREEN,
+        "rebase.title": f"bold {BRAND_MAIN_GREEN}",
+        "rebase.value": f"bold {BRAND_BRIGHT_GREEN}",
+        "rebase.warning": BRAND_AMBER,
+    }
+)
+
+
+def _apply_typer_brand_styles() -> None:
+    for name, style in {
+        "STYLE_ABORTED": BRAND_CORAL_RED,
+        "STYLE_COMMANDS_PANEL_BORDER": BRAND_MAIN_GREEN,
+        "STYLE_COMMANDS_TABLE_FIRST_COLUMN": f"bold {BRAND_MAIN_GREEN}",
+        "STYLE_DEPRECATED": BRAND_CORAL_RED,
+        "STYLE_ERRORS_PANEL_BORDER": BRAND_CORAL_RED,
+        "STYLE_ERRORS_SUGGESTION": BRAND_MEDIUM_GRAY,
+        "STYLE_HELPTEXT": BRAND_MEDIUM_GRAY,
+        "STYLE_METAVAR": f"bold {BRAND_BRIGHT_GREEN}",
+        "STYLE_NEGATIVE_OPTION": f"bold {BRAND_MEDIUM_GRAY}",
+        "STYLE_NEGATIVE_SWITCH": f"bold {BRAND_MEDIUM_GRAY}",
+        "STYLE_OPTION": f"bold {BRAND_MAIN_GREEN}",
+        "STYLE_OPTION_DEFAULT": BRAND_MEDIUM_GRAY,
+        "STYLE_OPTION_ENVVAR": f"dim {BRAND_AMBER}",
+        "STYLE_OPTIONS_PANEL_BORDER": BRAND_MEDIUM_GRAY,
+        "STYLE_REQUIRED_LONG": BRAND_CORAL_RED,
+        "STYLE_REQUIRED_SHORT": f"bold {BRAND_CORAL_RED}",
+        "STYLE_SWITCH": f"bold {BRAND_BRIGHT_GREEN}",
+        "STYLE_USAGE": BRAND_BRIGHT_GREEN,
+        "STYLE_USAGE_COMMAND": f"bold {BRAND_BRIGHT_GREEN}",
+    }.items():
+        setattr(typer_rich, name, style)
+
+
+_apply_typer_brand_styles()
+
+console = Console(highlight=False, soft_wrap=True, theme=REBASE_THEME)
+error_console = Console(stderr=True, highlight=False, soft_wrap=True, theme=REBASE_THEME)
 
 app = typer.Typer(
     add_completion=False,
@@ -64,6 +117,13 @@ def _load_module(path: Path) -> ModuleType:
     return module
 
 
+def _load_python_module(module_name: str) -> ModuleType:
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        raise RebaseWorkflowError(f"module not found: {module_name}") from exc
+
+
 def _unique_named_objects(module: ModuleType, types: tuple[type, ...]) -> list[tuple[str, Any]]:
     seen: set[int] = set()
     objects: list[tuple[str, Any]] = []
@@ -76,6 +136,137 @@ def _unique_named_objects(module: ModuleType, types: tuple[type, ...]) -> list[t
         seen.add(object_id)
         objects.append((name, value))
     return objects
+
+
+def _target_ref_parts(target_ref: str) -> tuple[str, str | None]:
+    source_ref, separator, object_ref = target_ref.partition("::")
+    if not source_ref:
+        raise RebaseWorkflowError("run target must be '{file or module}::function_name'")
+    if separator and not object_ref:
+        raise RebaseWorkflowError("run target is missing the function name after '::'")
+    return source_ref, object_ref or None
+
+
+def _load_target_module(source_ref: str, *, as_module: bool) -> ModuleType:
+    if as_module:
+        return _load_python_module(source_ref)
+    return _load_module(Path(source_ref))
+
+
+RunnableTarget = Function | Workflow
+
+
+def _function_objects(module: ModuleType) -> list[tuple[str, Function]]:
+    return [
+        (name, function)
+        for name, function in _unique_named_objects(module, (Function,))
+        if not isinstance(function, Step)
+    ]
+
+
+def _runnable_objects(module: ModuleType) -> list[tuple[str, RunnableTarget]]:
+    return [
+        (name, target)
+        for name, target in _unique_named_objects(module, (Function, Workflow))
+        if not isinstance(target, Step)
+    ]
+
+
+def _resolve_object_ref(module: ModuleType, object_ref: str, *, target_ref: str) -> Any:
+    target: Any = module
+    for part in object_ref.split("."):
+        if not part:
+            raise RebaseWorkflowError(f"invalid target reference: {target_ref}")
+        if not hasattr(target, part):
+            raise RebaseWorkflowError(f"target reference not found: {object_ref}")
+        target = getattr(target, part)
+    return target
+
+
+def _resolve_run_target(target_ref: str, *, as_module: bool = False) -> RunnableTarget:
+    source_ref, object_ref = _target_ref_parts(target_ref)
+    module = _load_target_module(source_ref, as_module=as_module)
+
+    if object_ref is not None:
+        target = _resolve_object_ref(module, object_ref, target_ref=target_ref)
+        if isinstance(target, Step):
+            raise RebaseWorkflowError("rebase run cannot run a step directly; run the workflow that uses it")
+        if not isinstance(target, (Function, Workflow)):
+            raise RebaseWorkflowError(f"target is not a Rebase function or workflow: {object_ref}")
+        return target
+
+    targets = _runnable_objects(module)
+    if not targets:
+        raise RebaseWorkflowError(
+            "No runnable Rebase targets found. Define one top-level rb.function(...) or rb.workflow(...) target."
+        )
+    if len(targets) > 1:
+        names = ", ".join(name for name, _target in targets)
+        raise RebaseWorkflowError(f"Multiple Rebase targets found ({names}); use '{source_ref}::target_name'.")
+    return targets[0][1]
+
+
+def _parse_json_value(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _parse_run_parameters(parameters_json: str | None, parameters: Iterable[str] | None) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    if parameters_json:
+        try:
+            loaded = json.loads(parameters_json)
+        except json.JSONDecodeError as exc:
+            raise RebaseWorkflowError(f"--parameters-json must be a JSON object: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise RebaseWorkflowError("--parameters-json must be a JSON object")
+        parsed.update(loaded)
+
+    for item in parameters or []:
+        name, separator, value = item.partition("=")
+        if not separator or not name:
+            raise RebaseWorkflowError("--param values must be formatted as name=value")
+        parsed[name] = _parse_json_value(value)
+    return parsed
+
+
+def _validate_backend_override(backend: str | None) -> FunctionBackend | None:
+    if backend is None:
+        return None
+    if backend not in {"modal", "prefect", "prefect_cloud", "cloud_run", "cloud_run_shared"}:
+        raise RebaseWorkflowError(
+            "backend must be 'modal', 'prefect', 'prefect_cloud', 'cloud_run', or 'cloud_run_shared'"
+        )
+    return backend
+
+
+def _validate_run_backend_override(backend: str | None, target: RunnableTarget) -> str | None:
+    if backend is None:
+        return None
+    if isinstance(target, Workflow):
+        if backend not in {"prefect", "prefect_cloud_run_jobs", "prefect_cloud_run_service"}:
+            raise RebaseWorkflowError(
+                "workflow backend must be 'prefect', 'prefect_cloud_run_jobs', or 'prefect_cloud_run_service'"
+            )
+        return backend
+    return _validate_backend_override(backend)
+
+
+def _run_table(run_id: str, status: str) -> Table:
+    table = Table(
+        title="Rebase Run",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Run ID", style="rebase.value")
+    table.add_column("Status", style="rebase.muted")
+    table.add_row(run_id, status)
+    return table
 
 
 def deploy_file(path: str | Path, *, object_names: Iterable[str] | None = None) -> list[tuple[str, str, str | None]]:
@@ -136,23 +327,37 @@ def _workspace_id(data: dict[str, Any]) -> str:
 
 
 def _workspace_table(profiles: dict[str, dict[str, Any]], *, active_profile: str) -> Table:
-    table = Table(title="Workspace Profiles", box=box.ASCII, show_header=True)
-    table.add_column("Active", justify="center", no_wrap=True)
-    table.add_column("Profile", style="bold", no_wrap=True)
+    table = Table(
+        title="Workspace Profiles",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Active", justify="center", no_wrap=True, style="rebase.active")
+    table.add_column("Profile", style="rebase.value", no_wrap=True)
     table.add_column("Workspace")
-    table.add_column("Workspace ID")
+    table.add_column("Workspace ID", style="rebase.muted")
     for profile, data in sorted(profiles.items()):
         is_active = profile == active_profile
-        style = "green" if is_active else None
+        style = "rebase.active" if is_active else None
         table.add_row("*" if is_active else "", profile, _workspace_value(data), _workspace_id(data), style=style)
     return table
 
 
 def _deploy_table(deployed: list[tuple[str, str, str | None]]) -> Table:
-    table = Table(title="Deployed Targets", box=box.ASCII, show_header=True)
-    table.add_column("Type", no_wrap=True)
-    table.add_column("Name", style="bold")
-    table.add_column("ID")
+    table = Table(
+        title="Deployed Targets",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Type", no_wrap=True, style="rebase.muted")
+    table.add_column("Name", style="rebase.value")
+    table.add_column("ID", style="rebase.muted")
     for target_type, name, target_id in deployed:
         table.add_row(target_type, name, target_id or "-")
     return table
@@ -162,6 +367,13 @@ def _deploy_table(deployed: list[tuple[str, str, str | None]]) -> Table:
 def setup_command(
     profile: Annotated[str, typer.Option("--profile", help="Credential profile name.")] = DEFAULT_PROFILE,
     api_key: Annotated[str | None, typer.Option("--api-key", hidden=True)] = None,
+    api_url: Annotated[
+        str | None,
+        typer.Option(
+            "--api-url",
+            help="Rebase API URL to store for this profile. Useful for local development with port-forwarding.",
+        ),
+    ] = None,
     verify: Annotated[
         bool,
         typer.Option(
@@ -178,14 +390,15 @@ def setup_command(
 
     workspace: dict[str, Any] | None = None
     if verify:
+        verify_url = api_url or DEFAULT_SERVER_URL
         try:
-            workspace = Client(api_key=api_key).get_workspace()
+            workspace = Client(api_key=api_key, api_url=verify_url).get_workspace()
         except Exception as exc:
-            raise RebaseWorkflowError(f"could not verify API key against {DEFAULT_API_URL}: {exc}") from exc
+            raise RebaseWorkflowError(f"could not verify API key against {verify_url}: {exc}") from exc
 
-    path = write_profile(api_key=api_key, profile=profile, workspace=workspace)
-    console.print(f"Saved Rebase credentials for profile '[bold]{profile}[/bold]'")
-    console.print(f"[dim]{path}[/dim]")
+    path = write_profile(api_key=api_key, profile=profile, api_url=api_url, workspace=workspace)
+    console.print(f"Saved Rebase credentials for profile '[rebase.value]{profile}[/rebase.value]'")
+    console.print(f"[rebase.muted]{path}[/rebase.muted]")
 
 
 def _show_active_workspace() -> None:
@@ -222,7 +435,7 @@ def _switch_workspace(profile: str) -> None:
         raise RebaseWorkflowError(
             f"unknown workspace profile: {profile}. Run `rebase setup --profile {profile}` first."
         ) from exc
-    console.print(f"Switched workspace profile to '[bold green]{profile}[/bold green]'")
+    console.print(f"Switched workspace profile to '[rebase.value]{profile}[/rebase.value]'")
 
 
 @workspace_app.command("switch")
@@ -257,18 +470,84 @@ def deploy_command(
     console.print(_deploy_table(deployed))
 
 
+@app.command("run")
+def run_command(
+    target_ref: Annotated[
+        str,
+        typer.Argument(
+            help="Target reference: file.py::target_name. Omit ::target_name when the file has one runnable target."
+        ),
+    ],
+    parameter: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--param",
+            "-p",
+            help="Target parameter as name=json_value. Can be passed more than once.",
+        ),
+    ] = None,
+    parameters_json: Annotated[
+        str | None,
+        typer.Option("--parameters-json", help="JSON object with target parameters."),
+    ] = None,
+    backend: Annotated[
+        str | None,
+        typer.Option(
+            "--backend",
+            help="Override the cloud execution backend for this ephemeral run.",
+        ),
+    ] = None,
+    module: Annotated[
+        bool,
+        typer.Option("--module", "-m", help="Interpret the target source as a Python module path instead of a file."),
+    ] = False,
+    wait: Annotated[
+        bool,
+        typer.Option("--wait/--no-wait", help="Wait for the function result before exiting."),
+    ] = True,
+    timeout: Annotated[int, typer.Option("--timeout", help="Maximum seconds to wait for the result.")] = 600,
+    poll_interval: Annotated[
+        float,
+        typer.Option("--poll-interval", help="Seconds between run status polls."),
+    ] = 1.0,
+) -> None:
+    """Run a Rebase function or workflow from local source without deploying it."""
+    target = _resolve_run_target(target_ref, as_module=module)
+    backend_override = _validate_run_backend_override(backend, target)
+    if backend_override is not None:
+        target.execution_backend = backend_override
+
+    parameters = _parse_run_parameters(parameters_json, parameter)
+    run = target.ephemeral_run(**parameters)
+
+    if not wait:
+        console.print(_run_table(run.id, run.status))
+        return
+
+    result = run.result(timeout=timeout, poll_interval=poll_interval)
+    console.print_json(data=result)
+
+
 def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    if not args:
+        try:
+            app(args=["--help"], prog_name="rebase", standalone_mode=True)
+        except SystemExit as exc:
+            return int(exc.code or 0)
+        return 0
+
     try:
-        app(args=argv, prog_name="rebase", standalone_mode=False)
+        app(args=args, prog_name="rebase", standalone_mode=False)
         return 0
     except RebaseWorkflowError as exc:
-        error_console.print(f"Error: {exc}", style="red")
+        error_console.print(f"Error: {exc}", style="rebase.error")
         return 1
     except click.ClickException as exc:
         exc.show(file=sys.stderr)
         return int(exc.exit_code)
     except click.Abort:
-        error_console.print("Aborted.", style="red")
+        error_console.print("Aborted.", style="rebase.error")
         return 1
 
 

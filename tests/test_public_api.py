@@ -1,7 +1,7 @@
 from typing import Any
 
 import rebase as rb
-from rebase.client import Client, Function, Project, Workflow
+from rebase.client import Client, Function, Project, Step, Workflow
 
 
 def test_version_is_exported() -> None:
@@ -27,6 +27,26 @@ def test_function_helper_creates_function_handle() -> None:
     assert add.name == "add"
 
 
+def test_function_helper_defaults_project() -> None:
+    @rb.function(name="add")
+    def add(a: int = 0, b: int = 0) -> dict:
+        return {"sum": a + b}
+
+    assert isinstance(add, Function)
+    assert add.project == "default"
+    assert add.name == "add"
+
+
+def test_step_helper_defaults_project() -> None:
+    @rb.step(name="load-name")
+    def load_name(name: str = "World") -> dict:
+        return {"name": name}
+
+    assert isinstance(load_name, Step)
+    assert load_name.project == "default"
+    assert load_name.name == "load-name"
+
+
 def test_workflow_helper_creates_workflow_handle() -> None:
     @rb.workflow(project="forecasting")
     def forecast(site_id: str = "site-001") -> dict:
@@ -35,6 +55,16 @@ def test_workflow_helper_creates_workflow_handle() -> None:
     assert isinstance(forecast, Workflow)
     assert forecast.project == "forecasting"
     assert forecast.name == "forecast"
+
+
+def test_workflow_helper_defaults_project() -> None:
+    @rb.workflow(name="hello-workflow")
+    def hello_workflow(name: str = "World") -> dict:
+        return {"message": f"Hello, {name}!"}
+
+    assert isinstance(hello_workflow, Workflow)
+    assert hello_workflow.project == "default"
+    assert hello_workflow.name == "hello-workflow"
 
 
 def test_deploy_helper_deploys_targets(monkeypatch) -> None:

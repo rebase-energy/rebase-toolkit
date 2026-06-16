@@ -6,7 +6,8 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-DEFAULT_API_URL = "https://workflows.rebase.energy"
+DEFAULT_SERVER_URL = "https://rebase-workflow-api-1002868894268.europe-north1.run.app"
+DEFAULT_API_URL = DEFAULT_SERVER_URL
 DEFAULT_PROFILE = "default"
 CONFIG_PATH_ENV = "REBASE_CONFIG_PATH"
 
@@ -86,6 +87,7 @@ def write_profile(
     *,
     api_key: str,
     profile: str = DEFAULT_PROFILE,
+    api_url: str | None = None,
     workspace: dict[str, Any] | None = None,
     path: Path | None = None,
 ) -> Path:
@@ -96,6 +98,8 @@ def write_profile(
         profiles = {}
 
     profile_data: dict[str, Any] = {"api_key": api_key}
+    if api_url:
+        profile_data["api_url"] = api_url.rstrip("/")
     if workspace:
         workspace_id = workspace.get("id")
         workspace_name = workspace.get("name")
