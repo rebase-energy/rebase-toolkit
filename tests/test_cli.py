@@ -14,6 +14,9 @@ def test_main_without_args_prints_help(capsys) -> None:
     assert "Rebase Platform toolkit." in output
     assert "setup" in output
     assert "workspace" in output
+    assert "project" in output
+    assert "function" in output
+    assert "workflow" in output
     assert "deploy" in output
 
 
@@ -392,3 +395,299 @@ def test_workspace_switch_changes_default_profile(monkeypatch, tmp_path: Path, c
     data = json.loads(config_path.read_text(encoding="utf-8"))
     assert data["default_profile"] == "prod"
     assert capsys.readouterr().out == "Switched workspace profile to 'prod'\n"
+
+
+def test_project_list_command_prints_projects(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "list_projects",
+        lambda self: [
+            {
+                "id": "project-id",
+                "name": "energy",
+                "source_mode": "rebase_hosted",
+                "updated_at": "2026-06-16T12:00:00Z",
+            }
+        ],
+    )
+
+    assert main(["project", "list"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Projects" in output
+    assert "energy" in output
+    assert "project-id" in output
+
+
+def test_project_get_command_supports_name_and_id(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "list_projects",
+        lambda self: [
+            {
+                "id": "project-id",
+                "workspace_id": "default",
+                "name": "energy",
+                "description": "Forecasting",
+                "source_mode": "rebase_hosted",
+                "repo_owner": None,
+                "repo_name": None,
+                "repo_path": None,
+                "created_at": "2026-06-15T12:00:00Z",
+                "updated_at": "2026-06-16T12:00:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        Client,
+        "get_project",
+        lambda self, project_id: {
+            "id": project_id,
+            "workspace_id": "default",
+            "name": "energy",
+            "description": "Forecasting",
+            "source_mode": "rebase_hosted",
+            "repo_owner": None,
+            "repo_name": None,
+            "repo_path": None,
+            "created_at": "2026-06-15T12:00:00Z",
+            "updated_at": "2026-06-16T12:00:00Z",
+        },
+    )
+
+    assert main(["project", "get", "energy"]) == 0
+    output = capsys.readouterr().out
+    assert "Project" in output
+    assert "Forecasting" in output
+
+    assert main(["project", "get", "--id", "project-id", "--json"]) == 0
+    output = capsys.readouterr().out
+    assert '"name": "energy"' in output
+    assert '"id": "project-id"' in output
+
+
+def test_function_list_command_supports_project_filter(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "list_projects",
+        lambda self: [
+            {"id": "project-id", "name": "energy"},
+            {"id": "other-project-id", "name": "trading"},
+        ],
+    )
+    monkeypatch.setattr(
+        Client,
+        "list_functions",
+        lambda self, *, project=None, project_id=None: [
+            {
+                "id": "function-id",
+                "project_id": project_id or "project-id",
+                "name": "add",
+                "execution_backend": "cloud_run",
+                "enabled": True,
+                "updated_at": "2026-06-16T12:00:00Z",
+            }
+        ],
+    )
+
+    assert main(["function", "list", "--project", "energy"]) == 0
+    output = capsys.readouterr().out
+    assert "Functions" in output
+    assert "add" in output
+    assert "energy" in output
+
+    assert main(["function", "list", "--json"]) == 0
+    output = capsys.readouterr().out
+    assert '"name": "add"' in output
+
+
+def test_function_get_command_requires_project_for_name_lookup(capsys) -> None:
+    assert main(["function", "get", "add"]) == 1
+
+    error_output = capsys.readouterr().err
+    assert "--project is required when selecting a function by name" in error_output
+
+
+def test_function_get_and_versions_commands(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(Client, "list_projects", lambda self: [{"id": "project-id", "name": "energy"}])
+    monkeypatch.setattr(
+        Client,
+        "list_functions",
+        lambda self, *, project=None, project_id=None: [
+            {
+                "id": "function-id",
+                "workspace_id": "default",
+                "project_id": project_id or "project-id",
+                "name": "add",
+                "description": "sum numbers",
+                "source_code": "def add(a: int, b: int) -> dict:\n    return {'sum': a + b}\n",
+                "entrypoint": "add",
+                "default_parameters": {"a": 1},
+                "execution_backend": "cloud_run",
+                "image_spec": {"kind": "python"},
+                "image_fingerprint": "image-fingerprint",
+                "cloud_run_min_instances": None,
+                "cloud_run_concurrency": None,
+                "cloud_run_service_name": "rebase-fn-add",
+                "cloud_run_url": "https://service.run.app",
+                "deployment_timings": {"backend_provision_seconds": 1.0},
+                "enabled": True,
+                "current_version_id": "version-id",
+                "created_at": "2026-06-15T12:00:00Z",
+                "updated_at": "2026-06-16T12:00:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        Client,
+        "get_function",
+        lambda self, function_id: {
+            "id": function_id,
+            "workspace_id": "default",
+            "project_id": "project-id",
+            "name": "add",
+            "description": "sum numbers",
+            "source_code": "def add(a: int, b: int) -> dict:\n    return {'sum': a + b}\n",
+            "entrypoint": "add",
+            "default_parameters": {"a": 1},
+            "execution_backend": "cloud_run",
+            "image_spec": {"kind": "python"},
+            "image_fingerprint": "image-fingerprint",
+            "cloud_run_min_instances": None,
+            "cloud_run_concurrency": None,
+            "cloud_run_service_name": "rebase-fn-add",
+            "cloud_run_url": "https://service.run.app",
+            "deployment_timings": {"backend_provision_seconds": 1.0},
+            "enabled": True,
+            "current_version_id": "version-id",
+            "created_at": "2026-06-15T12:00:00Z",
+            "updated_at": "2026-06-16T12:00:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        Client,
+        "list_function_versions",
+        lambda self, function_id: [
+            {
+                "id": "version-id",
+                "version_number": 3,
+                "fingerprint": "fp-123",
+                "execution_backend": "cloud_run",
+                "created_at": "2026-06-16T12:00:00Z",
+            }
+        ],
+    )
+
+    assert main(["function", "get", "add", "--project", "energy"]) == 0
+    output = capsys.readouterr().out
+    assert "Function" in output
+    assert "rebase-fn-add" in output
+
+    assert main(["function", "get", "--id", "function-id", "--json"]) == 0
+    output = capsys.readouterr().out
+    assert '"name": "add"' in output
+    assert '"id": "function-id"' in output
+
+    assert main(["function", "versions", "add", "--project", "energy"]) == 0
+    output = capsys.readouterr().out
+    assert "Function Versions" in output
+    assert "fp-123" in output
+
+
+def test_workflow_list_and_get_commands(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(Client, "list_projects", lambda self: [{"id": "project-id", "name": "energy"}])
+    monkeypatch.setattr(
+        Client,
+        "list_workflows",
+        lambda self, *, project=None, project_id=None: [
+            {
+                "id": "workflow-id",
+                "workspace_id": "default",
+                "project_id": project_id or "project-id",
+                "name": "forecast",
+                "description": "forecast workflow",
+                "flow_ref": None,
+                "source_code": "def forecast(site_id: str) -> dict:\n    return {'site_id': site_id}\n",
+                "entrypoint": "forecast",
+                "default_parameters": {"site_id": "site-001"},
+                "execution_backend": "prefect_cloud_run_service",
+                "enabled": True,
+                "current_version_id": "workflow-version-id",
+                "created_at": "2026-06-15T12:00:00Z",
+                "updated_at": "2026-06-16T12:00:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        Client,
+        "get_workflow",
+        lambda self, workflow_id: {
+            "id": workflow_id,
+            "workspace_id": "default",
+            "project_id": "project-id",
+            "name": "forecast",
+            "description": "forecast workflow",
+            "flow_ref": None,
+            "source_code": "def forecast(site_id: str) -> dict:\n    return {'site_id': site_id}\n",
+            "entrypoint": "forecast",
+            "default_parameters": {"site_id": "site-001"},
+            "execution_backend": "prefect_cloud_run_service",
+            "enabled": True,
+            "current_version_id": "workflow-version-id",
+            "created_at": "2026-06-15T12:00:00Z",
+            "updated_at": "2026-06-16T12:00:00Z",
+        },
+    )
+
+    assert main(["workflow", "list"]) == 0
+    output = capsys.readouterr().out
+    assert "Workflows" in output
+    assert "forecast" in output
+
+    assert main(["workflow", "get", "forecast", "--project", "energy"]) == 0
+    output = capsys.readouterr().out
+    assert "Workflow" in output
+    assert "prefect_cloud_run_service" in output
+
+    assert main(["workflow", "get", "--id", "workflow-id", "--json"]) == 0
+    output = capsys.readouterr().out
+    assert '"name": "forecast"' in output
+
+
+def test_workflow_versions_command_and_name_lookup_error(capsys, monkeypatch) -> None:
+    assert main(["workflow", "versions", "forecast"]) == 1
+    error_output = capsys.readouterr().err
+    assert "--project is required when selecting a workflow by name" in error_output
+
+    monkeypatch.setattr(Client, "list_projects", lambda self: [{"id": "project-id", "name": "energy"}])
+    monkeypatch.setattr(
+        Client,
+        "list_workflows",
+        lambda self, *, project=None, project_id=None: [
+            {
+                "id": "workflow-id",
+                "project_id": project_id or "project-id",
+                "name": "forecast",
+                "execution_backend": "prefect_cloud_run_service",
+                "enabled": True,
+                "updated_at": "2026-06-16T12:00:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        Client,
+        "list_workflow_versions",
+        lambda self, workflow_id: [
+            {
+                "id": "workflow-version-id",
+                "version_number": 2,
+                "fingerprint": "workflow-fingerprint",
+                "execution_backend": "prefect_cloud_run_service",
+                "created_at": "2026-06-16T12:00:00Z",
+            }
+        ],
+    )
+
+    assert main(["workflow", "versions", "forecast", "--project", "energy", "--json"]) == 0
+    output = capsys.readouterr().out
+    assert '"version_number": 2' in output

@@ -477,6 +477,12 @@ class Client:
             raise RebaseWorkflowError("expected project list response")
         return response
 
+    def get_project(self, project_id: str) -> dict[str, Any]:
+        response = self.request("GET", f"/projects/{project_id}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected project response")
+        return response
+
     def get_workspace(self) -> dict[str, Any]:
         response = self.request("GET", "/workspace")
         if not isinstance(response, dict):
@@ -606,7 +612,10 @@ class Client:
     def list_functions(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
         resolved_project_id = project_id
         if resolved_project_id is None and project is not None:
-            resolved_project_id = self.ensure_project(project)["id"]
+            resolved_project = self.find_project(project)
+            if resolved_project is None:
+                return []
+            resolved_project_id = resolved_project["id"]
         if resolved_project_id is None:
             projects = self.list_projects()
             functions: list[dict[str, Any]] = []
@@ -759,7 +768,10 @@ class Client:
     def list_workflows(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
         resolved_project_id = project_id
         if resolved_project_id is None and project is not None:
-            resolved_project_id = self.ensure_project(project)["id"]
+            resolved_project = self.find_project(project)
+            if resolved_project is None:
+                return []
+            resolved_project_id = resolved_project["id"]
         path = f"/projects/{resolved_project_id}/workflows" if resolved_project_id is not None else "/workflows"
         response = self.request("GET", path)
         if not isinstance(response, list):

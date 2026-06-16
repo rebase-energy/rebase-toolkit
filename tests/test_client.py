@@ -38,6 +38,27 @@ def test_client_sends_bearer_token(monkeypatch) -> None:
     }
 
 
+def test_client_get_project_requests_project_endpoint(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["headers"] = kwargs["headers"]
+        return FakeResponse({"id": "project-id", "name": "energy"})
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    assert client.get_project("project-id") == {"id": "project-id", "name": "energy"}
+
+    assert observed == {
+        "method": "GET",
+        "url": "https://workflows.example.com/projects/project-id",
+        "headers": {"Authorization": "Bearer rbw_test"},
+    }
+
+
 def test_client_uses_hosted_api_url_by_default(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(tmp_path / "missing-config.json"))
 
@@ -81,6 +102,24 @@ def test_client_can_select_named_profile(monkeypatch, tmp_path) -> None:
 
     assert client.api_key == "rbw_prod"
     assert client.api_url == DEFAULT_API_URL
+
+
+def test_list_functions_with_project_name_does_not_create_project(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        return FakeResponse([])
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "find_project", lambda name: {"id": "project-id", "name": name})
+    monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: (_ for _ in ()).throw(AssertionError()))
+
+    assert client.list_functions(project="energy") == []
+    assert observed["method"] == "GET"
+    assert observed["url"] == "https://workflows.example.com/projects/project-id/functions"
 
 
 def test_workflow_deploy_updates_existing_workflow_version(monkeypatch) -> None:

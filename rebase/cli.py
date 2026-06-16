@@ -92,6 +92,24 @@ workspace_app = typer.Typer(
     no_args_is_help=False,
     rich_markup_mode="rich",
 )
+project_app = typer.Typer(
+    add_completion=False,
+    help="Inspect Rebase projects.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+function_app = typer.Typer(
+    add_completion=False,
+    help="Inspect Rebase functions.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+workflow_app = typer.Typer(
+    add_completion=False,
+    help="Inspect Rebase workflows.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
 
 
 def _load_module(path: Path) -> ModuleType:
@@ -363,6 +381,213 @@ def _deploy_table(deployed: list[tuple[str, str, str | None]]) -> Table:
     return table
 
 
+def _format_value(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, indent=2, sort_keys=True)
+    return str(value)
+
+
+def _print_json(data: Any) -> None:
+    console.print_json(data=data)
+
+
+def _detail_table(title: str, data: dict[str, Any], *, preferred_keys: Iterable[str] | None = None) -> Table:
+    ordered_keys: list[str] = []
+    seen: set[str] = set()
+    for key in preferred_keys or []:
+        if key in data:
+            ordered_keys.append(key)
+            seen.add(key)
+    for key in data:
+        if key not in seen:
+            ordered_keys.append(key)
+
+    table = Table(
+        title=title,
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Field", style="rebase.muted", no_wrap=True)
+    table.add_column("Value", style="rebase.value")
+    for key in ordered_keys:
+        table.add_row(key, _format_value(data[key]))
+    return table
+
+
+def _project_table(projects: list[dict[str, Any]]) -> Table:
+    table = Table(
+        title="Projects",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Name", style="rebase.value")
+    table.add_column("ID", style="rebase.muted")
+    table.add_column("Source Mode")
+    table.add_column("Updated", style="rebase.muted")
+    for project in projects:
+        table.add_row(
+            str(project.get("name", "-")),
+            str(project.get("id", "-")),
+            _format_value(project.get("source_mode")),
+            _format_value(project.get("updated_at")),
+        )
+    return table
+
+
+def _function_table(functions: list[dict[str, Any]], *, project_names: dict[str, str]) -> Table:
+    table = Table(
+        title="Functions",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Name", style="rebase.value")
+    table.add_column("Project")
+    table.add_column("Backend")
+    table.add_column("Enabled")
+    table.add_column("ID", style="rebase.muted")
+    table.add_column("Updated", style="rebase.muted")
+    for function in functions:
+        project_id = str(function.get("project_id", ""))
+        table.add_row(
+            str(function.get("name", "-")),
+            project_names.get(project_id, project_id or "-"),
+            _format_value(function.get("execution_backend")),
+            _format_value(function.get("enabled")),
+            str(function.get("id", "-")),
+            _format_value(function.get("updated_at")),
+        )
+    return table
+
+
+def _workflow_table(workflows: list[dict[str, Any]], *, project_names: dict[str, str]) -> Table:
+    table = Table(
+        title="Workflows",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Name", style="rebase.value")
+    table.add_column("Project")
+    table.add_column("Backend")
+    table.add_column("Enabled")
+    table.add_column("ID", style="rebase.muted")
+    table.add_column("Updated", style="rebase.muted")
+    for workflow in workflows:
+        project_id = str(workflow.get("project_id", ""))
+        table.add_row(
+            str(workflow.get("name", "-")),
+            project_names.get(project_id, project_id or "-"),
+            _format_value(workflow.get("execution_backend")),
+            _format_value(workflow.get("enabled")),
+            str(workflow.get("id", "-")),
+            _format_value(workflow.get("updated_at")),
+        )
+    return table
+
+
+def _version_table(title: str, versions: list[dict[str, Any]]) -> Table:
+    table = Table(
+        title=title,
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Version", style="rebase.value")
+    table.add_column("ID", style="rebase.muted")
+    table.add_column("Fingerprint")
+    table.add_column("Backend")
+    table.add_column("Created", style="rebase.muted")
+    for version in versions:
+        table.add_row(
+            _format_value(version.get("version_number")),
+            str(version.get("id", "-")),
+            _format_value(version.get("fingerprint")),
+            _format_value(version.get("execution_backend")),
+            _format_value(version.get("created_at")),
+        )
+    return table
+
+
+def _resolve_project_by_name(client: Client, name: str) -> dict[str, Any]:
+    project = client.find_project(name)
+    if project is None:
+        raise RebaseWorkflowError(f"project not found: {name}")
+    return project
+
+
+def _resolve_project_selector(client: Client, name: str | None, *, project_id: str | None = None) -> dict[str, Any]:
+    if project_id is not None:
+        if name is not None:
+            raise RebaseWorkflowError("provide either a project name or --id, not both")
+        return client.get_project(project_id)
+    if name is None:
+        raise RebaseWorkflowError("project name is required unless --id is provided")
+    return _resolve_project_by_name(client, name)
+
+
+def _resolve_function_selector(
+    client: Client,
+    name: str | None,
+    *,
+    function_id: str | None = None,
+    project_name: str | None = None,
+) -> dict[str, Any]:
+    if function_id is not None:
+        if name is not None:
+            raise RebaseWorkflowError("provide either a function name or --id, not both")
+        return client.get_function(function_id)
+    if name is None:
+        raise RebaseWorkflowError("function name is required unless --id is provided")
+    if not project_name:
+        raise RebaseWorkflowError("--project is required when selecting a function by name")
+    project = _resolve_project_by_name(client, project_name)
+    for function in client.list_functions(project_id=str(project["id"])):
+        if function.get("name") == name:
+            return function
+    raise RebaseWorkflowError(f"function not found: {project_name}/{name}")
+
+
+def _resolve_workflow_selector(
+    client: Client,
+    name: str | None,
+    *,
+    workflow_id: str | None = None,
+    project_name: str | None = None,
+) -> dict[str, Any]:
+    if workflow_id is not None:
+        if name is not None:
+            raise RebaseWorkflowError("provide either a workflow name or --id, not both")
+        return client.get_workflow(workflow_id)
+    if name is None:
+        raise RebaseWorkflowError("workflow name is required unless --id is provided")
+    if not project_name:
+        raise RebaseWorkflowError("--project is required when selecting a workflow by name")
+    project = _resolve_project_by_name(client, project_name)
+    for workflow in client.list_workflows(project_id=str(project["id"])):
+        if workflow.get("name") == name:
+            return workflow
+    raise RebaseWorkflowError(f"workflow not found: {project_name}/{name}")
+
+
+def _project_name_map(projects: list[dict[str, Any]]) -> dict[str, str]:
+    return {str(project.get("id", "")): str(project.get("name", "-")) for project in projects}
+
+
 @app.command("setup")
 def setup_command(
     profile: Annotated[str, typer.Option("--profile", help="Credential profile name.")] = DEFAULT_PROFILE,
@@ -451,6 +676,229 @@ def workspace_use_command(profile: Annotated[str, typer.Argument(help="Profile n
 
 
 app.add_typer(workspace_app, name="workspace")
+
+
+@project_app.command("list")
+def project_list_command(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List projects in the active workspace."""
+    client = Client()
+    projects = client.list_projects()
+    if json_output:
+        _print_json(projects)
+        return
+    console.print(_project_table(projects))
+
+
+@project_app.command("get")
+def project_get_command(
+    name: Annotated[
+        str | None,
+        typer.Argument(help="Project name. Omit when using --id."),
+    ] = None,
+    project_id: Annotated[str | None, typer.Option("--id", help="Exact project ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show project metadata."""
+    client = Client()
+    project = _resolve_project_selector(client, name, project_id=project_id)
+    if json_output:
+        _print_json(project)
+        return
+    console.print(
+        _detail_table(
+            "Project",
+            project,
+            preferred_keys=[
+                "name",
+                "id",
+                "workspace_id",
+                "description",
+                "source_mode",
+                "repo_owner",
+                "repo_name",
+                "repo_path",
+                "created_at",
+                "updated_at",
+            ],
+        )
+    )
+
+
+app.add_typer(project_app, name="project")
+
+
+@function_app.command("list")
+def function_list_command(
+    project: Annotated[str | None, typer.Option("--project", help="Filter by project name.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List functions in the active workspace."""
+    client = Client()
+    if project is not None:
+        project_data = _resolve_project_by_name(client, project)
+        functions = client.list_functions(project_id=str(project_data["id"]))
+        project_names = {str(project_data["id"]): str(project_data["name"])}
+    else:
+        functions = client.list_functions()
+        project_names = _project_name_map(client.list_projects())
+    if json_output:
+        _print_json(functions)
+        return
+    console.print(_function_table(functions, project_names=project_names))
+
+
+@function_app.command("get")
+def function_get_command(
+    name: Annotated[
+        str | None,
+        typer.Argument(help="Function name. Omit when using --id."),
+    ] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    function_id: Annotated[str | None, typer.Option("--id", help="Exact function ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show function metadata."""
+    client = Client()
+    function = _resolve_function_selector(client, name, function_id=function_id, project_name=project)
+    if json_output:
+        _print_json(function)
+        return
+    console.print(
+        _detail_table(
+            "Function",
+            function,
+            preferred_keys=[
+                "name",
+                "id",
+                "project_id",
+                "workspace_id",
+                "description",
+                "entrypoint",
+                "execution_backend",
+                "enabled",
+                "default_parameters",
+                "image_spec",
+                "image_fingerprint",
+                "cloud_run_min_instances",
+                "cloud_run_concurrency",
+                "cloud_run_service_name",
+                "cloud_run_url",
+                "current_version_id",
+                "deployment_timings",
+                "created_at",
+                "updated_at",
+                "source_code",
+            ],
+        )
+    )
+
+
+@function_app.command("versions")
+def function_versions_command(
+    name: Annotated[
+        str | None,
+        typer.Argument(help="Function name. Omit when using --id."),
+    ] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    function_id: Annotated[str | None, typer.Option("--id", help="Exact function ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List versions for a function."""
+    client = Client()
+    function = _resolve_function_selector(client, name, function_id=function_id, project_name=project)
+    versions = client.list_function_versions(str(function["id"]))
+    if json_output:
+        _print_json(versions)
+        return
+    console.print(_version_table("Function Versions", versions))
+
+
+app.add_typer(function_app, name="function")
+
+
+@workflow_app.command("list")
+def workflow_list_command(
+    project: Annotated[str | None, typer.Option("--project", help="Filter by project name.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List workflows in the active workspace."""
+    client = Client()
+    if project is not None:
+        project_data = _resolve_project_by_name(client, project)
+        workflows = client.list_workflows(project_id=str(project_data["id"]))
+        project_names = {str(project_data["id"]): str(project_data["name"])}
+    else:
+        workflows = client.list_workflows()
+        project_names = _project_name_map(client.list_projects())
+    if json_output:
+        _print_json(workflows)
+        return
+    console.print(_workflow_table(workflows, project_names=project_names))
+
+
+@workflow_app.command("get")
+def workflow_get_command(
+    name: Annotated[
+        str | None,
+        typer.Argument(help="Workflow name. Omit when using --id."),
+    ] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show workflow metadata."""
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    if json_output:
+        _print_json(workflow)
+        return
+    console.print(
+        _detail_table(
+            "Workflow",
+            workflow,
+            preferred_keys=[
+                "name",
+                "id",
+                "project_id",
+                "workspace_id",
+                "description",
+                "entrypoint",
+                "flow_ref",
+                "execution_backend",
+                "enabled",
+                "default_parameters",
+                "current_version_id",
+                "created_at",
+                "updated_at",
+                "source_code",
+            ],
+        )
+    )
+
+
+@workflow_app.command("versions")
+def workflow_versions_command(
+    name: Annotated[
+        str | None,
+        typer.Argument(help="Workflow name. Omit when using --id."),
+    ] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List versions for a workflow."""
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    versions = client.list_workflow_versions(str(workflow["id"]))
+    if json_output:
+        _print_json(versions)
+        return
+    console.print(_version_table("Workflow Versions", versions))
+
+
+app.add_typer(workflow_app, name="workflow")
 
 
 @app.command("deploy")
