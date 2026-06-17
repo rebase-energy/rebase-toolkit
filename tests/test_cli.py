@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from rebase.cli import deploy_file, main
+from rebase.cli import _format_duration, deploy_file, main
 from rebase.client import Client, Function, Project, Run, Workflow
 
 
@@ -18,6 +18,12 @@ def test_main_without_args_prints_help(capsys) -> None:
     assert "function" in output
     assert "workflow" in output
     assert "deploy" in output
+
+
+def test_format_duration_uses_two_decimal_places() -> None:
+    assert _format_duration(0) == "0.00"
+    assert _format_duration(1.234) == "1.23"
+    assert _format_duration(12.999) == "13.00"
 
 
 def test_deploy_file_deploys_top_level_project(monkeypatch, tmp_path: Path) -> None:
@@ -149,6 +155,7 @@ def add(a: int, b: int) -> dict:
 
     monkeypatch.setattr(Function, "deploy", fake_deploy)
     monkeypatch.setattr(Client, "run_ephemeral", fake_run_ephemeral)
+    monkeypatch.setattr(Client, "list_run_events", lambda self, run_id: [])
     monkeypatch.setattr(
         Client,
         "get_run",
@@ -249,6 +256,23 @@ def hello_workflow(name: str = "World") -> dict:
     monkeypatch.setattr(Client, "run_ephemeral", fake_run_ephemeral)
     monkeypatch.setattr(
         Client,
+        "list_run_events",
+        lambda self, run_id: [
+            {"id": "event-1", "status": "completed", "message": "Accepted run request."},
+            {"id": "event-2", "status": "running", "message": "Submitting workflow run to Prefect Cloud Run Service."},
+            {"id": "event-3", "status": "completed", "message": "Prefect Cloud Run Service accepted the workflow run."},
+        ],
+    )
+    monkeypatch.setattr(
+        Client,
+        "list_run_steps",
+        lambda self, run_id: [
+            {"id": "step-1", "name": "load-name", "status": "succeeded"},
+            {"id": "step-2", "name": "package", "status": "succeeded"},
+        ],
+    )
+    monkeypatch.setattr(
+        Client,
         "get_run",
         lambda self, run_id: {"id": run_id, "status": "succeeded", "result": {"message": "Hello, Rebase!"}},
     )
@@ -262,7 +286,127 @@ def hello_workflow(name: str = "World") -> dict:
     assert observed["execution_backend"] == "prefect_cloud_run_service"
     assert [node["name"] for node in observed["step_graph"]["nodes"]] == ["load-name", "package"]
     assert all(node["source_code"] for node in observed["step_graph"]["nodes"])
-    assert '"Hello, Rebase!"' in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Accepted run request." in output
+    assert "Prefect Cloud Run Service accepted the workflow run." in output
+    assert "Step load-name completed." in output
+    assert "Step package completed." in output
+    assert "Run completed in " in output
+    assert '"Hello, Rebase!"' in output
+
+
+def test_run_list_command_renders_runs(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(Client, "list_projects", lambda self: [{"id": "project-id", "name": "default"}])
+    monkeypatch.setattr(
+        Client,
+        "list_runs",
+        lambda self, **kwargs: [
+            {
+                "id": "run-id",
+                "project_id": "project-id",
+                "target_type": "workflow",
+                "status": "succeeded",
+                "execution_backend": "prefect_cloud_run_service",
+                "created_at": "2026-06-16T10:00:00Z",
+                "finished_at": "2026-06-16T10:00:05Z",
+            }
+        ],
+    )
+
+    assert main(["run", "list"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Runs" in output
+    assert "run-id" in output
+    assert "workflow" in output
+    assert "default" in output
+
+
+def test_run_list_command_can_print_json(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(Client, "list_projects", lambda self: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(
+        Client,
+        "list_runs",
+        lambda self, **kwargs: [{"id": "run-id", "status": "queued"}],
+    )
+
+    assert main(["run", "list", "--json"]) == 0
+
+    output = capsys.readouterr().out
+    assert '"id": "run-id"' in output
+    assert '"status": "queued"' in output
+
+
+def test_run_get_command_renders_detail(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "get_run",
+        lambda self, run_id: {
+            "id": run_id,
+            "target_type": "function",
+            "status": "succeeded",
+            "execution_backend": "cloud_run",
+            "result": {"sum": 3},
+            "timings": {"backend_execution_seconds": 1.2},
+        },
+    )
+
+    assert main(["run", "get", "run-id"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Run" in output
+    assert "run-id" in output
+    assert "cloud_run" in output
+    assert "backend_execution_seconds" in output
+
+
+def test_run_logs_command_renders_events_and_steps_without_following(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "get_run",
+        lambda self, run_id: {"id": run_id, "target_type": "workflow", "status": "succeeded", "result": {"ok": True}},
+    )
+    monkeypatch.setattr(
+        Client,
+        "list_run_events",
+        lambda self, run_id: [{"id": "event-id", "status": "completed", "message": "Accepted run request."}],
+    )
+    monkeypatch.setattr(
+        Client,
+        "list_run_steps",
+        lambda self, run_id: [{"id": "step-id", "name": "load-name", "status": "succeeded"}],
+    )
+
+    assert main(["run", "logs", "run-id", "--no-follow"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Accepted run request." in output
+    assert "Step load-name completed." in output
+    assert "Run completed." in output
+
+
+def test_run_logs_command_can_print_json(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "get_run",
+        lambda self, run_id: {"id": run_id, "target_type": "function", "status": "running"},
+    )
+    monkeypatch.setattr(Client, "list_run_events", lambda self, run_id: [{"id": "event-id"}])
+    monkeypatch.setattr(Client, "list_run_steps", lambda self, run_id: (_ for _ in ()).throw(AssertionError()))
+
+    assert main(["run", "logs", "run-id", "--json"]) == 0
+
+    output = capsys.readouterr().out
+    assert '"run"' in output
+    assert '"events"' in output
+    assert '"steps": []' in output
+
+
+def test_run_cancel_command_is_explicitly_unsupported(capsys) -> None:
+    assert main(["run", "cancel", "run-id"]) == 1
+
+    output = capsys.readouterr().err
+    assert "run cancellation is not supported yet: run-id" in output
 
 
 def test_setup_stores_api_key(monkeypatch, tmp_path: Path, capsys) -> None:

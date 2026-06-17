@@ -971,10 +971,41 @@ class Client:
             raise RebaseWorkflowError("expected run response")
         return response
 
+    def list_runs(
+        self,
+        *,
+        project_id: str | None = None,
+        workflow_id: str | None = None,
+        function_id: str | None = None,
+        target_type: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        params = {
+            key: value
+            for key, value in {
+                "project_id": project_id,
+                "workflow_id": workflow_id,
+                "function_id": function_id,
+                "target_type": target_type,
+                "limit": limit,
+            }.items()
+            if value is not None
+        }
+        response = self.request("GET", "/runs", params=params)
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected run list response")
+        return response
+
     def list_run_steps(self, run_id: str) -> list[dict[str, Any]]:
         response = self.request("GET", f"/runs/{run_id}/steps")
         if not isinstance(response, list):
             raise RebaseWorkflowError("expected step run list response")
+        return response
+
+    def list_run_events(self, run_id: str) -> list[dict[str, Any]]:
+        response = self.request("GET", f"/runs/{run_id}/events")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected run event list response")
         return response
 
 
@@ -1571,6 +1602,9 @@ class Run:
 
     def steps(self) -> list[dict[str, Any]]:
         return self.client.list_run_steps(self.id)
+
+    def events(self) -> list[dict[str, Any]]:
+        return self.client.list_run_events(self.id)
 
     @property
     def status(self) -> str:

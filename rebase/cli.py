@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import json
 import sys
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from types import ModuleType
@@ -14,11 +15,15 @@ import click
 import typer
 import typer.rich_utils as typer_rich
 from rich import box
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
+from rich.spinner import Spinner
 from rich.table import Table
+from rich.text import Text
 from rich.theme import Theme
+from rich.tree import Tree
 
-from rebase.client import Client, Function, FunctionBackend, Project, RebaseWorkflowError, Step, Workflow
+from rebase.client import Client, Function, FunctionBackend, Project, RebaseWorkflowError, Run, Step, Workflow
 from rebase.config import (
     DEFAULT_PROFILE,
     DEFAULT_SERVER_URL,
@@ -34,6 +39,43 @@ BRAND_MEDIUM_GRAY = "#656565"
 BRAND_CORAL_RED = "#E46962"
 BRAND_AMBER = "#FBAE40"
 BRAND_SLATE_BLUE = "#3F6E91"
+
+_BANNER_LINES = [
+    "██████╗  ███████╗ ██████╗   █████╗  ███████╗ ███████╗",
+    "██╔══██╗ ██╔════╝ ██╔══██╗ ██╔══██╗ ██╔════╝ ██╔════╝",
+    "██████╔╝ █████╗   ██████╔╝ ███████║ ███████╗ █████╗  ",
+    "██╔══██╗ ██╔══╝   ██╔══██╗ ██╔══██║ ╚════██║ ██╔══╝  ",
+    "██║  ██║ ███████╗ ██████╔╝ ██║  ██║ ███████║ ███████╗",
+    "╚═╝  ╚═╝ ╚══════╝ ╚═════╝  ╚═╝  ╚═╝ ╚══════╝ ╚══════╝",
+]
+
+# "REBASE CLI" — REBASE rows extended with 2-space gap then C, L, I in matching ANSI-shadow style.
+# C/L/I are each 9 display chars wide; I (narrow) is 3 wide.  Total width ≈ 78 cols.
+_BANNER_LINES_CLI = [
+    "██████╗  ███████╗ ██████╗   █████╗  ███████╗ ███████╗     ██████╗ ██╗      ██╗",
+    "██╔══██╗ ██╔════╝ ██╔══██╗ ██╔══██╗ ██╔════╝ ██╔════╝    ██╔════╝ ██║      ██║",
+    "██████╔╝ █████╗   ██████╔╝ ███████║ ███████╗ █████╗      ██║      ██║      ██║",
+    "██╔══██╗ ██╔══╝   ██╔══██╗ ██╔══██║ ╚════██║ ██╔══╝      ██║      ██║      ██║",
+    "██║  ██║ ███████╗ ██████╔╝ ██║  ██║ ███████║ ███████╗    ╚██████╗ ███████╗ ██║",
+    "╚═╝  ╚═╝ ╚══════╝ ╚═════╝  ╚═╝  ╚═╝ ╚══════╝ ╚══════╝     ╚═════╝ ╚══════╝ ╚═╝",
+]
+
+
+def _banner(variant: int = 1) -> str | Text:
+    lines = _BANNER_LINES_CLI if variant in {3, 4} else _BANNER_LINES
+    if variant in {1, 3}:
+        body = "\n".join(lines)
+        return f"[bold {BRAND_BRIGHT_GREEN}]\n{body}\n[/bold {BRAND_BRIGHT_GREEN}]"
+    # variants 2 and 4: 4 stripes, same total height as solid variants (6 char rows, no extras).
+    # Rows 0, 2, 4 replaced with ▀ (upper-half block): top 50% green, bottom 50% = black gap.
+    # Gaps fall at natural letter-structure breaks; box-drawing chars produce thin green outlines.
+    text = Text("\n")
+    for i, line in enumerate(lines):
+        modified = line.replace("█", "▀") if i in {0, 2, 4} else line
+        text.append(modified + "\n", style=f"bold {BRAND_BRIGHT_GREEN}")
+    text.append("\n")
+    return text
+
 
 REBASE_THEME = Theme(
     {
@@ -107,6 +149,12 @@ function_app = typer.Typer(
 workflow_app = typer.Typer(
     add_completion=False,
     help="Inspect Rebase workflows.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+run_app = typer.Typer(
+    add_completion=False,
+    help="Run local Rebase targets and inspect submitted runs.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -287,6 +335,289 @@ def _run_table(run_id: str, status: str) -> Table:
     return table
 
 
+def _runs_table(runs: list[dict[str, Any]], *, project_names: dict[str, str]) -> Table:
+    table = Table(
+        title="Runs",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("ID", style="rebase.muted")
+    table.add_column("Target")
+    table.add_column("Status", style="rebase.value")
+    table.add_column("Backend")
+    table.add_column("Project")
+    table.add_column("Created", style="rebase.muted")
+    table.add_column("Finished", style="rebase.muted")
+    for run in runs:
+        project_id = str(run.get("project_id", ""))
+        table.add_row(
+            str(run.get("id", "-")),
+            _format_value(run.get("target_type")),
+            _format_value(run.get("status")),
+            _format_value(run.get("execution_backend")),
+            project_names.get(project_id, project_id or "-"),
+            _format_value(run.get("created_at")),
+            _format_value(run.get("finished_at")),
+        )
+    return table
+
+
+def _raw_run_logs(run: dict[str, Any], events: list[dict[str, Any]], steps: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"run": run, "events": events, "steps": steps}
+
+
+def _emit_event_to_reporter(
+    reporter: _TerminalRunProgressReporter | _LineRunProgressReporter,
+    event: dict[str, Any],
+) -> None:
+    status = str(event.get("status") or "info")
+    message = str(event.get("message") or "")
+    if not message:
+        return
+    if status == "running":
+        reporter.update(message)
+    elif status == "failed":
+        reporter.fail(message)
+    else:
+        reporter.complete(message)
+
+
+def _emit_step_to_reporter(
+    reporter: _TerminalRunProgressReporter | _LineRunProgressReporter,
+    step: dict[str, Any],
+) -> None:
+    step_name = str(step.get("name") or step.get("node_key") or step.get("id") or "step")
+    step_status = str(step.get("status") or "unknown")
+    reporter.step(step_name, step_status)
+
+
+def _render_run_snapshot(
+    *,
+    run: dict[str, Any],
+    events: list[dict[str, Any]],
+    steps: list[dict[str, Any]],
+    reporter: _TerminalRunProgressReporter | _LineRunProgressReporter,
+) -> None:
+    for event in events:
+        _emit_event_to_reporter(reporter, event)
+    for step in steps:
+        _emit_step_to_reporter(reporter, step)
+    status = str(run.get("status") or "unknown")
+    if status in {"succeeded", "failed", "cancelled"}:
+        if status == "succeeded":
+            reporter.finish("Run completed.")
+        elif status == "failed":
+            reporter.fail(str(run.get("error") or "Run failed."))
+        else:
+            reporter.fail("Run cancelled.")
+    else:
+        reporter.update(f"Run is {status}.")
+
+
+def _progress_prefix(status: str) -> tuple[str, str]:
+    if status == "completed":
+        return "✓", "rebase.success"
+    if status == "failed":
+        return "✗", "rebase.error"
+    return "•", "rebase.muted"
+
+
+def _format_duration(seconds: float) -> str:
+    return f"{seconds:.2f}"
+
+
+class _LineRunProgressReporter:
+    def __init__(self) -> None:
+        self._last_running_message: str | None = None
+
+    def __enter__(self) -> _LineRunProgressReporter:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        return None
+
+    def update(self, message: str) -> None:
+        if message == self._last_running_message:
+            return
+        self._last_running_message = message
+        prefix, style = _progress_prefix("running")
+        console.print(f"{prefix} {message}", style=style)
+
+    def complete(self, message: str) -> None:
+        prefix, style = _progress_prefix("completed")
+        console.print(f"{prefix} {message}", style=style)
+
+    def fail(self, message: str) -> None:
+        prefix, style = _progress_prefix("failed")
+        console.print(f"{prefix} {message}", style=style)
+
+    def step(self, name: str, status: str) -> None:
+        if status == "running":
+            self.update(f"Running step {name}.")
+            return
+        if status == "succeeded":
+            self.complete(f"Step {name} completed.")
+            return
+        if status in {"failed", "cancelled"}:
+            self.fail(f"Step {name} {status}.")
+            return
+        self.update(f"Step {name}: {status}.")
+
+    def finish(self, message: str) -> None:
+        self.complete(message)
+
+
+class _TerminalRunProgressReporter:
+    def __init__(self) -> None:
+        self._header: Spinner | Text = Spinner("dots", text=Text("Preparing run...", style="rebase.info"))
+        self._tree = Tree("[rebase.title]Run[/rebase.title]", guide_style="rebase.border")
+        self._steps_tree: Tree | None = None
+        self._live = Live(self._renderable(), console=console, refresh_per_second=8, transient=False)
+
+    def _renderable(self) -> Group:
+        return Group(self._header, self._tree)
+
+    def _refresh(self) -> None:
+        self._live.update(self._renderable(), refresh=True)
+
+    def __enter__(self) -> _TerminalRunProgressReporter:
+        self._live.__enter__()
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self._live.__exit__(*args)
+
+    def update(self, message: str) -> None:
+        if isinstance(self._header, Spinner):
+            self._header.update(text=Text(message, style="rebase.info"))
+        else:
+            self._header = Spinner("dots", text=Text(message, style="rebase.info"))
+        self._refresh()
+
+    def complete(self, message: str) -> None:
+        self._tree.add(f"[green]✓[/green] {message}")
+        self._refresh()
+
+    def fail(self, message: str) -> None:
+        self._tree.add(f"[red]✗[/red] {message}")
+        self._header = Text.from_markup(f"[red]✗[/red] {message}")
+        self._refresh()
+
+    def _workflow_steps_tree(self) -> Tree:
+        if self._steps_tree is None:
+            self._steps_tree = self._tree.add("[rebase.title]Workflow steps[/rebase.title]")
+        return self._steps_tree
+
+    def step(self, name: str, status: str) -> None:
+        if status == "running":
+            self.update(f"Running step {name}...")
+            return
+        steps_tree = self._workflow_steps_tree()
+        if status == "succeeded":
+            steps_tree.add(f"[green]✓[/green] {name}")
+        elif status in {"failed", "cancelled"}:
+            steps_tree.add(f"[red]✗[/red] {name} ({status})")
+        else:
+            steps_tree.add(f"[dim]•[/dim] {name}: {status}")
+        self._refresh()
+
+    def finish(self, message: str) -> None:
+        self._header = Text.from_markup(f"[green]✓[/green] {message}")
+        self._refresh()
+
+
+def _run_progress_reporter() -> _TerminalRunProgressReporter | _LineRunProgressReporter:
+    if console.is_terminal:
+        return _TerminalRunProgressReporter()
+    return _LineRunProgressReporter()
+
+
+def _stream_run_result(
+    run: Run,
+    *,
+    target: RunnableTarget | None = None,
+    target_type: str | None = None,
+    reporter: _TerminalRunProgressReporter | _LineRunProgressReporter,
+    started_at: float,
+    timeout: int,
+    poll_interval: float,
+    return_result: bool = True,
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout
+    seen_event_ids: set[str] = set()
+    seen_step_statuses: dict[str, str] = {}
+    events_supported = True
+    steps_supported = isinstance(target, Workflow) or target_type == "workflow"
+    terminal_statuses = {"succeeded", "failed", "cancelled"}
+    first_iteration = True
+
+    while True:
+        if events_supported:
+            try:
+                for event in run.events():
+                    event_id = str(event.get("id", ""))
+                    if not event_id or event_id in seen_event_ids:
+                        continue
+                    seen_event_ids.add(event_id)
+                    event_status = str(event.get("status") or "info")
+                    message = str(event.get("message") or "")
+                    if not message:
+                        continue
+                    if event_status == "running":
+                        reporter.update(message)
+                        continue
+                    if event_status == "failed":
+                        reporter.fail(message)
+                    else:
+                        reporter.complete(message)
+            except RebaseWorkflowError:
+                events_supported = False
+
+        if steps_supported:
+            try:
+                for step in run.steps():
+                    step_key = str(step.get("id") or step.get("node_key") or step.get("name") or "")
+                    if not step_key:
+                        continue
+                    step_status = str(step.get("status") or "")
+                    previous = seen_step_statuses.get(step_key)
+                    if step_status == previous:
+                        continue
+                    seen_step_statuses[step_key] = step_status
+                    step_name = str(step.get("name") or step.get("node_key") or step_key)
+                    reporter.step(step_name, step_status)
+            except RebaseWorkflowError:
+                steps_supported = False
+
+        data = run.data if first_iteration and run.data else run.refresh()
+        first_iteration = False
+        status = str(data.get("status") or "queued")
+        if status in terminal_statuses:
+            if status == "succeeded":
+                if return_result:
+                    reporter.finish(f"Run completed in {_format_duration(time.monotonic() - started_at)} seconds.")
+                else:
+                    reporter.finish("Run completed.")
+                return data.get("result") if return_result else None
+            error = data.get("error") or f"run ended with status {status}"
+            reporter.fail(str(error))
+            if return_result:
+                raise RebaseWorkflowError(str(error))
+            return None
+        if status == "queued" and not seen_event_ids:
+            reporter.update("Run queued.")
+        elif status == "submitted" and not seen_event_ids:
+            reporter.update("Run submitted to the backend.")
+        elif status == "running" and not seen_event_ids and not seen_step_statuses:
+            reporter.update("Run is executing.")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"run {run.id} did not finish within {timeout} seconds")
+        time.sleep(poll_interval)
+
+
 def deploy_file(path: str | Path, *, object_names: Iterable[str] | None = None) -> list[tuple[str, str, str | None]]:
     module = _load_module(Path(path))
     selected_names = set(object_names or [])
@@ -295,9 +626,7 @@ def deploy_file(path: str | Path, *, object_names: Iterable[str] | None = None) 
     projects = all_projects
     if selected_names:
         projects = [
-            (name, project)
-            for name, project in projects
-            if name in selected_names or project.name in selected_names
+            (name, project) for name, project in projects if name in selected_names or project.name in selected_names
         ]
 
     deployed: list[tuple[str, str, str | None]] = []
@@ -918,6 +1247,9 @@ def deploy_command(
     console.print(_deploy_table(deployed))
 
 
+RUN_INSPECTION_COMMANDS = {"list", "get", "logs", "cancel"}
+
+
 @app.command("run")
 def run_command(
     target_ref: Annotated[
@@ -960,25 +1292,199 @@ def run_command(
     ] = 1.0,
 ) -> None:
     """Run a Rebase function or workflow from local source without deploying it."""
-    target = _resolve_run_target(target_ref, as_module=module)
-    backend_override = _validate_run_backend_override(backend, target)
-    if backend_override is not None:
-        target.execution_backend = backend_override
+    run: Run | None = None
+    result: dict[str, Any] | None = None
+    wait_for_result = wait
+    started_at = time.monotonic()
+    with _run_progress_reporter() as reporter:
+        reporter.update("Loading local Rebase target...")
+        target = _resolve_run_target(target_ref, as_module=module)
+        reporter.complete("Loaded local Rebase target.")
 
-    parameters = _parse_run_parameters(parameters_json, parameter)
-    run = target.ephemeral_run(**parameters)
+        backend_override = _validate_run_backend_override(backend, target)
+        if backend_override is not None:
+            target.execution_backend = backend_override
 
-    if not wait:
+        parameters = _parse_run_parameters(parameters_json, parameter)
+        if isinstance(target, Workflow):
+            reporter.update("Packaging workflow source and step graph...")
+        else:
+            reporter.update("Packaging function source...")
+        run = target.ephemeral_run(**parameters)
+        if isinstance(target, Workflow):
+            reporter.complete("Packaged workflow source and step graph.")
+        else:
+            reporter.complete("Packaged function source.")
+        reporter.complete(f"Created ephemeral run {run.id}.")
+
+        if not wait:
+            reporter.finish("Run submitted.")
+        else:
+            result = _stream_run_result(
+                run,
+                target=target,
+                reporter=reporter,
+                started_at=started_at,
+                timeout=timeout,
+                poll_interval=poll_interval,
+            )
+
+    if run is None:
+        raise RebaseWorkflowError("run did not start")
+    if not wait_for_result:
         console.print(_run_table(run.id, run.status))
         return
-
-    result = run.result(timeout=timeout, poll_interval=poll_interval)
+    if result is None:
+        raise RebaseWorkflowError("run completed without a result")
     console.print_json(data=result)
+
+
+@run_app.command("list")
+def run_list_command(
+    project: Annotated[str | None, typer.Option("--project", help="Filter by project name.")] = None,
+    target_type: Annotated[
+        str | None,
+        typer.Option("--target-type", help="Filter by target type: function or workflow."),
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", min=1, max=500, help="Maximum number of runs to list.")] = 100,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List submitted runs in the active workspace."""
+    if target_type is not None and target_type not in {"function", "workflow"}:
+        raise RebaseWorkflowError("--target-type must be 'function' or 'workflow'")
+
+    client = Client()
+    project_id: str | None = None
+    if project is not None:
+        project_data = _resolve_project_by_name(client, project)
+        project_id = str(project_data["id"])
+
+    runs = client.list_runs(project_id=project_id, target_type=target_type, limit=limit)
+    if json_output:
+        _print_json(runs)
+        return
+    if project is not None:
+        if project_id is None:
+            raise RebaseWorkflowError("project lookup did not return an ID")
+        project_names = {project_id: str(project_data["name"])}
+    else:
+        project_names = _project_name_map(client.list_projects())
+    console.print(_runs_table(runs, project_names=project_names))
+
+
+@run_app.command("get")
+def run_get_command(
+    run_id: Annotated[str, typer.Argument(help="Run ID.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show run metadata."""
+    client = Client()
+    run = client.get_run(run_id)
+    if json_output:
+        _print_json(run)
+        return
+    console.print(
+        _detail_table(
+            "Run",
+            run,
+            preferred_keys=[
+                "id",
+                "target_type",
+                "status",
+                "execution_backend",
+                "project_id",
+                "workflow_id",
+                "function_id",
+                "backend_run_id",
+                "prefect_flow_run_id",
+                "parameters",
+                "result",
+                "error",
+                "timings",
+                "created_at",
+                "started_at",
+                "finished_at",
+            ],
+        )
+    )
+
+
+@run_app.command("logs")
+def run_logs_command(
+    run_id: Annotated[str, typer.Argument(help="Run ID.")],
+    follow: Annotated[
+        bool,
+        typer.Option("--follow/--no-follow", help="Follow until the run reaches a terminal state."),
+    ] = True,
+    poll_interval: Annotated[
+        float,
+        typer.Option("--poll-interval", help="Seconds between run status polls when following."),
+    ] = 1.0,
+    timeout: Annotated[int, typer.Option("--timeout", help="Maximum seconds to follow the run.")] = 600,
+    json_output: Annotated[bool, typer.Option("--json", help="Print raw event and step JSON output.")] = False,
+) -> None:
+    """Show persisted run events and workflow step state."""
+    client = Client()
+    run_data = client.get_run(run_id)
+    events = client.list_run_events(run_id)
+    steps = client.list_run_steps(run_id) if run_data.get("target_type") == "workflow" else []
+    if json_output:
+        _print_json(_raw_run_logs(run_data, events, steps))
+        return
+
+    run = Run(run_id, client=client, data=run_data)
+    with _run_progress_reporter() as reporter:
+        if not follow:
+            _render_run_snapshot(run=run_data, events=events, steps=steps, reporter=reporter)
+            return
+        _stream_run_result(
+            run,
+            target_type=str(run_data.get("target_type") or ""),
+            reporter=reporter,
+            started_at=time.monotonic(),
+            timeout=timeout,
+            poll_interval=poll_interval,
+            return_result=False,
+        )
+
+
+@run_app.command("cancel")
+def run_cancel_command(
+    run_id: Annotated[str, typer.Argument(help="Run ID.")],
+) -> None:
+    """Cancel a run."""
+    raise RebaseWorkflowError(f"run cancellation is not supported yet: {run_id}")
+
+
+def _parse_logo_variant(args: list[str]) -> tuple[int, list[str]]:
+    """Strip --logo N from args and return (variant, remaining_args)."""
+    variant = 1
+    remaining: list[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--logo" and i + 1 < len(args):
+            try:
+                variant = int(args[i + 1])
+            except ValueError:
+                remaining.extend(args[i : i + 2])
+            i += 2
+        elif args[i].startswith("--logo="):
+            try:
+                variant = int(args[i].split("=", 1)[1])
+            except ValueError:
+                remaining.append(args[i])
+            i += 1
+        else:
+            remaining.append(args[i])
+            i += 1
+    return variant, remaining
 
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
-    if not args:
+    logo_variant, args = _parse_logo_variant(list(args))
+    if not args or args == ["--help"]:
+        console.print(_banner(logo_variant))
         try:
             app(args=["--help"], prog_name="rebase", standalone_mode=True)
         except SystemExit as exc:
@@ -986,7 +1492,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        app(args=args, prog_name="rebase", standalone_mode=False)
+        if len(args) > 1 and args[0] == "run" and args[1] in RUN_INSPECTION_COMMANDS:
+            run_app(args=args[1:], prog_name="rebase run", standalone_mode=False)
+        else:
+            app(args=args, prog_name="rebase", standalone_mode=False)
         return 0
     except RebaseWorkflowError as exc:
         error_console.print(f"Error: {exc}", style="rebase.error")

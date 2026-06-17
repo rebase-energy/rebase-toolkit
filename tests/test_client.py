@@ -59,6 +59,56 @@ def test_client_get_project_requests_project_endpoint(monkeypatch) -> None:
     }
 
 
+def test_client_lists_run_events_from_events_endpoint(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["headers"] = kwargs["headers"]
+        return FakeResponse([{"id": "event-id", "message": "Accepted run request."}])
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    assert client.list_run_events("run-id") == [{"id": "event-id", "message": "Accepted run request."}]
+
+    assert observed == {
+        "method": "GET",
+        "url": "https://workflows.example.com/runs/run-id/events",
+        "headers": {"Authorization": "Bearer rbw_test"},
+    }
+
+
+def test_client_lists_runs_with_filters(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["headers"] = kwargs["headers"]
+        observed["params"] = kwargs["params"]
+        return FakeResponse([{"id": "run-id", "status": "succeeded"}])
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    assert client.list_runs(project_id="project-id", target_type="workflow", limit=25) == [
+        {"id": "run-id", "status": "succeeded"}
+    ]
+
+    assert observed == {
+        "method": "GET",
+        "url": "https://workflows.example.com/runs",
+        "headers": {"Authorization": "Bearer rbw_test"},
+        "params": {
+            "project_id": "project-id",
+            "target_type": "workflow",
+            "limit": 25,
+        },
+    }
+
+
 def test_client_uses_hosted_api_url_by_default(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(tmp_path / "missing-config.json"))
 
