@@ -23,7 +23,20 @@ from rich.text import Text
 from rich.theme import Theme
 from rich.tree import Tree
 
-from rebase.client import Client, Function, FunctionBackend, Project, RebaseWorkflowError, Run, Step, Workflow
+from rebase.client import (
+    Agent,
+    Client,
+    Function,
+    FunctionBackend,
+    Model,
+    Optimizer,
+    Predictor,
+    Project,
+    RebaseWorkflowError,
+    Run,
+    Step,
+    Workflow,
+)
 from rebase.config import (
     DEFAULT_PROFILE,
     DEFAULT_SERVER_URL,
@@ -219,7 +232,7 @@ def _load_target_module(source_ref: str, *, as_module: bool) -> ModuleType:
     return _load_module(Path(source_ref))
 
 
-RunnableTarget = Function | Workflow
+RunnableTarget = Function | Workflow | Model
 
 
 def _function_objects(module: ModuleType) -> list[tuple[str, Function]]:
@@ -233,9 +246,19 @@ def _function_objects(module: ModuleType) -> list[tuple[str, Function]]:
 def _runnable_objects(module: ModuleType) -> list[tuple[str, RunnableTarget]]:
     return [
         (name, target)
-        for name, target in _unique_named_objects(module, (Function, Workflow))
+        for name, target in _unique_named_objects(module, (Function, Workflow, Model))
         if not isinstance(target, Step)
     ]
+
+
+def _model_target_type(target: Model) -> str:
+    if isinstance(target, Predictor):
+        return "predictor"
+    if isinstance(target, Optimizer):
+        return "optimizer"
+    if isinstance(target, Agent):
+        return "agent"
+    return "model"
 
 
 def _resolve_object_ref(module: ModuleType, object_ref: str, *, target_ref: str) -> Any:
@@ -257,14 +280,15 @@ def _resolve_run_target(target_ref: str, *, as_module: bool = False) -> Runnable
         target = _resolve_object_ref(module, object_ref, target_ref=target_ref)
         if isinstance(target, Step):
             raise RebaseWorkflowError("rebase run cannot run a step directly; run the workflow that uses it")
-        if not isinstance(target, (Function, Workflow)):
-            raise RebaseWorkflowError(f"target is not a Rebase function or workflow: {object_ref}")
+        if not isinstance(target, (Function, Workflow, Model)):
+            raise RebaseWorkflowError(f"target is not a Rebase function, workflow, or model: {object_ref}")
         return target
 
     targets = _runnable_objects(module)
     if not targets:
         raise RebaseWorkflowError(
-            "No runnable Rebase targets found. Define one top-level rb.function(...) or rb.workflow(...) target."
+            "No runnable Rebase targets found. Define one top-level rb.function(...), rb.workflow(...), "
+            "rb.Predictor, rb.Optimizer, or rb.Agent instance target."
         )
     if len(targets) > 1:
         names = ", ".join(name for name, _target in targets)
@@ -638,7 +662,7 @@ def deploy_file(path: str | Path, *, object_names: Iterable[str] | None = None) 
     if all_projects and selected_names:
         raise RebaseWorkflowError(f"No matching Rebase project found for: {', '.join(sorted(selected_names))}")
 
-    deployables = _unique_named_objects(module, (Workflow, Function))
+    deployables = _unique_named_objects(module, (Workflow, Function, Model))
     deployables = [(name, item) for name, item in deployables if not isinstance(item, Step)]
     if selected_names:
         deployables = [
@@ -649,12 +673,15 @@ def deploy_file(path: str | Path, *, object_names: Iterable[str] | None = None) 
     if not deployables:
         raise RebaseWorkflowError(
             "No deployable Rebase objects found. Define a top-level rb.project(...), "
-            "rb.workflow(...), or rb.function(...)."
+            "rb.workflow(...), rb.function(...), rb.Predictor, rb.Optimizer, or rb.Agent instance."
         )
 
     for name, deployable in deployables:
         deployable.deploy()
-        deployed.append((deployable.__class__.__name__.lower(), deployable.name or name, deployable.id))
+        target_type = (
+            _model_target_type(deployable) if isinstance(deployable, Model) else deployable.__class__.__name__.lower()
+        )
+        deployed.append((target_type, deployable.name or name, deployable.id))
     return deployed
 
 
@@ -1291,7 +1318,7 @@ def run_command(
         typer.Option("--poll-interval", help="Seconds between run status polls."),
     ] = 1.0,
 ) -> None:
-    """Run a Rebase function or workflow from local source without deploying it."""
+    """Run a Rebase function, workflow, or model from local source without deploying it."""
     run: Run | None = None
     result: dict[str, Any] | None = None
     wait_for_result = wait
@@ -1308,11 +1335,15 @@ def run_command(
         parameters = _parse_run_parameters(parameters_json, parameter)
         if isinstance(target, Workflow):
             reporter.update("Packaging workflow source and step graph...")
+        elif isinstance(target, Model):
+            reporter.update("Packaging model source...")
         else:
             reporter.update("Packaging function source...")
         run = target.ephemeral_run(**parameters)
         if isinstance(target, Workflow):
             reporter.complete("Packaged workflow source and step graph.")
+        elif isinstance(target, Model):
+            reporter.complete("Packaged model source.")
         else:
             reporter.complete("Packaged function source.")
         reporter.complete(f"Created ephemeral run {run.id}.")

@@ -143,6 +143,33 @@ If the file contains exactly one Rebase function, the function name can be omitt
 rebase run functions.py --parameters-json '{"a": 2, "b": 3}'
 ```
 
+## Models
+
+`rebase.Model` is the shared base for model metadata and deployment config. Deployable models use typed emflow-style
+subclasses such as `rebase.Predictor`, `rebase.Optimizer`, and `rebase.Agent`.
+
+```python
+import rebase
+
+
+class PriceForecastPredictor(rebase.Predictor):
+    name = "price-forecast"
+
+    def predict(self, zone: str = "SE3", horizon_hours: int = 24) -> dict:
+        return {"zone": zone, "horizon_hours": horizon_hours}
+
+
+model = PriceForecastPredictor()
+rebase.deploy(model)
+```
+
+Call a deployed model through its generated `predict` endpoint:
+
+```python
+model = rebase.get_predictor("default/price-forecast")
+result = model.predict.remote(zone="SE4")
+```
+
 ## Dependencies
 
 Function dependencies are declared with a Modal-like image builder:
@@ -160,11 +187,11 @@ def add_with_boltons(a: int = 0, b: int = 0) -> dict:
 
 ## Data and Modeling Packages
 
-The toolkit keeps Rebase's data/modeling libraries optional:
+The toolkit includes `emflow` for Rebase model classes and keeps the direct EnergyDataModel import optional:
 
 ```python
 from rebase import data
 from rebase import modeling
 ```
 
-Install `rebase-toolkit[data]` for `energydatamodel` and `rebase-toolkit[modeling]` for `emflow`.
+Install `rebase-toolkit[data]` if you want to import `energydatamodel` directly through `rebase.data`.

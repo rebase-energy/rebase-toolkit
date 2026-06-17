@@ -750,6 +750,153 @@ def test_function_ephemeral_run_sends_source_without_deploy(monkeypatch) -> None
     assert "def add(a: int, b: int) -> dict:" in observed["source_code"]
 
 
+def test_predictor_as_function_generates_predict_wrapper() -> None:
+    class PriceForecastPredictor(rb.Predictor):
+        name = "price-forecast"
+
+        def predict(self, zone: str = "SE3", horizon_hours: int = 24) -> dict:
+            return {"zone": zone, "horizon_hours": horizon_hours}
+
+    model = PriceForecastPredictor(project="models", dependencies=["boltons==25.0.0"])
+    function = model.as_function()
+
+    assert function.project == "models"
+    assert function.name == "price-forecast"
+    assert function.entrypoint == "predict"
+    assert function.default_parameters == {"zone": "SE3", "horizon_hours": 24}
+    assert function.execution_backend == "cloud_run"
+    assert function.image_spec is not None
+    assert "boltons==25.0.0" in function.image_spec["uv_pip_packages"]
+    assert any("emflow" in package for package in function.image_spec["uv_pip_packages"])
+    assert "class PriceForecastPredictor(rb.Predictor):" in str(function.source_code)
+    assert "def predict(zone: str = 'SE3', horizon_hours: int = 24) -> dict:" in str(function.source_code)
+    assert "model = PriceForecastPredictor()" in str(function.source_code)
+    assert "return model.predict(zone=zone, horizon_hours=horizon_hours)" in str(function.source_code)
+
+
+def test_predictor_deploy_registers_function(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "find_function", lambda name, *, project: None)
+
+    def fake_register_function(**kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        return {"id": "function-id", "name": kwargs["name"], "current_version_id": "version-id"}
+
+    monkeypatch.setattr(client, "register_function", fake_register_function)
+
+    class PriceForecastPredictor(rb.Predictor):
+        name = "price-forecast"
+
+        def predict(self, zone: str = "SE3") -> dict:
+            return {"zone": zone}
+
+    model = PriceForecastPredictor(project="models", client=client).deploy()
+
+    assert model.id == "function-id"
+    assert observed["project"] == "models"
+    assert observed["name"] == "price-forecast"
+    assert observed["entrypoint"] == "predict"
+    assert observed["default_parameters"] == {"zone": "SE3"}
+    assert observed["execution_backend"] == "cloud_run"
+    assert any("emflow" in package for package in observed["image_spec"]["uv_pip_packages"])
+
+
+def test_predictor_ephemeral_run_sends_function_payload(monkeypatch) -> None:
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    observed: dict[str, Any] = {}
+
+    def fake_run_ephemeral(**kwargs: Any) -> rb.Run:
+        observed.update(kwargs)
+        return rb.Run("run-id", client=client, data={"id": "run-id", "status": "submitted"})
+
+    monkeypatch.setattr(client, "run_ephemeral", fake_run_ephemeral)
+    monkeypatch.setattr(
+        rb.Function,
+        "deploy",
+        lambda self, **kwargs: pytest.fail("ephemeral model run should not deploy"),
+    )
+
+    class PriceForecastPredictor(rb.Predictor):
+        name = "price-forecast"
+
+        def predict(self, zone: str = "SE3") -> dict:
+            return {"zone": zone}
+
+    run = PriceForecastPredictor(project="models", client=client).ephemeral_run(zone="SE4")
+
+    assert run.id == "run-id"
+    assert observed["target_type"] == "function"
+    assert observed["project"] == "models"
+    assert observed["name"] == "price-forecast"
+    assert observed["entrypoint"] == "predict"
+    assert observed["parameters"] == {"zone": "SE4"}
+    assert observed["default_parameters"] == {"zone": "SE3"}
+    assert observed["execution_backend"] == "cloud_run"
+
+
+def test_optimizer_as_function_generates_optimize_wrapper() -> None:
+    class DispatchOptimizer(rb.Optimizer):
+        name = "dispatch-optimizer"
+
+        def optimize(self, site_id: str, horizon_hours: int = 24) -> dict:
+            return {"site_id": site_id, "horizon_hours": horizon_hours}
+
+    function = DispatchOptimizer(project="models").as_function()
+
+    assert function.name == "dispatch-optimizer"
+    assert function.entrypoint == "optimize"
+    assert function.default_parameters == {"horizon_hours": 24}
+    assert "class DispatchOptimizer(rb.Optimizer):" in str(function.source_code)
+    assert "def optimize(site_id: str, horizon_hours: int = 24) -> dict:" in str(function.source_code)
+    assert "return model.optimize(site_id=site_id, horizon_hours=horizon_hours)" in str(function.source_code)
+
+
+def test_agent_as_function_generates_act_wrapper() -> None:
+    class BatteryAgent(rb.Agent):
+        name = "battery-agent"
+
+        def act(self, state: dict) -> dict:
+            return {"action": "hold", "state": state}
+
+    function = BatteryAgent(project="models").as_function()
+
+    assert function.name == "battery-agent"
+    assert function.entrypoint == "act"
+    assert function.default_parameters == {}
+    assert "class BatteryAgent(rb.Agent):" in str(function.source_code)
+    assert "def act(state: dict) -> dict:" in str(function.source_code)
+    assert "return model.act(state=state)" in str(function.source_code)
+
+
+def test_plain_model_is_not_directly_deployable() -> None:
+    class BaseEnergyModel(rb.Model):
+        name = "base-energy-model"
+
+    with pytest.raises(rb.RebaseWorkflowError, match="rebase.Model is not directly deployable"):
+        BaseEnergyModel().as_function()
+
+
+def test_simulator_is_local_only_for_cloud_deploy() -> None:
+    class BatterySimulator(rb.Simulator):
+        name = "battery-simulator"
+
+        def _transition_function(self, state, action):
+            return state
+
+        def _gather_info(self):
+            return {}
+
+        def reset(self):
+            return {}
+
+        def step(self, action=None):
+            return {}, {}
+
+    with pytest.raises(rb.RebaseWorkflowError, match="Simulator cloud deployment is not supported"):
+        BatterySimulator().deploy()
+
+
 def test_workflow_ephemeral_run_embeds_step_sources_without_deploy(monkeypatch) -> None:
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     observed: dict[str, Any] = {}

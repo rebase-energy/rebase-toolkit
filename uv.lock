@@ -147,7 +147,7 @@ wheels = [
 [[package]]
 name = "emflow"
 version = "0.2.0"
-source = { git = "ssh://git@github.com/rebase-energy/emflow.git#2d0205e1b479d439df72e50c6865735d0b26de8d" }
+source = { git = "https://github.com/rebase-energy/emflow.git?rev=2d0205e1b479d439df72e50c6865735d0b26de8d#2d0205e1b479d439df72e50c6865735d0b26de8d" }
 dependencies = [
     { name = "energydatamodel" },
     { name = "fsspec" },
@@ -158,7 +158,7 @@ dependencies = [
 [[package]]
 name = "energydatamodel"
 version = "0.7.0"
-source = { git = "ssh://git@github.com/rebase-energy/EnergyDataModel.git#8f0724d32af5470968321bb39b6145ab63291692" }
+source = { git = "https://github.com/rebase-energy/EnergyDataModel.git?rev=8f0724d32af5470968321bb39b6145ab63291692#8f0724d32af5470968321bb39b6145ab63291692" }
 dependencies = [
     { name = "geopandas" },
     { name = "pandas" },
@@ -842,6 +842,7 @@ version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
+    { name = "emflow" },
     { name = "requests" },
     { name = "rich" },
     { name = "typer" },
@@ -849,14 +850,10 @@ dependencies = [
 
 [package.optional-dependencies]
 all = [
-    { name = "emflow" },
     { name = "energydatamodel" },
 ]
 data = [
     { name = "energydatamodel" },
-]
-modeling = [
-    { name = "emflow" },
 ]
 
 [package.dev-dependencies]
@@ -870,10 +867,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.4.1" },
-    { name = "emflow", marker = "extra == 'all'", git = "ssh://git@github.com/rebase-energy/emflow.git" },
-    { name = "emflow", marker = "extra == 'modeling'", git = "ssh://git@github.com/rebase-energy/emflow.git" },
-    { name = "energydatamodel", marker = "extra == 'all'", git = "ssh://git@github.com/rebase-energy/EnergyDataModel.git" },
-    { name = "energydatamodel", marker = "extra == 'data'", git = "ssh://git@github.com/rebase-energy/EnergyDataModel.git" },
+    { name = "emflow", git = "https://github.com/rebase-energy/emflow.git?rev=2d0205e1b479d439df72e50c6865735d0b26de8d" },
+    { name = "energydatamodel", marker = "extra == 'all'", git = "https://github.com/rebase-energy/EnergyDataModel.git?rev=8f0724d32af5470968321bb39b6145ab63291692" },
+    { name = "energydatamodel", marker = "extra == 'data'", git = "https://github.com/rebase-energy/EnergyDataModel.git?rev=8f0724d32af5470968321bb39b6145ab63291692" },
     { name = "requests", specifier = ">=2.32.0" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "typer", specifier = ">=0.25.1" },

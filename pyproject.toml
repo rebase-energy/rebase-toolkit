@@ -14,6 +14,7 @@ authors = [
 ]
 dependencies = [
     "click>=8.4.1",
+    "emflow @ git+https://github.com/rebase-energy/emflow.git@2d0205e1b479d439df72e50c6865735d0b26de8d",
     "requests>=2.32.0",
     "rich>=15.0.0",
     "typer>=0.25.1",
@@ -28,14 +29,11 @@ rebase = "rebase.cli:main"
 
 [project.optional-dependencies]
 data = [
-    "energydatamodel @ git+ssh://git@github.com/rebase-energy/EnergyDataModel.git",
+    "energydatamodel @ git+https://github.com/rebase-energy/EnergyDataModel.git@8f0724d32af5470968321bb39b6145ab63291692",
 ]
-modeling = [
-    "emflow @ git+ssh://git@github.com/rebase-energy/emflow.git",
-]
+modeling = []
 all = [
-    "energydatamodel @ git+ssh://git@github.com/rebase-energy/EnergyDataModel.git",
-    "emflow @ git+ssh://git@github.com/rebase-energy/emflow.git",
+    "energydatamodel @ git+https://github.com/rebase-energy/EnergyDataModel.git@8f0724d32af5470968321bb39b6145ab63291692",
 ]
 
 [dependency-groups]

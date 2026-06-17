@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any
 
 from rebase.cli import _format_duration, deploy_file, main
-from rebase.client import Client, Function, Project, Run, Workflow
+from rebase.client import Client, Function, Model, Project, Run, Workflow
 
 
 def test_main_without_args_prints_help(capsys) -> None:
@@ -113,6 +113,55 @@ workflow = rb.Workflow(forecast, name="site-forecast")
     assert result == [("workflow", "site-forecast", "site-forecast-id")]
 
 
+def test_deploy_file_deploys_standalone_predictor(monkeypatch, tmp_path: Path) -> None:
+    deployed: list[str] = []
+
+    def fake_model_deploy(self: Model, *, replace: bool = False) -> Model:
+        deployed.append(str(self.name))
+        self.id = f"{self.name}-id"
+        return self
+
+    monkeypatch.setattr(Model, "deploy", fake_model_deploy)
+    model_file = tmp_path / "model.py"
+    model_file.write_text(
+        """
+import rebase as rb
+
+class PriceForecastPredictor(rb.Predictor):
+    name = "price-forecast"
+
+    def predict(self, zone: str = "SE3") -> dict:
+        return {"zone": zone}
+
+model = PriceForecastPredictor()
+""",
+        encoding="utf-8",
+    )
+
+    result = deploy_file(model_file)
+
+    assert deployed == ["price-forecast"]
+    assert result == [("predictor", "price-forecast", "price-forecast-id")]
+
+
+def test_deploy_file_rejects_plain_model(tmp_path: Path, capsys) -> None:
+    model_file = tmp_path / "model.py"
+    model_file.write_text(
+        """
+import rebase as rb
+
+class BaseEnergyModel(rb.Model):
+    name = "base-energy-model"
+
+model = BaseEnergyModel()
+""",
+        encoding="utf-8",
+    )
+
+    assert main(["deploy", str(model_file)]) == 1
+    assert "rebase.Model is not directly deployable" in capsys.readouterr().err
+
+
 def test_main_prints_deployed_targets(monkeypatch, tmp_path: Path, capsys) -> None:
     workflow_file = tmp_path / "workflow.py"
     workflow_file.write_text("import rebase as rb\nproject = rb.Project('energy-forecasting')\n", encoding="utf-8")
@@ -191,6 +240,50 @@ def add(a: int, b: int) -> dict:
     }
     assert "def add(a: int, b: int) -> dict:" in observed["source_code"]
     assert '"sum": 3' in capsys.readouterr().out
+
+
+def test_run_command_runs_model_as_ephemeral_function(monkeypatch, tmp_path: Path, capsys) -> None:
+    model_file = tmp_path / "model.py"
+    model_file.write_text(
+        """
+import rebase as rb
+
+class PriceForecastPredictor(rb.Predictor):
+    name = "price-forecast"
+
+    def predict(self, zone: str = "SE3") -> dict:
+        return {"zone": zone}
+
+model = PriceForecastPredictor()
+""",
+        encoding="utf-8",
+    )
+    observed: dict[str, Any] = {}
+
+    def fake_run_ephemeral(self: Client, **kwargs: Any) -> Run:
+        observed.update(kwargs)
+        return Run("run-id", client=self)
+
+    monkeypatch.setattr(Function, "deploy", lambda self, **kwargs: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(Client, "run_ephemeral", fake_run_ephemeral)
+    monkeypatch.setattr(Client, "list_run_events", lambda self, run_id: [])
+    monkeypatch.setattr(
+        Client,
+        "get_run",
+        lambda self, run_id: {"id": run_id, "status": "succeeded", "result": {"zone": "SE4"}},
+    )
+
+    assert main(["run", str(model_file), "--param", "zone=SE4"]) == 0
+
+    assert observed["target_type"] == "function"
+    assert observed["project"] == "default"
+    assert observed["name"] == "price-forecast"
+    assert observed["entrypoint"] == "predict"
+    assert observed["parameters"] == {"zone": "SE4"}
+    assert observed["default_parameters"] == {"zone": "SE3"}
+    assert any("emflow" in package for package in observed["image_spec"]["uv_pip_packages"])
+    assert "class PriceForecastPredictor(rb.Predictor):" in observed["source_code"]
+    assert '"zone": "SE4"' in capsys.readouterr().out
 
 
 def test_run_command_can_submit_without_waiting(monkeypatch, tmp_path: Path, capsys) -> None:

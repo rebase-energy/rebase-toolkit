@@ -6,10 +6,18 @@ from typing import Any, overload
 from rebase.client import (
     DEFAULT_FUNCTION_BACKEND,
     DEFAULT_WORKFLOW_BACKEND,
+    Agent,
+    AgentHandle,
     Client,
     Function,
     FunctionBackend,
     Image,
+    Model,
+    ModelHandle,
+    Optimizer,
+    OptimizerHandle,
+    Predictor,
+    PredictorHandle,
     Project,
     RebaseWorkflowError,
     Schedule,
@@ -248,9 +256,15 @@ def workflow(
     return decorator
 
 
-def deploy(*targets: Project | Function | Workflow, replace: bool = False) -> Project | Function | Workflow | list[Any]:
+DeployTarget = Project | Function | Workflow | Model
+
+
+def deploy(
+    *targets: DeployTarget,
+    replace: bool = False,
+) -> DeployTarget | list[Any]:
     if not targets:
-        raise RebaseWorkflowError("deploy requires at least one Rebase project, function, or workflow")
+        raise RebaseWorkflowError("deploy requires at least one Rebase project, function, workflow, or model")
     deployed = [target.deploy(replace=replace) for target in targets]
     return deployed[0] if len(deployed) == 1 else deployed
 
@@ -263,6 +277,26 @@ def get_function(project: str, name: str | None = None) -> Function:
 def get_workflow(project: str, name: str | None = None) -> Workflow:
     project_name, workflow_name = _split_ref(project, name=name, target="workflow")
     return Workflow.from_name(project_name, workflow_name)
+
+
+def get_model(project: str, name: str | None = None) -> ModelHandle:
+    project_name, model_name = _split_ref(project, name=name, target="model")
+    return Model.from_name(project_name, model_name)
+
+
+def get_predictor(project: str, name: str | None = None) -> PredictorHandle:
+    project_name, predictor_name = _split_ref(project, name=name, target="predictor")
+    return Predictor.from_name(project_name, predictor_name)
+
+
+def get_optimizer(project: str, name: str | None = None) -> OptimizerHandle:
+    project_name, optimizer_name = _split_ref(project, name=name, target="optimizer")
+    return Optimizer.from_name(project_name, optimizer_name)
+
+
+def get_agent(project: str, name: str | None = None) -> AgentHandle:
+    project_name, agent_name = _split_ref(project, name=name, target="agent")
+    return Agent.from_name(project_name, agent_name)
 
 
 def workspace() -> dict[str, Any]:

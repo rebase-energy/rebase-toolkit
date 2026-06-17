@@ -17,6 +17,38 @@ import requests
 
 from rebase.config import DEFAULT_SERVER_URL, load_profile
 
+try:
+    from emflow.models import Agent as _ImportedEmflowAgent
+    from emflow.models import Model as _ImportedEmflowModel
+    from emflow.models import Optimizer as _ImportedEmflowOptimizer
+    from emflow.models import Predictor as _ImportedEmflowPredictor
+    from emflow.models import Simulator as _ImportedEmflowSimulator
+except ImportError:
+
+    class _ImportedEmflowModel:
+        def __init__(self, name: str | None = None) -> None:
+            self.name = name
+
+    class _ImportedEmflowPredictor(_ImportedEmflowModel):
+        pass
+
+    class _ImportedEmflowOptimizer(_ImportedEmflowModel):
+        pass
+
+    class _ImportedEmflowAgent(_ImportedEmflowModel):
+        pass
+
+    class _ImportedEmflowSimulator(_ImportedEmflowModel):
+        pass
+
+
+_EmflowModel: Any = _ImportedEmflowModel
+_EmflowPredictor: Any = _ImportedEmflowPredictor
+_EmflowOptimizer: Any = _ImportedEmflowOptimizer
+_EmflowAgent: Any = _ImportedEmflowAgent
+_EmflowSimulator: Any = _ImportedEmflowSimulator
+
+
 _default_client: Client | None = None
 _trace_stack: list[_WorkflowTrace] = []
 _UNSET = object()
@@ -65,6 +97,9 @@ DEFAULT_FUNCTION_BACKEND: FunctionBackend = "cloud_run"
 WorkflowBackend = str
 DEFAULT_WORKFLOW_BACKEND: WorkflowBackend = "prefect_cloud_run_service"
 DEFAULT_PYTHON_VERSION = "3.13"
+DEFAULT_MODEL_DEPENDENCY = (
+    "emflow @ git+https://github.com/rebase-energy/emflow.git@2d0205e1b479d439df72e50c6865735d0b26de8d"
+)
 
 
 def _validate_function_backend(backend: FunctionBackend) -> FunctionBackend:
@@ -83,8 +118,12 @@ def _validate_workflow_backend(backend: WorkflowBackend) -> WorkflowBackend:
     return backend
 
 
+def _is_pinned_dependency(package: str) -> bool:
+    return "==" in package or re.search(r"git\+.*\.git@[a-f0-9]{7,40}(?:$|#)", package.strip().lower()) is not None
+
+
 def _warn_unpinned_dependencies(packages: list[str]) -> None:
-    unpinned = [package for package in packages if "==" not in package]
+    unpinned = [package for package in packages if not _is_pinned_dependency(package)]
     if unpinned:
         warnings.warn(
             "Unpinned Rebase function dependencies are allowed but make function versions less reproducible. "
@@ -146,6 +185,55 @@ def _image_spec_for(
     return Image.python().to_dict()
 
 
+def _installs_emflow(package: str) -> bool:
+    normalized = package.strip().lower()
+    return (
+        normalized == "emflow"
+        or normalized.startswith("emflow ")
+        or normalized.startswith("emflow=")
+        or normalized.startswith("emflow>")
+        or normalized.startswith("emflow<")
+        or "github.com/rebase-energy/emflow" in normalized
+    )
+
+
+def _model_dependencies(dependencies: list[str] | tuple[str, ...] | None = None) -> list[str]:
+    packages = [package for package in dependencies or [] if package.strip()]
+    if not any(_installs_emflow(package) for package in packages):
+        packages.append(DEFAULT_MODEL_DEPENDENCY)
+    return packages
+
+
+def _model_image_spec_for(
+    *,
+    image: Image | dict[str, Any] | None = None,
+    dependencies: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any] | None:
+    if image is not None and dependencies:
+        raise ValueError("provide either image or dependencies, not both")
+    if image is None:
+        return _image_spec_for(dependencies=_model_dependencies(dependencies))
+    if isinstance(image, Image):
+        packages = _model_dependencies(image.uv_pip_packages)
+        return Image(
+            kind=image.kind,
+            python_version=image.python_version,
+            uv_pip_packages=packages,
+            uv_version=image.uv_version,
+        ).to_dict()
+    if isinstance(image, dict):
+        if image.get("kind", "python") != "python":
+            raise ValueError("only python images are supported")
+        copied = dict(image)
+        copied["uv_pip_packages"] = _model_dependencies(
+            [str(package) for package in copied.get("uv_pip_packages") or []]
+        )
+        copied.setdefault("python_version", DEFAULT_PYTHON_VERSION)
+        copied.setdefault("uv_version", None)
+        return copied
+    return _image_spec_for(image=image)
+
+
 def configure(*, api_key: str | None = None, api_url: str | None = None, profile: str | None = None) -> None:
     global _default_client
     _default_client = Client(api_key=api_key, api_url=api_url, profile=profile)
@@ -182,6 +270,157 @@ def _source_for(fn: Callable[..., Any], *, target: str) -> str:
     return source
 
 
+def _source_slice(source_lines: list[str], node: ast.AST) -> str:
+    lineno = getattr(node, "lineno", None)
+    end_lineno = getattr(node, "end_lineno", None)
+    if not isinstance(lineno, int) or not isinstance(end_lineno, int):
+        return ""
+    return "\n".join(source_lines[lineno - 1 : end_lineno])
+
+
+def _format_import_alias(alias: ast.alias) -> str:
+    return f"{alias.name} as {alias.asname}" if alias.asname else alias.name
+
+
+def _module_import_source_for(obj: Any) -> tuple[list[str], list[str]]:
+    module = inspect.getmodule(obj)
+    if module is None:
+        return [], []
+    try:
+        source = textwrap.dedent(inspect.getsource(module))
+    except (OSError, TypeError):
+        return [], []
+    try:
+        parsed = ast.parse(source)
+    except SyntaxError:
+        return [], []
+
+    source_lines = source.splitlines()
+    future_imports: list[str] = []
+    imports: list[str] = []
+    for node in parsed.body:
+        if isinstance(node, ast.Import):
+            aliases = [alias for alias in node.names if alias.name != "rebase"]
+            if aliases:
+                imports.append("import " + ", ".join(_format_import_alias(alias) for alias in aliases))
+        elif isinstance(node, ast.ImportFrom):
+            module_name = node.module or ""
+            if module_name == "__future__":
+                future_imports.append(_source_slice(source_lines, node))
+            elif module_name == "rebase" or module_name.startswith("rebase."):
+                continue
+            else:
+                imports.append(_source_slice(source_lines, node))
+    return _dedupe_lines(future_imports), _dedupe_lines(imports)
+
+
+def _dedupe_lines(lines: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for line in lines:
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        deduped.append(line)
+    return deduped
+
+
+def _validate_model_constructor(model: Model) -> None:
+    signature = inspect.signature(model.__class__)
+    required = [
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.default is inspect.Parameter.empty
+        and parameter.kind
+        in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+    ]
+    if required:
+        raise RebaseWorkflowError(
+            "Deployable models must be constructible without required __init__ arguments. "
+            f"Missing defaults for: {', '.join(required)}"
+        )
+
+
+def _source_for_model(model: Model, *, operation_name: str) -> str:
+    _validate_model_constructor(model)
+    try:
+        class_source = textwrap.dedent(inspect.getsource(model.__class__))
+    except OSError as exc:
+        raise RebaseWorkflowError(
+            "Could not read source for model. Define it in a .py file or a notebook cell "
+            "where Python can inspect the class source."
+        ) from exc
+
+    operation = getattr(model, operation_name)
+    signature = inspect.signature(operation)
+    parameter_names: list[str] = []
+    for name, parameter in signature.parameters.items():
+        if parameter.kind in {
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+            inspect.Parameter.POSITIONAL_ONLY,
+        }:
+            raise TypeError(
+                f"{model.__class__.__name__}.{operation_name} can only use positional-or-keyword "
+                "and keyword-only parameters"
+            )
+        parameter_names.append(name)
+
+    call_arguments = ", ".join(f"{name}={name}" for name in parameter_names)
+    call_expression = (
+        f"model.{operation_name}({call_arguments})" if call_arguments else f"model.{operation_name}()"
+    )
+    future_imports, imports = _module_import_source_for(model.__class__)
+    runtime_prelude = textwrap.dedent(
+        """
+        class _RebaseModel:
+            def __init__(self, name=None):
+                cls = type(self)
+                self.name = name if name is not None else getattr(cls, "name", None)
+
+        class _RebasePredictor(_RebaseModel):
+            pass
+
+        class _RebaseOptimizer(_RebaseModel):
+            pass
+
+        class _RebaseAgent(_RebaseModel):
+            pass
+
+        class _RebaseSimulator(_RebaseModel):
+            pass
+
+        class _RebaseNamespace:
+            Model = _RebaseModel
+            Predictor = _RebasePredictor
+            Optimizer = _RebaseOptimizer
+            Agent = _RebaseAgent
+            Simulator = _RebaseSimulator
+
+        rb = _RebaseNamespace()
+        rebase = rb
+        Model = _RebaseModel
+        Predictor = _RebasePredictor
+        Optimizer = _RebaseOptimizer
+        Agent = _RebaseAgent
+        Simulator = _RebaseSimulator
+        """
+    ).strip()
+    wrapper = textwrap.dedent(
+        f"""
+        def {operation_name}{signature}:
+            model = {model.__class__.__name__}()
+            return {call_expression}
+        """
+    ).strip()
+    sections = [*future_imports, *imports, runtime_prelude, class_source.strip(), wrapper]
+    return "\n\n".join(section for section in sections if section) + "\n"
+
+
 def _defaults_for(fn: Callable[..., Any], *, target: str) -> dict[str, Any]:
     signature = inspect.signature(fn)
     defaults: dict[str, Any] = {}
@@ -215,6 +454,11 @@ def _required_parameters_for(fn: Callable[..., Any], *, target: str) -> list[str
 
 def _target_name(fn: FunctionType, name: str | None) -> str:
     return name or fn.__name__.replace("_", "-")
+
+
+def _model_target_name(cls: type[Any]) -> str:
+    name = re.sub(r"(?<!^)(?=[A-Z])", "-", cls.__name__).replace("_", "-").lower()
+    return name or "model"
 
 
 def _node_key_for(name: str, existing: set[str]) -> str:
@@ -1306,6 +1550,266 @@ class Function:
         if self.fn is None:
             raise RebaseWorkflowError("remote function handles cannot be called locally; use .remote(...)")
         return self.fn(*args, **kwargs)
+
+
+MODEL_NOT_DIRECTLY_DEPLOYABLE_ERROR = (
+    "rebase.Model is not directly deployable; inherit from rebase.Predictor, rebase.Optimizer, or rebase.Agent"
+)
+SIMULATOR_NOT_DEPLOYABLE_ERROR = (
+    "rebase.Simulator cloud deployment is not supported yet; simulators are local-only until state/session "
+    "semantics are defined"
+)
+
+
+class _RemoteModelOperation:
+    def __init__(self, function: Function) -> None:
+        self._function = function
+
+    def spawn(self, **parameters: Any) -> Run:
+        return self._function.spawn(**parameters)
+
+    def remote(self, **parameters: Any) -> dict[str, Any]:
+        return self._function.remote(**parameters)
+
+    def run(self, **parameters: Any) -> Run:
+        return self.spawn(**parameters)
+
+    def __call__(self, **parameters: Any) -> dict[str, Any]:
+        return self.remote(**parameters)
+
+
+class ModelHandle:
+    def __init__(self, function: Function, *, operation_name: str | None = None) -> None:
+        self._function = function
+        self.operation_name = operation_name
+        if operation_name is not None:
+            setattr(self, operation_name, _RemoteModelOperation(function))
+
+    @property
+    def id(self) -> str | None:
+        return self._function.id
+
+    @property
+    def name(self) -> str:
+        return str(self._function.name)
+
+    @property
+    def project(self) -> str:
+        return self._function.project
+
+    @property
+    def data(self) -> dict[str, Any]:
+        return self._function.data
+
+    def _operation(self) -> _RemoteModelOperation:
+        if self.operation_name is None:
+            raise RebaseWorkflowError("model handle does not expose a known remote operation")
+        return getattr(self, self.operation_name)
+
+    def spawn(self, **parameters: Any) -> Run:
+        return self._operation().spawn(**parameters)
+
+    def remote(self, **parameters: Any) -> dict[str, Any]:
+        return self._operation().remote(**parameters)
+
+    def run(self, **parameters: Any) -> Run:
+        return self._operation().run(**parameters)
+
+
+class PredictorHandle(ModelHandle):
+    predict: _RemoteModelOperation
+
+    def __init__(self, function: Function) -> None:
+        super().__init__(function, operation_name="predict")
+
+
+class OptimizerHandle(ModelHandle):
+    optimize: _RemoteModelOperation
+
+    def __init__(self, function: Function) -> None:
+        super().__init__(function, operation_name="optimize")
+
+
+class AgentHandle(ModelHandle):
+    act: _RemoteModelOperation
+
+    def __init__(self, function: Function) -> None:
+        super().__init__(function, operation_name="act")
+
+
+def _model_handle_for_function(function: Function) -> ModelHandle:
+    operation_name = function.entrypoint or function.data.get("entrypoint")
+    if operation_name == "predict":
+        return PredictorHandle(function)
+    if operation_name == "optimize":
+        return OptimizerHandle(function)
+    if operation_name == "act":
+        return AgentHandle(function)
+    return ModelHandle(function, operation_name=str(operation_name) if operation_name else None)
+
+
+class Model(_EmflowModel):
+    _operation_name: str | None = None
+    _emflow_init_mode = "name"
+    _not_deployable_message = MODEL_NOT_DIRECTLY_DEPLOYABLE_ERROR
+
+    project: str | None = "default"
+    description: str | None = None
+    default_parameters: dict[str, Any] | None = None
+    backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND
+    dependencies: list[str] | tuple[str, ...] | None = None
+    image: Image | dict[str, Any] | None = None
+    min_instances: int | None = None
+    concurrency: int | None = None
+    enabled: bool = True
+
+    def __init__(
+        self,
+        name: str | None = None,
+        *,
+        project: str | None = None,
+        description: str | None = None,
+        default_parameters: dict[str, Any] | None = None,
+        backend: FunctionBackend | None = None,
+        dependencies: list[str] | tuple[str, ...] | None = None,
+        image: Image | dict[str, Any] | None = None,
+        min_instances: int | None = None,
+        concurrency: int | None = None,
+        enabled: bool | None = None,
+        client: Client | None = None,
+    ) -> None:
+        cls = type(self)
+        resolved_name = name or getattr(cls, "name", None) or _model_target_name(cls)
+        self._init_emflow_base(resolved_name)
+        self.name = resolved_name
+        self.project = project if project is not None else getattr(cls, "project", "default")
+        self.description = description if description is not None else getattr(cls, "description", None)
+        class_default_parameters = getattr(cls, "default_parameters", None)
+        self.default_parameters: dict[str, Any] = (
+            dict(default_parameters)
+            if default_parameters is not None
+            else dict(class_default_parameters or {})
+        )
+        self.execution_backend = _validate_function_backend(
+            backend or getattr(cls, "backend", DEFAULT_FUNCTION_BACKEND)
+        )
+        self.dependencies = dependencies if dependencies is not None else getattr(cls, "dependencies", None)
+        self.image = image if image is not None else getattr(cls, "image", None)
+        self.cloud_run_min_instances = (
+            min_instances if min_instances is not None else getattr(cls, "min_instances", None)
+        )
+        self.cloud_run_concurrency = concurrency if concurrency is not None else getattr(cls, "concurrency", None)
+        self.enabled = enabled if enabled is not None else bool(getattr(cls, "enabled", True))
+        self.client = client
+        self.id: str | None = None
+        self.data: dict[str, Any] = {}
+        self._function: Function | None = None
+
+        if self.project is None:
+            self.project = "default"
+        if self.cloud_run_min_instances is not None and self.cloud_run_min_instances < 0:
+            raise ValueError("min_instances must be greater than or equal to 0")
+        if self.cloud_run_concurrency is not None and self.cloud_run_concurrency < 1:
+            raise ValueError("concurrency must be greater than or equal to 1")
+
+    @classmethod
+    def from_name(cls, project: str, name: str, *, client: Client | None = None) -> ModelHandle:
+        return _model_handle_for_function(Function.from_name(project, name, client=client))
+
+    @property
+    def _client(self) -> Client:
+        return self.client or default_client()
+
+    def _init_emflow_base(self, resolved_name: str) -> None:
+        mode = getattr(type(self), "_emflow_init_mode", "name")
+        if mode == "skip":
+            return
+        try:
+            if mode == "name":
+                super().__init__(resolved_name)
+            else:
+                super().__init__()
+        except TypeError:
+            return
+
+    def _deploy_operation_name(self) -> str:
+        if self._operation_name is None:
+            raise RebaseWorkflowError(self._not_deployable_message)
+        return self._operation_name
+
+    def as_function(self) -> Function:
+        if self._function is None:
+            operation_name = self._deploy_operation_name()
+            operation = getattr(self, operation_name)
+            inferred_defaults = _defaults_for(operation, target=f"{self.__class__.__name__}.{operation_name}")
+            default_parameters = self.default_parameters or {}
+            function = Function(
+                project=str(self.project or "default"),
+                name=str(self.name),
+                description=self.description,
+                default_parameters={**inferred_defaults, **default_parameters},
+                enabled=self.enabled,
+                client=self._client,
+            )
+            function.source_code = _source_for_model(self, operation_name=operation_name)
+            function.entrypoint = operation_name
+            function.execution_backend = self.execution_backend
+            function.image_spec = _model_image_spec_for(image=self.image, dependencies=self.dependencies)
+            function.cloud_run_min_instances = self.cloud_run_min_instances
+            function.cloud_run_concurrency = self.cloud_run_concurrency
+            function.source_metadata = _git_metadata_for(operation)
+            self._function = function
+        return self._function
+
+    def deploy(self, *, replace: bool = False) -> Model:
+        function = self.as_function().deploy(replace=replace)
+        self.id = function.id
+        self.data = function.data
+        return self
+
+    def spawn(self, **parameters: Any) -> Run:
+        return self.as_function().spawn(**parameters)
+
+    def remote(self, **parameters: Any) -> dict[str, Any]:
+        return self.as_function().remote(**parameters)
+
+    def run(self, **parameters: Any) -> Run:
+        return self.spawn(**parameters)
+
+    def ephemeral_run(self, **parameters: Any) -> Run:
+        return self.as_function().ephemeral_run(**parameters)
+
+
+class Predictor(Model, _EmflowPredictor):
+    _operation_name = "predict"
+    _emflow_init_mode = "empty"
+
+    @classmethod
+    def from_name(cls, project: str, name: str, *, client: Client | None = None) -> PredictorHandle:
+        return PredictorHandle(Function.from_name(project, name, client=client))
+
+
+class Optimizer(Model, _EmflowOptimizer):
+    _operation_name = "optimize"
+    _emflow_init_mode = "empty"
+
+    @classmethod
+    def from_name(cls, project: str, name: str, *, client: Client | None = None) -> OptimizerHandle:
+        return OptimizerHandle(Function.from_name(project, name, client=client))
+
+
+class Agent(Model, _EmflowAgent):
+    _operation_name = "act"
+    _emflow_init_mode = "empty"
+
+    @classmethod
+    def from_name(cls, project: str, name: str, *, client: Client | None = None) -> AgentHandle:
+        return AgentHandle(Function.from_name(project, name, client=client))
+
+
+class Simulator(Model, _EmflowSimulator):
+    _emflow_init_mode = "skip"
+    _not_deployable_message = SIMULATOR_NOT_DEPLOYABLE_ERROR
 
 
 class Step(Function):

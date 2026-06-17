@@ -1,7 +1,20 @@
 from typing import Any
 
+import pytest
+
 import rebase as rb
-from rebase.client import Client, Function, Project, Step, Workflow
+from rebase.client import (
+    AgentHandle,
+    Client,
+    Function,
+    Model,
+    OptimizerHandle,
+    Predictor,
+    PredictorHandle,
+    Project,
+    Step,
+    Workflow,
+)
 
 
 def test_version_is_exported() -> None:
@@ -67,6 +80,34 @@ def test_workflow_helper_defaults_project() -> None:
     assert hello_workflow.name == "hello-workflow"
 
 
+def test_model_base_creates_named_model_without_operation() -> None:
+    class BaseEnergyModel(rb.Model):
+        name = "price-forecast"
+
+    model = BaseEnergyModel()
+
+    assert isinstance(model, Model)
+    assert model.name == "price-forecast"
+    assert model.project == "default"
+    with pytest.raises(rb.RebaseWorkflowError, match="rebase.Model is not directly deployable"):
+        model.deploy()
+
+
+def test_predictor_base_creates_named_predictor() -> None:
+    class PriceForecastPredictor(rb.Predictor):
+        name = "price-forecast"
+
+        def predict(self, zone: str = "SE3") -> dict:
+            return {"zone": zone}
+
+    predictor = PriceForecastPredictor()
+
+    assert isinstance(predictor, Predictor)
+    assert predictor.name == "price-forecast"
+    assert predictor.project == "default"
+    assert predictor.predict(zone="SE4") == {"zone": "SE4"}
+
+
 def test_deploy_helper_deploys_targets(monkeypatch) -> None:
     deployed: list[str] = []
 
@@ -79,6 +120,27 @@ def test_deploy_helper_deploys_targets(monkeypatch) -> None:
 
     assert rb.deploy(project) is project
     assert deployed == ["energy-forecasting"]
+
+
+def test_deploy_helper_deploys_models(monkeypatch) -> None:
+    deployed: list[str] = []
+
+    class PriceForecastPredictor(rb.Predictor):
+        name = "price-forecast"
+
+        def predict(self, zone: str = "SE3") -> dict:
+            return {"zone": zone}
+
+    def fake_model_deploy(self: Model, *, replace: bool = False) -> Model:
+        deployed.append(str(self.name))
+        self.id = "function-id"
+        return self
+
+    monkeypatch.setattr(Model, "deploy", fake_model_deploy)
+    model = PriceForecastPredictor()
+
+    assert rb.deploy(model) is model
+    assert deployed == ["price-forecast"]
 
 
 def test_get_function_resolves_project_name(monkeypatch) -> None:
@@ -95,6 +157,48 @@ def test_get_function_resolves_project_name(monkeypatch) -> None:
 
     assert handle.name == "normalize-weather"
     assert observed == {"project": "shared-utils", "name": "normalize-weather"}
+
+
+def test_get_model_returns_predict_handle(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    function = Function(
+        project="models",
+        name="price-forecast",
+        function_id="function-id",
+        data={"id": "function-id", "name": "price-forecast", "entrypoint": "predict"},
+    )
+
+    def fake_from_name(project: str, name: str, *, client: Client | None = None) -> Function:
+        observed["project"] = project
+        observed["name"] = name
+        return function
+
+    monkeypatch.setattr(Function, "from_name", staticmethod(fake_from_name))
+
+    handle = rb.get_model("models/price-forecast")
+
+    assert isinstance(handle, PredictorHandle)
+    assert handle.name == "price-forecast"
+    assert observed == {"project": "models", "name": "price-forecast"}
+
+
+def test_typed_model_getters_return_typed_handles(monkeypatch) -> None:
+    observed: list[tuple[str, str]] = []
+
+    def fake_from_name(project: str, name: str, *, client: Client | None = None) -> Function:
+        observed.append((project, name))
+        return Function(project=project, name=name, function_id="function-id")
+
+    monkeypatch.setattr(Function, "from_name", staticmethod(fake_from_name))
+
+    assert isinstance(rb.get_predictor("models/price"), PredictorHandle)
+    assert isinstance(rb.get_optimizer("models/dispatch"), OptimizerHandle)
+    assert isinstance(rb.get_agent("models/controller"), AgentHandle)
+    assert observed == [
+        ("models", "price"),
+        ("models", "dispatch"),
+        ("models", "controller"),
+    ]
 
 
 def test_workspace_helper_uses_default_client(monkeypatch) -> None:
