@@ -774,16 +774,16 @@ def test_predictor_as_function_generates_predict_wrapper() -> None:
     assert "return model.predict(zone=zone, horizon_hours=horizon_hours)" in str(function.source_code)
 
 
-def test_predictor_deploy_registers_function(monkeypatch) -> None:
+def test_predictor_deploy_registers_model(monkeypatch) -> None:
     observed: dict[str, Any] = {}
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
-    monkeypatch.setattr(client, "find_function", lambda name, *, project: None)
+    monkeypatch.setattr(client, "find_model", lambda name, *, project: None)
 
-    def fake_register_function(**kwargs: Any) -> dict[str, Any]:
+    def fake_register_model(**kwargs: Any) -> dict[str, Any]:
         observed.update(kwargs)
-        return {"id": "function-id", "name": kwargs["name"], "current_version_id": "version-id"}
+        return {"id": "model-id", "name": kwargs["name"], "current_version_id": "version-id"}
 
-    monkeypatch.setattr(client, "register_function", fake_register_function)
+    monkeypatch.setattr(client, "register_model", fake_register_model)
 
     class PriceForecastPredictor(rb.Predictor):
         name = "price-forecast"
@@ -793,16 +793,18 @@ def test_predictor_deploy_registers_function(monkeypatch) -> None:
 
     model = PriceForecastPredictor(project="models", client=client).deploy()
 
-    assert model.id == "function-id"
+    assert model.id == "model-id"
     assert observed["project"] == "models"
     assert observed["name"] == "price-forecast"
-    assert observed["entrypoint"] == "predict"
+    assert observed["kind"] == "predictor"
+    assert observed["operation_name"] == "predict"
+    assert observed["environment"] == "dev"
     assert observed["default_parameters"] == {"zone": "SE3"}
     assert observed["execution_backend"] == "cloud_run"
     assert any("emflow" in package for package in observed["image_spec"]["uv_pip_packages"])
 
 
-def test_predictor_ephemeral_run_sends_function_payload(monkeypatch) -> None:
+def test_predictor_ephemeral_run_sends_model_payload(monkeypatch) -> None:
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     observed: dict[str, Any] = {}
 
@@ -826,13 +828,57 @@ def test_predictor_ephemeral_run_sends_function_payload(monkeypatch) -> None:
     run = PriceForecastPredictor(project="models", client=client).ephemeral_run(zone="SE4")
 
     assert run.id == "run-id"
-    assert observed["target_type"] == "function"
+    assert observed["target_type"] == "model"
     assert observed["project"] == "models"
     assert observed["name"] == "price-forecast"
     assert observed["entrypoint"] == "predict"
     assert observed["parameters"] == {"zone": "SE4"}
     assert observed["default_parameters"] == {"zone": "SE3"}
     assert observed["execution_backend"] == "cloud_run"
+
+
+def test_predictor_handle_runs_model(monkeypatch) -> None:
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(
+        client,
+        "find_model",
+        lambda name, *, project: {
+            "id": "model-id",
+            "name": name,
+            "operation_name": "predict",
+            "project_id": "project-id",
+        },
+    )
+    observed: dict[str, Any] = {}
+
+    def fake_run_model(model_id: str, parameters: dict[str, Any] | None = None, *, environment: str = "dev") -> rb.Run:
+        observed["model_id"] = model_id
+        observed["parameters"] = parameters
+        observed["environment"] = environment
+        return rb.Run(
+            "run-id",
+            client=client,
+            data={"id": "run-id", "status": "succeeded", "result": {"zone": "SE4"}},
+        )
+
+    monkeypatch.setattr(client, "run_model", fake_run_model)
+    monkeypatch.setattr(
+        client,
+        "get_run",
+        lambda run_id: {"id": run_id, "status": "succeeded", "result": {"zone": "SE4"}},
+    )
+
+    result = rb.Predictor.from_name("models", "price-forecast", client=client).predict.remote(
+        environment="staging",
+        zone="SE4",
+    )
+
+    assert result == {"zone": "SE4"}
+    assert observed == {
+        "model_id": "model-id",
+        "parameters": {"zone": "SE4"},
+        "environment": "staging",
+    }
 
 
 def test_optimizer_as_function_generates_optimize_wrapper() -> None:

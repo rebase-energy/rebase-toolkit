@@ -20,6 +20,20 @@ def test_main_without_args_prints_help(capsys) -> None:
     assert "deploy" in output
 
 
+def test_tui_command_invokes_textual_app(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_run_tui(*, project: str | None = None, limit: int = 25, client: Client | None = None) -> None:
+        observed["project"] = project
+        observed["limit"] = limit
+        observed["client"] = client
+
+    monkeypatch.setattr("rebase.tui.run_tui", fake_run_tui)
+
+    assert main(["tui", "--project", "energy", "--limit", "10"]) == 0
+    assert observed == {"project": "energy", "limit": 10, "client": None}
+
+
 def test_format_duration_uses_two_decimal_places() -> None:
     assert _format_duration(0) == "0.00"
     assert _format_duration(1.234) == "1.23"
@@ -242,7 +256,7 @@ def add(a: int, b: int) -> dict:
     assert '"sum": 3' in capsys.readouterr().out
 
 
-def test_run_command_runs_model_as_ephemeral_function(monkeypatch, tmp_path: Path, capsys) -> None:
+def test_run_command_runs_model_as_ephemeral_model(monkeypatch, tmp_path: Path, capsys) -> None:
     model_file = tmp_path / "model.py"
     model_file.write_text(
         """
@@ -275,7 +289,7 @@ model = PriceForecastPredictor()
 
     assert main(["run", str(model_file), "--param", "zone=SE4"]) == 0
 
-    assert observed["target_type"] == "function"
+    assert observed["target_type"] == "model"
     assert observed["project"] == "default"
     assert observed["name"] == "price-forecast"
     assert observed["entrypoint"] == "predict"

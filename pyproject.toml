@@ -17,6 +17,7 @@ dependencies = [
     "emflow @ git+https://github.com/rebase-energy/emflow.git@2d0205e1b479d439df72e50c6865735d0b26de8d",
     "requests>=2.32.0",
     "rich>=15.0.0",
+    "textual>=8.2.7",
     "typer>=0.25.1",
 ]
 

@@ -20,9 +20,16 @@ from rich.live import Live
 from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
-from rich.theme import Theme
 from rich.tree import Tree
 
+from rebase.brand import (
+    BRAND_AMBER,
+    BRAND_BRIGHT_GREEN,
+    BRAND_CORAL_RED,
+    BRAND_MAIN_GREEN,
+    BRAND_MEDIUM_GRAY,
+    REBASE_THEME,
+)
 from rebase.client import (
     Agent,
     Client,
@@ -45,13 +52,6 @@ from rebase.config import (
     set_default_profile,
     write_profile,
 )
-
-BRAND_MAIN_GREEN = "#0D9373"
-BRAND_BRIGHT_GREEN = "#03C497"
-BRAND_MEDIUM_GRAY = "#656565"
-BRAND_CORAL_RED = "#E46962"
-BRAND_AMBER = "#FBAE40"
-BRAND_SLATE_BLUE = "#3F6E91"
 
 _BANNER_LINES = [
     "██████╗  ███████╗ ██████╗   █████╗  ███████╗ ███████╗",
@@ -88,21 +88,6 @@ def _banner(variant: int = 1) -> str | Text:
         text.append(modified + "\n", style=f"bold {BRAND_BRIGHT_GREEN}")
     text.append("\n")
     return text
-
-
-REBASE_THEME = Theme(
-    {
-        "rebase.active": f"bold {BRAND_BRIGHT_GREEN}",
-        "rebase.border": f"dim {BRAND_MEDIUM_GRAY}",
-        "rebase.error": BRAND_CORAL_RED,
-        "rebase.info": BRAND_SLATE_BLUE,
-        "rebase.muted": BRAND_MEDIUM_GRAY,
-        "rebase.success": BRAND_MAIN_GREEN,
-        "rebase.title": f"bold {BRAND_MAIN_GREEN}",
-        "rebase.value": f"bold {BRAND_BRIGHT_GREEN}",
-        "rebase.warning": BRAND_AMBER,
-    }
-)
 
 
 def _apply_typer_brand_styles() -> None:
@@ -162,6 +147,12 @@ function_app = typer.Typer(
 workflow_app = typer.Typer(
     add_completion=False,
     help="Inspect Rebase workflows.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+model_app = typer.Typer(
+    add_completion=False,
+    help="Deploy and operate Rebase models.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -854,6 +845,90 @@ def _workflow_table(workflows: list[dict[str, Any]], *, project_names: dict[str,
     return table
 
 
+def _model_table(models: list[dict[str, Any]], *, project_names: dict[str, str]) -> Table:
+    table = Table(
+        title="Models",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Name", style="rebase.value")
+    table.add_column("Project")
+    table.add_column("Kind")
+    table.add_column("Operation")
+    table.add_column("Backend")
+    table.add_column("ID", style="rebase.muted")
+    table.add_column("Updated", style="rebase.muted")
+    for model in models:
+        project_id = str(model.get("project_id", ""))
+        table.add_row(
+            str(model.get("name", "-")),
+            project_names.get(project_id, project_id or "-"),
+            _format_value(model.get("kind")),
+            _format_value(model.get("operation_name")),
+            _format_value(model.get("execution_backend")),
+            str(model.get("id", "-")),
+            _format_value(model.get("updated_at")),
+        )
+    return table
+
+
+def _deployment_table(deployments: list[dict[str, Any]]) -> Table:
+    table = Table(
+        title="Model Deployments",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Environment", style="rebase.value")
+    table.add_column("Version ID", style="rebase.muted")
+    table.add_column("Previous Version")
+    table.add_column("Updated By")
+    table.add_column("Updated", style="rebase.muted")
+    for deployment in deployments:
+        table.add_row(
+            _format_value(deployment.get("environment")),
+            str(deployment.get("model_version_id", "-")),
+            _format_value(deployment.get("previous_model_version_id")),
+            _format_value(deployment.get("updated_by")),
+            _format_value(deployment.get("updated_at")),
+        )
+    return table
+
+
+def _promotion_request_table(requests: list[dict[str, Any]]) -> Table:
+    table = Table(
+        title="Model Promotion Requests",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("ID", style="rebase.muted")
+    table.add_column("Status", style="rebase.value")
+    table.add_column("Version ID")
+    table.add_column("From")
+    table.add_column("To")
+    table.add_column("Requested By")
+    table.add_column("Updated", style="rebase.muted")
+    for request in requests:
+        table.add_row(
+            str(request.get("id", "-")),
+            _format_value(request.get("status")),
+            str(request.get("model_version_id", "-")),
+            _format_value(request.get("from_environment")),
+            _format_value(request.get("to_environment")),
+            _format_value(request.get("requested_by")),
+            _format_value(request.get("updated_at")),
+        )
+    return table
+
+
 def _version_table(title: str, versions: list[dict[str, Any]]) -> Table:
     table = Table(
         title=title,
@@ -940,6 +1015,28 @@ def _resolve_workflow_selector(
     raise RebaseWorkflowError(f"workflow not found: {project_name}/{name}")
 
 
+def _resolve_model_selector(
+    client: Client,
+    name: str | None,
+    *,
+    model_id: str | None = None,
+    project_name: str | None = None,
+) -> dict[str, Any]:
+    if model_id is not None:
+        if name is not None:
+            raise RebaseWorkflowError("provide either a model name or --id, not both")
+        return client.get_model(model_id)
+    if name is None:
+        raise RebaseWorkflowError("model name is required unless --id is provided")
+    if not project_name:
+        raise RebaseWorkflowError("--project is required when selecting a model by name")
+    project = _resolve_project_by_name(client, project_name)
+    for model in client.list_models(project_id=str(project["id"])):
+        if model.get("name") == name:
+            return model
+    raise RebaseWorkflowError(f"model not found: {project_name}/{name}")
+
+
 def _project_name_map(projects: list[dict[str, Any]]) -> dict[str, str]:
     return {str(project.get("id", "")): str(project.get("name", "-")) for project in projects}
 
@@ -980,6 +1077,23 @@ def setup_command(
     path = write_profile(api_key=api_key, profile=profile, api_url=api_url, workspace=workspace)
     console.print(f"Saved Rebase credentials for profile '[rebase.value]{profile}[/rebase.value]'")
     console.print(f"[rebase.muted]{path}[/rebase.muted]")
+
+
+@app.command("tui")
+def tui_command(
+    project: Annotated[
+        str | None,
+        typer.Option("--project", help="Filter functions and workflows by project name."),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", min=1, max=500, help="Maximum latest runs to load per selected target."),
+    ] = 25,
+) -> None:
+    """Open the Rebase terminal UI."""
+    from rebase.tui import run_tui
+
+    run_tui(project=project, limit=limit)
 
 
 def _show_active_workspace() -> None:
@@ -1257,6 +1371,299 @@ def workflow_versions_command(
 app.add_typer(workflow_app, name="workflow")
 
 
+@model_app.command("list")
+def model_list_command(
+    project: Annotated[str | None, typer.Option("--project", help="Filter by project name.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List models in the active workspace."""
+    client = Client()
+    if project is not None:
+        project_data = _resolve_project_by_name(client, project)
+        models = client.list_models(project_id=str(project_data["id"]))
+        project_names = {str(project_data["id"]): str(project_data["name"])}
+    else:
+        models = client.list_models()
+        project_names = _project_name_map(client.list_projects())
+    if json_output:
+        _print_json(models)
+        return
+    console.print(_model_table(models, project_names=project_names))
+
+
+@model_app.command("get")
+def model_get_command(
+    name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show model metadata."""
+    client = Client()
+    model = _resolve_model_selector(client, name, model_id=model_id, project_name=project)
+    if json_output:
+        _print_json(model)
+        return
+    console.print(
+        _detail_table(
+            "Model",
+            model,
+            preferred_keys=[
+                "name",
+                "id",
+                "project_id",
+                "workspace_id",
+                "kind",
+                "operation_name",
+                "description",
+                "execution_backend",
+                "enabled",
+                "default_parameters",
+                "image_spec",
+                "image_fingerprint",
+                "cloud_run_min_instances",
+                "cloud_run_concurrency",
+                "current_version_id",
+                "created_at",
+                "updated_at",
+            ],
+        )
+    )
+
+
+@model_app.command("deploy")
+def model_deploy_command(
+    file: Annotated[Path, typer.Argument(help="Python file containing a top-level Rebase model.")],
+    name: Annotated[
+        list[str] | None,
+        typer.Option("--name", "-n", help="Deploy only the top-level variable name or model name."),
+    ] = None,
+    environment: Annotated[str, typer.Option("--env", help="Deployment environment: dev, staging, or prod.")] = "dev",
+) -> None:
+    """Deploy model objects from a Python file."""
+    module = _load_module(file)
+    selected_names = set(name or [])
+    models = _unique_named_objects(module, (Model,))
+    if selected_names:
+        models = [
+            (object_name, model)
+            for object_name, model in models
+            if object_name in selected_names or getattr(model, "name", None) in selected_names
+        ]
+    if not models:
+        raise RebaseWorkflowError("No Rebase model objects found in the file.")
+    deployed: list[tuple[str, str, str | None]] = []
+    for object_name, model in models:
+        model.deploy(environment=environment)
+        deployed.append((_model_target_type(model), model.name or object_name, model.id))
+    console.print(_deploy_table(deployed))
+
+
+@model_app.command("run")
+def model_run_command(
+    name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
+    environment: Annotated[str, typer.Option("--env", help="Deployment environment to run.")] = "dev",
+    parameter: Annotated[
+        list[str] | None,
+        typer.Option("--param", "-p", help="Model parameter as name=json_value. Can be passed more than once."),
+    ] = None,
+    parameters_json: Annotated[str | None, typer.Option("--parameters-json", help="JSON object of parameters.")] = None,
+    wait: Annotated[bool, typer.Option("--wait/--no-wait", help="Wait for the run to finish.")] = True,
+    timeout: Annotated[int, typer.Option("--timeout", help="Maximum seconds to wait.")] = 600,
+    poll_interval: Annotated[float, typer.Option("--poll-interval", help="Seconds between status polls.")] = 1.0,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Run a deployed model."""
+    client = Client()
+    model = _resolve_model_selector(client, name, model_id=model_id, project_name=project)
+    parameters = _parse_run_parameters(parameters_json, parameter)
+    run = client.run_model(str(model["id"]), parameters, environment=environment)
+    if not wait:
+        data = run.data or {"id": run.id, "status": run.status}
+        _print_json(data) if json_output else console.print(_run_table(run.id, run.status))
+        return
+    with _run_progress_reporter() as reporter:
+        result = _stream_run_result(
+            run,
+            target_type="model",
+            reporter=reporter,
+            started_at=time.monotonic(),
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
+    if json_output:
+        _print_json(result)
+    else:
+        console.print_json(data=result)
+
+
+@model_app.command("versions")
+def model_versions_command(
+    name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List versions for a model."""
+    client = Client()
+    model = _resolve_model_selector(client, name, model_id=model_id, project_name=project)
+    versions = client.list_model_versions(str(model["id"]))
+    if json_output:
+        _print_json(versions)
+        return
+    console.print(_version_table("Model Versions", versions))
+
+
+@model_app.command("deployments")
+def model_deployments_command(
+    name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List model environment deployments."""
+    client = Client()
+    model = _resolve_model_selector(client, name, model_id=model_id, project_name=project)
+    deployments = client.list_model_deployments(str(model["id"]))
+    if json_output:
+        _print_json(deployments)
+        return
+    console.print(_deployment_table(deployments))
+
+
+@model_app.command("promote")
+def model_promote_command(
+    name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
+    from_environment: Annotated[str, typer.Option("--from", help="Source environment.")] = "dev",
+    to_environment: Annotated[str, typer.Option("--to", help="Target environment.")] = "staging",
+    model_version_id: Annotated[str | None, typer.Option("--version-id", help="Specific model version ID.")] = None,
+    promotion_request_id: Annotated[
+        str | None,
+        typer.Option("--promotion-request-id", help="Approved request ID required for prod."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Promote a model version between environments."""
+    client = Client()
+    model = _resolve_model_selector(client, name, model_id=model_id, project_name=project)
+    deployment = client.promote_model(
+        str(model["id"]),
+        from_environment=from_environment,
+        to_environment=to_environment,
+        model_version_id=model_version_id,
+        promotion_request_id=promotion_request_id,
+    )
+    _print_json(deployment) if json_output else console.print(_detail_table("Model Deployment", deployment))
+
+
+@model_app.command("request-promotion")
+def model_request_promotion_command(
+    name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
+    model_version_id: Annotated[str | None, typer.Option("--version-id", help="Model version ID.")] = None,
+    from_environment: Annotated[str, typer.Option("--from", help="Source environment.")] = "staging",
+    to_environment: Annotated[str, typer.Option("--to", help="Target environment.")] = "prod",
+    reason: Annotated[str | None, typer.Option("--reason", help="Promotion reason.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Request approval to promote a model to prod."""
+    client = Client()
+    model = _resolve_model_selector(client, name, model_id=model_id, project_name=project)
+    resolved_version_id = model_version_id or str(model.get("current_version_id") or "")
+    if not resolved_version_id:
+        raise RebaseWorkflowError("model has no current version; pass --version-id")
+    request = client.create_model_promotion_request(
+        str(model["id"]),
+        model_version_id=resolved_version_id,
+        from_environment=from_environment,
+        to_environment=to_environment,
+        reason=reason,
+    )
+    _print_json(request) if json_output else console.print(_detail_table("Model Promotion Request", request))
+
+
+@model_app.command("promotion-requests")
+def model_promotion_requests_command(
+    name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List promotion requests for a model."""
+    client = Client()
+    model = _resolve_model_selector(client, name, model_id=model_id, project_name=project)
+    requests = client.request("GET", f"/models/{model['id']}/promotion-requests")
+    if not isinstance(requests, list):
+        raise RebaseWorkflowError("expected model promotion request list response")
+    if json_output:
+        _print_json(requests)
+        return
+    console.print(_promotion_request_table(requests))
+
+
+@model_app.command("approve-promotion")
+def model_approve_promotion_command(
+    request_id: Annotated[str, typer.Argument(help="Promotion request ID.")],
+    reason: Annotated[str | None, typer.Option("--reason", help="Review reason.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Approve a model promotion request."""
+    request = Client().approve_model_promotion_request(request_id, reason=reason)
+    _print_json(request) if json_output else console.print(_detail_table("Model Promotion Request", request))
+
+
+@model_app.command("reject-promotion")
+def model_reject_promotion_command(
+    request_id: Annotated[str, typer.Argument(help="Promotion request ID.")],
+    reason: Annotated[str | None, typer.Option("--reason", help="Review reason.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Reject a model promotion request."""
+    request = Client().reject_model_promotion_request(request_id, reason=reason)
+    _print_json(request) if json_output else console.print(_detail_table("Model Promotion Request", request))
+
+
+@model_app.command("rollback")
+def model_rollback_command(
+    name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
+    environment: Annotated[str, typer.Option("--env", help="Environment to roll back.")] = "prod",
+    model_version_id: Annotated[str | None, typer.Option("--version-id", help="Specific prior version ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Roll back a model environment."""
+    client = Client()
+    model = _resolve_model_selector(client, name, model_id=model_id, project_name=project)
+    deployment = client.rollback_model(str(model["id"]), environment=environment, model_version_id=model_version_id)
+    _print_json(deployment) if json_output else console.print(_detail_table("Model Deployment", deployment))
+
+
+@model_app.command("events")
+def model_events_command(
+    name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List model audit events."""
+    client = Client()
+    model = _resolve_model_selector(client, name, model_id=model_id, project_name=project)
+    events = client.list_model_events(str(model["id"]))
+    if json_output:
+        _print_json(events)
+        return
+    console.print(_detail_table("Latest Model Event", events[0]) if events else _detail_table("Latest Model Event", {}))
+
+
+app.add_typer(model_app, name="model")
+
+
 @app.command("deploy")
 def deploy_command(
     file: Annotated[Path, typer.Argument(help="Python file containing a top-level Rebase target.")],
@@ -1375,14 +1782,14 @@ def run_list_command(
     project: Annotated[str | None, typer.Option("--project", help="Filter by project name.")] = None,
     target_type: Annotated[
         str | None,
-        typer.Option("--target-type", help="Filter by target type: function or workflow."),
+        typer.Option("--target-type", help="Filter by target type: function, workflow, or model."),
     ] = None,
     limit: Annotated[int, typer.Option("--limit", min=1, max=500, help="Maximum number of runs to list.")] = 100,
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List submitted runs in the active workspace."""
-    if target_type is not None and target_type not in {"function", "workflow"}:
-        raise RebaseWorkflowError("--target-type must be 'function' or 'workflow'")
+    if target_type is not None and target_type not in {"function", "workflow", "model"}:
+        raise RebaseWorkflowError("--target-type must be 'function', 'workflow', or 'model'")
 
     client = Client()
     project_id: str | None = None

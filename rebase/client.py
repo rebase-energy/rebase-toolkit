@@ -997,6 +997,272 @@ class Client:
             raise RebaseWorkflowError("expected run response")
         return Run(response["id"], client=self, data=response)
 
+    def list_models(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
+        resolved_project_id = project_id
+        if resolved_project_id is None and project is not None:
+            resolved_project = self.find_project(project)
+            if resolved_project is None:
+                return []
+            resolved_project_id = resolved_project["id"]
+        path = f"/projects/{resolved_project_id}/models" if resolved_project_id is not None else "/models"
+        response = self.request("GET", path)
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected model list response")
+        return response
+
+    def get_model(self, model_id: str) -> dict[str, Any]:
+        response = self.request("GET", f"/models/{model_id}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected model response")
+        return response
+
+    def find_model(self, name: str, *, project: str) -> dict[str, Any] | None:
+        for model in self.list_models(project=project):
+            if model["name"] == name:
+                return model
+        return None
+
+    def register_model(
+        self,
+        *,
+        project: str,
+        name: str,
+        kind: str,
+        operation_name: str,
+        source_code: str,
+        description: str | None = None,
+        default_parameters: dict[str, Any] | None = None,
+        execution_backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
+        image_spec: dict[str, Any] | None = None,
+        cloud_run_min_instances: int | None = None,
+        cloud_run_concurrency: int | None = None,
+        enabled: bool = True,
+        environment: str | None = "dev",
+        source_mode: str | None = None,
+        repo_owner: str | None = None,
+        repo_name: str | None = None,
+        repo_path: str | None = None,
+        source_path: str | None = None,
+        git_commit_sha: str | None = None,
+        git_branch: str | None = None,
+        git_tag: str | None = None,
+        git_dirty: bool | None = None,
+    ) -> dict[str, Any]:
+        project_id = self.ensure_project(project)["id"]
+        response = self.request(
+            "POST",
+            f"/projects/{project_id}/models",
+            json={
+                "name": name,
+                "kind": kind,
+                "operation_name": operation_name,
+                "description": description,
+                "source_code": source_code,
+                "default_parameters": default_parameters or {},
+                "execution_backend": execution_backend,
+                "image_spec": image_spec,
+                "cloud_run_min_instances": cloud_run_min_instances,
+                "cloud_run_concurrency": cloud_run_concurrency,
+                "enabled": enabled,
+                "environment": environment,
+                "source_mode": source_mode,
+                "repo_owner": repo_owner,
+                "repo_name": repo_name,
+                "repo_path": repo_path,
+                "source_path": source_path,
+                "git_commit_sha": git_commit_sha,
+                "git_branch": git_branch,
+                "git_tag": git_tag,
+                "git_dirty": git_dirty or False,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected model response")
+        return response
+
+    def update_model(
+        self,
+        model_id: str,
+        *,
+        name: str | None = None,
+        kind: str | None = None,
+        operation_name: str | None = None,
+        source_code: str | None = None,
+        description: str | None = None,
+        default_parameters: dict[str, Any] | None = None,
+        execution_backend: FunctionBackend | None = None,
+        image_spec: dict[str, Any] | None = None,
+        cloud_run_min_instances: int | None = None,
+        cloud_run_concurrency: int | None = None,
+        enabled: bool | None = None,
+        environment: str | None = None,
+        source_mode: str | None = None,
+        repo_owner: str | None = None,
+        repo_name: str | None = None,
+        repo_path: str | None = None,
+        source_path: str | None = None,
+        git_commit_sha: str | None = None,
+        git_branch: str | None = None,
+        git_tag: str | None = None,
+        git_dirty: bool | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            key: value
+            for key, value in {
+                "name": name,
+                "kind": kind,
+                "operation_name": operation_name,
+                "description": description,
+                "source_code": source_code,
+                "default_parameters": default_parameters,
+                "execution_backend": execution_backend,
+                "image_spec": image_spec,
+                "cloud_run_min_instances": cloud_run_min_instances,
+                "cloud_run_concurrency": cloud_run_concurrency,
+                "enabled": enabled,
+                "environment": environment,
+                "source_mode": source_mode,
+                "repo_owner": repo_owner,
+                "repo_name": repo_name,
+                "repo_path": repo_path,
+                "source_path": source_path,
+                "git_commit_sha": git_commit_sha,
+                "git_branch": git_branch,
+                "git_tag": git_tag,
+                "git_dirty": git_dirty,
+            }.items()
+            if value is not None
+        }
+        response = self.request("PATCH", f"/models/{model_id}", json=payload)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected model response")
+        return response
+
+    def run_model(
+        self,
+        model_id: str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        environment: str = "dev",
+    ) -> Run:
+        response = self.request(
+            "POST",
+            f"/models/{model_id}/runs",
+            json={"parameters": parameters or {}, "environment": environment},
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected run response")
+        return Run(response["id"], client=self, data=response)
+
+    def list_model_versions(self, model_id: str) -> list[dict[str, Any]]:
+        response = self.request("GET", f"/models/{model_id}/versions")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected model version list response")
+        return response
+
+    def list_model_deployments(self, model_id: str) -> list[dict[str, Any]]:
+        response = self.request("GET", f"/models/{model_id}/deployments")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected model deployment list response")
+        return response
+
+    def deploy_model_version(
+        self,
+        model_id: str,
+        *,
+        environment: str,
+        model_version_id: str,
+        promotion_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            f"/models/{model_id}/deployments/{environment}",
+            json={"model_version_id": model_version_id, "promotion_request_id": promotion_request_id},
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected model deployment response")
+        return response
+
+    def create_model_promotion_request(
+        self,
+        model_id: str,
+        *,
+        model_version_id: str,
+        from_environment: str = "staging",
+        to_environment: str = "prod",
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            f"/models/{model_id}/promotion-requests",
+            json={
+                "model_version_id": model_version_id,
+                "from_environment": from_environment,
+                "to_environment": to_environment,
+                "reason": reason,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected model promotion request response")
+        return response
+
+    def approve_model_promotion_request(self, request_id: str, *, reason: str | None = None) -> dict[str, Any]:
+        response = self.request("POST", f"/model-promotion-requests/{request_id}/approve", json={"reason": reason})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected model promotion request response")
+        return response
+
+    def reject_model_promotion_request(self, request_id: str, *, reason: str | None = None) -> dict[str, Any]:
+        response = self.request("POST", f"/model-promotion-requests/{request_id}/reject", json={"reason": reason})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected model promotion request response")
+        return response
+
+    def promote_model(
+        self,
+        model_id: str,
+        *,
+        from_environment: str = "dev",
+        to_environment: str,
+        model_version_id: str | None = None,
+        promotion_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            f"/models/{model_id}/promote",
+            json={
+                "from_environment": from_environment,
+                "to_environment": to_environment,
+                "model_version_id": model_version_id,
+                "promotion_request_id": promotion_request_id,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected model deployment response")
+        return response
+
+    def rollback_model(
+        self,
+        model_id: str,
+        *,
+        environment: str = "prod",
+        model_version_id: str | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            f"/models/{model_id}/rollback",
+            json={"environment": environment, "model_version_id": model_version_id},
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected model deployment response")
+        return response
+
+    def list_model_events(self, model_id: str) -> list[dict[str, Any]]:
+        response = self.request("GET", f"/models/{model_id}/events")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected model event list response")
+        return response
+
     def list_function_versions(self, function_id: str) -> list[dict[str, Any]]:
         response = self.request("GET", f"/functions/{function_id}/versions")
         if not isinstance(response, list):
@@ -1221,6 +1487,7 @@ class Client:
         project_id: str | None = None,
         workflow_id: str | None = None,
         function_id: str | None = None,
+        model_id: str | None = None,
         target_type: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
@@ -1230,6 +1497,7 @@ class Client:
                 "project_id": project_id,
                 "workflow_id": workflow_id,
                 "function_id": function_id,
+                "model_id": model_id,
                 "target_type": target_type,
                 "limit": limit,
             }.items()
@@ -1562,90 +1830,122 @@ SIMULATOR_NOT_DEPLOYABLE_ERROR = (
 
 
 class _RemoteModelOperation:
-    def __init__(self, function: Function) -> None:
-        self._function = function
+    def __init__(self, handle: ModelHandle) -> None:
+        self._handle = handle
 
-    def spawn(self, **parameters: Any) -> Run:
-        return self._function.spawn(**parameters)
+    def spawn(self, *, environment: str = "dev", **parameters: Any) -> Run:
+        return self._handle.spawn(environment=environment, **parameters)
 
-    def remote(self, **parameters: Any) -> dict[str, Any]:
-        return self._function.remote(**parameters)
+    def remote(self, *, environment: str = "dev", **parameters: Any) -> dict[str, Any]:
+        return self._handle.remote(environment=environment, **parameters)
 
-    def run(self, **parameters: Any) -> Run:
-        return self.spawn(**parameters)
+    def run(self, *, environment: str = "dev", **parameters: Any) -> Run:
+        return self.spawn(environment=environment, **parameters)
 
-    def __call__(self, **parameters: Any) -> dict[str, Any]:
-        return self.remote(**parameters)
+    def __call__(self, *, environment: str = "dev", **parameters: Any) -> dict[str, Any]:
+        return self.remote(environment=environment, **parameters)
 
 
 class ModelHandle:
-    def __init__(self, function: Function, *, operation_name: str | None = None) -> None:
-        self._function = function
-        self.operation_name = operation_name
-        if operation_name is not None:
-            setattr(self, operation_name, _RemoteModelOperation(function))
+    def __init__(
+        self,
+        data: dict[str, Any],
+        *,
+        client: Client | None = None,
+        project: str | None = None,
+        operation_name: str | None = None,
+    ) -> None:
+        self.data = data
+        self.client = client
+        self.project_name = project
+        self.operation_name = operation_name or data.get("operation_name")
+        if self.operation_name is not None:
+            setattr(self, str(self.operation_name), _RemoteModelOperation(self))
 
     @property
     def id(self) -> str | None:
-        return self._function.id
+        model_id = self.data.get("id")
+        return str(model_id) if model_id is not None else None
 
     @property
     def name(self) -> str:
-        return str(self._function.name)
+        return str(self.data.get("name") or "")
 
     @property
     def project(self) -> str:
-        return self._function.project
+        return self.project_name or str(self.data.get("project_id") or "")
 
     @property
-    def data(self) -> dict[str, Any]:
-        return self._function.data
+    def _client(self) -> Client:
+        return self.client or default_client()
 
     def _operation(self) -> _RemoteModelOperation:
         if self.operation_name is None:
             raise RebaseWorkflowError("model handle does not expose a known remote operation")
         return getattr(self, self.operation_name)
 
-    def spawn(self, **parameters: Any) -> Run:
-        return self._operation().spawn(**parameters)
+    def spawn(self, *, environment: str = "dev", **parameters: Any) -> Run:
+        if self.id is None:
+            raise RebaseWorkflowError("model handle has no ID")
+        return self._client.run_model(self.id, parameters, environment=environment)
 
-    def remote(self, **parameters: Any) -> dict[str, Any]:
-        return self._operation().remote(**parameters)
+    def remote(self, *, environment: str = "dev", **parameters: Any) -> dict[str, Any]:
+        return self.spawn(environment=environment, **parameters).result()
 
-    def run(self, **parameters: Any) -> Run:
-        return self._operation().run(**parameters)
+    def run(self, *, environment: str = "dev", **parameters: Any) -> Run:
+        return self.spawn(environment=environment, **parameters)
 
 
 class PredictorHandle(ModelHandle):
     predict: _RemoteModelOperation
 
-    def __init__(self, function: Function) -> None:
-        super().__init__(function, operation_name="predict")
+    def __init__(self, data: dict[str, Any], *, client: Client | None = None, project: str | None = None) -> None:
+        super().__init__(data, client=client, project=project, operation_name="predict")
 
 
 class OptimizerHandle(ModelHandle):
     optimize: _RemoteModelOperation
 
-    def __init__(self, function: Function) -> None:
-        super().__init__(function, operation_name="optimize")
+    def __init__(self, data: dict[str, Any], *, client: Client | None = None, project: str | None = None) -> None:
+        super().__init__(data, client=client, project=project, operation_name="optimize")
 
 
 class AgentHandle(ModelHandle):
     act: _RemoteModelOperation
 
-    def __init__(self, function: Function) -> None:
-        super().__init__(function, operation_name="act")
+    def __init__(self, data: dict[str, Any], *, client: Client | None = None, project: str | None = None) -> None:
+        super().__init__(data, client=client, project=project, operation_name="act")
 
 
-def _model_handle_for_function(function: Function) -> ModelHandle:
-    operation_name = function.entrypoint or function.data.get("entrypoint")
+def _model_handle_for_data(
+    data: dict[str, Any],
+    *,
+    client: Client | None = None,
+    project: str | None = None,
+) -> ModelHandle:
+    operation_name = data.get("operation_name")
     if operation_name == "predict":
-        return PredictorHandle(function)
+        return PredictorHandle(data, client=client, project=project)
     if operation_name == "optimize":
-        return OptimizerHandle(function)
+        return OptimizerHandle(data, client=client, project=project)
     if operation_name == "act":
-        return AgentHandle(function)
-    return ModelHandle(function, operation_name=str(operation_name) if operation_name else None)
+        return AgentHandle(data, client=client, project=project)
+    return ModelHandle(
+        data,
+        client=client,
+        project=project,
+        operation_name=str(operation_name) if operation_name else None,
+    )
+
+
+def _model_kind_for(model: Model) -> str:
+    if isinstance(model, Predictor):
+        return "predictor"
+    if isinstance(model, Optimizer):
+        return "optimizer"
+    if isinstance(model, Agent):
+        return "agent"
+    return "model"
 
 
 class Model(_EmflowModel):
@@ -1714,7 +2014,11 @@ class Model(_EmflowModel):
 
     @classmethod
     def from_name(cls, project: str, name: str, *, client: Client | None = None) -> ModelHandle:
-        return _model_handle_for_function(Function.from_name(project, name, client=client))
+        resolved_client = client or default_client()
+        data = resolved_client.find_model(name, project=project)
+        if data is None:
+            raise RebaseWorkflowError(f"model not found: {project}/{name}")
+        return _model_handle_for_data(data, client=resolved_client, project=project)
 
     @property
     def _client(self) -> Client:
@@ -1761,23 +2065,78 @@ class Model(_EmflowModel):
             self._function = function
         return self._function
 
-    def deploy(self, *, replace: bool = False) -> Model:
-        function = self.as_function().deploy(replace=replace)
-        self.id = function.id
-        self.data = function.data
+    def deploy(self, *, replace: bool = False, environment: str = "dev") -> Model:
+        function = self.as_function()
+        if function.source_code is None or function.entrypoint is None:
+            raise RebaseWorkflowError("cannot deploy a model without source_code and operation entrypoint")
+        model = self._client.find_model(str(self.name), project=str(self.project or "default"))
+        if model is not None:
+            model_data = self._client.update_model(
+                model["id"],
+                kind=_model_kind_for(self),
+                operation_name=function.entrypoint,
+                description=self.description,
+                source_code=function.source_code,
+                default_parameters=function.default_parameters,
+                execution_backend=function.execution_backend,
+                image_spec=function.image_spec,
+                cloud_run_min_instances=function.cloud_run_min_instances,
+                cloud_run_concurrency=function.cloud_run_concurrency,
+                enabled=self.enabled,
+                environment=environment,
+                **function.source_metadata,
+            )
+        else:
+            model_data = self._client.register_model(
+                project=str(self.project or "default"),
+                name=str(self.name),
+                kind=_model_kind_for(self),
+                operation_name=function.entrypoint,
+                description=self.description,
+                source_code=function.source_code,
+                default_parameters=function.default_parameters,
+                execution_backend=function.execution_backend,
+                image_spec=function.image_spec,
+                cloud_run_min_instances=function.cloud_run_min_instances,
+                cloud_run_concurrency=function.cloud_run_concurrency,
+                enabled=self.enabled,
+                environment=environment,
+                **function.source_metadata,
+            )
+        self.id = model_data["id"]
+        self.data = model_data
         return self
 
-    def spawn(self, **parameters: Any) -> Run:
-        return self.as_function().spawn(**parameters)
+    def spawn(self, *, environment: str = "dev", **parameters: Any) -> Run:
+        if self.id is None:
+            self.deploy(environment=environment)
+        if self.id is None:
+            raise RebaseWorkflowError("model has no ID after deployment")
+        return self._client.run_model(self.id, parameters, environment=environment)
 
-    def remote(self, **parameters: Any) -> dict[str, Any]:
-        return self.as_function().remote(**parameters)
+    def remote(self, *, environment: str = "dev", **parameters: Any) -> dict[str, Any]:
+        return self.spawn(environment=environment, **parameters).result()
 
-    def run(self, **parameters: Any) -> Run:
-        return self.spawn(**parameters)
+    def run(self, *, environment: str = "dev", **parameters: Any) -> Run:
+        return self.spawn(environment=environment, **parameters)
 
     def ephemeral_run(self, **parameters: Any) -> Run:
-        return self.as_function().ephemeral_run(**parameters)
+        function = self.as_function()
+        if function.source_code is None or function.entrypoint is None:
+            raise RebaseWorkflowError("cannot run an ephemeral model without local source")
+        return self._client.run_ephemeral(
+            target_type="model",
+            project=str(self.project or "default"),
+            name=str(self.name),
+            source_code=function.source_code,
+            entrypoint=function.entrypoint,
+            default_parameters=function.default_parameters,
+            parameters=parameters,
+            execution_backend=function.execution_backend,
+            image_spec=function.image_spec,
+            cloud_run_min_instances=function.cloud_run_min_instances,
+            cloud_run_concurrency=function.cloud_run_concurrency,
+        )
 
 
 class Predictor(Model, _EmflowPredictor):
@@ -1786,7 +2145,11 @@ class Predictor(Model, _EmflowPredictor):
 
     @classmethod
     def from_name(cls, project: str, name: str, *, client: Client | None = None) -> PredictorHandle:
-        return PredictorHandle(Function.from_name(project, name, client=client))
+        resolved_client = client or default_client()
+        data = resolved_client.find_model(name, project=project)
+        if data is None:
+            raise RebaseWorkflowError(f"model not found: {project}/{name}")
+        return PredictorHandle(data, client=resolved_client, project=project)
 
 
 class Optimizer(Model, _EmflowOptimizer):
@@ -1795,7 +2158,11 @@ class Optimizer(Model, _EmflowOptimizer):
 
     @classmethod
     def from_name(cls, project: str, name: str, *, client: Client | None = None) -> OptimizerHandle:
-        return OptimizerHandle(Function.from_name(project, name, client=client))
+        resolved_client = client or default_client()
+        data = resolved_client.find_model(name, project=project)
+        if data is None:
+            raise RebaseWorkflowError(f"model not found: {project}/{name}")
+        return OptimizerHandle(data, client=resolved_client, project=project)
 
 
 class Agent(Model, _EmflowAgent):
@@ -1804,7 +2171,11 @@ class Agent(Model, _EmflowAgent):
 
     @classmethod
     def from_name(cls, project: str, name: str, *, client: Client | None = None) -> AgentHandle:
-        return AgentHandle(Function.from_name(project, name, client=client))
+        resolved_client = client or default_client()
+        data = resolved_client.find_model(name, project=project)
+        if data is None:
+            raise RebaseWorkflowError(f"model not found: {project}/{name}")
+        return AgentHandle(data, client=resolved_client, project=project)
 
 
 class Simulator(Model, _EmflowSimulator):

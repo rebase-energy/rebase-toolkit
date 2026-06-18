@@ -161,19 +161,13 @@ def test_get_function_resolves_project_name(monkeypatch) -> None:
 
 def test_get_model_returns_predict_handle(monkeypatch) -> None:
     observed: dict[str, Any] = {}
-    function = Function(
-        project="models",
-        name="price-forecast",
-        function_id="function-id",
-        data={"id": "function-id", "name": "price-forecast", "entrypoint": "predict"},
-    )
 
-    def fake_from_name(project: str, name: str, *, client: Client | None = None) -> Function:
+    def fake_find_model(self: Client, name: str, *, project: str) -> dict[str, Any]:
         observed["project"] = project
         observed["name"] = name
-        return function
+        return {"id": "model-id", "name": name, "operation_name": "predict"}
 
-    monkeypatch.setattr(Function, "from_name", staticmethod(fake_from_name))
+    monkeypatch.setattr(Client, "find_model", fake_find_model)
 
     handle = rb.get_model("models/price-forecast")
 
@@ -185,11 +179,11 @@ def test_get_model_returns_predict_handle(monkeypatch) -> None:
 def test_typed_model_getters_return_typed_handles(monkeypatch) -> None:
     observed: list[tuple[str, str]] = []
 
-    def fake_from_name(project: str, name: str, *, client: Client | None = None) -> Function:
+    def fake_find_model(self: Client, name: str, *, project: str) -> dict[str, Any]:
         observed.append((project, name))
-        return Function(project=project, name=name, function_id="function-id")
+        return {"id": f"{name}-id", "name": name, "operation_name": "predict"}
 
-    monkeypatch.setattr(Function, "from_name", staticmethod(fake_from_name))
+    monkeypatch.setattr(Client, "find_model", fake_find_model)
 
     assert isinstance(rb.get_predictor("models/price"), PredictorHandle)
     assert isinstance(rb.get_optimizer("models/dispatch"), OptimizerHandle)
