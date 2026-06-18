@@ -8,7 +8,7 @@ import sys
 import time
 from collections.abc import Iterable
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Annotated, Any
 
 import click
@@ -1056,13 +1056,96 @@ def setup_command(
         bool,
         typer.Option(
             "--verify/--no-verify",
-            help="Verify the API key against the hosted Rebase API before saving it.",
+            help="Verify an API key against the hosted Rebase API before saving it.",
         ),
     ] = True,
+    provider: Annotated[str | None, typer.Option("--provider", help="Supabase social auth provider.")] = None,
+    force_auth: Annotated[
+        bool,
+        typer.Option("--force-auth", help="Ignore any stored Supabase session and authenticate again."),
+    ] = False,
+    callback_port: Annotated[int, typer.Option("--callback-port", help="Local Supabase OAuth callback port.")] = 17658,
+    auth_timeout: Annotated[
+        float,
+        typer.Option("--auth-timeout", help="Seconds to wait for Supabase auth callback."),
+    ] = 300,
+    no_browser: Annotated[
+        bool,
+        typer.Option("--no-browser", help="Print URLs instead of opening the browser."),
+    ] = False,
+    workspace: Annotated[str | None, typer.Option("--workspace", help="Workspace id to use or create.")] = None,
+    workspace_name: Annotated[
+        str | None,
+        typer.Option("--workspace-name", help="Workspace display name when creating a workspace."),
+    ] = None,
+    github: Annotated[
+        bool | None,
+        typer.Option("--github/--no-github", help="Connect or skip GitHub during setup."),
+    ] = None,
+    github_installation_id: Annotated[
+        int | None,
+        typer.Option("--github-installation-id", help="Existing GitHub App installation id."),
+    ] = None,
+    github_timeout: Annotated[
+        float,
+        typer.Option("--github-timeout", help="Seconds to wait for GitHub installation."),
+    ] = 300,
+    poll_interval: Annotated[
+        float,
+        typer.Option("--poll-interval", help="Seconds between GitHub setup status checks."),
+    ] = 1.0,
+    repo: Annotated[
+        str | None,
+        typer.Option("--repo", help="GitHub repository full name, for example owner/name."),
+    ] = None,
+    repo_scope: Annotated[
+        str | None,
+        typer.Option("--repo-scope", help="Connect repo at workspace or project level."),
+    ] = None,
+    repo_path: Annotated[
+        str | None,
+        typer.Option("--repo-path", help="Optional path inside the repository."),
+    ] = None,
+    create_repo: Annotated[
+        bool,
+        typer.Option("--create-repo", help="Open GitHub to create a repository during setup."),
+    ] = False,
+    project: Annotated[
+        str | None,
+        typer.Option("--project", help="Project name for project-level repo connections."),
+    ] = None,
 ) -> None:
-    """Store a Rebase API key on this computer."""
-    api_key = api_key or getpass.getpass("Rebase API key: ")
+    """Authenticate and configure Rebase on this computer."""
+    if api_key is None:
+        from rebase.setup import run_setup
+
+        run_setup(
+            SimpleNamespace(
+                profile=profile,
+                api_url=api_url,
+                provider=provider,
+                force_auth=force_auth,
+                callback_port=callback_port,
+                auth_timeout=auth_timeout,
+                no_browser=no_browser,
+                workspace=workspace,
+                workspace_name=workspace_name,
+                github=github,
+                github_installation_id=github_installation_id,
+                github_timeout=github_timeout,
+                poll_interval=poll_interval,
+                repo=repo,
+                repo_scope=repo_scope,
+                repo_path=repo_path,
+                create_repo=create_repo,
+                project=project,
+            )
+        )
+        return
+
     api_key = api_key.strip()
+    if not api_key:
+        api_key = getpass.getpass("Rebase API key: ").strip()
     if not api_key:
         raise RebaseWorkflowError("API key is required")
 

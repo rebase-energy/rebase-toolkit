@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import os
 import re
 import subprocess
 import textwrap
@@ -15,6 +16,7 @@ from typing import Any, Self
 
 import requests
 
+from rebase.auth import AuthError, load_access_token
 from rebase.config import DEFAULT_SERVER_URL, load_profile
 
 try:
@@ -59,6 +61,20 @@ class RebaseWorkflowError(RuntimeError):
 
 
 RebaseError = RebaseWorkflowError
+
+
+def _response_error_message(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text
+    if isinstance(payload, dict):
+        detail = payload.get("detail")
+        if isinstance(detail, str):
+            return detail
+        if detail is not None:
+            return json.dumps(detail)
+    return response.text
 
 
 class Cron:
@@ -234,9 +250,15 @@ def _model_image_spec_for(
     return _image_spec_for(image=image)
 
 
-def configure(*, api_key: str | None = None, api_url: str | None = None, profile: str | None = None) -> None:
+def configure(
+    *,
+    api_key: str | None = None,
+    api_url: str | None = None,
+    profile: str | None = None,
+    access_token: str | None = None,
+) -> None:
     global _default_client
-    _default_client = Client(api_key=api_key, api_url=api_url, profile=profile)
+    _default_client = Client(api_key=api_key, api_url=api_url, profile=profile, access_token=access_token)
 
 
 def default_client() -> Client:
@@ -696,24 +718,146 @@ class Client:
         api_key: str | None = None,
         api_url: str | None = None,
         profile: str | None = None,
-    ) -> None:
-        profile_data = load_profile(profile)
+        access_token: str | None = None,
+        ) -> None:
+        env_api_key = os.getenv("REBASE_API_KEY") or os.getenv("REBASE_WORKFLOWS_API_KEY")
+        env_access_token = os.getenv("REBASE_ACCESS_TOKEN") or os.getenv("REBASE_WORKFLOWS_ACCESS_TOKEN")
+        explicit_credentials = any(
+            credential is not None for credential in (api_key, access_token, env_api_key, env_access_token)
+        )
+        profile_data = {} if explicit_credentials and profile is None else load_profile(profile)
         configured_api_key = profile_data.get("api_key")
         configured_api_url = profile_data.get("api_url")
-        self.api_key = api_key or (configured_api_key if isinstance(configured_api_key, str) else None)
+        configured_workspace_id = profile_data.get("workspace_id")
+        self.access_token = access_token or env_access_token
+        self.api_key = api_key or env_api_key
+        if self.api_key is None and self.access_token is None and isinstance(configured_api_key, str):
+            self.api_key = configured_api_key
+        self.workspace_id = configured_workspace_id if isinstance(configured_workspace_id, str) else None
         profile_api_url = configured_api_url if isinstance(configured_api_url, str) else None
-        self.api_url = (api_url or profile_api_url or DEFAULT_SERVER_URL).rstrip("/")
+        selected_api_url = api_url or os.getenv("REBASE_WORKFLOWS_API_URL") or profile_api_url or DEFAULT_SERVER_URL
+        self.api_url = selected_api_url.rstrip("/")
 
-    def request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any] | list[dict[str, Any]]:
+    def request(
+        self, method: str, path: str, *, auth: bool = True, **kwargs: Any
+    ) -> dict[str, Any] | list[dict[str, Any]]:
         headers = dict(kwargs.pop("headers", {}))
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        if auth:
+            bearer_token = self.api_key or self.access_token
+            if bearer_token is None:
+                try:
+                    bearer_token = load_access_token()
+                except AuthError as exc:
+                    raise RebaseWorkflowError(str(exc)) from exc
+            if bearer_token:
+                headers["Authorization"] = f"Bearer {bearer_token}"
+        if self.workspace_id and "X-Rebase-Workspace" not in headers:
+            headers["X-Rebase-Workspace"] = self.workspace_id
         response = requests.request(method, f"{self.api_url}{path}", headers=headers, timeout=30, **kwargs)
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
-            raise RebaseWorkflowError(response.text) from exc
+            raise RebaseWorkflowError(_response_error_message(response)) from exc
         return response.json()
+
+    def setup_config(self) -> dict[str, Any]:
+        response = self.request("GET", "/setup/config", auth=False)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected setup config response")
+        return response
+
+    def list_my_workspaces(self) -> list[dict[str, Any]]:
+        response = self.request("GET", "/me/workspaces")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected workspace list response")
+        return response
+
+    def create_workspace(self, workspace_id: str, *, name: str | None = None) -> dict[str, Any]:
+        response = self.request("POST", "/workspaces", json={"id": workspace_id, "name": name})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected workspace response")
+        return response
+
+    def list_platform_invites(self) -> list[dict[str, Any]]:
+        response = self.request("GET", "/platform/invites")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected platform invite list response")
+        return response
+
+    def create_platform_invite(self, email: str, *, expires_at: str | None = None) -> dict[str, Any]:
+        response = self.request("POST", "/platform/invites", json={"email": email, "expires_at": expires_at})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected platform invite response")
+        return response
+
+    def revoke_platform_invite(self, invite_id: str) -> dict[str, Any]:
+        response = self.request("DELETE", f"/platform/invites/{invite_id}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected platform invite response")
+        return response
+
+    def create_github_setup_session(self, *, workspace_id: str | None = None) -> dict[str, Any]:
+        response = self.request("POST", "/integrations/github/setup-sessions", json={"workspace_id": workspace_id})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected GitHub setup response")
+        return response
+
+    def get_github_setup_session(self, setup_session_id: str) -> dict[str, Any]:
+        response = self.request("GET", f"/integrations/github/setup-sessions/{setup_session_id}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected GitHub setup status response")
+        return response
+
+    def list_github_repositories(self, installation_id: int) -> list[dict[str, Any]]:
+        response = self.request("GET", "/integrations/github/repositories", params={"installation_id": installation_id})
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected GitHub repository list response")
+        return response
+
+    def connect_github_repo(
+        self,
+        *,
+        scope: str,
+        installation_id: int,
+        repo_id: int,
+        repo_owner: str,
+        repo_name: str,
+        repo_path: str | None = None,
+        default_branch: str | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            "/integrations/github/repo-connections",
+            json={
+                "scope": scope,
+                "installation_id": installation_id,
+                "repo_id": repo_id,
+                "repo_owner": repo_owner,
+                "repo_name": repo_name,
+                "repo_path": repo_path,
+                "default_branch": default_branch,
+                "project_id": project_id,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected GitHub repo connection response")
+        return response
+
+    def create_github_starter_workflow(
+        self,
+        connection_id: str,
+        *,
+        path: str = ".rebase/starter_workflow.py",
+    ) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            f"/integrations/github/repo-connections/{connection_id}/starter-workflow",
+            json={"path": path},
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected GitHub starter workflow response")
+        return response
 
     def list_projects(self) -> list[dict[str, Any]]:
         response = self.request("GET", "/projects")

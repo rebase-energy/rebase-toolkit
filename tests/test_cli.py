@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from rebase.auth import AuthSession
 from rebase.cli import _format_duration, deploy_file, main
 from rebase.client import Client, Function, Model, Project, Run, Workflow
 
@@ -519,10 +520,9 @@ def test_run_cancel_command_is_explicitly_unsupported(capsys) -> None:
 def test_setup_stores_api_key(monkeypatch, tmp_path: Path, capsys) -> None:
     config_path = tmp_path / "config.json"
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
-    monkeypatch.setattr("getpass.getpass", lambda prompt: "rbw_secret")
     monkeypatch.setattr(Client, "get_workspace", lambda self: {"id": "workspace-id", "name": "ACME"})
 
-    assert main(["setup", "--profile", "test"]) == 0
+    assert main(["setup", "--profile", "test", "--api-key", "rbw_secret"]) == 0
 
     data = json.loads(config_path.read_text(encoding="utf-8"))
     assert data == {
@@ -573,6 +573,76 @@ def test_setup_can_skip_verification(monkeypatch, tmp_path: Path) -> None:
 
     data = json.loads(config_path.read_text(encoding="utf-8"))
     assert data["profiles"]["default"]["api_key"] == "rbw_secret"
+
+
+def test_setup_wizard_stores_supabase_profile(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+
+    class FakeClient:
+        def __init__(
+            self,
+            *,
+            api_key: str | None = None,
+            api_url: str | None = None,
+            profile: str | None = None,
+            access_token: str | None = None,
+        ) -> None:
+            self.api_key = api_key
+            self.api_url = (api_url or "https://workflows.example.com").rstrip("/")
+            self.profile = profile
+            self.access_token = access_token
+
+        def setup_config(self) -> dict[str, Any]:
+            return {
+                "supabase_url": "https://project.supabase.co",
+                "supabase_anon_key": "anon",
+                "github_app_configured": False,
+            }
+
+        def list_my_workspaces(self) -> list[dict[str, Any]]:
+            return [{"id": "default", "name": "Default", "default": True}]
+
+    monkeypatch.setattr("rebase.setup.Client", FakeClient)
+    monkeypatch.setattr("rebase.setup.load_access_token", lambda: "access-token")
+    monkeypatch.setattr(
+        "rebase.setup.load_session",
+        lambda: AuthSession(
+            access_token="access-token",
+            refresh_token="refresh-token",
+            expires_at=2_000_000_000,
+            token_type="bearer",
+            email="sebastian@rebase.energy",
+        ),
+    )
+
+    assert (
+        main(
+            [
+                "setup",
+                "--profile",
+                "local",
+                "--api-url",
+                "https://workflows.example.com",
+                "--workspace",
+                "default",
+                "--no-github",
+            ]
+        )
+        == 0
+    )
+
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data == {
+        "default_profile": "local",
+        "profiles": {
+            "local": {
+                "api_url": "https://workflows.example.com",
+                "workspace_id": "default",
+                "workspace_name": "Default",
+            }
+        },
+    }
 
 
 def test_workspace_lists_profiles(monkeypatch, tmp_path: Path, capsys) -> None:

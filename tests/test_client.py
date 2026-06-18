@@ -1,6 +1,7 @@
 from typing import Any
 
 import pytest
+import requests
 
 import rebase as rb
 from rebase.config import DEFAULT_API_URL, DEFAULT_SERVER_URL, write_profile
@@ -15,6 +16,13 @@ class FakeResponse:
 
     def json(self) -> dict[str, Any] | list[dict[str, Any]]:
         return self._payload
+
+
+class FakeErrorResponse(FakeResponse):
+    text = '{"detail":"Rebase Workflows is invite-only."}'
+
+    def raise_for_status(self) -> None:
+        raise requests.HTTPError("403")
 
 
 def test_client_sends_bearer_token(monkeypatch) -> None:
@@ -35,6 +43,71 @@ def test_client_sends_bearer_token(monkeypatch) -> None:
         "method": "GET",
         "url": "https://workflows.example.com/workflows",
         "headers": {"Authorization": "Bearer rbw_test"},
+    }
+
+
+def test_create_github_starter_workflow_posts_path(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["json"] = kwargs["json"]
+        return FakeResponse(
+            {
+                "repo_owner": "rebase",
+                "repo_name": "platform",
+                "path": ".rebase/starter_workflow.py",
+                "html_url": "https://github.com/rebase/platform/blob/main/.rebase/starter_workflow.py",
+                "commit_sha": "abc123",
+            }
+        )
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    response = client.create_github_starter_workflow("connection-id")
+
+    assert response["commit_sha"] == "abc123"
+    assert observed == {
+        "method": "POST",
+        "url": "https://workflows.example.com/integrations/github/repo-connections/connection-id/starter-workflow",
+        "json": {"path": ".rebase/starter_workflow.py"},
+    }
+
+
+def test_client_uses_fastapi_detail_for_http_errors(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "requests.request",
+        lambda *args, **kwargs: FakeErrorResponse({"detail": "Rebase Workflows is invite-only."}),
+    )
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    with pytest.raises(rb.RebaseWorkflowError) as exc_info:
+        client.list_my_workspaces()
+
+    assert str(exc_info.value) == "Rebase Workflows is invite-only."
+
+
+def test_create_platform_invite_posts_email(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["json"] = kwargs["json"]
+        return FakeResponse({"id": "invite-id", "email": "new@example.com", "status": "pending"})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    response = client.create_platform_invite("new@example.com")
+
+    assert response["email"] == "new@example.com"
+    assert observed == {
+        "method": "POST",
+        "url": "https://workflows.example.com/platform/invites",
+        "json": {"email": "new@example.com", "expires_at": None},
     }
 
 
@@ -140,6 +213,60 @@ def test_client_reads_api_url_from_local_profile(monkeypatch, tmp_path) -> None:
 
     assert client.api_key == "rbw_profile"
     assert client.api_url == "http://127.0.0.1:8080"
+
+
+def test_client_sends_workspace_header_from_local_profile(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    write_profile(
+        api_key="rbw_profile",
+        api_url="http://127.0.0.1:8080",
+        profile="default",
+        workspace={"id": "workspace-id", "name": "ACME"},
+        path=config_path,
+    )
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["headers"] = kwargs["headers"]
+        return FakeResponse([])
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    client = rb.Client()
+    assert client.list_workflows() == []
+
+    assert observed["headers"] == {
+        "Authorization": "Bearer rbw_profile",
+        "X-Rebase-Workspace": "workspace-id",
+    }
+
+
+def test_client_prefers_explicit_access_token_over_profile_api_key(monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    write_profile(
+        api_key="rbw_old",
+        api_url="http://127.0.0.1:8080",
+        profile="default",
+        workspace={"id": "workspace-id", "name": "ACME"},
+        path=config_path,
+    )
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["headers"] = kwargs["headers"]
+        return FakeResponse([])
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    client = rb.Client(access_token="supabase-token", profile="default")
+    assert client.list_my_workspaces() == []
+
+    assert observed["headers"] == {
+        "Authorization": "Bearer supabase-token",
+        "X-Rebase-Workspace": "workspace-id",
+    }
 
 
 def test_client_can_select_named_profile(monkeypatch, tmp_path) -> None:

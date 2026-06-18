@@ -85,7 +85,7 @@ def set_default_profile(profile: str, *, path: Path | None = None) -> Path:
 
 def write_profile(
     *,
-    api_key: str,
+    api_key: str | None = None,
     profile: str = DEFAULT_PROFILE,
     api_url: str | None = None,
     workspace: dict[str, Any] | None = None,
@@ -97,7 +97,9 @@ def write_profile(
     if not isinstance(profiles, dict):
         profiles = {}
 
-    profile_data: dict[str, Any] = {"api_key": api_key}
+    profile_data: dict[str, Any] = {}
+    if api_key:
+        profile_data["api_key"] = api_key
     if api_url:
         profile_data["api_url"] = api_url.rstrip("/")
     if workspace:
