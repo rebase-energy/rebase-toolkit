@@ -494,7 +494,13 @@ def _should_create_repo(args: Any) -> bool:
         return True
     if args.repo:
         return False
-    return _confirm("Create a new GitHub repository?", default=True)
+    selected = _choose(
+        "repository setup",
+        ["Select an existing repository", "Create a new one"],
+        default="Create a new one",
+        title="Do you want to use an existing GitHub repository as your sync repo or create a new one?",
+    )
+    return selected == "Create a new one"
 
 
 def _create_repo_in_browser(args: Any, *, default_name: str) -> str:

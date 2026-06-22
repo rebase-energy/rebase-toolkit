@@ -709,6 +709,30 @@ def test_setup_confirm_uses_selector(monkeypatch) -> None:
     }
 
 
+def test_setup_repo_creation_uses_action_selector(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    observed: dict[str, Any] = {}
+
+    class Args:
+        create_repo = False
+        repo = None
+
+    def fake_choose(label: str, values: list[str], *, default: str | None = None, title: str | None = None) -> str:
+        observed.update({"label": label, "values": values, "default": default, "title": title})
+        return "Create a new one"
+
+    monkeypatch.setattr(setup_module, "_choose", fake_choose)
+
+    assert setup_module._should_create_repo(Args()) is True
+    assert observed == {
+        "label": "repository setup",
+        "values": ["Select an existing repository", "Create a new one"],
+        "default": "Create a new one",
+        "title": "Do you want to use an existing GitHub repository as your sync repo or create a new one?",
+    }
+
+
 def test_main_keyboard_interrupt_aborts_cleanly(monkeypatch, capsys) -> None:
     def interrupting_app(*args: Any, **kwargs: Any) -> None:
         raise KeyboardInterrupt
