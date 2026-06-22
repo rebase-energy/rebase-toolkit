@@ -26,6 +26,10 @@ from rebase.brand import BRAND_BRIGHT_GREEN, BRAND_MEDIUM_GRAY
 from rebase.client import Client, RebaseWorkflowError, _parse_github_remote
 from rebase.config import write_profile
 
+JOIN_WORKSPACE = "Join an existing workspace"
+CREATE_WORKSPACE = "Create a new workspace"
+HANDLE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{1,37}[a-z0-9])?$")
+
 
 class _CallbackHandler(BaseHTTPRequestHandler):
     server: _CallbackServer
@@ -309,6 +313,52 @@ def _prompt(value: str | None, message: str, *, default: str | None = None) -> s
     raise RebaseWorkflowError(f"{message} is required")
 
 
+def _normalize_handle(value: str, *, label: str) -> str:
+    handle = value.strip().lower()
+    if not HANDLE_RE.fullmatch(handle):
+        raise RebaseWorkflowError(
+            f"{label} must be 3-39 characters and contain only letters, numbers, hyphens, or underscores"
+        )
+    return handle
+
+
+def _handle_suggestion(session: Any | None) -> str | None:
+    email = getattr(session, "email", None)
+    if not isinstance(email, str) or "@" not in email:
+        return None
+    local_part = email.split("@", 1)[0].lower()
+    suggestion = re.sub(r"[^a-z0-9_-]+", "-", local_part).strip("-_")
+    if HANDLE_RE.fullmatch(suggestion):
+        return suggestion
+    return None
+
+
+def _get_my_profile(client: Client) -> dict[str, Any]:
+    response = client.request("GET", "/me/profile")
+    if not isinstance(response, dict):
+        raise RebaseWorkflowError("expected profile response")
+    return response
+
+
+def _update_my_profile(client: Client, *, handle: str) -> dict[str, Any]:
+    response = client.request("PATCH", "/me/profile", json={"handle": handle})
+    if not isinstance(response, dict):
+        raise RebaseWorkflowError("expected profile response")
+    return response
+
+
+def _ensure_profile_handle(args: Any, client: Client, *, session: Any | None) -> dict[str, Any]:
+    profile = _get_my_profile(client)
+    existing_handle = profile.get("handle")
+    if isinstance(existing_handle, str) and existing_handle:
+        return profile
+    handle = _prompt(getattr(args, "handle", None), "Choose your Rebase handle", default=_handle_suggestion(session))
+    normalized_handle = _normalize_handle(handle, label="Rebase handle")
+    profile = _update_my_profile(client, handle=normalized_handle)
+    _success(f"Using Rebase handle @{profile['handle']}")
+    return profile
+
+
 def _confirm(message: str, *, default: bool) -> bool:
     default_value = "Yes" if default else "No"
     return _choose("answer", ["Yes", "No"], default=default_value, title=message) == "Yes"
@@ -415,22 +465,42 @@ def _access_token(args: Any, config: dict[str, Any]) -> str:
     return _oauth_session(args, config)
 
 
-def _select_workspace(args: Any, client: Client) -> dict[str, Any]:
+def _workspace_by_id(workspaces: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {str(workspace["id"]): workspace for workspace in workspaces}
+
+
+def _select_joined_workspace(workspace_id: str, workspaces_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    workspace = workspaces_by_id.get(workspace_id)
+    if workspace is None:
+        raise RebaseWorkflowError(f"You do not have access to workspace {workspace_id!r}. Ask an owner to invite you.")
+    return workspace
+
+
+def _select_workspace(args: Any, client: Client, *, session: Any | None) -> dict[str, Any]:
     workspaces = client.list_my_workspaces()
-    workspaces_by_id = {workspace["id"]: workspace for workspace in workspaces}
-    workspace_ids = list(workspaces_by_id)
+    workspaces_by_id = _workspace_by_id(workspaces)
     if args.workspace:
-        if args.workspace not in workspaces_by_id:
-            return client.create_workspace(args.workspace, name=args.workspace_name)
-        return workspaces_by_id[args.workspace]
-    if workspace_ids:
-        default_workspace = next(
-            (workspace["id"] for workspace in workspaces if workspace.get("default")),
-            workspace_ids[0],
-        )
-        selected = _choose("workspace", workspace_ids, default=default_workspace)
-        return workspaces_by_id[selected]
-    workspace_id = _prompt(None, "Workspace id", default="default")
+        workspace_id = _normalize_handle(args.workspace, label="Workspace handle")
+        if workspace_id not in workspaces_by_id:
+            _ensure_profile_handle(args, client, session=session)
+            return client.create_workspace(workspace_id, name=args.workspace_name or workspace_id)
+        return workspaces_by_id[workspace_id]
+    action = _choose(
+        "workspace setup",
+        [JOIN_WORKSPACE, CREATE_WORKSPACE],
+        default=JOIN_WORKSPACE if workspaces else CREATE_WORKSPACE,
+        title="Do you want to join an existing workspace or create a new one?",
+    )
+    if action == JOIN_WORKSPACE:
+        workspace_id = _normalize_handle(_prompt(None, "Workspace handle to join"), label="Workspace handle")
+        return _select_joined_workspace(workspace_id, workspaces_by_id)
+    profile = _ensure_profile_handle(args, client, session=session)
+    profile_handle = profile.get("handle")
+    default_workspace = profile_handle if isinstance(profile_handle, str) and profile_handle else None
+    workspace_id = _normalize_handle(
+        _prompt(None, "Workspace handle to create", default=default_workspace),
+        label="Workspace handle",
+    )
     return client.create_workspace(workspace_id, name=args.workspace_name)
 
 
@@ -580,7 +650,7 @@ def run_setup(args: Any) -> int:
     if session is not None:
         _success(f"Authenticated as {session.email or session.user_id or 'Supabase user'}")
     _section("Workspace")
-    workspace = _select_workspace(args, authed_client)
+    workspace = _select_workspace(args, authed_client, session=session)
     workspace_id = str(workspace["id"])
     path = write_profile(profile=args.profile, api_url=authed_client.api_url, workspace=workspace)
     _success(f"Using workspace {workspace_id}")

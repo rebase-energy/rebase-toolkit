@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from rebase.auth import AuthSession
@@ -707,6 +708,81 @@ def test_setup_confirm_uses_selector(monkeypatch) -> None:
         "default": "No",
         "title": "Connect GitHub now?",
     }
+
+
+def test_setup_workspace_join_prompts_for_workspace_handle(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    class FakeClient:
+        def list_my_workspaces(self) -> list[dict[str, Any]]:
+            return [{"id": "default", "name": "Default", "default": True}]
+
+    prompts: list[str] = []
+
+    monkeypatch.setattr(setup_module, "_choose", lambda *args, **kwargs: setup_module.JOIN_WORKSPACE)
+
+    def fake_prompt(value: str | None, message: str, *, default: str | None = None) -> str:
+        prompts.append(message)
+        return "Default"
+
+    monkeypatch.setattr(setup_module, "_prompt", fake_prompt)
+
+    workspace = setup_module._select_workspace(
+        SimpleNamespace(workspace=None, workspace_name=None, handle=None),
+        FakeClient(),
+        session=None,
+    )
+
+    assert workspace["id"] == "default"
+    assert prompts == ["Workspace handle to join"]
+
+
+def test_setup_workspace_create_claims_profile_handle_first(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[tuple[str, str | None]] = []
+
+    class FakeClient:
+        def list_my_workspaces(self) -> list[dict[str, Any]]:
+            return []
+
+        def request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+            if (method, path) == ("GET", "/me/profile"):
+                calls.append(("get_profile", None))
+                return {"id": "profile-id", "handle": None}
+            assert (method, path) == ("PATCH", "/me/profile")
+            handle = kwargs["json"]["handle"]
+            calls.append(("update_profile", handle))
+            return {"id": "profile-id", "handle": handle}
+
+        def create_workspace(self, workspace_id: str, *, name: str | None = None) -> dict[str, Any]:
+            calls.append(("create_workspace", workspace_id))
+            return {"id": workspace_id, "name": name}
+
+    monkeypatch.setattr(setup_module, "_choose", lambda *args, **kwargs: setup_module.CREATE_WORKSPACE)
+
+    def fake_prompt(value: str | None, message: str, *, default: str | None = None) -> str:
+        if message == "Choose your Rebase handle":
+            assert default == "sebastian"
+            return "SebaHeg"
+        assert message == "Workspace handle to create"
+        assert default == "sebaheg"
+        return default or "fallback"
+
+    monkeypatch.setattr(setup_module, "_prompt", fake_prompt)
+
+    workspace = setup_module._select_workspace(
+        SimpleNamespace(workspace=None, workspace_name=None, handle=None),
+        FakeClient(),
+        session=SimpleNamespace(email="sebastian@rebase.energy"),
+    )
+
+    assert workspace["id"] == "sebaheg"
+    assert calls == [
+        ("get_profile", None),
+        ("update_profile", "sebaheg"),
+        ("create_workspace", "sebaheg"),
+    ]
 
 
 def test_setup_repo_creation_uses_action_selector(monkeypatch) -> None:

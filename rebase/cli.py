@@ -1078,6 +1078,10 @@ def setup_command(
         str | None,
         typer.Option("--workspace-name", help="Workspace display name when creating a workspace."),
     ] = None,
+    handle: Annotated[
+        str | None,
+        typer.Option("--handle", help="Unique Rebase user handle to claim during setup."),
+    ] = None,
     github: Annotated[
         bool | None,
         typer.Option("--github/--no-github", help="Connect or skip GitHub during setup."),
@@ -1131,6 +1135,7 @@ def setup_command(
                     no_browser=no_browser,
                     workspace=workspace,
                     workspace_name=workspace_name,
+                    handle=handle,
                     github=github,
                     github_installation_id=github_installation_id,
                     github_timeout=github_timeout,
