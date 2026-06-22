@@ -658,6 +658,17 @@ def test_setup_prompt_treats_literal_ctrl_c_as_abort(monkeypatch) -> None:
     raise AssertionError("expected KeyboardInterrupt")
 
 
+def test_setup_prompt_restores_terminal_before_input(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[str] = []
+    monkeypatch.setattr(setup_module, "_restore_terminal_for_prompts", lambda: calls.append("restore"))
+    monkeypatch.setattr("builtins.input", lambda _prompt: "1")
+
+    assert setup_module._read_input("auth provider [1-2]: ") == "1"
+    assert calls == ["restore"]
+
+
 def test_main_keyboard_interrupt_aborts_cleanly(monkeypatch, capsys) -> None:
     def interrupting_app(*args: Any, **kwargs: Any) -> None:
         raise KeyboardInterrupt

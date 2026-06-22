@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -77,24 +78,39 @@ class _CallbackServer(HTTPServer):
 
 
 def _restore_terminal_for_prompts() -> None:
-    if not sys.stdin.isatty():
-        return
     try:
         import termios
     except ImportError:
         return
+
+    fds: list[int] = []
+    tty_fd: int | None = None
+    if sys.stdin.isatty():
+        fds.append(sys.stdin.fileno())
     try:
-        fd = sys.stdin.fileno()
-        attrs = termios.tcgetattr(fd)
-        attrs[0] |= termios.ICRNL
-        attrs[3] |= termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG
-        attrs[6][termios.VINTR] = b"\x03"
-        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        tty_fd = os.open("/dev/tty", os.O_RDWR)
     except OSError:
-        return
+        tty_fd = None
+    if tty_fd is not None and tty_fd not in fds:
+        fds.append(tty_fd)
+
+    try:
+        for fd in fds:
+            try:
+                attrs = termios.tcgetattr(fd)
+            except OSError:
+                continue
+            attrs[0] |= termios.ICRNL
+            attrs[3] |= termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG
+            attrs[6][termios.VINTR] = b"\x03" if isinstance(attrs[6][termios.VINTR], bytes) else 3
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    finally:
+        if tty_fd is not None:
+            os.close(tty_fd)
 
 
 def _read_input(prompt: str) -> str:
+    _restore_terminal_for_prompts()
     try:
         entered = input(prompt)
     except EOFError:
