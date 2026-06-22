@@ -66,7 +66,34 @@ You can select a named local profile when needed:
 rebase setup --profile prod
 ```
 
-For local development against the internal workflow API, port-forward the API and store that URL in the profile:
+For fast local development against a locally running workflow API, start the API
+from the platform checkout and run the editable toolkit setup helper:
+
+```bash
+cd /Users/sebaheg/Documents/Github/platform/workflows
+./scripts/dev_api.sh
+
+cd /Users/sebaheg/Documents/Github/platform/rebase-toolkit
+./scripts/dev_setup_local.sh --print-command
+./scripts/dev_setup_local.sh
+```
+
+The helper waits for `http://127.0.0.1:18082/health` and then runs:
+
+```bash
+uv run rebase setup --force-auth --api-url http://127.0.0.1:18082
+```
+
+Common overrides:
+
+```bash
+REBASE_DEV_PROFILE=local ./scripts/dev_setup_local.sh
+REBASE_DEV_PROVIDER=github ./scripts/dev_setup_local.sh
+REBASE_DEV_REPO=sebaheg/toolkit-test REBASE_DEV_GITHUB=1 ./scripts/dev_setup_local.sh
+```
+
+For local development against the internal deployed workflow API, port-forward
+the API and store that URL in the profile:
 
 ```bash
 kubectl -n rebase-workflows port-forward svc/workflow-mvp-api 8080:8080

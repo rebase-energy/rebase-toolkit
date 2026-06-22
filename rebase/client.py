@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import textwrap
 import time
 import warnings
@@ -112,6 +113,8 @@ FunctionBackend = str
 DEFAULT_FUNCTION_BACKEND: FunctionBackend = "cloud_run"
 WorkflowBackend = str
 DEFAULT_WORKFLOW_BACKEND: WorkflowBackend = "prefect_cloud_run_service"
+DeploySource = str
+DEFAULT_DEPLOY_SOURCE: DeploySource = "rebase"
 DEFAULT_PYTHON_VERSION = "3.13"
 DEFAULT_MODEL_DEPENDENCY = (
     "emflow @ git+https://github.com/rebase-energy/emflow.git@2d0205e1b479d439df72e50c6865735d0b26de8d"
@@ -128,10 +131,16 @@ def _validate_function_backend(backend: FunctionBackend) -> FunctionBackend:
 
 def _validate_workflow_backend(backend: WorkflowBackend) -> WorkflowBackend:
     if backend not in {"prefect", "prefect_cloud_run_jobs", "prefect_cloud_run_service"}:
-        raise ValueError(
-            "workflow backend must be 'prefect', 'prefect_cloud_run_jobs', or 'prefect_cloud_run_service'"
-        )
+        raise ValueError("workflow backend must be 'prefect', 'prefect_cloud_run_jobs', or 'prefect_cloud_run_service'")
     return backend
+
+
+def _validate_deploy_source(source: str | None) -> DeploySource | None:
+    if source is None:
+        return None
+    if source not in {"rebase", "github"}:
+        raise ValueError("deploy_source must be 'rebase' or 'github'")
+    return source
 
 
 def _is_pinned_dependency(package: str) -> bool:
@@ -183,6 +192,51 @@ class Image:
             "uv_pip_packages": packages,
             "uv_version": self.uv_version,
         }
+
+
+class HuggingFacePublishConfig:
+    def __init__(
+        self,
+        repo_id: str,
+        *,
+        private: bool = True,
+        repo_type: str = "model",
+        artifact_path: str | Path | None = None,
+        path_in_repo: str | None = None,
+        revision: str = "main",
+        token: str | None = None,
+        create_repo: bool = True,
+        include_source: bool = True,
+        sync_source_git: bool = True,
+        allow_patterns: str | list[str] | None = None,
+        ignore_patterns: str | list[str] | None = None,
+        delete_patterns: str | list[str] | None = None,
+        commit_message: str | None = None,
+    ) -> None:
+        cleaned_repo_id = repo_id.strip()
+        if not cleaned_repo_id or "/" not in cleaned_repo_id or cleaned_repo_id.startswith("/"):
+            raise ValueError("repo_id must use the Hugging Face namespace/name format")
+        if cleaned_repo_id.endswith("/") or "//" in cleaned_repo_id:
+            raise ValueError("repo_id must use the Hugging Face namespace/name format")
+        if repo_type not in {"model", "dataset"}:
+            raise ValueError("repo_type must be 'model' or 'dataset'")
+        cleaned_revision = revision.strip()
+        if not cleaned_revision:
+            raise ValueError("revision cannot be empty")
+        self.repo_id = cleaned_repo_id
+        self.private = private
+        self.repo_type = repo_type
+        self.artifact_path = Path(artifact_path).expanduser() if artifact_path is not None else None
+        self.path_in_repo = path_in_repo.strip("/") if path_in_repo else None
+        self.revision = cleaned_revision
+        self.token = token
+        self.create_repo = create_repo
+        self.include_source = include_source
+        self.sync_source_git = sync_source_git
+        self.allow_patterns = allow_patterns
+        self.ignore_patterns = ignore_patterns
+        self.delete_patterns = delete_patterns
+        self.commit_message = commit_message
 
 
 def _image_spec_for(
@@ -393,9 +447,7 @@ def _source_for_model(model: Model, *, operation_name: str) -> str:
         parameter_names.append(name)
 
     call_arguments = ", ".join(f"{name}={name}" for name in parameter_names)
-    call_expression = (
-        f"model.{operation_name}({call_arguments})" if call_arguments else f"model.{operation_name}()"
-    )
+    call_expression = f"model.{operation_name}({call_arguments})" if call_arguments else f"model.{operation_name}()"
     future_imports, imports = _module_import_source_for(model.__class__)
     runtime_prelude = textwrap.dedent(
         """
@@ -694,7 +746,7 @@ def _git_metadata_for(fn: Callable[..., Any]) -> dict[str, Any]:
     if branch == "HEAD":
         branch = None
     tag = _git(["describe", "--tags", "--exact-match", "HEAD"], cwd=root_path)
-    dirty = _git(["status", "--porcelain"], cwd=root_path) is not None
+    dirty = _git(["status", "--porcelain", "--", str(relative_source_path)], cwd=root_path) is not None
 
     return {
         key: value
@@ -711,6 +763,57 @@ def _git_metadata_for(fn: Callable[..., Any]) -> dict[str, Any]:
     }
 
 
+def _source_metadata_for_deploy(
+    metadata: dict[str, Any],
+    *,
+    deploy_source: str | None,
+    project_source_mode: str | None = None,
+) -> dict[str, Any]:
+    resolved_source = _validate_deploy_source(deploy_source) or DEFAULT_DEPLOY_SOURCE
+    resolved = dict(metadata)
+    if resolved_source == "rebase":
+        resolved["source_mode"] = "rebase_hosted"
+        resolved["git_dirty"] = bool(resolved.get("git_dirty", False))
+        return resolved
+
+    missing = [
+        field for field in ("repo_owner", "repo_name", "source_path", "git_commit_sha") if not resolved.get(field)
+    ]
+    if missing:
+        raise RebaseWorkflowError(
+            "GitHub deploy requires the source file to be in a GitHub-backed git repository. "
+            f"Missing metadata: {', '.join(missing)}."
+        )
+    if resolved.get("git_dirty"):
+        raise RebaseWorkflowError(
+            "GitHub deploy requires the source file to be committed. "
+            "Commit or discard changes to this file before deploying."
+        )
+    resolved["source_mode"] = (
+        project_source_mode if project_source_mode in {"workspace_repo", "project_repo"} else "workspace_repo"
+    )
+    resolved["git_dirty"] = False
+    return resolved
+
+
+def _connected_source_mode(
+    client: Any,
+    *,
+    project: str | None,
+    project_source_mode: str | None,
+) -> str | None:
+    if project_source_mode in {"workspace_repo", "project_repo"}:
+        return project_source_mode
+    if project:
+        project_data = client.find_project(project)
+        project_mode = project_data.get("source_mode") if isinstance(project_data, dict) else None
+        if project_mode in {"workspace_repo", "project_repo"}:
+            return project_mode
+    workspace = client.get_workspace()
+    workspace_mode = workspace.get("source_mode") if isinstance(workspace, dict) else None
+    return workspace_mode if workspace_mode in {"workspace_repo", "project_repo"} else None
+
+
 class Client:
     def __init__(
         self,
@@ -719,7 +822,7 @@ class Client:
         api_url: str | None = None,
         profile: str | None = None,
         access_token: str | None = None,
-        ) -> None:
+    ) -> None:
         env_api_key = os.getenv("REBASE_API_KEY") or os.getenv("REBASE_WORKFLOWS_API_KEY")
         env_access_token = os.getenv("REBASE_ACCESS_TOKEN") or os.getenv("REBASE_WORKFLOWS_ACCESS_TOKEN")
         explicit_credentials = any(
@@ -1314,6 +1417,53 @@ class Client:
             raise RebaseWorkflowError("expected model version list response")
         return response
 
+    def get_model_version(self, model_id: str, version_id: str) -> dict[str, Any]:
+        response = self.request("GET", f"/models/{model_id}/versions/{version_id}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected model version response")
+        return response
+
+    def list_model_publications(self, model_id: str) -> list[dict[str, Any]]:
+        response = self.request("GET", f"/models/{model_id}/publications")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected model publication list response")
+        return response
+
+    def record_model_publication(
+        self,
+        model_id: str,
+        *,
+        model_version_id: str,
+        repo_id: str,
+        provider_commit_sha: str,
+        provider: str = "huggingface",
+        repo_type: str = "model",
+        visibility: str = "private",
+        path_in_repo: str | None = None,
+        revision: str = "main",
+        source_git_commit_sha: str | None = None,
+        publication_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            f"/models/{model_id}/publications",
+            json={
+                "model_version_id": model_version_id,
+                "provider": provider,
+                "repo_type": repo_type,
+                "repo_id": repo_id,
+                "visibility": visibility,
+                "path_in_repo": path_in_repo,
+                "revision": revision,
+                "provider_commit_sha": provider_commit_sha,
+                "source_git_commit_sha": source_git_commit_sha,
+                "publication_metadata": publication_metadata or {},
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected model publication response")
+        return response
+
     def list_model_deployments(self, model_id: str) -> list[dict[str, Any]]:
         response = self.request("GET", f"/models/{model_id}/deployments")
         if not isinstance(response, list):
@@ -1685,6 +1835,7 @@ class Project:
         repo_owner: str | None = None,
         repo_name: str | None = None,
         repo_path: str | None = None,
+        deploy_source: str | None = None,
         client: Client | None = None,
     ) -> None:
         self.name = name
@@ -1693,6 +1844,7 @@ class Project:
         self.repo_owner = repo_owner
         self.repo_name = repo_name
         self.repo_path = repo_path
+        self.deploy_source = _validate_deploy_source(deploy_source)
         self.client = client
         self.id: str | None = None
         self._functions: list[Function] = []
@@ -1703,9 +1855,10 @@ class Project:
     def _client(self) -> Client:
         return self.client or default_client()
 
-    def deploy(self, *, replace: bool = False) -> Self:
+    def deploy(self, *, replace: bool = False, deploy_source: str | None = None) -> Self:
         for workflow in self._workflows:
             workflow._validate_schedule_defaults()
+        resolved_deploy_source = _validate_deploy_source(deploy_source)
         project = self._client.ensure_project(
             self.name,
             description=self.description,
@@ -1716,9 +1869,9 @@ class Project:
         )
         self.id = project["id"]
         for function in self._functions:
-            function.deploy(replace=replace)
+            function.deploy(replace=replace, deploy_source=resolved_deploy_source)
         for workflow in self._workflows:
-            workflow.deploy(replace=replace)
+            workflow.deploy(replace=replace, deploy_source=resolved_deploy_source)
         return self
 
     def function(
@@ -1733,6 +1886,7 @@ class Project:
         min_instances: int | None = None,
         concurrency: int | None = None,
         enabled: bool = True,
+        deploy_source: str | None = None,
     ) -> Callable[[Callable[..., Any]], Function]:
         def decorator(fn: Callable[..., Any]) -> Function:
             function = Function(
@@ -1747,6 +1901,8 @@ class Project:
                 min_instances=min_instances,
                 concurrency=concurrency,
                 enabled=enabled,
+                deploy_source=deploy_source if deploy_source is not None else self.deploy_source,
+                project_source_mode=self.source_mode,
                 client=self._client,
             )
             self._functions.append(function)
@@ -1770,6 +1926,7 @@ class Project:
         timeout_seconds: int | float | None = None,
         cache: bool = False,
         resources: dict[str, Any] | None = None,
+        deploy_source: str | None = None,
     ) -> Callable[[Callable[..., Any]], Step]:
         def decorator(fn: Callable[..., Any]) -> Step:
             step = Step(
@@ -1784,6 +1941,8 @@ class Project:
                 min_instances=min_instances,
                 concurrency=concurrency,
                 enabled=enabled,
+                deploy_source=deploy_source if deploy_source is not None else self.deploy_source,
+                project_source_mode=self.source_mode,
                 client=self._client,
                 retries=retries,
                 timeout_seconds=timeout_seconds,
@@ -1805,6 +1964,7 @@ class Project:
         default_parameters: dict[str, Any] | None = None,
         backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
         enabled: bool = True,
+        deploy_source: str | None = None,
     ) -> Callable[[Callable[..., Any]], Workflow]:
         def decorator(fn: Callable[..., Any]) -> Workflow:
             workflow = Workflow(
@@ -1816,6 +1976,8 @@ class Project:
                 default_parameters=default_parameters,
                 backend=backend,
                 enabled=enabled,
+                deploy_source=deploy_source if deploy_source is not None else self.deploy_source,
+                project_source_mode=self.source_mode,
                 client=self._client,
             )
             self._workflows.append(workflow)
@@ -1839,6 +2001,8 @@ class Function:
         min_instances: int | None = None,
         concurrency: int | None = None,
         enabled: bool = True,
+        deploy_source: str | None = None,
+        project_source_mode: str | None = None,
         client: Client | None = None,
         function_id: str | None = None,
         data: dict[str, Any] | None = None,
@@ -1850,6 +2014,8 @@ class Function:
         self.client = client
         self.id: str | None = function_id
         self.data = data or {}
+        self.deploy_source = _validate_deploy_source(deploy_source)
+        self.project_source_mode = project_source_mode
         self.name = name or (data["name"] if data else None)
         self.source_code: str | None = None
         self.entrypoint: str | None = None
@@ -1895,12 +2061,30 @@ class Function:
     def _client(self) -> Client:
         return self.client or default_client()
 
-    def deploy(self, *, replace: bool = False) -> Function:
+    def _source_metadata_for_deploy(self, deploy_source: str | None = None) -> dict[str, Any]:
+        resolved_deploy_source = _validate_deploy_source(deploy_source) or self.deploy_source
+        project_source_mode = (
+            _connected_source_mode(
+                self._client,
+                project=self.project,
+                project_source_mode=self.project_source_mode,
+            )
+            if resolved_deploy_source == "github"
+            else self.project_source_mode
+        )
+        return _source_metadata_for_deploy(
+            self.source_metadata,
+            deploy_source=resolved_deploy_source,
+            project_source_mode=project_source_mode,
+        )
+
+    def deploy(self, *, replace: bool = False, deploy_source: str | None = None) -> Function:
         if self.source_code is None or self.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy a function handle without source_code and entrypoint")
         if self.name is None:
             raise RebaseWorkflowError("function name is required")
         name = self.name
+        source_metadata = self._source_metadata_for_deploy(deploy_source)
         existing = self._client.find_function(name, project=self.project)
         if existing is not None:
             function = self._client.update_function(
@@ -1914,7 +2098,7 @@ class Function:
                 cloud_run_min_instances=self.cloud_run_min_instances,
                 cloud_run_concurrency=self.cloud_run_concurrency,
                 enabled=self.enabled,
-                **self.source_metadata,
+                **source_metadata,
             )
             self.id = function["id"]
             self.data = function
@@ -1932,7 +2116,7 @@ class Function:
             cloud_run_min_instances=self.cloud_run_min_instances,
             cloud_run_concurrency=self.cloud_run_concurrency,
             enabled=self.enabled,
-            **self.source_metadata,
+            **source_metadata,
         )
         self.id = function["id"]
         self.data = function
@@ -2102,6 +2286,111 @@ def _model_kind_for(model: Model) -> str:
     return "model"
 
 
+def _hf_repo_type_arg(repo_type: str) -> str | None:
+    return None if repo_type == "model" else repo_type
+
+
+def _hf_commit_oid(commit_info: Any) -> str | None:
+    oid = getattr(commit_info, "oid", None) or getattr(commit_info, "commit_id", None)
+    if isinstance(oid, str) and oid:
+        return oid
+    value = str(commit_info)
+    return value if value and value.startswith("http") is False else None
+
+
+def _hf_commit_url(commit_info: Any) -> str | None:
+    commit_url = getattr(commit_info, "commit_url", None)
+    return commit_url if isinstance(commit_url, str) and commit_url else None
+
+
+def _hf_latest_commit(api: Any, *, repo_id: str, repo_type: str, revision: str) -> str | None:
+    try:
+        commits = api.list_repo_commits(
+            repo_id=repo_id,
+            repo_type=_hf_repo_type_arg(repo_type),
+            revision=revision,
+        )
+    except Exception:
+        return None
+    if not commits:
+        return None
+    commit_id = getattr(commits[0], "commit_id", None)
+    return commit_id if isinstance(commit_id, str) and commit_id else None
+
+
+def _version_source_url(version: dict[str, Any]) -> str | None:
+    owner = version.get("repo_owner")
+    repo = version.get("repo_name")
+    commit = version.get("git_commit_sha")
+    source_path = version.get("source_path")
+    if not owner or not repo or not commit:
+        return None
+    base = f"https://github.com/{owner}/{repo}/tree/{commit}"
+    return f"{base}/{source_path}" if source_path else base
+
+
+def _write_huggingface_provenance_files(
+    folder: Path,
+    *,
+    model_name: str,
+    model_data: dict[str, Any],
+    version: dict[str, Any],
+    include_source: bool,
+    include_readme: bool,
+) -> None:
+    provenance = {
+        "schema_version": 1,
+        "provider": "rebase",
+        "target_type": "model",
+        "model_id": version.get("model_id") or model_data.get("id"),
+        "model_name": model_name,
+        "model_kind": version.get("kind") or model_data.get("kind"),
+        "model_version_id": version.get("id"),
+        "model_version_number": version.get("version_number"),
+        "model_fingerprint": version.get("fingerprint"),
+        "operation_name": version.get("operation_name"),
+        "source_repo": (
+            f"{version.get('repo_owner')}/{version.get('repo_name')}"
+            if version.get("repo_owner") and version.get("repo_name")
+            else None
+        ),
+        "source_path": version.get("source_path"),
+        "source_url": _version_source_url(version),
+        "git_commit_sha": version.get("git_commit_sha"),
+        "git_branch": version.get("git_branch"),
+        "git_tag": version.get("git_tag"),
+        "git_dirty": version.get("git_dirty"),
+        "source_hash": version.get("source_hash"),
+        "image_fingerprint": version.get("image_fingerprint"),
+    }
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "rebase_model.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if include_source and version.get("source_code"):
+        (folder / "rebase_source.py").write_text(str(version["source_code"]), encoding="utf-8")
+    if include_readme:
+        source_commit = provenance["git_commit_sha"] or "not recorded"
+        source_ref = provenance["source_url"] or provenance["source_hash"] or "not recorded"
+        readme = textwrap.dedent(
+            f"""
+            ---
+            tags:
+            - rebase
+            ---
+
+            # {model_name}
+
+            This repository was published from Rebase model version `{provenance["model_version_id"]}`.
+
+            Source commit: `{source_commit}`
+
+            Source reference: {source_ref}
+
+            Rebase fingerprint: `{provenance["model_fingerprint"]}`
+            """
+        ).lstrip()
+        (folder / "README.md").write_text(readme, encoding="utf-8")
+
+
 class Model(_EmflowModel):
     _operation_name: str | None = None
     _emflow_init_mode = "name"
@@ -2116,6 +2405,7 @@ class Model(_EmflowModel):
     min_instances: int | None = None
     concurrency: int | None = None
     enabled: bool = True
+    deploy_source: str | None = None
 
     def __init__(
         self,
@@ -2130,6 +2420,7 @@ class Model(_EmflowModel):
         min_instances: int | None = None,
         concurrency: int | None = None,
         enabled: bool | None = None,
+        deploy_source: str | None = None,
         client: Client | None = None,
     ) -> None:
         cls = type(self)
@@ -2140,9 +2431,7 @@ class Model(_EmflowModel):
         self.description = description if description is not None else getattr(cls, "description", None)
         class_default_parameters = getattr(cls, "default_parameters", None)
         self.default_parameters: dict[str, Any] = (
-            dict(default_parameters)
-            if default_parameters is not None
-            else dict(class_default_parameters or {})
+            dict(default_parameters) if default_parameters is not None else dict(class_default_parameters or {})
         )
         self.execution_backend = _validate_function_backend(
             backend or getattr(cls, "backend", DEFAULT_FUNCTION_BACKEND)
@@ -2154,6 +2443,9 @@ class Model(_EmflowModel):
         )
         self.cloud_run_concurrency = concurrency if concurrency is not None else getattr(cls, "concurrency", None)
         self.enabled = enabled if enabled is not None else bool(getattr(cls, "enabled", True))
+        self.deploy_source = _validate_deploy_source(
+            deploy_source if deploy_source is not None else getattr(cls, "deploy_source", None)
+        )
         self.client = client
         self.id: str | None = None
         self.data: dict[str, Any] = {}
@@ -2207,6 +2499,7 @@ class Model(_EmflowModel):
                 description=self.description,
                 default_parameters={**inferred_defaults, **default_parameters},
                 enabled=self.enabled,
+                deploy_source=self.deploy_source,
                 client=self._client,
             )
             function.source_code = _source_for_model(self, operation_name=operation_name)
@@ -2219,10 +2512,147 @@ class Model(_EmflowModel):
             self._function = function
         return self._function
 
-    def deploy(self, *, replace: bool = False, environment: str = "dev") -> Model:
+    def _publish_to_huggingface(
+        self,
+        *,
+        version: dict[str, Any],
+        config: HuggingFacePublishConfig,
+    ) -> dict[str, Any]:
+        source_git_commit_sha = version.get("git_commit_sha")
+        record_source_git_commit_sha = (
+            str(source_git_commit_sha)
+            if config.sync_source_git and source_git_commit_sha and not version.get("git_dirty")
+            else None
+        )
+        if config.artifact_path is not None and not config.artifact_path.exists():
+            raise RebaseWorkflowError(f"Hugging Face artifact path does not exist: {config.artifact_path}")
+
+        try:
+            from huggingface_hub import HfApi
+        except ImportError as exc:
+            raise RebaseWorkflowError(
+                "Install the Hugging Face extra before publishing: uv add 'rebase-toolkit[huggingface]' "
+                "or pip install 'rebase-toolkit[huggingface]'."
+            ) from exc
+
+        api = HfApi(token=config.token)
+        repo_type = _hf_repo_type_arg(config.repo_type)
+        if config.create_repo:
+            api.create_repo(
+                repo_id=config.repo_id,
+                repo_type=repo_type,
+                private=config.private,
+                exist_ok=True,
+            )
+
+        parent_commit = _hf_latest_commit(
+            api,
+            repo_id=config.repo_id,
+            repo_type=config.repo_type,
+            revision=config.revision,
+        )
+        commit_message = config.commit_message or f"Publish Rebase model {self.name} v{version.get('version_number')}"
+        final_commit_info: Any
+
+        if config.artifact_path is not None:
+            if config.artifact_path.is_file():
+                final_commit_info = api.upload_file(
+                    path_or_fileobj=str(config.artifact_path),
+                    path_in_repo=(config.path_in_repo or config.artifact_path.name),
+                    repo_id=config.repo_id,
+                    repo_type=repo_type,
+                    revision=config.revision,
+                    commit_message=commit_message,
+                    parent_commit=parent_commit,
+                )
+            else:
+                final_commit_info = api.upload_folder(
+                    folder_path=str(config.artifact_path),
+                    path_in_repo=config.path_in_repo,
+                    repo_id=config.repo_id,
+                    repo_type=repo_type,
+                    revision=config.revision,
+                    commit_message=commit_message,
+                    parent_commit=parent_commit,
+                    allow_patterns=config.allow_patterns,
+                    ignore_patterns=config.ignore_patterns,
+                    delete_patterns=config.delete_patterns,
+                )
+            parent_commit = _hf_commit_oid(final_commit_info) or parent_commit
+            with tempfile.TemporaryDirectory() as temp_dir:
+                provenance_dir = Path(temp_dir)
+                _write_huggingface_provenance_files(
+                    provenance_dir,
+                    model_name=str(self.name),
+                    model_data=self.data,
+                    version=version,
+                    include_source=config.include_source,
+                    include_readme=False,
+                )
+                final_commit_info = api.upload_folder(
+                    folder_path=str(provenance_dir),
+                    repo_id=config.repo_id,
+                    repo_type=repo_type,
+                    revision=config.revision,
+                    commit_message=f"Record Rebase provenance for {self.name} v{version.get('version_number')}",
+                    parent_commit=parent_commit,
+                )
+        else:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                folder = Path(temp_dir)
+                _write_huggingface_provenance_files(
+                    folder,
+                    model_name=str(self.name),
+                    model_data=self.data,
+                    version=version,
+                    include_source=config.include_source,
+                    include_readme=True,
+                )
+                final_commit_info = api.upload_folder(
+                    folder_path=str(folder),
+                    path_in_repo=config.path_in_repo,
+                    repo_id=config.repo_id,
+                    repo_type=repo_type,
+                    revision=config.revision,
+                    commit_message=commit_message,
+                    parent_commit=parent_commit,
+                )
+
+        provider_commit_sha = _hf_commit_oid(final_commit_info)
+        if provider_commit_sha is None:
+            raise RebaseWorkflowError("Hugging Face upload did not return a commit SHA")
+        publication_metadata = {
+            "hub_commit_url": _hf_commit_url(final_commit_info),
+            "artifact_path": str(config.artifact_path) if config.artifact_path is not None else None,
+            "source_included": config.include_source,
+            "source_git_sync": record_source_git_commit_sha is not None,
+            "provenance_file": "rebase_model.json",
+        }
+        return self._client.record_model_publication(
+            str(self.id),
+            model_version_id=str(version["id"]),
+            repo_id=config.repo_id,
+            repo_type=config.repo_type,
+            visibility="private" if config.private else "public",
+            path_in_repo=config.path_in_repo,
+            revision=config.revision,
+            provider_commit_sha=provider_commit_sha,
+            source_git_commit_sha=record_source_git_commit_sha,
+            publication_metadata=publication_metadata,
+        )
+
+    def deploy(
+        self,
+        *,
+        replace: bool = False,
+        environment: str = "dev",
+        huggingface: HuggingFacePublishConfig | None = None,
+        deploy_source: str | None = None,
+    ) -> Model:
         function = self.as_function()
         if function.source_code is None or function.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy a model without source_code and operation entrypoint")
+        source_metadata = function._source_metadata_for_deploy(deploy_source)
         model = self._client.find_model(str(self.name), project=str(self.project or "default"))
         if model is not None:
             model_data = self._client.update_model(
@@ -2238,7 +2668,7 @@ class Model(_EmflowModel):
                 cloud_run_concurrency=function.cloud_run_concurrency,
                 enabled=self.enabled,
                 environment=environment,
-                **function.source_metadata,
+                **source_metadata,
             )
         else:
             model_data = self._client.register_model(
@@ -2255,10 +2685,17 @@ class Model(_EmflowModel):
                 cloud_run_concurrency=function.cloud_run_concurrency,
                 enabled=self.enabled,
                 environment=environment,
-                **function.source_metadata,
+                **source_metadata,
             )
         self.id = model_data["id"]
         self.data = model_data
+        if huggingface is not None:
+            version_id = model_data.get("current_version_id")
+            if not version_id:
+                raise RebaseWorkflowError("cannot publish model to Hugging Face without a current Rebase version")
+            version = self._client.get_model_version(str(self.id), str(version_id))
+            publication = self._publish_to_huggingface(version=version, config=huggingface)
+            self.data["huggingface_publication"] = publication
         return self
 
     def spawn(self, *, environment: str = "dev", **parameters: Any) -> Run:
@@ -2352,6 +2789,8 @@ class Step(Function):
         min_instances: int | None = None,
         concurrency: int | None = None,
         enabled: bool = True,
+        deploy_source: str | None = None,
+        project_source_mode: str | None = None,
         client: Client | None = None,
         function_id: str | None = None,
         data: dict[str, Any] | None = None,
@@ -2372,6 +2811,8 @@ class Step(Function):
             min_instances=min_instances,
             concurrency=concurrency,
             enabled=enabled,
+            deploy_source=deploy_source,
+            project_source_mode=project_source_mode,
             client=client,
             function_id=function_id,
             data=data,
@@ -2417,6 +2858,8 @@ class Workflow:
         default_parameters: dict[str, Any] | None = None,
         backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
         enabled: bool = True,
+        deploy_source: str | None = None,
+        project_source_mode: str | None = None,
         client: Client | None = None,
         workflow_id: str | None = None,
         data: dict[str, Any] | None = None,
@@ -2428,15 +2871,15 @@ class Workflow:
         self.client = client
         self.id: str | None = workflow_id
         self.data = data or {}
+        self.deploy_source = _validate_deploy_source(deploy_source)
+        self.project_source_mode = project_source_mode
         self.name = name or (data["name"] if data else None)
         self.flow_ref: str | None = None
         self.source_code: str | None = None
         self.entrypoint: str | None = None
         self.step_graph: dict[str, Any] | None = data.get("step_graph") if data else None
         self.schedule = (
-            _schedule_payload(schedule)
-            if schedule is not None
-            else (data.get("schedule") if data else None)
+            _schedule_payload(schedule) if schedule is not None else (data.get("schedule") if data else None)
         )
         self.default_parameters = default_parameters or {}
         self.execution_backend: WorkflowBackend = (
@@ -2470,6 +2913,23 @@ class Workflow:
     @property
     def _client(self) -> Client:
         return self.client or default_client()
+
+    def _source_metadata_for_deploy(self, deploy_source: str | None = None) -> dict[str, Any]:
+        resolved_deploy_source = _validate_deploy_source(deploy_source) or self.deploy_source
+        project_source_mode = (
+            _connected_source_mode(
+                self._client,
+                project=self.project,
+                project_source_mode=self.project_source_mode,
+            )
+            if resolved_deploy_source == "github"
+            else self.project_source_mode
+        )
+        return _source_metadata_for_deploy(
+            self.source_metadata,
+            deploy_source=resolved_deploy_source,
+            project_source_mode=project_source_mode,
+        )
 
     def _references_step(self) -> bool:
         if self.fn is None:
@@ -2531,11 +2991,10 @@ class Workflow:
         if self.schedule is not None and self.required_parameters:
             missing = ", ".join(self.required_parameters)
             raise RebaseWorkflowError(
-                "Scheduled workflows require defaults for every workflow parameter. "
-                f"Missing defaults: {missing}"
+                f"Scheduled workflows require defaults for every workflow parameter. Missing defaults: {missing}"
             )
 
-    def deploy(self, *, replace: bool = False) -> Workflow:
+    def deploy(self, *, replace: bool = False, deploy_source: str | None = None) -> Workflow:
         if self.source_code is None or self.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy a workflow handle without source_code and entrypoint")
         if self.name is None:
@@ -2543,6 +3002,7 @@ class Workflow:
         self._validate_schedule_defaults()
         name = self.name
         step_graph = self._build_step_graph()
+        source_metadata = self._source_metadata_for_deploy(deploy_source)
         existing = self._client.find_workflow(name, project=self.project)
         if existing is not None:
             workflow = self._client.update_workflow(
@@ -2557,7 +3017,7 @@ class Workflow:
                 required_parameters=self.required_parameters,
                 execution_backend=self.execution_backend,
                 enabled=self.enabled,
-                **self.source_metadata,
+                **source_metadata,
             )
             self.id = workflow["id"]
             self.data = workflow
@@ -2577,7 +3037,7 @@ class Workflow:
             required_parameters=self.required_parameters,
             execution_backend=self.execution_backend,
             enabled=self.enabled,
-            **self.source_metadata,
+            **source_metadata,
         )
         self.id = workflow["id"]
         self.data = workflow

@@ -32,9 +32,13 @@ rebase = "rebase.cli:main"
 data = [
     "energydatamodel @ git+https://github.com/rebase-energy/EnergyDataModel.git@8f0724d32af5470968321bb39b6145ab63291692",
 ]
+huggingface = [
+    "huggingface-hub>=1.20.1",
+]
 modeling = []
 all = [
     "energydatamodel @ git+https://github.com/rebase-energy/EnergyDataModel.git@8f0724d32af5470968321bb39b6145ab63291692",
+    "huggingface-hub>=1.20.1",
 ]
 
 [dependency-groups]

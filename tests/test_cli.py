@@ -101,6 +101,37 @@ second = rb.Project("second")
     assert result == [("project", "second", "second-id")]
 
 
+def test_deploy_file_passes_source_override(monkeypatch, tmp_path: Path) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_project_deploy(
+        self: Project,
+        *,
+        replace: bool = False,
+        deploy_source: str | None = None,
+    ) -> Project:
+        observed["name"] = self.name
+        observed["deploy_source"] = deploy_source
+        self.id = "project-id"
+        return self
+
+    monkeypatch.setattr(Project, "deploy", fake_project_deploy)
+    workflow_file = tmp_path / "workflow.py"
+    workflow_file.write_text(
+        """
+import rebase as rb
+
+project = rb.Project("energy-forecasting")
+""",
+        encoding="utf-8",
+    )
+
+    result = deploy_file(workflow_file, deploy_source="github")
+
+    assert observed == {"name": "energy-forecasting", "deploy_source": "github"}
+    assert result == [("project", "energy-forecasting", "project-id")]
+
+
 def test_deploy_file_deploys_standalone_workflow(monkeypatch, tmp_path: Path) -> None:
     deployed: list[str] = []
 

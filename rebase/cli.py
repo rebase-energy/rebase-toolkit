@@ -633,7 +633,12 @@ def _stream_run_result(
         time.sleep(poll_interval)
 
 
-def deploy_file(path: str | Path, *, object_names: Iterable[str] | None = None) -> list[tuple[str, str, str | None]]:
+def deploy_file(
+    path: str | Path,
+    *,
+    object_names: Iterable[str] | None = None,
+    deploy_source: str | None = None,
+) -> list[tuple[str, str, str | None]]:
     module = _load_module(Path(path))
     selected_names = set(object_names or [])
 
@@ -647,7 +652,10 @@ def deploy_file(path: str | Path, *, object_names: Iterable[str] | None = None) 
     deployed: list[tuple[str, str, str | None]] = []
     if projects:
         for name, project in projects:
-            project.deploy()
+            if deploy_source is None:
+                project.deploy()
+            else:
+                project.deploy(deploy_source=deploy_source)
             deployed.append(("project", project.name or name, project.id))
         return deployed
     if all_projects and selected_names:
@@ -668,7 +676,10 @@ def deploy_file(path: str | Path, *, object_names: Iterable[str] | None = None) 
         )
 
     for name, deployable in deployables:
-        deployable.deploy()
+        if deploy_source is None:
+            deployable.deploy()
+        else:
+            deployable.deploy(deploy_source=deploy_source)
         target_type = (
             _model_target_type(deployable) if isinstance(deployable, Model) else deployable.__class__.__name__.lower()
         )
@@ -1767,9 +1778,13 @@ def deploy_command(
             help="Deploy only the top-level variable name or Rebase target name. Can be passed more than once.",
         ),
     ] = None,
+    source: Annotated[
+        str | None,
+        typer.Option("--source", help="Override deploy source for this command: rebase or github."),
+    ] = None,
 ) -> None:
     """Deploy Rebase objects from a Python file."""
-    deployed = deploy_file(file, object_names=name)
+    deployed = deploy_file(file, object_names=name, deploy_source=source)
     console.print(_deploy_table(deployed))
 
 

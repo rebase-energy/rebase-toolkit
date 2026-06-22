@@ -342,7 +342,7 @@ wheels = [
 
 [[package]]
 name = "huggingface-hub"
-version = "1.19.0"
+version = "1.20.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
@@ -356,9 +356,9 @@ dependencies = [
     { name = "typer" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/88/27/629cfe58c582f92ded066c4a07d1a057ff617118ab7973200f770bd853cb/huggingface_hub-1.19.0.tar.gz", hash = "sha256:fd771622182d40977272a923953ee3b1b13538f9f8a7f5d78398f10af0f1c0bd", size = 824721, upload-time = "2026-06-11T12:33:18.665Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e6/7e/fad82ad491b226e832d2da90a1a59f36acd4526cda8c726f639834754aa4/huggingface_hub-1.20.1.tar.gz", hash = "sha256:9f6d63bfbeab2d2a8357200a9bc4f18cd2c8bfac9579f792f5922e77bf6471d0", size = 859910, upload-time = "2026-06-18T22:06:53.348Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b2/a5/558da89f66464d8d0229ff497e8b8666977de2d8cf48c28a2862ecf1250f/huggingface_hub-1.19.0-py3-none-any.whl", hash = "sha256:1dc72e1f6b4d6df6b30eb72e57d00514ef453d660f04af2b87f0e67267f31ee0", size = 693398, upload-time = "2026-06-11T12:33:16.695Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/b5/ff8516e74b459da3dce9567540c39f2d305ee7a2655109f6802873ff1588/huggingface_hub-1.20.1-py3-none-any.whl", hash = "sha256:274448a45c1ba6f112fe2fb168ead05574c654faa156904157a84085cfae14bd", size = 719837, upload-time = "2026-06-18T22:06:51.486Z" },
 ]
 
 [[package]]
@@ -890,9 +890,13 @@ dependencies = [
 [package.optional-dependencies]
 all = [
     { name = "energydatamodel" },
+    { name = "huggingface-hub" },
 ]
 data = [
     { name = "energydatamodel" },
+]
+huggingface = [
+    { name = "huggingface-hub" },
 ]
 
 [package.dev-dependencies]
@@ -909,12 +913,14 @@ requires-dist = [
     { name = "emflow", git = "https://github.com/rebase-energy/emflow.git?rev=2d0205e1b479d439df72e50c6865735d0b26de8d" },
     { name = "energydatamodel", marker = "extra == 'all'", git = "https://github.com/rebase-energy/EnergyDataModel.git?rev=8f0724d32af5470968321bb39b6145ab63291692" },
     { name = "energydatamodel", marker = "extra == 'data'", git = "https://github.com/rebase-energy/EnergyDataModel.git?rev=8f0724d32af5470968321bb39b6145ab63291692" },
+    { name = "huggingface-hub", marker = "extra == 'all'", specifier = ">=1.20.1" },
+    { name = "huggingface-hub", marker = "extra == 'huggingface'", specifier = ">=1.20.1" },
     { name = "requests", specifier = ">=2.32.0" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "textual", specifier = ">=8.2.7" },
     { name = "typer", specifier = ">=0.25.1" },
 ]
-provides-extras = ["data", "modeling", "all"]
+provides-extras = ["data", "huggingface", "modeling", "all"]
 
 [package.metadata.requires-dev]
 dev = [

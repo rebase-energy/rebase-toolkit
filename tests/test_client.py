@@ -1,3 +1,6 @@
+import json
+import sys
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -483,7 +486,84 @@ def test_project_deploy_registers_function_source(monkeypatch) -> None:
     assert "def normalize_weather(site_id: str, horizon_hours: int = 24) -> dict:" in observed["source_code"]
     assert observed["default_parameters"] == {"horizon_hours": 24}
     assert observed["execution_backend"] == "cloud_run"
+    assert observed["source_mode"] == "rebase_hosted"
     assert normalize_weather.execution_backend == rb.DEFAULT_FUNCTION_BACKEND
+
+
+def test_function_deploy_github_source_uses_project_repo_metadata(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "find_project", lambda name: {"id": "project-id", "source_mode": "project_repo"})
+    monkeypatch.setattr(client, "find_function", lambda name, *, project: None)
+    monkeypatch.setattr(client, "register_function", lambda **kwargs: observed.update(kwargs) or {"id": "function-id"})
+
+    function = rb.Function(project="energy-forecasting", name="forecast", deploy_source="github", client=client)
+    function.source_code = "def forecast() -> dict:\n    return {}\n"
+    function.entrypoint = "forecast"
+    function.source_metadata = {
+        "repo_owner": "rebase-energy",
+        "repo_name": "platform",
+        "source_path": "workflows/forecast.py",
+        "git_commit_sha": "abc123",
+        "git_branch": "main",
+        "git_dirty": False,
+    }
+
+    function.deploy()
+
+    assert observed["source_mode"] == "project_repo"
+    assert observed["repo_owner"] == "rebase-energy"
+    assert observed["repo_name"] == "platform"
+    assert observed["source_path"] == "workflows/forecast.py"
+    assert observed["git_commit_sha"] == "abc123"
+    assert observed["git_dirty"] is False
+
+
+def test_function_deploy_github_source_rejects_dirty_source_file(monkeypatch) -> None:
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "find_project", lambda name: {"id": "project-id", "source_mode": "workspace_repo"})
+
+    function = rb.Function(project="energy-forecasting", name="forecast", deploy_source="github", client=client)
+    function.source_code = "def forecast() -> dict:\n    return {}\n"
+    function.entrypoint = "forecast"
+    function.source_metadata = {
+        "repo_owner": "rebase-energy",
+        "repo_name": "platform",
+        "source_path": "workflows/forecast.py",
+        "git_commit_sha": "abc123",
+        "git_dirty": True,
+    }
+
+    with pytest.raises(rb.RebaseWorkflowError, match="source file to be committed"):
+        function.deploy()
+
+
+def test_project_deploy_preserves_target_deploy_source_override(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
+    monkeypatch.setattr(client, "find_project", lambda name: {"id": "project-id", "source_mode": "project_repo"})
+    monkeypatch.setattr(client, "find_function", lambda name, *, project: None)
+    monkeypatch.setattr(client, "register_function", lambda **kwargs: observed.update(kwargs) or {"id": "function-id"})
+
+    project = rb.Project("energy-forecasting", deploy_source="rebase", client=client)
+
+    @project.function(name="forecast", deploy_source="github")
+    def forecast() -> dict:
+        return {}
+
+    forecast.source_metadata = {
+        "repo_owner": "rebase-energy",
+        "repo_name": "platform",
+        "source_path": "workflows/forecast.py",
+        "git_commit_sha": "abc123",
+        "git_dirty": False,
+    }
+
+    project.deploy()
+
+    assert observed["source_mode"] == "project_repo"
+    assert observed["git_commit_sha"] == "abc123"
 
 
 def test_project_function_can_use_prefect_backend(monkeypatch) -> None:
@@ -962,6 +1042,234 @@ def test_predictor_deploy_registers_model(monkeypatch) -> None:
     assert observed["default_parameters"] == {"zone": "SE3"}
     assert observed["execution_backend"] == "cloud_run"
     assert any("emflow" in package for package in observed["image_spec"]["uv_pip_packages"])
+
+
+def test_client_records_model_publication(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["json"] = kwargs["json"]
+        return FakeResponse({"id": "publication-id", **kwargs["json"]})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    publication = client.record_model_publication(
+        "model-id",
+        model_version_id="version-id",
+        repo_id="rebase/price-forecast",
+        repo_type="model",
+        visibility="public",
+        revision="main",
+        provider_commit_sha="hf-commit",
+        source_git_commit_sha="git-commit",
+        publication_metadata={"hub_commit_url": "https://huggingface.co/rebase/price-forecast/commit/hf-commit"},
+    )
+
+    assert publication["id"] == "publication-id"
+    assert observed == {
+        "method": "POST",
+        "url": "https://workflows.example.com/models/model-id/publications",
+        "json": {
+            "model_version_id": "version-id",
+            "provider": "huggingface",
+            "repo_type": "model",
+            "repo_id": "rebase/price-forecast",
+            "visibility": "public",
+            "path_in_repo": None,
+            "revision": "main",
+            "provider_commit_sha": "hf-commit",
+            "source_git_commit_sha": "git-commit",
+            "publication_metadata": {"hub_commit_url": "https://huggingface.co/rebase/price-forecast/commit/hf-commit"},
+        },
+    }
+
+
+def test_predictor_deploy_can_publish_to_huggingface(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "find_model", lambda name, *, project: None)
+    monkeypatch.setattr(
+        client,
+        "register_model",
+        lambda **kwargs: {"id": "model-id", "name": kwargs["name"], "current_version_id": "version-id"},
+    )
+    monkeypatch.setattr(
+        client,
+        "get_model_version",
+        lambda model_id, version_id: {
+            "id": version_id,
+            "model_id": model_id,
+            "version_number": 1,
+            "git_commit_sha": "git-commit",
+            "git_dirty": False,
+            "source_code": "def predict():\n    return {}\n",
+        },
+    )
+
+    def fake_publish(self: rb.Model, *, version: dict[str, Any], config: rb.HuggingFacePublishConfig) -> dict[str, Any]:
+        observed["model_id"] = self.id
+        observed["version"] = version
+        observed["repo_id"] = config.repo_id
+        observed["private"] = config.private
+        return {"id": "publication-id", "repo_id": config.repo_id}
+
+    monkeypatch.setattr(rb.Model, "_publish_to_huggingface", fake_publish)
+
+    class PriceForecastPredictor(rb.Predictor):
+        name = "price-forecast"
+
+        def predict(self, zone: str = "SE3") -> dict:
+            return {"zone": zone}
+
+    model = PriceForecastPredictor(project="models", client=client).deploy(
+        huggingface=rb.HuggingFacePublishConfig("rebase/price-forecast", private=False),
+    )
+
+    assert model.data["huggingface_publication"] == {
+        "id": "publication-id",
+        "repo_id": "rebase/price-forecast",
+    }
+    assert observed["model_id"] == "model-id"
+    assert observed["version"]["id"] == "version-id"
+    assert observed["repo_id"] == "rebase/price-forecast"
+    assert observed["private"] is False
+
+
+def test_publish_to_huggingface_does_not_require_git_metadata(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    class FakeHfApi:
+        def __init__(self, *, token: str | None = None) -> None:
+            observed["token"] = token
+
+        def create_repo(self, **kwargs: Any) -> None:
+            observed["create_repo"] = kwargs
+
+        def list_repo_commits(self, **kwargs: Any) -> list[Any]:
+            observed["list_repo_commits"] = kwargs
+            return []
+
+        def upload_folder(self, **kwargs: Any) -> SimpleNamespace:
+            folder_path = kwargs["folder_path"]
+            with open(f"{folder_path}/rebase_model.json", encoding="utf-8") as provenance_file:
+                observed["provenance"] = json.load(provenance_file)
+            observed["upload_folder"] = kwargs
+            return SimpleNamespace(
+                oid="hf-commit",
+                commit_url="https://huggingface.co/rebase/price-forecast/commit/hf-commit",
+            )
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(HfApi=FakeHfApi))
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    def fake_record_model_publication(model_id: str, **kwargs: Any) -> dict[str, Any]:
+        observed["record_model_id"] = model_id
+        observed["record"] = kwargs
+        return {"id": "publication-id", **kwargs}
+
+    monkeypatch.setattr(client, "record_model_publication", fake_record_model_publication)
+
+    class PriceForecastPredictor(rb.Predictor):
+        name = "price-forecast"
+
+        def predict(self) -> dict:
+            return {}
+
+    model = PriceForecastPredictor(client=client)
+    model.id = "model-id"
+    model.data = {"id": "model-id"}
+
+    publication = model._publish_to_huggingface(
+        version={
+            "id": "version-id",
+            "model_id": "model-id",
+            "version_number": 1,
+            "fingerprint": "fp-123",
+            "git_commit_sha": None,
+            "git_dirty": False,
+            "source_hash": "source-hash",
+            "source_code": "def predict():\n    return {}\n",
+        },
+        config=rb.HuggingFacePublishConfig("rebase/price-forecast", private=False),
+    )
+
+    assert publication["id"] == "publication-id"
+    assert observed["record_model_id"] == "model-id"
+    assert observed["record"]["provider_commit_sha"] == "hf-commit"
+    assert observed["record"]["source_git_commit_sha"] is None
+    assert observed["record"]["publication_metadata"]["source_git_sync"] is False
+    assert observed["provenance"]["git_commit_sha"] is None
+    assert observed["provenance"]["source_hash"] == "source-hash"
+
+
+def test_publish_to_huggingface_can_disable_source_git_sync(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    class FakeHfApi:
+        def __init__(self, *, token: str | None = None) -> None:
+            observed["token"] = token
+
+        def create_repo(self, **kwargs: Any) -> None:
+            observed["create_repo"] = kwargs
+
+        def list_repo_commits(self, **kwargs: Any) -> list[Any]:
+            observed["list_repo_commits"] = kwargs
+            return []
+
+        def upload_folder(self, **kwargs: Any) -> SimpleNamespace:
+            folder_path = kwargs["folder_path"]
+            with open(f"{folder_path}/rebase_model.json", encoding="utf-8") as provenance_file:
+                observed["provenance"] = json.load(provenance_file)
+            return SimpleNamespace(
+                oid="hf-commit",
+                commit_url="https://huggingface.co/rebase/price-forecast/commit/hf-commit",
+            )
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(HfApi=FakeHfApi))
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    def fake_record_model_publication(model_id: str, **kwargs: Any) -> dict[str, Any]:
+        observed["record_model_id"] = model_id
+        observed["record"] = kwargs
+        return {"id": "publication-id", **kwargs}
+
+    monkeypatch.setattr(client, "record_model_publication", fake_record_model_publication)
+
+    class PriceForecastPredictor(rb.Predictor):
+        name = "price-forecast"
+
+        def predict(self) -> dict:
+            return {}
+
+    model = PriceForecastPredictor(client=client)
+    model.id = "model-id"
+    model.data = {"id": "model-id"}
+
+    model._publish_to_huggingface(
+        version={
+            "id": "version-id",
+            "model_id": "model-id",
+            "version_number": 1,
+            "fingerprint": "fp-123",
+            "git_commit_sha": "git-commit",
+            "git_dirty": False,
+            "source_hash": "source-hash",
+        },
+        config=rb.HuggingFacePublishConfig(
+            "rebase/price-forecast",
+            private=False,
+            sync_source_git=False,
+        ),
+    )
+
+    assert observed["record"]["source_git_commit_sha"] is None
+    assert observed["record"]["publication_metadata"]["source_git_sync"] is False
+    assert observed["provenance"]["git_commit_sha"] == "git-commit"
 
 
 def test_predictor_ephemeral_run_sends_model_payload(monkeypatch) -> None:

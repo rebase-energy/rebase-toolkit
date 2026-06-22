@@ -37,6 +37,7 @@ def project(
     repo_owner: str | None = None,
     repo_name: str | None = None,
     repo_path: str | None = None,
+    deploy_source: str | None = None,
 ) -> Project:
     return Project(
         name,
@@ -45,6 +46,7 @@ def project(
         repo_owner=repo_owner,
         repo_name=repo_name,
         repo_path=repo_path,
+        deploy_source=deploy_source,
     )
 
 
@@ -62,6 +64,7 @@ def function(
     min_instances: int | None = None,
     concurrency: int | None = None,
     enabled: bool = True,
+    deploy_source: str | None = None,
 ) -> Callable[[Callable[..., Any]], Function]: ...
 
 
@@ -79,6 +82,7 @@ def function(
     min_instances: int | None = None,
     concurrency: int | None = None,
     enabled: bool = True,
+    deploy_source: str | None = None,
 ) -> Function: ...
 
 
@@ -95,6 +99,7 @@ def function(
     min_instances: int | None = None,
     concurrency: int | None = None,
     enabled: bool = True,
+    deploy_source: str | None = None,
 ) -> Callable[[Callable[..., Any]], Function] | Function:
     def decorator(callable_: Callable[..., Any]) -> Function:
         return Function(
@@ -109,6 +114,7 @@ def function(
             min_instances=min_instances,
             concurrency=concurrency,
             enabled=enabled,
+            deploy_source=deploy_source,
         )
 
     if fn is not None:
@@ -134,6 +140,7 @@ def step(
     timeout_seconds: int | float | None = None,
     cache: bool = False,
     resources: dict[str, Any] | None = None,
+    deploy_source: str | None = None,
 ) -> Callable[[Callable[..., Any]], Step]: ...
 
 
@@ -155,6 +162,7 @@ def step(
     timeout_seconds: int | float | None = None,
     cache: bool = False,
     resources: dict[str, Any] | None = None,
+    deploy_source: str | None = None,
 ) -> Step: ...
 
 
@@ -175,6 +183,7 @@ def step(
     timeout_seconds: int | float | None = None,
     cache: bool = False,
     resources: dict[str, Any] | None = None,
+    deploy_source: str | None = None,
 ) -> Callable[[Callable[..., Any]], Step] | Step:
     def decorator(callable_: Callable[..., Any]) -> Step:
         return Step(
@@ -193,6 +202,7 @@ def step(
             timeout_seconds=timeout_seconds,
             cache=cache,
             resources=resources,
+            deploy_source=deploy_source,
         )
 
     if fn is not None:
@@ -211,6 +221,7 @@ def workflow(
     default_parameters: dict[str, Any] | None = None,
     backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
     enabled: bool = True,
+    deploy_source: str | None = None,
 ) -> Callable[[Callable[..., Any]], Workflow]: ...
 
 
@@ -225,6 +236,7 @@ def workflow(
     default_parameters: dict[str, Any] | None = None,
     backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
     enabled: bool = True,
+    deploy_source: str | None = None,
 ) -> Workflow: ...
 
 
@@ -238,6 +250,7 @@ def workflow(
     default_parameters: dict[str, Any] | None = None,
     backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
     enabled: bool = True,
+    deploy_source: str | None = None,
 ) -> Callable[[Callable[..., Any]], Workflow] | Workflow:
     def decorator(callable_: Callable[..., Any]) -> Workflow:
         return Workflow(
@@ -249,6 +262,7 @@ def workflow(
             default_parameters=default_parameters,
             backend=backend,
             enabled=enabled,
+            deploy_source=deploy_source,
         )
 
     if fn is not None:
@@ -262,10 +276,16 @@ DeployTarget = Project | Function | Workflow | Model
 def deploy(
     *targets: DeployTarget,
     replace: bool = False,
+    deploy_source: str | None = None,
 ) -> DeployTarget | list[Any]:
     if not targets:
         raise RebaseWorkflowError("deploy requires at least one Rebase project, function, workflow, or model")
-    deployed = [target.deploy(replace=replace) for target in targets]
+    deployed = [
+        target.deploy(replace=replace)
+        if deploy_source is None
+        else target.deploy(replace=replace, deploy_source=deploy_source)
+        for target in targets
+    ]
     return deployed[0] if len(deployed) == 1 else deployed
 
 

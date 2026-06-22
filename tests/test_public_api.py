@@ -22,6 +22,15 @@ def test_version_is_exported() -> None:
     assert rb.__version__
 
 
+def test_huggingface_publish_config_is_exported() -> None:
+    config = rb.HuggingFacePublishConfig("rebase/price-forecast", private=False)
+
+    assert config.repo_id == "rebase/price-forecast"
+    assert config.private is False
+    assert config.repo_type == "model"
+    assert config.sync_source_git is True
+
+
 def test_project_helper_returns_project() -> None:
     project = rb.project("energy-forecasting", description="Forecasts")
 
