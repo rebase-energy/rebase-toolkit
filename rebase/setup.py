@@ -88,8 +88,35 @@ def _ansi_color(hex_color: str) -> str:
 
 
 RESET = "\033[0m"
+GREEN = _ansi_color(BRAND_BRIGHT_GREEN)
+MUTED = _ansi_color(BRAND_MEDIUM_GRAY)
+BOLD = "\033[1m"
+DIM = "\033[2m"
 SELECTED_MARKER = f"{_ansi_color(BRAND_BRIGHT_GREEN)}●{RESET}"
 UNSELECTED_MARKER = f"{_ansi_color(BRAND_MEDIUM_GRAY)}○{RESET}"
+
+
+def _paint(text: str, *styles: str) -> str:
+    return "".join(styles) + text + RESET
+
+
+def _intro() -> None:
+    print(_paint("Rebase setup", BOLD, GREEN))
+    print(_paint("Connect your identity, workspace, and source repository.", DIM, MUTED))
+    print()
+
+
+def _section(title: str) -> None:
+    print()
+    print(f"{SELECTED_MARKER} {_paint(title, BOLD, GREEN)}")
+
+
+def _success(message: str) -> None:
+    print(f"{_paint('✓', GREEN)} {message}")
+
+
+def _hint(message: str) -> None:
+    print(_paint(message, DIM, MUTED))
 
 
 def _terminal_fd() -> tuple[int | None, bool]:
@@ -185,8 +212,8 @@ def _read_input(prompt: str) -> str:
     return entered
 
 
-def _selector_lines(label: str, values: list[str], selected_index: int) -> list[str]:
-    lines = [f"Choose {label}:"]
+def _selector_lines(title: str, values: list[str], selected_index: int) -> list[str]:
+    lines = [title]
     for index, value in enumerate(values):
         marker = SELECTED_MARKER if index == selected_index else UNSELECTED_MARKER
         lines.append(f"  {marker} {value}")
@@ -214,8 +241,8 @@ def _read_tty_key(fd: int) -> bytes:
     return key + bytes(suffix)
 
 
-def _render_selector(fd: int, label: str, values: list[str], selected_index: int, *, previous_lines: int) -> int:
-    lines = _selector_lines(label, values, selected_index)
+def _render_selector(fd: int, title: str, values: list[str], selected_index: int, *, previous_lines: int) -> int:
+    lines = _selector_lines(title, values, selected_index)
     if previous_lines:
         os.write(fd, f"\033[{previous_lines}F".encode())
     for line in lines:
@@ -223,7 +250,7 @@ def _render_selector(fd: int, label: str, values: list[str], selected_index: int
     return len(lines)
 
 
-def _choose_tty(label: str, values: list[str], *, default: str) -> str | None:
+def _choose_tty(title: str, values: list[str], *, default: str) -> str | None:
     try:
         import termios
     except ImportError:
@@ -249,7 +276,7 @@ def _choose_tty(label: str, values: list[str], *, default: str) -> str | None:
     try:
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
         os.write(fd, b"\033[?25l")
-        previous_lines = _render_selector(fd, label, values, selected_index, previous_lines=previous_lines)
+        previous_lines = _render_selector(fd, title, values, selected_index, previous_lines=previous_lines)
         while True:
             key = _read_tty_key(fd)
             if key == b"\x03":
@@ -262,7 +289,7 @@ def _choose_tty(label: str, values: list[str], *, default: str) -> str | None:
             next_index = _selector_index_for_key(selected_index, key, len(values))
             if next_index != selected_index:
                 selected_index = next_index
-                previous_lines = _render_selector(fd, label, values, selected_index, previous_lines=previous_lines)
+                previous_lines = _render_selector(fd, title, values, selected_index, previous_lines=previous_lines)
     finally:
         os.write(fd, b"\033[?25h")
         termios.tcsetattr(fd, termios.TCSANOW, old_attrs)
@@ -283,22 +310,20 @@ def _prompt(value: str | None, message: str, *, default: str | None = None) -> s
 
 
 def _confirm(message: str, *, default: bool) -> bool:
-    suffix = "Y/n" if default else "y/N"
-    entered = _read_input(f"{message} [{suffix}]: ").strip().lower()
-    if not entered:
-        return default
-    return entered in {"y", "yes"}
+    default_value = "Yes" if default else "No"
+    return _choose("answer", ["Yes", "No"], default=default_value, title=message) == "Yes"
 
 
-def _choose(label: str, values: list[str], *, default: str | None = None) -> str:
+def _choose(label: str, values: list[str], *, default: str | None = None, title: str | None = None) -> str:
     if not values:
         raise RebaseWorkflowError(f"no {label} options available")
     default = default if default in values else values[0]
-    selected = _choose_tty(label, values, default=default)
+    title = title or f"Choose {label}:"
+    selected = _choose_tty(title, values, default=default)
     if selected is not None:
         return selected
 
-    print(f"Choose {label}:")
+    print(title)
     for index, value in enumerate(values, start=1):
         marker = " (default)" if value == default else ""
         print(f"  {index}. {value}{marker}")
@@ -348,10 +373,11 @@ def _oauth_session(args: Any, config: dict[str, Any]) -> str:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     if args.no_browser:
+        _hint("Open this URL to authenticate:")
         print(auth_url)
     else:
         webbrowser.open(auth_url)
-        print("Opened browser for Supabase login")
+        _hint("Opened browser for Supabase login")
     deadline = time.monotonic() + args.auth_timeout
     while thread.is_alive() and time.monotonic() < deadline:
         time.sleep(0.1)
@@ -412,10 +438,11 @@ def _wait_for_github_installation(args: Any, client: Client, *, workspace_id: st
     setup_session = client.create_github_setup_session(workspace_id=workspace_id)
     install_url = setup_session["install_url"]
     if args.no_browser:
+        _hint("Open this URL to install the Rebase GitHub App:")
         print(install_url)
     else:
         webbrowser.open(install_url)
-        print("Opened browser for GitHub App installation")
+        _hint("Opened browser for GitHub App installation")
     deadline = time.monotonic() + args.github_timeout
     while time.monotonic() < deadline:
         status = client.get_github_setup_session(setup_session["id"])
@@ -473,11 +500,12 @@ def _should_create_repo(args: Any) -> bool:
 def _create_repo_in_browser(args: Any, *, default_name: str) -> str:
     new_repo_url = f"https://github.com/new?{urlencode({'name': default_name})}"
     if args.no_browser:
+        _hint("Open this URL to create the repository:")
         print(new_repo_url)
     else:
         webbrowser.open(new_repo_url)
-        print("Opened browser for GitHub repository creation")
-    print("Create the repository in GitHub, then return here.")
+        _hint("Opened browser for GitHub repository creation")
+    _hint("Create the repository in GitHub, then return here.")
     return _prompt(args.repo, "GitHub repository full name")
 
 
@@ -514,7 +542,7 @@ def _connect_github(args: Any, client: Client, *, workspace_id: str) -> None:
             args,
             default_name=_repo_name_seed(project_name, workspace_id),
         )
-        print("Select that repository when GitHub asks which repositories the Rebase App can access.")
+        _hint("Select that repository when GitHub asks which repositories the Rebase App can access.")
     if args.github_installation_id:
         setup_status = {"installation_id": args.github_installation_id}
     else:
@@ -531,34 +559,41 @@ def _connect_github(args: Any, client: Client, *, workspace_id: str) -> None:
         default_branch=repo.get("default_branch"),
         project_id=project_id,
     )
-    print(f"Connected {connection['repo_owner']}/{connection['repo_name']} at {scope} level")
+    _success(f"Connected {connection['repo_owner']}/{connection['repo_name']} at {scope} level")
 
 
 def run_setup(args: Any) -> int:
     _restore_terminal_for_prompts()
+    _intro()
     client = Client(api_url=args.api_url, profile=args.profile)
     config = client.setup_config()
+    _section("Authenticate")
     token = _access_token(args, config)
     authed_client = Client(api_url=client.api_url, access_token=token, profile=args.profile)
     session = load_session()
     if session is not None:
-        print(f"Authenticated as {session.email or session.user_id or 'Supabase user'}")
+        _success(f"Authenticated as {session.email or session.user_id or 'Supabase user'}")
+    _section("Workspace")
     workspace = _select_workspace(args, authed_client)
     workspace_id = str(workspace["id"])
     path = write_profile(profile=args.profile, api_url=authed_client.api_url, workspace=workspace)
-    print(f"Using workspace {workspace_id}")
-    print(f"Saved Rebase profile '{args.profile}' to {path}")
+    _success(f"Using workspace {workspace_id}")
+    _hint(f"Saved Rebase profile '{args.profile}' to {path}")
+    _section("GitHub")
     if args.github is False:
-        print("Run `rebase setup` again later to connect GitHub.")
+        _hint("Run `rebase setup` again later to connect GitHub.")
+        _success("Setup complete")
         return 0
     if not config.get("github_app_configured"):
         if args.github is True:
             raise RebaseWorkflowError("GitHub connection is not configured on this workflow API")
-        print("GitHub connection is not available on this workflow API.")
+        _hint("GitHub connection is not available on this workflow API.")
+        _success("Setup complete")
         return 0
     should_connect = args.github is True or _confirm("Connect GitHub now?", default=False)
     if should_connect:
         _connect_github(args, authed_client, workspace_id=workspace_id)
     else:
-        print("Run `rebase setup` again later to connect GitHub.")
+        _hint("Run `rebase setup` again later to connect GitHub.")
+    _success("Setup complete")
     return 0

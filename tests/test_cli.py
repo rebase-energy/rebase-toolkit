@@ -689,6 +689,26 @@ def test_setup_selector_arrow_navigation_wraps() -> None:
     assert setup_module._selector_index_for_key(1, b"x", 2) == 1
 
 
+def test_setup_confirm_uses_selector(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    observed: dict[str, Any] = {}
+
+    def fake_choose(label: str, values: list[str], *, default: str | None = None, title: str | None = None) -> str:
+        observed.update({"label": label, "values": values, "default": default, "title": title})
+        return "Yes"
+
+    monkeypatch.setattr(setup_module, "_choose", fake_choose)
+
+    assert setup_module._confirm("Connect GitHub now?", default=False) is True
+    assert observed == {
+        "label": "answer",
+        "values": ["Yes", "No"],
+        "default": "No",
+        "title": "Connect GitHub now?",
+    }
+
+
 def test_main_keyboard_interrupt_aborts_cleanly(monkeypatch, capsys) -> None:
     def interrupting_app(*args: Any, **kwargs: Any) -> None:
         raise KeyboardInterrupt
