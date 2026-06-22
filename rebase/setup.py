@@ -77,40 +77,90 @@ class _CallbackServer(HTTPServer):
     callback_params: dict[str, str] | None = None
 
 
+def _terminal_fd() -> tuple[int | None, bool]:
+    try:
+        return os.open("/dev/tty", os.O_RDWR), True
+    except OSError:
+        if sys.stdin.isatty():
+            return sys.stdin.fileno(), False
+    return None, False
+
+
 def _restore_terminal_for_prompts() -> None:
     try:
         import termios
     except ImportError:
         return
 
-    fds: list[int] = []
-    tty_fd: int | None = None
-    if sys.stdin.isatty():
-        fds.append(sys.stdin.fileno())
+    fd, should_close = _terminal_fd()
+    if fd is None:
+        return
     try:
-        tty_fd = os.open("/dev/tty", os.O_RDWR)
+        attrs = termios.tcgetattr(fd)
+        attrs[0] |= termios.ICRNL
+        attrs[3] |= termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG
+        attrs[6][termios.VINTR] = b"\x03" if isinstance(attrs[6][termios.VINTR], bytes) else 3
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
     except OSError:
-        tty_fd = None
-    if tty_fd is not None and tty_fd not in fds:
-        fds.append(tty_fd)
+        return
+    finally:
+        if should_close:
+            os.close(fd)
+
+
+def _read_tty_line(prompt: str) -> str | None:
+    try:
+        import termios
+    except ImportError:
+        return None
+
+    fd, should_close = _terminal_fd()
+    if fd is None:
+        return None
 
     try:
-        for fd in fds:
-            try:
-                attrs = termios.tcgetattr(fd)
-            except OSError:
+        old_attrs = termios.tcgetattr(fd)
+    except OSError:
+        if should_close:
+            os.close(fd)
+        return None
+
+    attrs = old_attrs[:]
+    attrs[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
+    attrs[6][termios.VMIN] = 1
+    attrs[6][termios.VTIME] = 0
+    buffer = bytearray()
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        os.write(fd, prompt.encode())
+        while True:
+            char = os.read(fd, 1)
+            if char == b"\x03":
+                os.write(fd, b"^C\n")
+                raise KeyboardInterrupt
+            if char in {b"\r", b"\n"}:
+                os.write(fd, b"\n")
+                return buffer.decode(errors="ignore")
+            if char in {b"\x7f", b"\b"}:
+                if buffer:
+                    del buffer[-1]
+                    os.write(fd, b"\b \b")
                 continue
-            attrs[0] |= termios.ICRNL
-            attrs[3] |= termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG
-            attrs[6][termios.VINTR] = b"\x03" if isinstance(attrs[6][termios.VINTR], bytes) else 3
-            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            if char == b"\x04" and not buffer:
+                raise KeyboardInterrupt
+            buffer.extend(char)
+            os.write(fd, char)
     finally:
-        if tty_fd is not None:
-            os.close(tty_fd)
+        termios.tcsetattr(fd, termios.TCSANOW, old_attrs)
+        if should_close:
+            os.close(fd)
 
 
 def _read_input(prompt: str) -> str:
     _restore_terminal_for_prompts()
+    tty_value = _read_tty_line(prompt)
+    if tty_value is not None:
+        return tty_value
     try:
         entered = input(prompt)
     except EOFError:

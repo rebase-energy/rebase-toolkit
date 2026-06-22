@@ -1119,28 +1119,32 @@ def setup_command(
     if api_key is None:
         from rebase.setup import run_setup
 
-        run_setup(
-            SimpleNamespace(
-                profile=profile,
-                api_url=api_url,
-                provider=provider,
-                force_auth=force_auth,
-                callback_port=callback_port,
-                auth_timeout=auth_timeout,
-                no_browser=no_browser,
-                workspace=workspace,
-                workspace_name=workspace_name,
-                github=github,
-                github_installation_id=github_installation_id,
-                github_timeout=github_timeout,
-                poll_interval=poll_interval,
-                repo=repo,
-                repo_scope=repo_scope,
-                repo_path=repo_path,
-                create_repo=create_repo,
-                project=project,
+        try:
+            run_setup(
+                SimpleNamespace(
+                    profile=profile,
+                    api_url=api_url,
+                    provider=provider,
+                    force_auth=force_auth,
+                    callback_port=callback_port,
+                    auth_timeout=auth_timeout,
+                    no_browser=no_browser,
+                    workspace=workspace,
+                    workspace_name=workspace_name,
+                    github=github,
+                    github_installation_id=github_installation_id,
+                    github_timeout=github_timeout,
+                    poll_interval=poll_interval,
+                    repo=repo,
+                    repo_scope=repo_scope,
+                    repo_path=repo_path,
+                    create_repo=create_repo,
+                    project=project,
+                )
             )
-        )
+        except KeyboardInterrupt:
+            error_console.print("Aborted.", style="rebase.error")
+            raise SystemExit(130) from None
         return
 
     api_key = api_key.strip()
@@ -2024,6 +2028,8 @@ def main(argv: list[str] | None = None) -> int:
     except click.ClickException as exc:
         exc.show(file=sys.stderr)
         return int(exc.exit_code)
+    except click.exceptions.Exit as exc:
+        return int(exc.exit_code or 0)
     except click.Abort:
         error_console.print("Aborted.", style="rebase.error")
         return 1
