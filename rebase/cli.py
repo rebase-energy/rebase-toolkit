@@ -722,6 +722,57 @@ def _workspace_table(profiles: dict[str, dict[str, Any]], *, active_profile: str
     return table
 
 
+def _workspace_member_identity(data: dict[str, Any]) -> str:
+    email = data.get("email")
+    if isinstance(email, str) and email:
+        return email
+    github_username = data.get("github_username")
+    if isinstance(github_username, str) and github_username:
+        return f"@{github_username}"
+    display_name = data.get("display_name")
+    if isinstance(display_name, str) and display_name:
+        return display_name
+    profile_id = data.get("profile_id")
+    if isinstance(profile_id, str) and profile_id:
+        return profile_id
+    return str(data.get("id", "-"))
+
+
+def _workspace_members_table(members: list[dict[str, Any]], pending_invites: list[dict[str, Any]]) -> Table:
+    table = Table(
+        title="Workspace Members",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Identity", style="rebase.value")
+    table.add_column("Role", no_wrap=True)
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Kind", no_wrap=True, style="rebase.muted")
+    table.add_column("Created", style="rebase.muted")
+
+    for member in members:
+        status = "active" if member.get("enabled", True) else "disabled"
+        table.add_row(
+            _workspace_member_identity(member),
+            _format_value(member.get("role")),
+            status,
+            "member",
+            _format_value(member.get("created_at")),
+        )
+    for invite in pending_invites:
+        table.add_row(
+            _workspace_member_identity(invite),
+            _format_value(invite.get("role")),
+            _format_value(invite.get("status")),
+            "invite",
+            _format_value(invite.get("created_at")),
+        )
+    return table
+
+
 def _deploy_table(deployed: list[tuple[str, str, str | None]]) -> Table:
     table = Table(
         title="Deployed Targets",
@@ -1246,6 +1297,72 @@ def workspace_switch_command(profile: Annotated[str, typer.Argument(help="Profil
 def workspace_use_command(profile: Annotated[str, typer.Argument(help="Profile name.")]) -> None:
     """Alias for `rebase workspace switch`."""
     _switch_workspace(profile)
+
+
+def _workspace_invite_identity(
+    target: str | None,
+    *,
+    email: str | None,
+    github_username: str | None,
+) -> tuple[str | None, str | None]:
+    provided = [value for value in (target, email, github_username) if value]
+    if len(provided) != 1:
+        raise RebaseWorkflowError("provide exactly one invite target: TARGET, --email, or --github")
+    if email:
+        return email, None
+    if github_username:
+        return None, github_username
+    if target and "@" in target:
+        return target, None
+    return None, target
+
+
+@workspace_app.command("invite")
+def workspace_invite_command(
+    target: Annotated[
+        str | None,
+        typer.Argument(help="Email address or GitHub username to invite."),
+    ] = None,
+    email: Annotated[str | None, typer.Option("--email", help="Email address to invite.")] = None,
+    github_username: Annotated[str | None, typer.Option("--github", help="GitHub username to invite.")] = None,
+    role: Annotated[
+        str,
+        typer.Option("--role", help="Workspace role: Viewer, Developer, Admin, or Owner."),
+    ] = "Viewer",
+) -> None:
+    """Invite a person to the active workspace."""
+    if role not in {"Viewer", "Developer", "Admin", "Owner"}:
+        raise RebaseWorkflowError("role must be one of: Viewer, Developer, Admin, Owner")
+    invite_email, invite_github_username = _workspace_invite_identity(
+        target,
+        email=email,
+        github_username=github_username,
+    )
+    invite = Client().create_workspace_invite(
+        email=invite_email,
+        github_username=invite_github_username,
+        role=role,
+    )
+    identity = invite.get("email") or f"@{invite.get('github_username')}"
+    status = invite.get("status", "pending")
+    console.print(
+        f"Invited [rebase.value]{identity}[/rebase.value] to workspace as "
+        f"[rebase.value]{invite.get('role', role)}[/rebase.value] ([rebase.value]{status}[/rebase.value])"
+    )
+
+
+@workspace_app.command("members")
+def workspace_members_command(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List active workspace members and pending invites."""
+    client = Client()
+    members = client.list_workspace_members()
+    pending_invites = [invite for invite in client.list_workspace_invites() if invite.get("status") == "pending"]
+    if json_output:
+        _print_json({"members": members, "pending_invites": pending_invites})
+        return
+    console.print(_workspace_members_table(members, pending_invites))
 
 
 app.add_typer(workspace_app, name="workspace")

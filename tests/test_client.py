@@ -147,6 +147,70 @@ def test_create_platform_invite_posts_email(monkeypatch) -> None:
     }
 
 
+def test_create_workspace_invite_posts_identity_and_role(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["json"] = kwargs["json"]
+        return FakeResponse(
+            {
+                "id": "invite-id",
+                "email": "new@example.com",
+                "github_username": None,
+                "role": "Developer",
+                "status": "pending",
+            }
+        )
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    response = client.create_workspace_invite(email="new@example.com", role="Developer")
+
+    assert response["email"] == "new@example.com"
+    assert observed == {
+        "method": "POST",
+        "url": "https://workflows.example.com/workspace/invites",
+        "json": {
+            "email": "new@example.com",
+            "github_username": None,
+            "role": "Developer",
+            "expires_at": None,
+        },
+    }
+
+
+def test_list_workspace_members_requests_members_endpoint(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        return FakeResponse(
+            [
+                {
+                    "email": "owner@example.com",
+                    "github_username": "owner-gh",
+                    "role": "Owner",
+                    "enabled": True,
+                }
+            ]
+        )
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    response = client.list_workspace_members()
+
+    assert response[0]["role"] == "Owner"
+    assert observed == {
+        "method": "GET",
+        "url": "https://workflows.example.com/workspace/members",
+    }
+
+
 def test_client_get_project_requests_project_endpoint(monkeypatch) -> None:
     observed: dict[str, Any] = {}
 

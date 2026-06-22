@@ -607,7 +607,7 @@ def test_setup_can_skip_verification(monkeypatch, tmp_path: Path) -> None:
     assert data["profiles"]["default"]["api_key"] == "rbw_secret"
 
 
-def test_setup_wizard_stores_supabase_profile(monkeypatch, tmp_path: Path) -> None:
+def test_setup_wizard_stores_supabase_profile(monkeypatch, tmp_path: Path, capsys) -> None:
     config_path = tmp_path / "config.json"
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
 
@@ -675,6 +675,11 @@ def test_setup_wizard_stores_supabase_profile(monkeypatch, tmp_path: Path) -> No
             }
         },
     }
+    output = capsys.readouterr().out
+    assert "Step 1 of 3: Authenticate" in output
+    assert "Step 2 of 3: Workspace" in output
+    assert "Step 3 of 3: GitHub" in output
+    assert "────────────────" in output
 
 
 def test_setup_prompt_treats_literal_ctrl_c_as_abort(monkeypatch) -> None:
@@ -894,7 +899,7 @@ def test_setup_existing_repo_prompts_before_verifying_installation(monkeypatch, 
     assert "Verified GitHub App access to rebase/platform" in capsys.readouterr().out
 
 
-def test_setup_opens_github_installation_before_repo_questions(monkeypatch) -> None:
+def test_setup_opens_github_installation_after_repo_questions(monkeypatch) -> None:
     from rebase import setup as setup_module
 
     calls: list[str] = []
@@ -969,11 +974,11 @@ def test_setup_opens_github_installation_before_repo_questions(monkeypatch) -> N
     )
 
     assert calls == [
-        "create_setup:default",
-        "open:https://github.com/apps/rebase-workflows/installations/new",
         "choose:GitHub connection scope",
         "choose:repository setup",
         "prompt:GitHub repository full name",
+        "create_setup:default",
+        "open:https://github.com/apps/rebase-workflows/installations/new",
         "find_repo:rebase/platform",
         "connect:rebase/platform",
     ]
@@ -1179,6 +1184,106 @@ def test_workspace_switch_changes_default_profile(monkeypatch, tmp_path: Path, c
     data = json.loads(config_path.read_text(encoding="utf-8"))
     assert data["default_profile"] == "prod"
     assert capsys.readouterr().out == "Switched workspace profile to 'prod'\n"
+
+
+def test_workspace_invite_email_target(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_create_workspace_invite(self: Client, **kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        return {
+            "email": kwargs["email"],
+            "github_username": None,
+            "role": kwargs["role"],
+            "status": "pending",
+        }
+
+    monkeypatch.setattr(Client, "create_workspace_invite", fake_create_workspace_invite)
+
+    assert main(["workspace", "invite", "davide@rebase.energy", "--role", "Developer"]) == 0
+
+    assert observed == {
+        "email": "davide@rebase.energy",
+        "github_username": None,
+        "role": "Developer",
+    }
+    output = capsys.readouterr().out
+    assert "davide@rebase.energy" in output
+    assert "Developer" in output
+
+
+def test_workspace_invite_github_target(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_create_workspace_invite(self: Client, **kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        return {
+            "email": None,
+            "github_username": kwargs["github_username"],
+            "role": kwargs["role"],
+            "status": "pending",
+        }
+
+    monkeypatch.setattr(Client, "create_workspace_invite", fake_create_workspace_invite)
+
+    assert main(["workspace", "invite", "davide-github"]) == 0
+
+    assert observed == {
+        "email": None,
+        "github_username": "davide-github",
+        "role": "Viewer",
+    }
+    assert "@davide-github" in capsys.readouterr().out
+
+
+def test_workspace_invite_requires_one_target(capsys) -> None:
+    assert main(["workspace", "invite"]) == 1
+
+    assert "provide exactly one invite target" in capsys.readouterr().err
+
+
+def test_workspace_members_lists_members_and_pending_invites(monkeypatch, capsys) -> None:
+    def fake_list_workspace_members(self: Client) -> list[dict[str, Any]]:
+        return [
+            {
+                "email": "sebastian@rebase.energy",
+                "github_username": "sebaheg",
+                "role": "Owner",
+                "enabled": True,
+                "created_at": "2026-06-22T22:00:00Z",
+            }
+        ]
+
+    def fake_list_workspace_invites(self: Client) -> list[dict[str, Any]]:
+        return [
+            {
+                "email": "davide@rebase.energy",
+                "github_username": None,
+                "role": "Viewer",
+                "status": "pending",
+                "created_at": "2026-06-22T22:52:29Z",
+            },
+            {
+                "email": "accepted@example.com",
+                "github_username": None,
+                "role": "Developer",
+                "status": "accepted",
+                "created_at": "2026-06-22T22:30:00Z",
+            },
+        ]
+
+    monkeypatch.setattr(Client, "list_workspace_members", fake_list_workspace_members)
+    monkeypatch.setattr(Client, "list_workspace_invites", fake_list_workspace_invites)
+
+    assert main(["workspace", "members"]) == 0
+
+    output = capsys.readouterr().out
+    assert "sebastian@rebase.energy" in output
+    assert "Owner" in output
+    assert "davide@rebase.energy" in output
+    assert "Viewer" in output
+    assert "pending" in output
+    assert "accepted@example.com" not in output
 
 
 def test_project_list_command_prints_projects(monkeypatch, capsys) -> None:

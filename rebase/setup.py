@@ -99,6 +99,8 @@ BOLD = "\033[1m"
 DIM = "\033[2m"
 SELECTED_MARKER = f"{_ansi_color(BRAND_BRIGHT_GREEN)}●{RESET}"
 UNSELECTED_MARKER = f"{_ansi_color(BRAND_MEDIUM_GRAY)}○{RESET}"
+SETUP_STEPS = ("Authenticate", "Workspace", "GitHub")
+SECTION_RULE = "─" * 72
 
 
 def _paint(text: str, *styles: str) -> str:
@@ -111,9 +113,12 @@ def _intro() -> None:
     print()
 
 
-def _section(title: str) -> None:
+def _section(title: str, *, step: int | None = None, total: int | None = None) -> None:
+    label = title if step is None or total is None else f"Step {step} of {total}: {title}"
     print()
-    print(f"{SELECTED_MARKER} {_paint(title, BOLD, GREEN)}")
+    print(_paint(SECTION_RULE, DIM, MUTED))
+    print(f"{SELECTED_MARKER} {_paint(label, BOLD, GREEN)}")
+    print(_paint(SECTION_RULE, DIM, MUTED))
 
 
 def _success(message: str) -> None:
@@ -637,8 +642,6 @@ def _select_repo_scope(args: Any) -> str:
 def _connect_github(args: Any, client: Client, *, workspace_id: str) -> None:
     setup_status = {"installation_id": args.github_installation_id} if args.github_installation_id else None
     repo = None
-    if setup_status is None:
-        _start_github_installation(args, client, workspace_id=workspace_id)
     scope = _select_repo_scope(args)
     project_id = None
     project_name = None
@@ -659,6 +662,8 @@ def _connect_github(args: Any, client: Client, *, workspace_id: str) -> None:
         repo_full_name = _prompt_existing_repo(args)
         _hint(f"Verifying the Rebase GitHub App can access {repo_full_name}.")
     if setup_status is None:
+        _hint(f"Select {repo_full_name} when GitHub asks which repositories the Rebase App can access.")
+        _start_github_installation(args, client, workspace_id=workspace_id)
         try:
             installation_id, repo = _find_repo_installation(client, repo_full_name)
         except RebaseWorkflowError as exc:
@@ -702,19 +707,20 @@ def run_setup(args: Any) -> int:
     _intro()
     client = Client(api_url=args.api_url, profile=args.profile)
     config = client.setup_config()
-    _section("Authenticate")
+    total_steps = len(SETUP_STEPS)
+    _section("Authenticate", step=1, total=total_steps)
     token = _access_token(args, config)
     authed_client = Client(api_url=client.api_url, access_token=token, profile=args.profile)
     session = load_session()
     if session is not None:
         _success(f"Authenticated as {session.email or session.user_id or 'Supabase user'}")
-    _section("Workspace")
+    _section("Workspace", step=2, total=total_steps)
     workspace = _select_workspace(args, authed_client, session=session)
     workspace_id = str(workspace["id"])
     path = write_profile(profile=args.profile, api_url=authed_client.api_url, workspace=workspace)
     _success(f"Using workspace {workspace_id}")
     _hint(f"Saved Rebase profile '{args.profile}' to {path}")
-    _section("GitHub")
+    _section("GitHub", step=3, total=total_steps)
     if args.github is False:
         _hint("Run `rebase setup` again later to connect GitHub.")
         _success("Setup complete")

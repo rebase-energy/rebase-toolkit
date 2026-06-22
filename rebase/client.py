@@ -899,6 +899,46 @@ class Client:
             raise RebaseWorkflowError("expected platform invite response")
         return response
 
+    def list_workspace_invites(self) -> list[dict[str, Any]]:
+        response = self.request("GET", "/workspace/invites")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected workspace invite list response")
+        return response
+
+    def list_workspace_members(self) -> list[dict[str, Any]]:
+        response = self.request("GET", "/workspace/members")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected workspace member list response")
+        return response
+
+    def create_workspace_invite(
+        self,
+        *,
+        email: str | None = None,
+        github_username: str | None = None,
+        role: str = "Viewer",
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            "/workspace/invites",
+            json={
+                "email": email,
+                "github_username": github_username,
+                "role": role,
+                "expires_at": expires_at,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected workspace invite response")
+        return response
+
+    def revoke_workspace_invite(self, invite_id: str) -> dict[str, Any]:
+        response = self.request("DELETE", f"/workspace/invites/{invite_id}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected workspace invite response")
+        return response
+
     def create_github_setup_session(self, *, workspace_id: str | None = None) -> dict[str, Any]:
         response = self.request("POST", "/integrations/github/setup-sessions", json={"workspace_id": workspace_id})
         if not isinstance(response, dict):
