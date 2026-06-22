@@ -645,6 +645,29 @@ def test_setup_wizard_stores_supabase_profile(monkeypatch, tmp_path: Path) -> No
     }
 
 
+def test_setup_prompt_treats_literal_ctrl_c_as_abort(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "\x03")
+
+    try:
+        setup_module._read_input("workspace [1-1]: ")
+    except KeyboardInterrupt:
+        return
+
+    raise AssertionError("expected KeyboardInterrupt")
+
+
+def test_main_keyboard_interrupt_aborts_cleanly(monkeypatch, capsys) -> None:
+    def interrupting_app(*args: Any, **kwargs: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("rebase.cli.app", interrupting_app)
+
+    assert main(["setup"]) == 130
+    assert "Aborted." in capsys.readouterr().err
+
+
 def test_workspace_lists_profiles(monkeypatch, tmp_path: Path, capsys) -> None:
     config_path = tmp_path / "config.json"
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))

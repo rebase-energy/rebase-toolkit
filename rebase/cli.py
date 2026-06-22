@@ -2027,6 +2027,9 @@ def main(argv: list[str] | None = None) -> int:
     except click.Abort:
         error_console.print("Aborted.", style="rebase.error")
         return 1
+    except KeyboardInterrupt:
+        error_console.print("Aborted.", style="rebase.error")
+        return 130
 
 
 if __name__ == "__main__":

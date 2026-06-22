@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 import threading
 import time
 import webbrowser
@@ -75,11 +76,39 @@ class _CallbackServer(HTTPServer):
     callback_params: dict[str, str] | None = None
 
 
+def _restore_terminal_for_prompts() -> None:
+    if not sys.stdin.isatty():
+        return
+    try:
+        import termios
+    except ImportError:
+        return
+    try:
+        fd = sys.stdin.fileno()
+        attrs = termios.tcgetattr(fd)
+        attrs[0] |= termios.ICRNL
+        attrs[3] |= termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG
+        attrs[6][termios.VINTR] = b"\x03"
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except OSError:
+        return
+
+
+def _read_input(prompt: str) -> str:
+    try:
+        entered = input(prompt)
+    except EOFError:
+        raise KeyboardInterrupt from None
+    if "\x03" in entered:
+        raise KeyboardInterrupt
+    return entered
+
+
 def _prompt(value: str | None, message: str, *, default: str | None = None) -> str:
     if value:
         return value
     suffix = f" [{default}]" if default else ""
-    entered = input(f"{message}{suffix}: ").strip()
+    entered = _read_input(f"{message}{suffix}: ").strip()
     if entered:
         return entered
     if default is not None:
@@ -89,7 +118,7 @@ def _prompt(value: str | None, message: str, *, default: str | None = None) -> s
 
 def _confirm(message: str, *, default: bool) -> bool:
     suffix = "Y/n" if default else "y/N"
-    entered = input(f"{message} [{suffix}]: ").strip().lower()
+    entered = _read_input(f"{message} [{suffix}]: ").strip().lower()
     if not entered:
         return default
     return entered in {"y", "yes"}
@@ -103,7 +132,7 @@ def _choose(label: str, values: list[str], *, default: str | None = None) -> str
     for index, value in enumerate(values, start=1):
         marker = " (default)" if value == default else ""
         print(f"  {index}. {value}{marker}")
-    entered = input(f"{label} [1-{len(values)}]: ").strip()
+    entered = _read_input(f"{label} [1-{len(values)}]: ").strip()
     if not entered:
         return default
     try:
@@ -336,6 +365,7 @@ def _connect_github(args: Any, client: Client, *, workspace_id: str) -> None:
 
 
 def run_setup(args: Any) -> int:
+    _restore_terminal_for_prompts()
     client = Client(api_url=args.api_url, profile=args.profile)
     config = client.setup_config()
     token = _access_token(args, config)
