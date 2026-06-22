@@ -94,6 +94,7 @@ def _ansi_color(hex_color: str) -> str:
 RESET = "\033[0m"
 GREEN = _ansi_color(BRAND_BRIGHT_GREEN)
 MUTED = _ansi_color(BRAND_MEDIUM_GRAY)
+ERROR = _ansi_color("#ff5c5c")
 BOLD = "\033[1m"
 DIM = "\033[2m"
 SELECTED_MARKER = f"{_ansi_color(BRAND_BRIGHT_GREEN)}●{RESET}"
@@ -117,6 +118,10 @@ def _section(title: str) -> None:
 
 def _success(message: str) -> None:
     print(f"{_paint('✓', GREEN)} {message}")
+
+
+def _failure(message: str) -> None:
+    print(f"{_paint('✗', ERROR)} {message}")
 
 
 def _hint(message: str) -> None:
@@ -517,7 +522,7 @@ def _select_workspace(args: Any, client: Client, *, session: Any | None) -> dict
     return client.create_workspace(workspace_id, name=args.workspace_name)
 
 
-def _wait_for_github_installation(args: Any, client: Client, *, workspace_id: str) -> dict[str, Any]:
+def _start_github_installation(args: Any, client: Client, *, workspace_id: str) -> dict[str, Any]:
     setup_session = client.create_github_setup_session(workspace_id=workspace_id)
     install_url = setup_session["install_url"]
     if args.no_browser:
@@ -526,10 +531,15 @@ def _wait_for_github_installation(args: Any, client: Client, *, workspace_id: st
     else:
         webbrowser.open(install_url)
         _hint("Opened browser for GitHub App installation")
+    return setup_session
+
+
+def _wait_for_github_installation(args: Any, client: Client, setup_session: dict[str, Any]) -> dict[str, Any]:
     deadline = time.monotonic() + args.github_timeout
     while time.monotonic() < deadline:
         status = client.get_github_setup_session(setup_session["id"])
         if status["status"] == "installed" and status.get("installation_id") is not None:
+            _success("GitHub App installation ready")
             return status
         if status["status"] == "expired":
             raise RebaseWorkflowError("GitHub setup session expired")
@@ -616,6 +626,10 @@ def _select_repo_scope(args: Any) -> str:
 
 
 def _connect_github(args: Any, client: Client, *, workspace_id: str) -> None:
+    setup_status = {"installation_id": args.github_installation_id} if args.github_installation_id else None
+    setup_session = None
+    if setup_status is None:
+        setup_session = _start_github_installation(args, client, workspace_id=workspace_id)
     scope = _select_repo_scope(args)
     project_id = None
     project_name = None
@@ -635,12 +649,20 @@ def _connect_github(args: Any, client: Client, *, workspace_id: str) -> None:
     else:
         repo_full_name = _prompt_existing_repo(args)
         _hint(f"Verifying the Rebase GitHub App can access {repo_full_name}.")
-    if args.github_installation_id:
-        setup_status = {"installation_id": args.github_installation_id}
-    else:
-        setup_status = _wait_for_github_installation(args, client, workspace_id=workspace_id)
+    if setup_status is None:
+        if setup_session is None:
+            raise RebaseWorkflowError("GitHub setup session was not started")
+        _hint("Waiting for GitHub App installation to complete.")
+        setup_status = _wait_for_github_installation(args, client, setup_session)
     installation_id = int(setup_status["installation_id"])
-    repo = _select_repo(args, client, installation_id, repo_full_name=repo_full_name)
+    try:
+        repo = _select_repo(args, client, installation_id, repo_full_name=repo_full_name)
+    except RebaseWorkflowError:
+        if repo_full_name:
+            _failure(f"Could not verify GitHub App access to {repo_full_name}")
+        raise
+    if repo_full_name:
+        _success(f"Verified GitHub App access to {repo_full_name}")
     connection = client.connect_github_repo(
         scope=scope,
         installation_id=installation_id,

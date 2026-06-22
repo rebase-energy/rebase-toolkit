@@ -809,7 +809,7 @@ def test_setup_repo_creation_uses_action_selector(monkeypatch) -> None:
     }
 
 
-def test_setup_existing_repo_prompts_before_verifying_installation(monkeypatch) -> None:
+def test_setup_existing_repo_prompts_before_verifying_installation(monkeypatch, capsys) -> None:
     from rebase import setup as setup_module
 
     calls: list[str] = []
@@ -860,6 +860,119 @@ def test_setup_existing_repo_prompts_before_verifying_installation(monkeypatch) 
         "list_repos:123",
         "connect:rebase/platform",
     ]
+    assert "Verified GitHub App access to rebase/platform" in capsys.readouterr().out
+
+
+def test_setup_opens_github_installation_before_repo_questions(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[str] = []
+
+    class FakeClient:
+        def create_github_setup_session(self, *, workspace_id: str | None = None) -> dict[str, Any]:
+            calls.append(f"create_setup:{workspace_id}")
+            return {"id": "setup-id", "install_url": "https://github.com/apps/rebase-workflows/installations/new"}
+
+        def get_github_setup_session(self, setup_session_id: str) -> dict[str, Any]:
+            calls.append(f"poll_setup:{setup_session_id}")
+            return {"status": "installed", "installation_id": 123}
+
+        def list_github_repositories(self, installation_id: int) -> list[dict[str, Any]]:
+            calls.append(f"list_repos:{installation_id}")
+            return [
+                {
+                    "id": 456,
+                    "owner": "rebase",
+                    "name": "platform",
+                    "full_name": "rebase/platform",
+                    "default_branch": "main",
+                }
+            ]
+
+        def connect_github_repo(self, **kwargs: Any) -> dict[str, Any]:
+            calls.append(f"connect:{kwargs['repo_owner']}/{kwargs['repo_name']}")
+            return {"repo_owner": kwargs["repo_owner"], "repo_name": kwargs["repo_name"]}
+
+    def fake_choose(label: str, values: list[str], *, default: str | None = None, title: str | None = None) -> str:
+        calls.append(f"choose:{label}")
+        if label == "GitHub connection scope":
+            return "workspace"
+        assert label == "repository setup"
+        return "Select an existing repository"
+
+    def fake_prompt(value: str | None, message: str, *, default: str | None = None) -> str:
+        calls.append(f"prompt:{message}")
+        return "rebase/platform"
+
+    monkeypatch.setattr(setup_module, "_choose", fake_choose)
+    monkeypatch.setattr(setup_module, "_prompt", fake_prompt)
+    monkeypatch.setattr(setup_module.webbrowser, "open", lambda url: calls.append(f"open:{url}"))
+
+    setup_module._connect_github(
+        SimpleNamespace(
+            repo_scope=None,
+            project=None,
+            repo=None,
+            create_repo=False,
+            github_installation_id=None,
+            github_timeout=1,
+            poll_interval=0,
+            repo_path=None,
+            no_browser=False,
+        ),
+        FakeClient(),
+        workspace_id="default",
+    )
+
+    assert calls == [
+        "create_setup:default",
+        "open:https://github.com/apps/rebase-workflows/installations/new",
+        "choose:GitHub connection scope",
+        "choose:repository setup",
+        "prompt:GitHub repository full name",
+        "poll_setup:setup-id",
+        "list_repos:123",
+        "connect:rebase/platform",
+    ]
+
+
+def test_setup_existing_repo_reports_verification_failure(monkeypatch, capsys) -> None:
+    from rebase import setup as setup_module
+
+    class FakeClient:
+        def list_github_repositories(self, installation_id: int) -> list[dict[str, Any]]:
+            return [
+                {
+                    "id": 456,
+                    "owner": "rebase",
+                    "name": "other",
+                    "full_name": "rebase/other",
+                    "default_branch": "main",
+                }
+            ]
+
+    monkeypatch.setattr(setup_module, "_choose", lambda *args, **kwargs: "Select an existing repository")
+    monkeypatch.setattr(setup_module, "_prompt", lambda *args, **kwargs: "rebase/platform")
+
+    try:
+        setup_module._connect_github(
+            SimpleNamespace(
+                repo_scope="workspace",
+                project=None,
+                repo=None,
+                create_repo=False,
+                github_installation_id=123,
+                repo_path=None,
+            ),
+            FakeClient(),
+            workspace_id="default",
+        )
+    except setup_module.RebaseWorkflowError:
+        pass
+    else:
+        raise AssertionError("expected repo verification to fail")
+
+    assert "Could not verify GitHub App access to rebase/platform" in capsys.readouterr().out
 
 
 def test_setup_existing_repo_requires_owner_name() -> None:
