@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import select
 import subprocess
 import sys
 import threading
@@ -21,6 +22,7 @@ from rebase.auth import (
     pkce_challenge,
     save_session,
 )
+from rebase.brand import BRAND_BRIGHT_GREEN, BRAND_MEDIUM_GRAY
 from rebase.client import Client, RebaseWorkflowError, _parse_github_remote
 from rebase.config import write_profile
 
@@ -75,6 +77,19 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
 class _CallbackServer(HTTPServer):
     callback_params: dict[str, str] | None = None
+
+
+def _ansi_color(hex_color: str) -> str:
+    hex_value = hex_color.lstrip("#")
+    red = int(hex_value[0:2], 16)
+    green = int(hex_value[2:4], 16)
+    blue = int(hex_value[4:6], 16)
+    return f"\033[38;2;{red};{green};{blue}m"
+
+
+RESET = "\033[0m"
+SELECTED_MARKER = f"{_ansi_color(BRAND_BRIGHT_GREEN)}●{RESET}"
+UNSELECTED_MARKER = f"{_ansi_color(BRAND_MEDIUM_GRAY)}○{RESET}"
 
 
 def _terminal_fd() -> tuple[int | None, bool]:
@@ -170,6 +185,91 @@ def _read_input(prompt: str) -> str:
     return entered
 
 
+def _selector_lines(label: str, values: list[str], selected_index: int) -> list[str]:
+    lines = [f"Choose {label}:"]
+    for index, value in enumerate(values):
+        marker = SELECTED_MARKER if index == selected_index else UNSELECTED_MARKER
+        lines.append(f"  {marker} {value}")
+    return lines
+
+
+def _selector_index_for_key(selected_index: int, key: bytes, count: int) -> int:
+    if key in {b"\x1b[A", b"k"}:
+        return (selected_index - 1) % count
+    if key in {b"\x1b[B", b"j"}:
+        return (selected_index + 1) % count
+    return selected_index
+
+
+def _read_tty_key(fd: int) -> bytes:
+    key = os.read(fd, 1)
+    if key != b"\x1b":
+        return key
+    suffix = bytearray()
+    for _ in range(2):
+        ready, _, _ = select.select([fd], [], [], 0.05)
+        if not ready:
+            break
+        suffix.extend(os.read(fd, 1))
+    return key + bytes(suffix)
+
+
+def _render_selector(fd: int, label: str, values: list[str], selected_index: int, *, previous_lines: int) -> int:
+    lines = _selector_lines(label, values, selected_index)
+    if previous_lines:
+        os.write(fd, f"\033[{previous_lines}F".encode())
+    for line in lines:
+        os.write(fd, f"\033[2K{line}\r\n".encode())
+    return len(lines)
+
+
+def _choose_tty(label: str, values: list[str], *, default: str) -> str | None:
+    try:
+        import termios
+    except ImportError:
+        return None
+
+    fd, should_close = _terminal_fd()
+    if fd is None:
+        return None
+
+    try:
+        old_attrs = termios.tcgetattr(fd)
+    except OSError:
+        if should_close:
+            os.close(fd)
+        return None
+
+    selected_index = values.index(default)
+    previous_lines = 0
+    attrs = old_attrs[:]
+    attrs[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
+    attrs[6][termios.VMIN] = 1
+    attrs[6][termios.VTIME] = 0
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        os.write(fd, b"\033[?25l")
+        previous_lines = _render_selector(fd, label, values, selected_index, previous_lines=previous_lines)
+        while True:
+            key = _read_tty_key(fd)
+            if key == b"\x03":
+                os.write(fd, b"^C\n")
+                raise KeyboardInterrupt
+            if key in {b"\r", b"\n"}:
+                return values[selected_index]
+            if key == b"\x04":
+                raise KeyboardInterrupt
+            next_index = _selector_index_for_key(selected_index, key, len(values))
+            if next_index != selected_index:
+                selected_index = next_index
+                previous_lines = _render_selector(fd, label, values, selected_index, previous_lines=previous_lines)
+    finally:
+        os.write(fd, b"\033[?25h")
+        termios.tcsetattr(fd, termios.TCSANOW, old_attrs)
+        if should_close:
+            os.close(fd)
+
+
 def _prompt(value: str | None, message: str, *, default: str | None = None) -> str:
     if value:
         return value
@@ -194,6 +294,10 @@ def _choose(label: str, values: list[str], *, default: str | None = None) -> str
     if not values:
         raise RebaseWorkflowError(f"no {label} options available")
     default = default if default in values else values[0]
+    selected = _choose_tty(label, values, default=default)
+    if selected is not None:
+        return selected
+
     print(f"Choose {label}:")
     for index, value in enumerate(values, start=1):
         marker = " (default)" if value == default else ""

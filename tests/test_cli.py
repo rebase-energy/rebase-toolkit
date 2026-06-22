@@ -669,6 +669,26 @@ def test_setup_prompt_restores_terminal_before_input(monkeypatch) -> None:
     assert calls == ["restore"]
 
 
+def test_setup_selector_uses_green_circle_marker() -> None:
+    from rebase import setup as setup_module
+
+    lines = setup_module._selector_lines("auth provider", ["google", "github"], 0)
+
+    assert setup_module.SELECTED_MARKER in lines[1]
+    assert "●" in lines[1]
+    assert "google" in lines[1]
+    assert setup_module.UNSELECTED_MARKER in lines[2]
+
+
+def test_setup_selector_arrow_navigation_wraps() -> None:
+    from rebase import setup as setup_module
+
+    assert setup_module._selector_index_for_key(0, b"\x1b[B", 2) == 1
+    assert setup_module._selector_index_for_key(1, b"\x1b[B", 2) == 0
+    assert setup_module._selector_index_for_key(0, b"\x1b[A", 2) == 1
+    assert setup_module._selector_index_for_key(1, b"x", 2) == 1
+
+
 def test_main_keyboard_interrupt_aborts_cleanly(monkeypatch, capsys) -> None:
     def interrupting_app(*args: Any, **kwargs: Any) -> None:
         raise KeyboardInterrupt
