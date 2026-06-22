@@ -877,6 +877,19 @@ def test_setup_opens_github_installation_before_repo_questions(monkeypatch) -> N
             calls.append(f"poll_setup:{setup_session_id}")
             return {"status": "installed", "installation_id": 123}
 
+        def find_github_repository_installation(self, repo_full_name: str) -> dict[str, Any]:
+            calls.append(f"find_repo:{repo_full_name}")
+            return {
+                "installation_id": 123,
+                "repository": {
+                    "id": 456,
+                    "owner": "rebase",
+                    "name": "platform",
+                    "full_name": "rebase/platform",
+                    "default_branch": "main",
+                },
+            }
+
         def list_github_repositories(self, installation_id: int) -> list[dict[str, Any]]:
             calls.append(f"list_repos:{installation_id}")
             return [
@@ -930,10 +943,76 @@ def test_setup_opens_github_installation_before_repo_questions(monkeypatch) -> N
         "choose:GitHub connection scope",
         "choose:repository setup",
         "prompt:GitHub repository full name",
-        "poll_setup:setup-id",
-        "list_repos:123",
+        "find_repo:rebase/platform",
         "connect:rebase/platform",
     ]
+
+
+def test_setup_retries_direct_repo_verification_after_user_finishes_install(monkeypatch, capsys) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[str] = []
+
+    class FakeClient:
+        attempts = 0
+
+        def create_github_setup_session(self, *, workspace_id: str | None = None) -> dict[str, Any]:
+            calls.append(f"create_setup:{workspace_id}")
+            return {"id": "setup-id", "install_url": "https://github.com/apps/rebase-workflows/installations/new"}
+
+        def find_github_repository_installation(self, repo_full_name: str) -> dict[str, Any]:
+            calls.append(f"find_repo:{repo_full_name}")
+            self.attempts += 1
+            if self.attempts == 1:
+                raise setup_module.RebaseWorkflowError("repository is not accessible")
+            return {
+                "installation_id": 123,
+                "repository": {
+                    "id": 456,
+                    "owner": "rebase",
+                    "name": "platform",
+                    "full_name": "rebase/platform",
+                    "default_branch": "main",
+                },
+            }
+
+        def connect_github_repo(self, **kwargs: Any) -> dict[str, Any]:
+            calls.append(f"connect:{kwargs['repo_owner']}/{kwargs['repo_name']}")
+            return {"repo_owner": kwargs["repo_owner"], "repo_name": kwargs["repo_name"]}
+
+    def fake_choose(label: str, values: list[str], *, default: str | None = None, title: str | None = None) -> str:
+        if label == "GitHub connection scope":
+            return "workspace"
+        return "Select an existing repository"
+
+    monkeypatch.setattr(setup_module, "_choose", fake_choose)
+    monkeypatch.setattr(setup_module, "_prompt", lambda *args, **kwargs: "rebase/platform")
+    monkeypatch.setattr(setup_module, "_read_input", lambda message: calls.append(message) or "")
+    monkeypatch.setattr(setup_module.webbrowser, "open", lambda url: calls.append(f"open:{url}"))
+
+    setup_module._connect_github(
+        SimpleNamespace(
+            repo_scope=None,
+            project=None,
+            repo=None,
+            create_repo=False,
+            github_installation_id=None,
+            repo_path=None,
+            no_browser=False,
+        ),
+        FakeClient(),
+        workspace_id="default",
+    )
+
+    assert calls == [
+        "create_setup:default",
+        "open:https://github.com/apps/rebase-workflows/installations/new",
+        "find_repo:rebase/platform",
+        "Press Enter to verify GitHub access again: ",
+        "find_repo:rebase/platform",
+        "connect:rebase/platform",
+    ]
+    assert "GitHub App access is not visible yet." in capsys.readouterr().out
 
 
 def test_setup_existing_repo_reports_verification_failure(monkeypatch, capsys) -> None:

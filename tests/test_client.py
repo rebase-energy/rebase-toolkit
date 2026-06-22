@@ -76,6 +76,39 @@ def test_create_github_starter_workflow_posts_path(monkeypatch) -> None:
     }
 
 
+def test_find_github_repository_installation_gets_repo_full_name(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["params"] = kwargs["params"]
+        return FakeResponse(
+            {
+                "installation_id": 123,
+                "repository": {
+                    "id": 456,
+                    "owner": "rebase",
+                    "name": "platform",
+                    "full_name": "rebase/platform",
+                    "private": True,
+                },
+            }
+        )
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    response = client.find_github_repository_installation("rebase/platform")
+
+    assert response["installation_id"] == 123
+    assert observed == {
+        "method": "GET",
+        "url": "https://workflows.example.com/integrations/github/repository-installation",
+        "params": {"repo_full_name": "rebase/platform"},
+    }
+
+
 def test_client_uses_fastapi_detail_for_http_errors(monkeypatch) -> None:
     monkeypatch.setattr(
         "requests.request",

@@ -814,6 +814,16 @@ class Client:
             raise RebaseWorkflowError("expected GitHub repository list response")
         return response
 
+    def find_github_repository_installation(self, repo_full_name: str) -> dict[str, Any]:
+        response = self.request(
+            "GET",
+            "/integrations/github/repository-installation",
+            params={"repo_full_name": repo_full_name},
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected GitHub repository installation response")
+        return response
+
     def connect_github_repo(
         self,
         *,

@@ -573,6 +573,15 @@ def _select_repo(
     return by_full_name[selected.lower()]
 
 
+def _find_repo_installation(client: Client, repo_full_name: str) -> tuple[int, dict[str, Any]]:
+    response = client.find_github_repository_installation(repo_full_name)
+    installation_id = response.get("installation_id")
+    repo = response.get("repository")
+    if not isinstance(installation_id, int) or not isinstance(repo, dict):
+        raise RebaseWorkflowError("expected GitHub repository installation response")
+    return installation_id, repo
+
+
 def _repo_name_seed(*values: str | None) -> str:
     for value in values:
         if value:
@@ -627,9 +636,9 @@ def _select_repo_scope(args: Any) -> str:
 
 def _connect_github(args: Any, client: Client, *, workspace_id: str) -> None:
     setup_status = {"installation_id": args.github_installation_id} if args.github_installation_id else None
-    setup_session = None
+    repo = None
     if setup_status is None:
-        setup_session = _start_github_installation(args, client, workspace_id=workspace_id)
+        _start_github_installation(args, client, workspace_id=workspace_id)
     scope = _select_repo_scope(args)
     project_id = None
     project_name = None
@@ -650,13 +659,25 @@ def _connect_github(args: Any, client: Client, *, workspace_id: str) -> None:
         repo_full_name = _prompt_existing_repo(args)
         _hint(f"Verifying the Rebase GitHub App can access {repo_full_name}.")
     if setup_status is None:
-        if setup_session is None:
-            raise RebaseWorkflowError("GitHub setup session was not started")
-        _hint("Waiting for GitHub App installation to complete.")
-        setup_status = _wait_for_github_installation(args, client, setup_session)
+        try:
+            installation_id, repo = _find_repo_installation(client, repo_full_name)
+        except RebaseWorkflowError as exc:
+            _hint("GitHub App access is not visible yet.")
+            _hint("Finish selecting this repository in GitHub, then return to this terminal.")
+            _read_input("Press Enter to verify GitHub access again: ")
+            try:
+                installation_id, repo = _find_repo_installation(client, repo_full_name)
+            except RebaseWorkflowError:
+                _failure(f"Could not verify GitHub App access to {repo_full_name}")
+                raise RebaseWorkflowError(
+                    f"GitHub App cannot access {repo_full_name}. "
+                    "Install or configure the Rebase GitHub App for this repository, then run rebase setup again."
+                ) from exc
+        setup_status = {"installation_id": installation_id}
     installation_id = int(setup_status["installation_id"])
     try:
-        repo = _select_repo(args, client, installation_id, repo_full_name=repo_full_name)
+        if repo is None:
+            repo = _select_repo(args, client, installation_id, repo_full_name=repo_full_name)
     except RebaseWorkflowError:
         if repo_full_name:
             _failure(f"Could not verify GitHub App access to {repo_full_name}")
