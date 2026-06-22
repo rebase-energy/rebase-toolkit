@@ -401,6 +401,19 @@ def _local_github_remote() -> str | None:
     return f"{owner}/{name}" if owner and name else None
 
 
+def _validate_github_repo_full_name(value: str) -> str:
+    repo_full_name = value.strip()
+    owner, repo = _parse_github_remote(f"https://github.com/{repo_full_name}")
+    if owner is None or repo is None or repo_full_name.count("/") != 1:
+        raise RebaseWorkflowError("GitHub repository must use the owner/name format")
+    return f"{owner}/{repo}"
+
+
+def _prompt_existing_repo(args: Any) -> str:
+    repo_full_name = _prompt(args.repo, "GitHub repository full name", default=_local_github_remote())
+    return _validate_github_repo_full_name(repo_full_name)
+
+
 def _oauth_session(args: Any, config: dict[str, Any]) -> str:
     supabase_url = config.get("supabase_url")
     supabase_anon_key = config.get("supabase_anon_key")
@@ -619,6 +632,9 @@ def _connect_github(args: Any, client: Client, *, workspace_id: str) -> None:
             default_name=_repo_name_seed(project_name, workspace_id),
         )
         _hint("Select that repository when GitHub asks which repositories the Rebase App can access.")
+    else:
+        repo_full_name = _prompt_existing_repo(args)
+        _hint(f"Verifying the Rebase GitHub App can access {repo_full_name}.")
     if args.github_installation_id:
         setup_status = {"installation_id": args.github_installation_id}
     else:

@@ -809,6 +809,72 @@ def test_setup_repo_creation_uses_action_selector(monkeypatch) -> None:
     }
 
 
+def test_setup_existing_repo_prompts_before_verifying_installation(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[str] = []
+
+    class FakeClient:
+        def list_github_repositories(self, installation_id: int) -> list[dict[str, Any]]:
+            calls.append(f"list_repos:{installation_id}")
+            return [
+                {
+                    "id": 456,
+                    "owner": "rebase",
+                    "name": "platform",
+                    "full_name": "rebase/platform",
+                    "default_branch": "main",
+                }
+            ]
+
+        def connect_github_repo(self, **kwargs: Any) -> dict[str, Any]:
+            calls.append(f"connect:{kwargs['repo_owner']}/{kwargs['repo_name']}")
+            return {"repo_owner": kwargs["repo_owner"], "repo_name": kwargs["repo_name"]}
+
+    def fake_choose(label: str, values: list[str], *, default: str | None = None, title: str | None = None) -> str:
+        assert label == "repository setup"
+        return "Select an existing repository"
+
+    def fake_prompt(value: str | None, message: str, *, default: str | None = None) -> str:
+        calls.append(f"prompt:{message}")
+        return "rebase/platform"
+
+    monkeypatch.setattr(setup_module, "_choose", fake_choose)
+    monkeypatch.setattr(setup_module, "_prompt", fake_prompt)
+
+    setup_module._connect_github(
+        SimpleNamespace(
+            repo_scope="workspace",
+            project=None,
+            repo=None,
+            create_repo=False,
+            github_installation_id=123,
+            repo_path=None,
+        ),
+        FakeClient(),
+        workspace_id="default",
+    )
+
+    assert calls == [
+        "prompt:GitHub repository full name",
+        "list_repos:123",
+        "connect:rebase/platform",
+    ]
+
+
+def test_setup_existing_repo_requires_owner_name() -> None:
+    from rebase import setup as setup_module
+
+    assert setup_module._validate_github_repo_full_name("Rebase/Platform.git") == "Rebase/Platform"
+
+    try:
+        setup_module._validate_github_repo_full_name("platform")
+    except Exception as exc:
+        assert "owner/name" in str(exc)
+    else:
+        raise AssertionError("expected invalid repo format")
+
+
 def test_main_keyboard_interrupt_aborts_cleanly(monkeypatch, capsys) -> None:
     def interrupting_app(*args: Any, **kwargs: Any) -> None:
         raise KeyboardInterrupt
