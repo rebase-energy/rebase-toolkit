@@ -28,6 +28,27 @@ class FakeErrorResponse(FakeResponse):
         raise requests.HTTPError("403")
 
 
+class FakeStreamResponse:
+    text = ""
+
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+        self.closed = False
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def iter_lines(self, *, decode_unicode: bool = False):
+        yield from self._lines
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _map_square(x: int) -> dict[str, int]:
+    return {"value": x * x}
+
+
 def test_client_sends_bearer_token(monkeypatch) -> None:
     observed: dict[str, Any] = {}
 
@@ -47,6 +68,143 @@ def test_client_sends_bearer_token(monkeypatch) -> None:
         "url": "https://workflows.example.com/workflows",
         "headers": {"Authorization": "Bearer rbw_test"},
     }
+
+
+def test_stream_request_parses_ndjson(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    response = FakeStreamResponse(
+        [
+            '{"type":"item","index":0,"status":"succeeded","result":{"value":1}}',
+            "",
+            '{"type":"summary","status":"succeeded"}',
+        ]
+    )
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeStreamResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["headers"] = kwargs["headers"]
+        observed["stream"] = kwargs["stream"]
+        observed["timeout"] = kwargs["timeout"]
+        return response
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    events = list(client.stream_request("POST", "/functions/fn/map", json={"items": [1]}))
+
+    assert events == [
+        {"type": "item", "index": 0, "status": "succeeded", "result": {"value": 1}},
+        {"type": "summary", "status": "succeeded"},
+    ]
+    assert response.closed is True
+    assert observed == {
+        "method": "POST",
+        "url": "https://workflows.example.com/functions/fn/map",
+        "headers": {"Authorization": "Bearer rbw_test"},
+        "stream": True,
+        "timeout": None,
+    }
+
+
+def test_client_run_function_map_posts_payload(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_stream_request(method: str, path: str, **kwargs: Any):
+        observed["method"] = method
+        observed["path"] = path
+        observed["json"] = kwargs["json"]
+        observed["timeout"] = kwargs["timeout"]
+        yield {"type": "summary", "status": "succeeded"}
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "stream_request", fake_stream_request)
+
+    assert list(
+        client.run_function_map(
+            "function-id",
+            items=[1, 2],
+            parameter="x",
+            kwargs={"scale": 10},
+            max_concurrency=4,
+            timeout=30,
+        )
+    ) == [{"type": "summary", "status": "succeeded"}]
+    assert observed == {
+        "method": "POST",
+        "path": "/functions/function-id/map",
+        "json": {
+            "items": [1, 2],
+            "parameter": "x",
+            "kwargs": {"scale": 10},
+            "ordered": True,
+            "return_exceptions": False,
+            "max_concurrency": 4,
+            "timeout_seconds": 30,
+        },
+        "timeout": None,
+    }
+
+
+def test_function_map_buffers_ordered_results(monkeypatch) -> None:
+    def fake_run_function_map(*args: Any, **kwargs: Any):
+        yield {"type": "item", "index": 1, "status": "succeeded", "result": {"value": 4}}
+        yield {"type": "item", "index": 0, "status": "succeeded", "result": {"value": 1}}
+        yield {"type": "summary", "status": "succeeded"}
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "run_function_map", fake_run_function_map)
+    function = rb.Function(
+        project="default",
+        name="square",
+        client=client,
+        function_id="function-id",
+        data={"name": "square"},
+    )
+
+    assert list(function.map([{"x": 1}, {"x": 2}])) == [{"value": 1}, {"value": 4}]
+
+
+def test_function_map_infers_single_required_parameter(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_run_function_map(function_id: str, **kwargs: Any):
+        observed["function_id"] = function_id
+        observed.update(kwargs)
+        yield {"type": "item", "index": 0, "status": "succeeded", "result": {"value": 1}}
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "run_function_map", fake_run_function_map)
+    function = rb.Function(_map_square, project="default", client=client)
+    function.id = "function-id"
+
+    assert list(function.map([1])) == [{"value": 1}]
+    assert observed["function_id"] == "function-id"
+    assert observed["items"] == [1]
+    assert observed["parameter"] == "x"
+
+
+def test_function_map_raises_or_returns_item_errors(monkeypatch) -> None:
+    def fake_run_function_map(*args: Any, **kwargs: Any):
+        yield {"type": "item", "index": 0, "status": "failed", "error": "boom"}
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "run_function_map", fake_run_function_map)
+    function = rb.Function(
+        project="default",
+        name="square",
+        client=client,
+        function_id="function-id",
+        data={"name": "square"},
+    )
+
+    with pytest.raises(rb.RebaseWorkflowError, match="boom"):
+        list(function.map([{"x": 1}]))
+
+    result = list(function.map([{"x": 1}], return_exceptions=True))
+    assert len(result) == 1
+    assert isinstance(result[0], rb.RebaseWorkflowError)
+    assert str(result[0]) == "boom"
 
 
 def test_create_github_starter_workflow_posts_path(monkeypatch) -> None:

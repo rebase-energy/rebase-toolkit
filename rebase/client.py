@@ -10,7 +10,7 @@ import tempfile
 import textwrap
 import time
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from types import FunctionType
 from typing import Any, Self
@@ -935,10 +935,8 @@ class Client:
         selected_api_url = api_url or os.getenv("REBASE_WORKFLOWS_API_URL") or profile_api_url or DEFAULT_SERVER_URL
         self.api_url = selected_api_url.rstrip("/")
 
-    def request(
-        self, method: str, path: str, *, auth: bool = True, **kwargs: Any
-    ) -> dict[str, Any] | list[dict[str, Any]]:
-        headers = dict(kwargs.pop("headers", {}))
+    def _request_headers(self, *, auth: bool, headers: dict[str, str] | None = None) -> dict[str, str]:
+        resolved_headers = dict(headers or {})
         if auth:
             bearer_token = self.api_key or self.access_token
             if bearer_token is None:
@@ -947,15 +945,53 @@ class Client:
                 except AuthError as exc:
                     raise RebaseWorkflowError(str(exc)) from exc
             if bearer_token:
-                headers["Authorization"] = f"Bearer {bearer_token}"
-        if self.workspace_id and "X-Rebase-Workspace" not in headers:
-            headers["X-Rebase-Workspace"] = self.workspace_id
+                resolved_headers["Authorization"] = f"Bearer {bearer_token}"
+        if self.workspace_id and "X-Rebase-Workspace" not in resolved_headers:
+            resolved_headers["X-Rebase-Workspace"] = self.workspace_id
+        return resolved_headers
+
+    def request(
+        self, method: str, path: str, *, auth: bool = True, **kwargs: Any
+    ) -> dict[str, Any] | list[dict[str, Any]]:
+        headers = self._request_headers(auth=auth, headers=kwargs.pop("headers", {}))
         response = requests.request(method, f"{self.api_url}{path}", headers=headers, timeout=30, **kwargs)
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
             raise RebaseWorkflowError(_response_error_message(response)) from exc
         return response.json()
+
+    def stream_request(self, method: str, path: str, *, auth: bool = True, **kwargs: Any) -> Iterator[dict[str, Any]]:
+        headers = self._request_headers(auth=auth, headers=kwargs.pop("headers", {}))
+        timeout = kwargs.pop("timeout", None)
+        response = requests.request(
+            method,
+            f"{self.api_url}{path}",
+            headers=headers,
+            timeout=timeout,
+            stream=True,
+            **kwargs,
+        )
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RebaseWorkflowError(_response_error_message(response)) from exc
+
+        try:
+            for line in response.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError as exc:
+                    raise RebaseWorkflowError("expected NDJSON stream response") from exc
+                if not isinstance(event, dict):
+                    raise RebaseWorkflowError("expected NDJSON stream item to be an object")
+                yield event
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
 
     def setup_config(self) -> dict[str, Any]:
         response = self.request("GET", "/setup/config", auth=False)
@@ -1487,6 +1523,31 @@ class Client:
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected run response")
         return Run(response["id"], client=self, data=response)
+
+    def run_function_map(
+        self,
+        function_id: str,
+        *,
+        items: list[Any],
+        parameter: str | None = None,
+        kwargs: dict[str, Any] | None = None,
+        max_concurrency: int | None = None,
+        ordered: bool = True,
+        return_exceptions: bool = False,
+        timeout: float | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        payload = {
+            "items": items,
+            "parameter": parameter,
+            "kwargs": kwargs or {},
+            "ordered": ordered,
+            "return_exceptions": return_exceptions,
+        }
+        if max_concurrency is not None:
+            payload["max_concurrency"] = max_concurrency
+        if timeout is not None:
+            payload["timeout_seconds"] = timeout
+        yield from self.stream_request("POST", f"/functions/{function_id}/map", json=payload, timeout=None)
 
     def list_models(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
         resolved_project_id = project_id
@@ -2381,6 +2442,78 @@ class Function:
 
     def remote(self, **parameters: Any) -> dict[str, Any]:
         return self.spawn(**parameters).result()
+
+    def _infer_map_parameter(self) -> str:
+        required_parameters = _required_parameters_for(self.fn, target="Function") if self.fn is not None else []
+        if len(required_parameters) == 1:
+            return required_parameters[0]
+        raise RebaseWorkflowError("parameter is required when Function.map items are not dictionaries")
+
+    def _map_event_value(
+        self,
+        event: dict[str, Any],
+        *,
+        return_exceptions: bool,
+    ) -> dict[str, Any] | RebaseWorkflowError:
+        if event.get("status") == "succeeded":
+            result = event.get("result")
+            if isinstance(result, dict):
+                return result
+            return {"value": result}
+
+        error = RebaseWorkflowError(str(event.get("error") or "Function.map item failed"))
+        if return_exceptions:
+            return error
+        raise error
+
+    def map(
+        self,
+        items: Iterable[Any],
+        *,
+        parameter: str | None = None,
+        kwargs: dict[str, Any] | None = None,
+        max_concurrency: int | None = None,
+        ordered: bool = True,
+        return_exceptions: bool = False,
+        timeout: float | None = None,
+    ) -> Iterator[dict[str, Any] | RebaseWorkflowError]:
+        item_list = list(items)
+        if not item_list:
+            raise RebaseWorkflowError("Function.map requires at least one item")
+        if parameter is None and any(not isinstance(item, dict) for item in item_list):
+            parameter = self._infer_map_parameter()
+        if self.id is None:
+            self.deploy()
+        if self.id is None:
+            raise RebaseWorkflowError("function has no ID after deployment")
+
+        events = self._client.run_function_map(
+            self.id,
+            items=item_list,
+            parameter=parameter,
+            kwargs=kwargs,
+            max_concurrency=max_concurrency,
+            ordered=ordered,
+            return_exceptions=return_exceptions,
+            timeout=timeout,
+        )
+        if not ordered:
+            for event in events:
+                if event.get("type") == "item":
+                    yield self._map_event_value(event, return_exceptions=return_exceptions)
+            return
+
+        expected_index = 0
+        buffer: dict[int, dict[str, Any]] = {}
+        for event in events:
+            if event.get("type") != "item":
+                continue
+            index = int(event["index"])
+            buffer[index] = event
+            while expected_index in buffer:
+                buffered_event = buffer.pop(expected_index)
+                yield self._map_event_value(buffered_event, return_exceptions=return_exceptions)
+                expected_index += 1
 
     def run(self, **parameters: Any) -> Run:
         return self.spawn(**parameters)
