@@ -164,6 +164,37 @@ run_app = typer.Typer(
 )
 
 
+def _print_run_help() -> None:
+    console.print("Usage: rebase run [OPTIONS] TARGET_REF")
+    console.print("       rebase run COMMAND [ARGS]...")
+    console.print()
+    console.print("Run a Rebase function, workflow, or model from local source without deploying it.")
+    console.print("Inspect submitted runs with the list, get, logs, and cancel subcommands.")
+    console.print()
+
+    options = Table(title="Execution Options", box=box.SIMPLE)
+    options.add_column("Option", style="rebase.value")
+    options.add_column("Description")
+    options.add_row("--param, -p", "Target parameter as name=json_value. Can be passed more than once.")
+    options.add_row("--parameters-json", "JSON object with target parameters.")
+    options.add_row("--backend", "Override the cloud execution backend for this ephemeral run.")
+    options.add_row("--module, -m", "Interpret the target source as a Python module path instead of a file.")
+    options.add_row("--wait / --no-wait", "Wait for the function result before exiting. Defaults to --wait.")
+    options.add_row("--timeout", "Maximum seconds to wait for the result. Defaults to 600.")
+    options.add_row("--poll-interval", "Seconds between run status polls. Defaults to 1.0.")
+    options.add_row("--help", "Show this message and exit.")
+    console.print(options)
+
+    commands = Table(title="Inspection Commands", box=box.SIMPLE)
+    commands.add_column("Command", style="rebase.value")
+    commands.add_column("Description")
+    commands.add_row("list", "List submitted runs in the active workspace.")
+    commands.add_row("get", "Show run metadata.")
+    commands.add_row("logs", "Show persisted run events and workflow step state.")
+    commands.add_row("cancel", "Cancellation placeholder. Exits with an unsupported error.")
+    console.print(commands)
+
+
 def _load_module(path: Path) -> ModuleType:
     resolved_path = path.expanduser().resolve()
     if not resolved_path.exists():
@@ -1949,7 +1980,7 @@ def run_command(
         typer.Option("--poll-interval", help="Seconds between run status polls."),
     ] = 1.0,
 ) -> None:
-    """Run a Rebase function, workflow, or model from local source without deploying it."""
+    """Run local Rebase targets and inspect submitted runs."""
     run: Run | None = None
     result: dict[str, Any] | None = None
     wait_for_result = wait
@@ -2154,6 +2185,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
+        if args in (["run", "--help"], ["run", "-h"]):
+            _print_run_help()
+            return 0
         if len(args) > 1 and args[0] == "run" and args[1] in RUN_INSPECTION_COMMANDS:
             run_app(args=args[1:], prog_name="rebase run", standalone_mode=False)
         else:

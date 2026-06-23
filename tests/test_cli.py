@@ -20,6 +20,24 @@ def test_main_without_args_prints_help(capsys) -> None:
     assert "function" in output
     assert "workflow" in output
     assert "deploy" in output
+    assert "inspect submitted runs" in output
+
+
+def test_run_help_shows_execution_and_inspection_commands(capsys) -> None:
+    assert main(["run", "--help"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Usage: rebase run [OPTIONS] TARGET_REF" in output
+    assert "--param, -p" in output
+    assert "--parameters-json" in output
+    assert "--backend" in output
+    assert "--module, -m" in output
+    assert "--wait / --no-wait" in output
+    assert "Inspection Commands" in output
+    assert "list" in output
+    assert "get" in output
+    assert "logs" in output
+    assert "cancel" in output
 
 
 def test_tui_command_invokes_textual_app(monkeypatch) -> None:
