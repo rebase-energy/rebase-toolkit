@@ -9,6 +9,7 @@ from rebase.client import (
     Agent,
     AgentHandle,
     Client,
+    EndpointConfig,
     Function,
     FunctionBackend,
     Image,
@@ -50,6 +51,31 @@ def project(
     )
 
 
+def endpoint(
+    *,
+    name: str | None = None,
+    method: str = "POST",
+    path: str | None = None,
+    auth: str = "api_key",
+    mode: str | None = None,
+    timeout: int | None = None,
+    timeout_seconds: int | None = None,
+    docs: bool = False,
+    enabled: bool = True,
+) -> EndpointConfig:
+    return EndpointConfig(
+        name=name,
+        method=method,
+        path=path,
+        auth=auth,
+        mode=mode,
+        timeout=timeout,
+        timeout_seconds=timeout_seconds,
+        docs=docs,
+        enabled=enabled,
+    )
+
+
 @overload
 def function(
     fn: None = None,
@@ -64,6 +90,7 @@ def function(
     min_instances: int | None = None,
     concurrency: int | None = None,
     enabled: bool = True,
+    endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
 ) -> Callable[[Callable[..., Any]], Function]: ...
 
@@ -82,6 +109,7 @@ def function(
     min_instances: int | None = None,
     concurrency: int | None = None,
     enabled: bool = True,
+    endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
 ) -> Function: ...
 
@@ -99,6 +127,7 @@ def function(
     min_instances: int | None = None,
     concurrency: int | None = None,
     enabled: bool = True,
+    endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
 ) -> Callable[[Callable[..., Any]], Function] | Function:
     def decorator(callable_: Callable[..., Any]) -> Function:
@@ -114,6 +143,7 @@ def function(
             min_instances=min_instances,
             concurrency=concurrency,
             enabled=enabled,
+            endpoint=endpoint,
             deploy_source=deploy_source,
         )
 
@@ -221,6 +251,7 @@ def workflow(
     default_parameters: dict[str, Any] | None = None,
     backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
     enabled: bool = True,
+    endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
 ) -> Callable[[Callable[..., Any]], Workflow]: ...
 
@@ -236,6 +267,7 @@ def workflow(
     default_parameters: dict[str, Any] | None = None,
     backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
     enabled: bool = True,
+    endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
 ) -> Workflow: ...
 
@@ -250,6 +282,7 @@ def workflow(
     default_parameters: dict[str, Any] | None = None,
     backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
     enabled: bool = True,
+    endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
 ) -> Callable[[Callable[..., Any]], Workflow] | Workflow:
     def decorator(callable_: Callable[..., Any]) -> Workflow:
@@ -262,6 +295,7 @@ def workflow(
             default_parameters=default_parameters,
             backend=backend,
             enabled=enabled,
+            endpoint=endpoint,
             deploy_source=deploy_source,
         )
 

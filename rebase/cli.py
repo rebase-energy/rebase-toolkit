@@ -31,6 +31,7 @@ from rebase.brand import (
     REBASE_THEME,
 )
 from rebase.client import (
+    DEFAULT_API_KEY_PERMISSIONS,
     Agent,
     Client,
     Function,
@@ -132,6 +133,18 @@ workspace_app = typer.Typer(
     no_args_is_help=False,
     rich_markup_mode="rich",
 )
+api_key_app = typer.Typer(
+    add_completion=False,
+    help="Create, list, and revoke workspace API keys.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+endpoint_app = typer.Typer(
+    add_completion=False,
+    help="Inspect and invoke Rebase endpoints.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
 project_app = typer.Typer(
     add_completion=False,
     help="Inspect Rebase projects.",
@@ -161,6 +174,34 @@ run_app = typer.Typer(
     help="Run local Rebase targets and inspect submitted runs.",
     no_args_is_help=True,
     rich_markup_mode="rich",
+)
+
+KNOWN_PERMISSIONS = frozenset(
+    {
+        "workspace:read",
+        "workspace:update",
+        "members:read",
+        "members:write",
+        "api_keys:read",
+        "api_keys:write",
+        "endpoints:read",
+        "endpoints:write",
+        "endpoints:execute",
+        "projects:read",
+        "projects:write",
+        "functions:read",
+        "functions:write",
+        "functions:execute",
+        "workflows:read",
+        "workflows:write",
+        "workflows:execute",
+        "models:read",
+        "models:write",
+        "models:promote",
+        "models:execute",
+        "runs:read",
+        "runs:write",
+    }
 )
 
 
@@ -669,7 +710,7 @@ def deploy_file(
     *,
     object_names: Iterable[str] | None = None,
     deploy_source: str | None = None,
-) -> list[tuple[str, str, str | None]]:
+) -> list[DeployRow]:
     module = _load_module(Path(path))
     selected_names = set(object_names or [])
 
@@ -680,7 +721,7 @@ def deploy_file(
             (name, project) for name, project in projects if name in selected_names or project.name in selected_names
         ]
 
-    deployed: list[tuple[str, str, str | None]] = []
+    deployed: list[DeployRow] = []
     if projects:
         for name, project in projects:
             if deploy_source is None:
@@ -688,6 +729,14 @@ def deploy_file(
             else:
                 project.deploy(deploy_source=deploy_source)
             deployed.append(("project", project.name or name, project.id))
+            for function in project._functions:
+                endpoint_url = _deployed_endpoint_url(function)
+                if endpoint_url is not None:
+                    deployed.append(("function", function.name or "-", function.id, endpoint_url))
+            for workflow in project._workflows:
+                endpoint_url = _deployed_endpoint_url(workflow)
+                if endpoint_url is not None:
+                    deployed.append(("workflow", workflow.name or "-", workflow.id, endpoint_url))
         return deployed
     if all_projects and selected_names:
         raise RebaseWorkflowError(f"No matching Rebase project found for: {', '.join(sorted(selected_names))}")
@@ -714,7 +763,11 @@ def deploy_file(
         target_type = (
             _model_target_type(deployable) if isinstance(deployable, Model) else deployable.__class__.__name__.lower()
         )
-        deployed.append((target_type, deployable.name or name, deployable.id))
+        endpoint_url = _deployed_endpoint_url(deployable)
+        if endpoint_url is not None:
+            deployed.append((target_type, deployable.name or name, deployable.id, endpoint_url))
+        else:
+            deployed.append((target_type, deployable.name or name, deployable.id))
     return deployed
 
 
@@ -804,7 +857,149 @@ def _workspace_members_table(members: list[dict[str, Any]], pending_invites: lis
     return table
 
 
-def _deploy_table(deployed: list[tuple[str, str, str | None]]) -> Table:
+def _permissions_summary(permissions: Any) -> str:
+    if not isinstance(permissions, list) or not permissions:
+        return "-"
+    values = [str(permission) for permission in permissions]
+    if len(values) == 1:
+        return values[0]
+    return f"{len(values)}p"
+
+
+def _api_keys_table(api_keys: list[dict[str, Any]]) -> Table:
+    table = Table(
+        title="API Keys",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Name", style="rebase.value")
+    table.add_column("Prefix", no_wrap=True)
+    table.add_column("Project", style="rebase.muted")
+    table.add_column("State", no_wrap=True)
+    table.add_column("Used", style="rebase.muted")
+    table.add_column("Expires", style="rebase.muted")
+    table.add_column("Revoked", style="rebase.muted")
+    table.add_column("Perms")
+    table.add_column("ID", style="rebase.muted")
+    for api_key in api_keys:
+        state = "active" if api_key.get("enabled") else "disabled"
+        if api_key.get("revoked_at"):
+            state = "revoked"
+        table.add_row(
+            str(api_key.get("name", "-")),
+            _format_value(api_key.get("key_prefix")),
+            _format_value(api_key.get("project_id")),
+            state,
+            _format_value(api_key.get("last_used_at")),
+            _format_value(api_key.get("expires_at")),
+            _format_value(api_key.get("revoked_at")),
+            _permissions_summary(api_key.get("permissions")),
+            str(api_key.get("id", "-")),
+        )
+    return table
+
+
+def _selected_api_key_permissions(permissions: list[str] | None) -> list[str]:
+    if not permissions:
+        return list(DEFAULT_API_KEY_PERMISSIONS)
+    selected = list(dict.fromkeys(permissions))
+    unknown = sorted(set(selected) - KNOWN_PERMISSIONS)
+    if unknown:
+        raise RebaseWorkflowError(f"unknown permissions: {', '.join(unknown)}")
+    return selected
+
+
+def _resolve_api_key_selector(api_keys: list[dict[str, Any]], selector: str) -> dict[str, Any]:
+    matches_by_id: dict[str, dict[str, Any]] = {}
+    for api_key in api_keys:
+        api_key_id = str(api_key.get("id", ""))
+        if selector in {
+            api_key_id,
+            str(api_key.get("key_prefix", "")),
+            str(api_key.get("name", "")),
+        }:
+            matches_by_id[api_key_id] = api_key
+    matches = list(matches_by_id.values())
+    if not matches:
+        raise RebaseWorkflowError(f"api key not found: {selector}")
+    if len(matches) > 1:
+        raise RebaseWorkflowError(f"api key selector is ambiguous: {selector}. Use the exact API key id.")
+    return matches[0]
+
+
+def _endpoints_table(endpoints: list[dict[str, Any]]) -> Table:
+    table = Table(
+        title="Endpoints",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Project", style="rebase.muted")
+    table.add_column("Name", style="rebase.value")
+    table.add_column("Method", no_wrap=True)
+    table.add_column("Path")
+    table.add_column("Auth", no_wrap=True)
+    table.add_column("Mode", no_wrap=True)
+    table.add_column("Target", no_wrap=True)
+    table.add_column("State", no_wrap=True)
+    table.add_column("URL", style="rebase.muted")
+    for endpoint in endpoints:
+        state = "active" if endpoint.get("enabled") else "disabled"
+        table.add_row(
+            _format_value(endpoint.get("project_name")),
+            str(endpoint.get("name", "-")),
+            _format_value(endpoint.get("method")),
+            _format_value(endpoint.get("path")),
+            _format_value(endpoint.get("auth")),
+            _format_value(endpoint.get("mode")),
+            f"{endpoint.get('target_type', '-')}/{_format_value(endpoint.get('target_id'))}",
+            state,
+            _format_value(endpoint.get("url")),
+        )
+    return table
+
+
+def _endpoint_selector_values(endpoint: dict[str, Any]) -> set[str]:
+    project_name = str(endpoint.get("project_name") or "")
+    name = str(endpoint.get("name") or "")
+    path = str(endpoint.get("path") or "")
+    values = {
+        str(endpoint.get("id") or ""),
+        name,
+        path,
+        str(endpoint.get("url_path") or ""),
+        str(endpoint.get("url") or ""),
+    }
+    if project_name and name:
+        values.add(f"{project_name}/{name}")
+    if project_name and path:
+        values.add(f"{project_name}{path}")
+        values.add(f"{project_name}/{path.lstrip('/')}")
+    return {value for value in values if value}
+
+
+def _resolve_endpoint_selector(endpoints: list[dict[str, Any]], selector: str) -> dict[str, Any]:
+    matches_by_id: dict[str, dict[str, Any]] = {}
+    for endpoint in endpoints:
+        if selector in _endpoint_selector_values(endpoint):
+            matches_by_id[str(endpoint.get("id"))] = endpoint
+    matches = list(matches_by_id.values())
+    if not matches:
+        raise RebaseWorkflowError(f"endpoint not found: {selector}")
+    if len(matches) > 1:
+        raise RebaseWorkflowError(f"endpoint selector is ambiguous: {selector}. Use the exact endpoint id.")
+    return matches[0]
+
+
+DeployRow = tuple[str, str, str | None] | tuple[str, str, str | None, str | None]
+
+
+def _deploy_table(deployed: list[DeployRow]) -> Table:
     table = Table(
         title="Deployed Targets",
         box=box.ASCII,
@@ -816,9 +1011,35 @@ def _deploy_table(deployed: list[tuple[str, str, str | None]]) -> Table:
     table.add_column("Type", no_wrap=True, style="rebase.muted")
     table.add_column("Name", style="rebase.value")
     table.add_column("ID", style="rebase.muted")
-    for target_type, name, target_id in deployed:
-        table.add_row(target_type, name, target_id or "-")
+    show_url = any(len(row) == 4 and row[3] for row in deployed)
+    if show_url:
+        table.add_column("Endpoint", style="rebase.muted")
+    for row in deployed:
+        target_type, name, target_id = row[:3]
+        cells = [target_type, name, target_id or "-"]
+        if show_url:
+            cells.append(row[3] if len(row) == 4 and row[3] else "-")
+        table.add_row(*cells)
     return table
+
+
+def _deployed_endpoint_url(target: Any) -> str | None:
+    data = getattr(target, "data", None)
+    if not isinstance(data, dict):
+        return None
+    endpoint = data.get("endpoint")
+    if not isinstance(endpoint, dict):
+        return None
+    url = endpoint.get("url")
+    if isinstance(url, str) and url:
+        return url
+    url_path = endpoint.get("url_path")
+    if isinstance(url_path, str) and url_path:
+        client = getattr(target, "_client", None)
+        api_url = getattr(client, "api_url", None)
+        if isinstance(api_url, str) and api_url:
+            return f"{api_url.rstrip('/')}{url_path}"
+    return None
 
 
 def _format_value(value: Any) -> str:
@@ -1397,6 +1618,215 @@ def workspace_members_command(
 
 
 app.add_typer(workspace_app, name="workspace")
+
+
+@api_key_app.command("list")
+def api_key_list_command(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List workspace API keys."""
+    api_keys = Client().list_api_keys()
+    if json_output:
+        _print_json(api_keys)
+        return
+    console.print(_api_keys_table(api_keys))
+
+
+@api_key_app.command("create")
+def api_key_create_command(
+    name: Annotated[str, typer.Argument(help="Operator-facing API key name.")],
+    project: Annotated[str | None, typer.Option("--project", help="Scope the key to a project name.")] = None,
+    project_id: Annotated[
+        str | None,
+        typer.Option("--project-id", help="Scope the key to an exact project ID."),
+    ] = None,
+    permission: Annotated[
+        list[str] | None,
+        typer.Option("--permission", help="Permission to grant. Repeat to override the read-only agent preset."),
+    ] = None,
+    expires_at: Annotated[str | None, typer.Option("--expires-at", help="ISO datetime when the key expires.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Create a workspace API key."""
+    if project is not None and project_id is not None:
+        raise RebaseWorkflowError("provide either --project or --project-id, not both")
+    client = Client()
+    resolved_project_id = project_id
+    if project is not None:
+        project_data = _resolve_project_by_name(client, project)
+        resolved_project_id = str(project_data["id"])
+    api_key = client.create_api_key(
+        name,
+        project_id=resolved_project_id,
+        permissions=_selected_api_key_permissions(permission),
+        expires_at=expires_at,
+    )
+    if json_output:
+        _print_json(api_key)
+        return
+    secret = api_key.get("api_key")
+    metadata = {key: value for key, value in api_key.items() if key != "api_key"}
+    console.print(
+        _detail_table(
+            "Created API Key",
+            metadata,
+            preferred_keys=[
+                "name",
+                "id",
+                "key_prefix",
+                "project_id",
+                "permissions",
+                "enabled",
+                "expires_at",
+                "created_at",
+            ],
+        )
+    )
+    if secret:
+        console.print(f"API key secret (shown once): [rebase.value]{secret}[/rebase.value]")
+        console.print("Store this key securely. It cannot be retrieved again.")
+
+
+@api_key_app.command("revoke")
+def api_key_revoke_command(
+    selector: Annotated[str, typer.Argument(help="API key id, key prefix, or unique name.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Revoke a workspace API key."""
+    client = Client()
+    api_key = _resolve_api_key_selector(client.list_api_keys(), selector)
+    revoked = client.revoke_api_key(str(api_key["id"]))
+    if json_output:
+        _print_json(revoked)
+        return
+    console.print(
+        _detail_table(
+            "Revoked API Key",
+            revoked,
+            preferred_keys=[
+                "name",
+                "id",
+                "key_prefix",
+                "enabled",
+                "revoked_at",
+                "updated_at",
+            ],
+        )
+    )
+
+
+app.add_typer(api_key_app, name="api-key")
+
+
+@endpoint_app.command("list")
+def endpoint_list_command(
+    project: Annotated[str | None, typer.Option("--project", help="Filter by project name.")] = None,
+    project_id: Annotated[str | None, typer.Option("--project-id", help="Filter by exact project ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List workspace endpoints."""
+    if project is not None and project_id is not None:
+        raise RebaseWorkflowError("provide either --project or --project-id, not both")
+    client = Client()
+    resolved_project_id = project_id
+    if project is not None:
+        project_data = _resolve_project_by_name(client, project)
+        resolved_project_id = str(project_data["id"])
+    endpoints = client.list_endpoints(project_id=resolved_project_id)
+    if json_output:
+        _print_json(endpoints)
+        return
+    console.print(_endpoints_table(endpoints))
+
+
+@endpoint_app.command("get")
+def endpoint_get_command(
+    selector: Annotated[str, typer.Argument(help="Endpoint id, name, path, or project/name.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Inspect an endpoint."""
+    client = Client()
+    endpoint = _resolve_endpoint_selector(client.list_endpoints(), selector)
+    endpoint = client.get_endpoint(str(endpoint["id"]))
+    if json_output:
+        _print_json(endpoint)
+        return
+    console.print(
+        _detail_table(
+            "Endpoint",
+            endpoint,
+            preferred_keys=[
+                "project_name",
+                "name",
+                "method",
+                "path",
+                "auth",
+                "mode",
+                "enabled",
+                "target_type",
+                "target_id",
+                "target_version_id",
+                "url",
+                "id",
+            ],
+        )
+    )
+
+
+@endpoint_app.command("invoke")
+def endpoint_invoke_command(
+    selector: Annotated[str, typer.Argument(help="Endpoint id, name, path, or project/name.")],
+    json_body: Annotated[str | None, typer.Option("--json", help="JSON object to send to the endpoint.")] = None,
+    parameter: Annotated[
+        list[str] | None,
+        typer.Option("--param", "-p", help="Endpoint parameter as name=json_value. Can be repeated."),
+    ] = None,
+) -> None:
+    """Invoke an endpoint."""
+    client = Client()
+    endpoint = _resolve_endpoint_selector(client.list_endpoints(), selector)
+    parameters = _parse_run_parameters(json_body, parameter)
+    result = client.invoke_endpoint(endpoint, parameters)
+    _print_json(result)
+
+
+@endpoint_app.command("disable")
+def endpoint_disable_command(
+    selector: Annotated[str, typer.Argument(help="Endpoint id, name, path, or project/name.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Disable an endpoint."""
+    client = Client()
+    endpoint = _resolve_endpoint_selector(client.list_endpoints(), selector)
+    disabled = client.disable_endpoint(str(endpoint["id"]))
+    if json_output:
+        _print_json(disabled)
+        return
+    console.print(
+        _detail_table(
+            "Disabled Endpoint",
+            disabled,
+            preferred_keys=["project_name", "name", "method", "path", "enabled", "url", "id"],
+        )
+    )
+
+
+@endpoint_app.command("versions")
+def endpoint_versions_command(
+    selector: Annotated[str, typer.Argument(help="Endpoint id, name, path, or project/name.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List endpoint versions."""
+    client = Client()
+    endpoint = _resolve_endpoint_selector(client.list_endpoints(), selector)
+    versions = client.list_endpoint_versions(str(endpoint["id"]))
+    if json_output:
+        _print_json(versions)
+        return
+    console.print(_version_table("Endpoint Versions", versions))
+
+
+app.add_typer(endpoint_app, name="endpoint")
 
 
 @project_app.command("list")

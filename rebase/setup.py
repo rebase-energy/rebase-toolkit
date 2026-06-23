@@ -28,6 +28,7 @@ from rebase.config import write_profile
 
 JOIN_WORKSPACE = "Join an existing workspace"
 CREATE_WORKSPACE = "Create a new workspace"
+BETA_ENROLLMENT_ERROR = "your account is not enrolled in the beta program. Contact hello@rebase.energy to get enrolled."
 HANDLE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{1,37}[a-z0-9])?$")
 
 
@@ -499,6 +500,57 @@ def _select_joined_workspace(workspace_id: str, workspaces_by_id: dict[str, dict
     return workspace
 
 
+def _workspace_display_name(workspace: dict[str, Any]) -> str:
+    workspace_id = str(workspace["id"])
+    name = workspace.get("name")
+    return name if isinstance(name, str) and name else workspace_id
+
+
+def _is_workspace_creation_permission_error(error: RebaseWorkflowError) -> bool:
+    message = str(error)
+    return any(
+        needle in message
+        for needle in (
+            "creating a workspace requires a platform beta invite",
+            "creating a workspace requires a beta invite",
+            "workspace creation limit reached",
+        )
+    )
+
+
+def _create_workspace(args: Any, client: Client, *, session: Any | None) -> dict[str, Any]:
+    profile = _ensure_profile_handle(args, client, session=session)
+    profile_handle = profile.get("handle")
+    default_workspace = profile_handle if isinstance(profile_handle, str) and profile_handle else None
+    workspace_id = _normalize_handle(
+        _prompt(None, "Workspace handle to create", default=default_workspace),
+        label="Workspace handle",
+    )
+    try:
+        return client.create_workspace(workspace_id, name=args.workspace_name)
+    except RebaseWorkflowError as exc:
+        if _is_workspace_creation_permission_error(exc):
+            raise RebaseWorkflowError(BETA_ENROLLMENT_ERROR) from exc
+        raise
+
+
+def _select_invited_workspace(workspaces: list[dict[str, Any]]) -> dict[str, Any] | str | None:
+    invited_workspaces = [workspace for workspace in workspaces if workspace.get("joined_via_invite")]
+    if not invited_workspaces:
+        return None
+    workspace_options = [f"Join workspace ({_workspace_display_name(workspace)})" for workspace in invited_workspaces]
+    selected = _choose(
+        "workspace setup",
+        [*workspace_options, CREATE_WORKSPACE],
+        default=workspace_options[0],
+        title="You were invited to a workspace. What do you want to do?",
+    )
+    if selected == CREATE_WORKSPACE:
+        return CREATE_WORKSPACE
+    selected_index = workspace_options.index(selected)
+    return invited_workspaces[selected_index]
+
+
 def _select_workspace(args: Any, client: Client, *, session: Any | None) -> dict[str, Any]:
     workspaces = client.list_my_workspaces()
     workspaces_by_id = _workspace_by_id(workspaces)
@@ -506,8 +558,18 @@ def _select_workspace(args: Any, client: Client, *, session: Any | None) -> dict
         workspace_id = _normalize_handle(args.workspace, label="Workspace handle")
         if workspace_id not in workspaces_by_id:
             _ensure_profile_handle(args, client, session=session)
-            return client.create_workspace(workspace_id, name=args.workspace_name or workspace_id)
+            try:
+                return client.create_workspace(workspace_id, name=args.workspace_name or workspace_id)
+            except RebaseWorkflowError as exc:
+                if _is_workspace_creation_permission_error(exc):
+                    raise RebaseWorkflowError(BETA_ENROLLMENT_ERROR) from exc
+                raise
         return workspaces_by_id[workspace_id]
+    invited_workspace = _select_invited_workspace(workspaces)
+    if invited_workspace == CREATE_WORKSPACE:
+        return _create_workspace(args, client, session=session)
+    if invited_workspace is not None:
+        return invited_workspace
     action = _choose(
         "workspace setup",
         [JOIN_WORKSPACE, CREATE_WORKSPACE],
@@ -517,14 +579,7 @@ def _select_workspace(args: Any, client: Client, *, session: Any | None) -> dict
     if action == JOIN_WORKSPACE:
         workspace_id = _normalize_handle(_prompt(None, "Workspace handle to join"), label="Workspace handle")
         return _select_joined_workspace(workspace_id, workspaces_by_id)
-    profile = _ensure_profile_handle(args, client, session=session)
-    profile_handle = profile.get("handle")
-    default_workspace = profile_handle if isinstance(profile_handle, str) and profile_handle else None
-    workspace_id = _normalize_handle(
-        _prompt(None, "Workspace handle to create", default=default_workspace),
-        label="Workspace handle",
-    )
-    return client.create_workspace(workspace_id, name=args.workspace_name)
+    return _create_workspace(args, client, session=session)
 
 
 def _start_github_installation(args: Any, client: Client, *, workspace_id: str) -> dict[str, Any]:

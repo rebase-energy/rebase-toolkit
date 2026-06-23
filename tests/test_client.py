@@ -137,13 +137,13 @@ def test_create_platform_invite_posts_email(monkeypatch) -> None:
     monkeypatch.setattr("requests.request", fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
-    response = client.create_platform_invite("new@example.com")
+    response = client.create_platform_invite("new@example.com", workspace_creation_limit=3)
 
     assert response["email"] == "new@example.com"
     assert observed == {
         "method": "POST",
         "url": "https://workflows.example.com/platform/invites",
-        "json": {"email": "new@example.com", "expires_at": None},
+        "json": {"email": "new@example.com", "expires_at": None, "workspace_creation_limit": 3},
     }
 
 
@@ -208,6 +208,102 @@ def test_list_workspace_members_requests_members_endpoint(monkeypatch) -> None:
     assert observed == {
         "method": "GET",
         "url": "https://workflows.example.com/workspace/members",
+    }
+
+
+def test_list_api_keys_requests_workspace_endpoint(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        return FakeResponse([{"id": "key-id", "name": "agent"}])
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    response = client.list_api_keys()
+
+    assert response == [{"id": "key-id", "name": "agent"}]
+    assert observed == {
+        "method": "GET",
+        "url": "https://workflows.example.com/workspace/api-keys",
+    }
+
+
+def test_create_api_key_posts_payload(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["json"] = kwargs["json"]
+        return FakeResponse({"id": "key-id", "name": "agent", "api_key": "rb_secret"})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    response = client.create_api_key(
+        "agent",
+        project_id="project-id",
+        permissions=["runs:read"],
+        expires_at="2026-07-01T00:00:00Z",
+    )
+
+    assert response["api_key"] == "rb_secret"
+    assert observed == {
+        "method": "POST",
+        "url": "https://workflows.example.com/workspace/api-keys",
+        "json": {
+            "name": "agent",
+            "project_id": "project-id",
+            "permissions": ["runs:read"],
+            "expires_at": "2026-07-01T00:00:00Z",
+        },
+    }
+
+
+def test_create_api_key_defaults_to_agent_permissions(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["json"] = kwargs["json"]
+        return FakeResponse({"id": "key-id", "name": "agent", "api_key": "rb_secret"})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.create_api_key("agent")
+
+    assert observed["json"]["permissions"] == [
+        "workspace:read",
+        "projects:read",
+        "endpoints:read",
+        "endpoints:execute",
+        "functions:read",
+        "workflows:read",
+        "models:read",
+        "runs:read",
+    ]
+
+
+def test_revoke_api_key_deletes_workspace_key(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        return FakeResponse({"id": "key-id", "enabled": False})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    response = client.revoke_api_key("key-id")
+
+    assert response == {"id": "key-id", "enabled": False}
+    assert observed == {
+        "method": "DELETE",
+        "url": "https://workflows.example.com/workspace/api-keys/key-id",
     }
 
 
@@ -552,6 +648,55 @@ def test_project_deploy_registers_function_source(monkeypatch) -> None:
     assert observed["execution_backend"] == "cloud_run"
     assert observed["source_mode"] == "rebase_hosted"
     assert normalize_weather.execution_backend == rb.DEFAULT_FUNCTION_BACKEND
+
+
+def test_function_endpoint_deploy_sends_endpoint_config(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
+    monkeypatch.setattr(client, "find_function", lambda name, *, project: None)
+    monkeypatch.setattr(client, "register_function", lambda **kwargs: observed.update(kwargs) or {"id": "function-id"})
+
+    @rb.endpoint(method="GET", path="forecast", auth="public", mode="sync", timeout=12)
+    def forecast(site_id: str) -> dict:
+        return {"site_id": site_id}
+
+    rb.Function(forecast, project="energy", client=client).deploy()
+
+    assert observed["endpoint"].to_payload() == {
+        "name": None,
+        "method": "GET",
+        "path": "/forecast",
+        "auth": "public",
+        "mode": "sync",
+        "timeout_seconds": 12,
+        "docs": False,
+        "enabled": True,
+    }
+
+
+def test_model_endpoint_constructor_sends_endpoint_config(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "find_model", lambda name, *, project: None)
+    monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
+    monkeypatch.setattr(client, "register_model", lambda **kwargs: observed.update(kwargs) or {"id": "model-id"})
+
+    class PriceForecastPredictor(rb.Predictor):
+        name = "price-forecast"
+
+        def predict(self, zone: str = "SE3") -> dict:
+            return {"zone": zone}
+
+    PriceForecastPredictor(
+        project="models",
+        endpoint=rb.endpoint(method="POST", path="/predict"),
+        client=client,
+    ).deploy()
+
+    assert observed["endpoint"].to_payload()["method"] == "POST"
+    assert observed["endpoint"].to_payload()["path"] == "/predict"
+    assert observed["endpoint"].to_payload()["auth"] == "api_key"
 
 
 def test_function_deploy_github_source_uses_project_repo_metadata(monkeypatch) -> None:

@@ -6,6 +6,7 @@ from rebase.client import (
     AgentHandle,
     Client,
     Cron,
+    EndpointConfig,
     Function,
     HuggingFacePublishConfig,
     Image,
@@ -28,6 +29,7 @@ from rebase.client import (
 from rebase.config import DEFAULT_API_URL, DEFAULT_SERVER_URL
 from rebase.public import (
     deploy,
+    endpoint,
     function,
     get_agent,
     get_function,
@@ -47,6 +49,7 @@ from rebase.version import __version__
 __all__ = [
     "Client",
     "Cron",
+    "EndpointConfig",
     "DEFAULT_FUNCTION_BACKEND",
     "DEFAULT_WORKFLOW_BACKEND",
     "DEFAULT_API_URL",
@@ -74,6 +77,7 @@ __all__ = [
     "configure",
     "data",
     "deploy",
+    "endpoint",
     "function",
     "get_agent",
     "get_function",

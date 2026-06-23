@@ -55,6 +55,16 @@ _EmflowSimulator: Any = _ImportedEmflowSimulator
 _default_client: Client | None = None
 _trace_stack: list[_WorkflowTrace] = []
 _UNSET = object()
+DEFAULT_API_KEY_PERMISSIONS = [
+    "workspace:read",
+    "projects:read",
+    "endpoints:read",
+    "endpoints:execute",
+    "functions:read",
+    "workflows:read",
+    "models:read",
+    "runs:read",
+]
 
 
 class RebaseWorkflowError(RuntimeError):
@@ -62,6 +72,90 @@ class RebaseWorkflowError(RuntimeError):
 
 
 RebaseError = RebaseWorkflowError
+
+
+class EndpointConfig:
+    def __init__(
+        self,
+        *,
+        name: str | None = None,
+        method: str = "POST",
+        path: str | None = None,
+        auth: str = "api_key",
+        mode: str | None = None,
+        timeout: int | None = None,
+        timeout_seconds: int | None = None,
+        docs: bool = False,
+        enabled: bool = True,
+    ) -> None:
+        method = method.upper()
+        if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+            raise ValueError("endpoint method must be one of: GET, POST, PUT, PATCH, DELETE")
+        if auth not in {"api_key", "workspace", "public"}:
+            raise ValueError("endpoint auth must be one of: api_key, workspace, public")
+        if mode is not None and mode not in {"sync", "async"}:
+            raise ValueError("endpoint mode must be one of: sync, async")
+        resolved_timeout = timeout_seconds if timeout_seconds is not None else timeout
+        if resolved_timeout is not None and resolved_timeout < 1:
+            raise ValueError("endpoint timeout must be greater than or equal to 1")
+        if path is not None:
+            path = path.strip()
+            if not path:
+                raise ValueError("endpoint path cannot be empty")
+            if not path.startswith("/"):
+                path = f"/{path}"
+            if "?" in path or "#" in path:
+                raise ValueError("endpoint path cannot include query strings or fragments")
+            path = path.rstrip("/") or "/"
+        self.name = name
+        self.method = method
+        self.path = path
+        self.auth = auth
+        self.mode = mode
+        self.timeout_seconds = resolved_timeout
+        self.docs = docs
+        self.enabled = enabled
+
+    def __call__(self, target: Any) -> Any:
+        target._rebase_endpoint = self
+        if isinstance(target, (Function, Workflow, Model)):
+            target.endpoint = self
+        return target
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "method": self.method,
+            "path": self.path,
+            "auth": self.auth,
+            "mode": self.mode,
+            "timeout_seconds": self.timeout_seconds,
+            "docs": self.docs,
+            "enabled": self.enabled,
+        }
+
+
+def _coerce_endpoint(endpoint: EndpointConfig | dict[str, Any] | None) -> EndpointConfig | None:
+    if endpoint is None:
+        return None
+    if isinstance(endpoint, EndpointConfig):
+        return endpoint
+    if isinstance(endpoint, dict):
+        return EndpointConfig(
+            name=endpoint.get("name"),
+            method=endpoint.get("method", "POST"),
+            path=endpoint.get("path"),
+            auth=endpoint.get("auth", "api_key"),
+            mode=endpoint.get("mode"),
+            timeout_seconds=endpoint.get("timeout_seconds"),
+            docs=bool(endpoint.get("docs", False)),
+            enabled=bool(endpoint.get("enabled", True)),
+        )
+    raise TypeError("endpoint must be an EndpointConfig")
+
+
+def _endpoint_for_callable(fn: Callable[..., Any] | None) -> EndpointConfig | None:
+    return _coerce_endpoint(getattr(fn, "_rebase_endpoint", None)) if fn is not None else None
 
 
 def _response_error_message(response: requests.Response) -> str:
@@ -887,8 +981,22 @@ class Client:
             raise RebaseWorkflowError("expected platform invite list response")
         return response
 
-    def create_platform_invite(self, email: str, *, expires_at: str | None = None) -> dict[str, Any]:
-        response = self.request("POST", "/platform/invites", json={"email": email, "expires_at": expires_at})
+    def create_platform_invite(
+        self,
+        email: str,
+        *,
+        expires_at: str | None = None,
+        workspace_creation_limit: int = 1,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            "/platform/invites",
+            json={
+                "email": email,
+                "expires_at": expires_at,
+                "workspace_creation_limit": workspace_creation_limit,
+            },
+        )
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected platform invite response")
         return response
@@ -937,6 +1045,88 @@ class Client:
         response = self.request("DELETE", f"/workspace/invites/{invite_id}")
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected workspace invite response")
+        return response
+
+    def list_api_keys(self) -> list[dict[str, Any]]:
+        response = self.request("GET", "/workspace/api-keys")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected API key list response")
+        return response
+
+    def create_api_key(
+        self,
+        name: str,
+        *,
+        project_id: str | None = None,
+        permissions: list[str] | None = None,
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            "/workspace/api-keys",
+            json={
+                "name": name,
+                "project_id": project_id,
+                "permissions": permissions if permissions is not None else list(DEFAULT_API_KEY_PERMISSIONS),
+                "expires_at": expires_at,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected API key response")
+        return response
+
+    def revoke_api_key(self, api_key_id: str) -> dict[str, Any]:
+        response = self.request("DELETE", f"/workspace/api-keys/{api_key_id}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected API key response")
+        return response
+
+    def _with_endpoint_url(self, endpoint: dict[str, Any]) -> dict[str, Any]:
+        url_path = endpoint.get("url_path")
+        if isinstance(url_path, str):
+            return {**endpoint, "url": f"{self.api_url}{url_path}"}
+        return endpoint
+
+    def list_endpoints(self, *, project_id: str | None = None) -> list[dict[str, Any]]:
+        params = {"project_id": project_id} if project_id is not None else None
+        response = self.request("GET", "/endpoints", params=params)
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected endpoint list response")
+        return [self._with_endpoint_url(endpoint) for endpoint in response]
+
+    def list_project_endpoints(self, project_id: str) -> list[dict[str, Any]]:
+        response = self.request("GET", f"/projects/{project_id}/endpoints")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected endpoint list response")
+        return [self._with_endpoint_url(endpoint) for endpoint in response]
+
+    def get_endpoint(self, endpoint_id: str) -> dict[str, Any]:
+        response = self.request("GET", f"/endpoints/{endpoint_id}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected endpoint response")
+        return self._with_endpoint_url(response)
+
+    def list_endpoint_versions(self, endpoint_id: str) -> list[dict[str, Any]]:
+        response = self.request("GET", f"/endpoints/{endpoint_id}/versions")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected endpoint version list response")
+        return response
+
+    def disable_endpoint(self, endpoint_id: str) -> dict[str, Any]:
+        response = self.request("PATCH", f"/endpoints/{endpoint_id}", json={"enabled": False})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected endpoint response")
+        return self._with_endpoint_url(response)
+
+    def invoke_endpoint(self, endpoint: dict[str, Any], parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+        method = str(endpoint.get("method") or "POST").upper()
+        url_path = endpoint.get("url_path")
+        if not isinstance(url_path, str):
+            raise RebaseWorkflowError("endpoint response is missing url_path")
+        kwargs: dict[str, Any] = {"params": parameters or {}} if method == "GET" else {"json": parameters or {}}
+        response = self.request(method, url_path, **kwargs)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected endpoint invoke response")
         return response
 
     def create_github_setup_session(self, *, workspace_id: str | None = None) -> dict[str, Any]:
@@ -1194,6 +1384,7 @@ class Client:
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
         enabled: bool = True,
+        endpoint: EndpointConfig | dict[str, Any] | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -1219,6 +1410,7 @@ class Client:
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
                 "enabled": enabled,
+                "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "source_mode": source_mode,
                 "repo_owner": repo_owner,
                 "repo_name": repo_name,
@@ -1248,6 +1440,7 @@ class Client:
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
         enabled: bool | None = None,
+        endpoint: EndpointConfig | dict[str, Any] | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -1271,6 +1464,7 @@ class Client:
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
                 "enabled": enabled,
+                "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "source_mode": source_mode,
                 "repo_owner": repo_owner,
                 "repo_name": repo_name,
@@ -1334,6 +1528,7 @@ class Client:
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
         enabled: bool = True,
+        endpoint: EndpointConfig | dict[str, Any] | None = None,
         environment: str | None = "dev",
         source_mode: str | None = None,
         repo_owner: str | None = None,
@@ -1361,6 +1556,7 @@ class Client:
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
                 "enabled": enabled,
+                "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "environment": environment,
                 "source_mode": source_mode,
                 "repo_owner": repo_owner,
@@ -1392,6 +1588,7 @@ class Client:
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
         enabled: bool | None = None,
+        endpoint: EndpointConfig | dict[str, Any] | None = None,
         environment: str | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
@@ -1417,6 +1614,7 @@ class Client:
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
                 "enabled": enabled,
+                "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "environment": environment,
                 "source_mode": source_mode,
                 "repo_owner": repo_owner,
@@ -1658,6 +1856,7 @@ class Client:
         required_parameters: list[str] | None = None,
         execution_backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
         enabled: bool = True,
+        endpoint: EndpointConfig | dict[str, Any] | None = None,
         project: str | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
@@ -1688,6 +1887,7 @@ class Client:
                 "required_parameters": required_parameters or [],
                 "execution_backend": execution_backend,
                 "enabled": enabled,
+                "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "source_mode": source_mode,
                 "repo_owner": repo_owner,
                 "repo_name": repo_name,
@@ -1718,6 +1918,7 @@ class Client:
         required_parameters: list[str] | None = None,
         execution_backend: WorkflowBackend | None = None,
         enabled: bool | None = None,
+        endpoint: EndpointConfig | dict[str, Any] | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -1740,6 +1941,7 @@ class Client:
                 "required_parameters": required_parameters,
                 "execution_backend": execution_backend,
                 "enabled": enabled,
+                "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "source_mode": source_mode,
                 "repo_owner": repo_owner,
                 "repo_name": repo_name,
@@ -1926,6 +2128,7 @@ class Project:
         min_instances: int | None = None,
         concurrency: int | None = None,
         enabled: bool = True,
+        endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
     ) -> Callable[[Callable[..., Any]], Function]:
         def decorator(fn: Callable[..., Any]) -> Function:
@@ -1941,6 +2144,7 @@ class Project:
                 min_instances=min_instances,
                 concurrency=concurrency,
                 enabled=enabled,
+                endpoint=endpoint,
                 deploy_source=deploy_source if deploy_source is not None else self.deploy_source,
                 project_source_mode=self.source_mode,
                 client=self._client,
@@ -2004,6 +2208,7 @@ class Project:
         default_parameters: dict[str, Any] | None = None,
         backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
         enabled: bool = True,
+        endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
     ) -> Callable[[Callable[..., Any]], Workflow]:
         def decorator(fn: Callable[..., Any]) -> Workflow:
@@ -2016,6 +2221,7 @@ class Project:
                 default_parameters=default_parameters,
                 backend=backend,
                 enabled=enabled,
+                endpoint=endpoint,
                 deploy_source=deploy_source if deploy_source is not None else self.deploy_source,
                 project_source_mode=self.source_mode,
                 client=self._client,
@@ -2041,6 +2247,7 @@ class Function:
         min_instances: int | None = None,
         concurrency: int | None = None,
         enabled: bool = True,
+        endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
         project_source_mode: str | None = None,
         client: Client | None = None,
@@ -2051,6 +2258,7 @@ class Function:
         self.project = project
         self.description = description
         self.enabled = enabled
+        self.endpoint = _coerce_endpoint(endpoint) or _endpoint_for_callable(fn)
         self.client = client
         self.id: str | None = function_id
         self.data = data or {}
@@ -2138,6 +2346,7 @@ class Function:
                 cloud_run_min_instances=self.cloud_run_min_instances,
                 cloud_run_concurrency=self.cloud_run_concurrency,
                 enabled=self.enabled,
+                endpoint=self.endpoint,
                 **source_metadata,
             )
             self.id = function["id"]
@@ -2156,6 +2365,7 @@ class Function:
             cloud_run_min_instances=self.cloud_run_min_instances,
             cloud_run_concurrency=self.cloud_run_concurrency,
             enabled=self.enabled,
+            endpoint=self.endpoint,
             **source_metadata,
         )
         self.id = function["id"]
@@ -2445,6 +2655,7 @@ class Model(_EmflowModel):
     min_instances: int | None = None
     concurrency: int | None = None
     enabled: bool = True
+    endpoint: EndpointConfig | dict[str, Any] | None = None
     deploy_source: str | None = None
 
     def __init__(
@@ -2460,6 +2671,7 @@ class Model(_EmflowModel):
         min_instances: int | None = None,
         concurrency: int | None = None,
         enabled: bool | None = None,
+        endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
         client: Client | None = None,
     ) -> None:
@@ -2483,6 +2695,7 @@ class Model(_EmflowModel):
         )
         self.cloud_run_concurrency = concurrency if concurrency is not None else getattr(cls, "concurrency", None)
         self.enabled = enabled if enabled is not None else bool(getattr(cls, "enabled", True))
+        self.endpoint = _coerce_endpoint(endpoint if endpoint is not None else getattr(cls, "endpoint", None))
         self.deploy_source = _validate_deploy_source(
             deploy_source if deploy_source is not None else getattr(cls, "deploy_source", None)
         )
@@ -2708,6 +2921,7 @@ class Model(_EmflowModel):
                 cloud_run_concurrency=function.cloud_run_concurrency,
                 enabled=self.enabled,
                 environment=environment,
+                endpoint=self.endpoint,
                 **source_metadata,
             )
         else:
@@ -2725,6 +2939,7 @@ class Model(_EmflowModel):
                 cloud_run_concurrency=function.cloud_run_concurrency,
                 enabled=self.enabled,
                 environment=environment,
+                endpoint=self.endpoint,
                 **source_metadata,
             )
         self.id = model_data["id"]
@@ -2898,6 +3113,7 @@ class Workflow:
         default_parameters: dict[str, Any] | None = None,
         backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
         enabled: bool = True,
+        endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
         project_source_mode: str | None = None,
         client: Client | None = None,
@@ -2908,6 +3124,7 @@ class Workflow:
         self.project = project
         self.description = description
         self.enabled = enabled
+        self.endpoint = _coerce_endpoint(endpoint) or _endpoint_for_callable(fn)
         self.client = client
         self.id: str | None = workflow_id
         self.data = data or {}
@@ -3057,6 +3274,7 @@ class Workflow:
                 required_parameters=self.required_parameters,
                 execution_backend=self.execution_backend,
                 enabled=self.enabled,
+                endpoint=self.endpoint,
                 **source_metadata,
             )
             self.id = workflow["id"]
@@ -3077,6 +3295,7 @@ class Workflow:
             required_parameters=self.required_parameters,
             execution_backend=self.execution_backend,
             enabled=self.enabled,
+            endpoint=self.endpoint,
             **source_metadata,
         )
         self.id = workflow["id"]

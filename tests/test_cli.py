@@ -3,6 +3,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from rebase.auth import AuthSession
 from rebase.cli import _format_duration, deploy_file, main
 from rebase.client import Client, Function, Model, Project, Run, Workflow
@@ -17,6 +19,7 @@ def test_main_without_args_prints_help(capsys) -> None:
     assert "setup" in output
     assert "workspace" in output
     assert "project" in output
+    assert "endpoint" in output
     assert "function" in output
     assert "workflow" in output
     assert "deploy" in output
@@ -791,6 +794,102 @@ def test_setup_workspace_join_prompts_for_workspace_handle(monkeypatch) -> None:
     assert prompts == ["Workspace handle to join"]
 
 
+def test_setup_workspace_invite_offers_join_and_create(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    class FakeClient:
+        def list_my_workspaces(self) -> list[dict[str, Any]]:
+            return [
+                {
+                    "id": "team",
+                    "name": "Team",
+                    "default": True,
+                    "joined_via_invite": True,
+                }
+            ]
+
+    choices: list[dict[str, Any]] = []
+
+    def fake_choose(label: str, values: list[str], *, default: str | None = None, title: str | None = None) -> str:
+        choices.append({"label": label, "values": values, "default": default, "title": title})
+        return "Join workspace (Team)"
+
+    monkeypatch.setattr(setup_module, "_choose", fake_choose)
+
+    workspace = setup_module._select_workspace(
+        SimpleNamespace(workspace=None, workspace_name=None, handle=None),
+        FakeClient(),
+        session=None,
+    )
+
+    assert workspace["id"] == "team"
+    assert choices == [
+        {
+            "label": "workspace setup",
+            "values": ["Join workspace (Team)", setup_module.CREATE_WORKSPACE],
+            "default": "Join workspace (Team)",
+            "title": "You were invited to a workspace. What do you want to do?",
+        }
+    ]
+
+
+def test_setup_workspace_invite_create_without_beta_enrollment_errors(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    class FakeClient:
+        def list_my_workspaces(self) -> list[dict[str, Any]]:
+            return [{"id": "team", "name": "Team", "joined_via_invite": True}]
+
+        def request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+            assert (method, path) == ("GET", "/me/profile")
+            return {"id": "profile-id", "handle": "invited-user"}
+
+        def create_workspace(self, workspace_id: str, *, name: str | None = None) -> dict[str, Any]:
+            raise setup_module.RebaseWorkflowError("creating a workspace requires a platform beta invite")
+
+    monkeypatch.setattr(setup_module, "_choose", lambda *args, **kwargs: setup_module.CREATE_WORKSPACE)
+    monkeypatch.setattr(setup_module, "_prompt", lambda *args, **kwargs: "invited-user")
+
+    with pytest.raises(setup_module.RebaseWorkflowError, match="not enrolled in the beta program"):
+        setup_module._select_workspace(
+            SimpleNamespace(workspace=None, workspace_name=None, handle=None),
+            FakeClient(),
+            session=None,
+        )
+
+
+def test_setup_workspace_invite_create_with_beta_enrollment_continues(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[tuple[str, str | None]] = []
+
+    class FakeClient:
+        def list_my_workspaces(self) -> list[dict[str, Any]]:
+            return [{"id": "team", "name": "Team", "joined_via_invite": True}]
+
+        def request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+            if (method, path) == ("GET", "/me/profile"):
+                calls.append(("get_profile", None))
+                return {"id": "profile-id", "handle": "sebaheg"}
+            raise AssertionError((method, path))
+
+        def create_workspace(self, workspace_id: str, *, name: str | None = None) -> dict[str, Any]:
+            calls.append(("create_workspace", workspace_id))
+            return {"id": workspace_id, "name": name}
+
+    monkeypatch.setattr(setup_module, "_choose", lambda *args, **kwargs: setup_module.CREATE_WORKSPACE)
+    monkeypatch.setattr(setup_module, "_prompt", lambda *args, **kwargs: "sebaheg")
+
+    workspace = setup_module._select_workspace(
+        SimpleNamespace(workspace=None, workspace_name=None, handle=None),
+        FakeClient(),
+        session=None,
+    )
+
+    assert workspace["id"] == "sebaheg"
+    assert calls == [("get_profile", None), ("create_workspace", "sebaheg")]
+
+
 def test_setup_workspace_create_claims_profile_handle_first(monkeypatch) -> None:
     from rebase import setup as setup_module
 
@@ -925,7 +1024,7 @@ def test_setup_opens_github_installation_after_repo_questions(monkeypatch) -> No
     class FakeClient:
         def create_github_setup_session(self, *, workspace_id: str | None = None) -> dict[str, Any]:
             calls.append(f"create_setup:{workspace_id}")
-            return {"id": "setup-id", "install_url": "https://github.com/apps/rebase-workflows/installations/new"}
+            return {"id": "setup-id", "install_url": "https://github.com/apps/rebase-toolkit/installations/new"}
 
         def get_github_setup_session(self, setup_session_id: str) -> dict[str, Any]:
             calls.append(f"poll_setup:{setup_session_id}")
@@ -996,7 +1095,7 @@ def test_setup_opens_github_installation_after_repo_questions(monkeypatch) -> No
         "choose:repository setup",
         "prompt:GitHub repository full name",
         "create_setup:default",
-        "open:https://github.com/apps/rebase-workflows/installations/new",
+        "open:https://github.com/apps/rebase-toolkit/installations/new",
         "find_repo:rebase/platform",
         "connect:rebase/platform",
     ]
@@ -1012,7 +1111,7 @@ def test_setup_retries_direct_repo_verification_after_user_finishes_install(monk
 
         def create_github_setup_session(self, *, workspace_id: str | None = None) -> dict[str, Any]:
             calls.append(f"create_setup:{workspace_id}")
-            return {"id": "setup-id", "install_url": "https://github.com/apps/rebase-workflows/installations/new"}
+            return {"id": "setup-id", "install_url": "https://github.com/apps/rebase-toolkit/installations/new"}
 
         def find_github_repository_installation(self, repo_full_name: str) -> dict[str, Any]:
             calls.append(f"find_repo:{repo_full_name}")
@@ -1060,7 +1159,7 @@ def test_setup_retries_direct_repo_verification_after_user_finishes_install(monk
 
     assert calls == [
         "create_setup:default",
-        "open:https://github.com/apps/rebase-workflows/installations/new",
+        "open:https://github.com/apps/rebase-toolkit/installations/new",
         "find_repo:rebase/platform",
         "Press Enter to verify GitHub access again: ",
         "find_repo:rebase/platform",
@@ -1302,6 +1401,190 @@ def test_workspace_members_lists_members_and_pending_invites(monkeypatch, capsys
     assert "Viewer" in output
     assert "pending" in output
     assert "accepted@example.com" not in output
+
+
+def test_api_key_list_command_renders_keys(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "list_api_keys",
+        lambda self: [
+            {
+                "id": "key-id",
+                "name": "agent",
+                "key_prefix": "rb_abcd1234",
+                "project_id": None,
+                "enabled": True,
+                "last_used_at": None,
+                "expires_at": None,
+                "revoked_at": None,
+                "permissions": ["workspace:read", "runs:read"],
+            }
+        ],
+    )
+
+    assert main(["api-key", "list"]) == 0
+
+    output = capsys.readouterr().out
+    assert "API Keys" in output
+    assert "agent" in output
+    assert "rb_abcd1234" in output
+    assert "2p" in output
+
+
+def test_api_key_create_uses_agent_permissions_and_prints_secret(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_create_api_key(self: Client, name: str, **kwargs: Any) -> dict[str, Any]:
+        observed["name"] = name
+        observed.update(kwargs)
+        return {
+            "id": "key-id",
+            "name": name,
+            "key_prefix": "rb_abcd1234",
+            "project_id": None,
+            "permissions": kwargs["permissions"],
+            "enabled": True,
+            "expires_at": None,
+            "created_at": "2026-06-23T10:00:00Z",
+            "api_key": "rb_abcd1234_secret",
+        }
+
+    monkeypatch.setattr(Client, "create_api_key", fake_create_api_key)
+
+    assert main(["api-key", "create", "agent"]) == 0
+
+    assert observed == {
+        "name": "agent",
+        "project_id": None,
+        "permissions": [
+            "workspace:read",
+            "projects:read",
+            "endpoints:read",
+            "endpoints:execute",
+            "functions:read",
+            "workflows:read",
+            "models:read",
+            "runs:read",
+        ],
+        "expires_at": None,
+    }
+    output = capsys.readouterr().out
+    assert "Created API Key" in output
+    assert "API key secret (shown once):" in output
+    assert "rb_abcd1234_secret" in output
+
+
+def test_api_key_create_overrides_permissions_and_resolves_project(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+    monkeypatch.setattr(Client, "find_project", lambda self, name: {"id": "project-id", "name": name})
+
+    def fake_create_api_key(self: Client, name: str, **kwargs: Any) -> dict[str, Any]:
+        observed["name"] = name
+        observed.update(kwargs)
+        return {"id": "key-id", "name": name, "api_key": "rb_secret"}
+
+    monkeypatch.setattr(Client, "create_api_key", fake_create_api_key)
+
+    assert (
+        main(
+            [
+                "api-key",
+                "create",
+                "runner",
+                "--project",
+                "energy",
+                "--permission",
+                "runs:read",
+                "--permission",
+                "runs:write",
+                "--expires-at",
+                "2026-07-01T00:00:00Z",
+            ]
+        )
+        == 0
+    )
+
+    assert observed == {
+        "name": "runner",
+        "project_id": "project-id",
+        "permissions": ["runs:read", "runs:write"],
+        "expires_at": "2026-07-01T00:00:00Z",
+    }
+    assert "rb_secret" in capsys.readouterr().out
+
+
+def test_api_key_create_rejects_project_and_project_id(capsys) -> None:
+    assert main(["api-key", "create", "agent", "--project", "energy", "--project-id", "project-id"]) == 1
+
+    assert "provide either --project or --project-id" in capsys.readouterr().err
+
+
+def test_api_key_revoke_resolves_id_prefix_and_unique_name(monkeypatch, capsys) -> None:
+    revoked_ids: list[str] = []
+
+    def fake_list_api_keys(self: Client) -> list[dict[str, Any]]:
+        return [
+            {"id": "key-id", "name": "agent", "key_prefix": "rb_agent"},
+            {"id": "other-id", "name": "other", "key_prefix": "rb_other"},
+        ]
+
+    def fake_revoke_api_key(self: Client, api_key_id: str) -> dict[str, Any]:
+        revoked_ids.append(api_key_id)
+        return {"id": api_key_id, "name": "revoked", "key_prefix": "rb_revoked", "enabled": False}
+
+    monkeypatch.setattr(Client, "list_api_keys", fake_list_api_keys)
+    monkeypatch.setattr(Client, "revoke_api_key", fake_revoke_api_key)
+
+    assert main(["api-key", "revoke", "key-id"]) == 0
+    assert main(["api-key", "revoke", "rb_other"]) == 0
+    assert main(["api-key", "revoke", "agent"]) == 0
+
+    assert revoked_ids == ["key-id", "other-id", "key-id"]
+    output = capsys.readouterr().out
+    assert "Revoked API Key" in output
+
+
+def test_api_key_revoke_errors_on_ambiguous_selector(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "list_api_keys",
+        lambda self: [
+            {"id": "key-id", "name": "agent", "key_prefix": "rb_first"},
+            {"id": "other-id", "name": "agent", "key_prefix": "rb_second"},
+        ],
+    )
+
+    assert main(["api-key", "revoke", "agent"]) == 1
+
+    assert "api key selector is ambiguous" in capsys.readouterr().err
+
+
+def test_endpoint_invoke_resolves_selector_and_posts_json(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+    endpoint = {
+        "id": "endpoint-id",
+        "project_name": "energy",
+        "name": "forecast",
+        "method": "POST",
+        "path": "/forecast",
+        "url_path": "/e/default/energy/forecast",
+    }
+
+    monkeypatch.setattr(Client, "list_endpoints", lambda self, **kwargs: [endpoint])
+
+    def fake_invoke_endpoint(self: Client, selected: dict[str, Any], parameters: dict[str, Any]) -> dict[str, Any]:
+        observed["endpoint"] = selected
+        observed["parameters"] = parameters
+        return {"run_id": "run-id", "status": "succeeded", "result": {"ok": True}}
+
+    monkeypatch.setattr(Client, "invoke_endpoint", fake_invoke_endpoint)
+
+    assert main(["endpoint", "invoke", "energy/forecast", "--json", '{"zone":"SE3"}']) == 0
+
+    assert observed == {"endpoint": endpoint, "parameters": {"zone": "SE3"}}
+    output = capsys.readouterr().out
+    assert '"run_id": "run-id"' in output
+    assert '"status": "succeeded"' in output
 
 
 def test_project_list_command_prints_projects(monkeypatch, capsys) -> None:

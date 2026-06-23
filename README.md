@@ -26,6 +26,21 @@ Once the package is published to PyPI:
 pip install rebase-toolkit
 ```
 
+The `rebase` PyPI project is a compatibility metapackage that installs the
+same toolkit:
+
+```bash
+pip install rebase
+```
+
+When releasing to PyPI, publish `rebase-toolkit` first, then publish the alias
+package from `pypi/rebase` with the same version:
+
+```bash
+uv build
+uv build --project pypi/rebase
+```
+
 For local development:
 
 ```bash
@@ -214,11 +229,12 @@ def add_with_boltons(a: int = 0, b: int = 0) -> dict:
 
 ## Data and Modeling Packages
 
-The toolkit includes `emflow` for Rebase model classes and keeps the direct EnergyDataModel import optional:
+The toolkit can expose optional `emflow` and EnergyDataModel modules through:
 
 ```python
 from rebase import data
 from rebase import modeling
 ```
 
-Install `rebase-toolkit[data]` if you want to import `energydatamodel` directly through `rebase.data`.
+Install `rebase-toolkit[modeling]` to use `emflow` through `rebase.modeling`.
+Install `rebase-toolkit[data]` to import `energydatamodel` through `rebase.data`.

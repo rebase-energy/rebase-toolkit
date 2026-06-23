@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rebase"
+version = "0.2.0"
+description = "Compatibility package for rebase-toolkit"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [
+    { name = "rebase.energy" },
+]
+dependencies = [
+    "rebase-toolkit==0.2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/rebase-energy/rebase-toolkit"
+Repository = "https://github.com/rebase-energy/rebase-toolkit"
+
+[project.optional-dependencies]
+data = [
+    "rebase-toolkit[data]==0.2.0",
+]
+huggingface = [
+    "rebase-toolkit[huggingface]==0.2.0",
+]
+modeling = [
+    "rebase-toolkit[modeling]==0.2.0",
+]
+all = [
+    "rebase-toolkit[all]==0.2.0",
+]
+
+[tool.setuptools]
+packages = []
