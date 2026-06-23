@@ -216,9 +216,10 @@ DEFAULT_MODEL_DEPENDENCY = (
 
 
 def _validate_function_backend(backend: FunctionBackend) -> FunctionBackend:
-    if backend not in {"modal", "prefect", "prefect_cloud", "cloud_run", "cloud_run_shared"}:
+    if backend not in {"modal", "prefect", "prefect_cloud", "cloud_run", "cloud_run_shared", "cloud_run_jobs"}:
         raise ValueError(
-            "function backend must be 'modal', 'prefect', 'prefect_cloud', 'cloud_run', or 'cloud_run_shared'"
+            "function backend must be 'modal', 'prefect', 'prefect_cloud', 'cloud_run', "
+            "'cloud_run_shared', or 'cloud_run_jobs'"
         )
     return backend
 

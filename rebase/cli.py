@@ -388,9 +388,10 @@ def _parse_run_parameters(parameters_json: str | None, parameters: Iterable[str]
 def _validate_backend_override(backend: str | None) -> FunctionBackend | None:
     if backend is None:
         return None
-    if backend not in {"modal", "prefect", "prefect_cloud", "cloud_run", "cloud_run_shared"}:
+    if backend not in {"modal", "prefect", "prefect_cloud", "cloud_run", "cloud_run_shared", "cloud_run_jobs"}:
         raise RebaseWorkflowError(
-            "backend must be 'modal', 'prefect', 'prefect_cloud', 'cloud_run', or 'cloud_run_shared'"
+            "backend must be 'modal', 'prefect', 'prefect_cloud', 'cloud_run', "
+            "'cloud_run_shared', or 'cloud_run_jobs'"
         )
     return backend
 

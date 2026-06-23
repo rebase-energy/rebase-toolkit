@@ -1009,6 +1009,25 @@ def test_project_function_can_use_cloud_run_shared_backend(monkeypatch) -> None:
     assert observed["execution_backend"] == "cloud_run_shared"
 
 
+def test_project_function_can_use_cloud_run_jobs_backend(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
+    monkeypatch.setattr(client, "find_function", lambda name, *, project: None)
+    monkeypatch.setattr(client, "register_function", lambda **kwargs: observed.update(kwargs) or {"id": "function-id"})
+
+    project = rb.Project("energy-forecasting", client=client)
+
+    @project.function(name="cloud-run-job-function", backend="cloud_run_jobs")
+    def cloud_run_job_function() -> dict:
+        return {"status": "ok"}
+
+    project.deploy()
+
+    assert cloud_run_job_function.execution_backend == "cloud_run_jobs"
+    assert observed["execution_backend"] == "cloud_run_jobs"
+
+
 def test_project_function_sends_cloud_run_isolation_settings(monkeypatch) -> None:
     observed: dict[str, Any] = {}
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
