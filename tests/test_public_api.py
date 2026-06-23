@@ -5,6 +5,7 @@ import pytest
 import rebase as rb
 from rebase.client import (
     AgentHandle,
+    ASGIApp,
     Client,
     Function,
     Model,
@@ -57,6 +58,36 @@ def test_function_helper_defaults_project() -> None:
     assert isinstance(add, Function)
     assert add.project == "default"
     assert add.name == "add"
+
+
+def test_asgi_app_helper_creates_asgi_app_handle() -> None:
+    image = rb.Image.python("3.12").uv_pip_install("fastapi==0.115.0")
+
+    @rb.asgi_app(
+        project="grid",
+        name="grid-api",
+        base_path="api",
+        auth="public",
+        image=image,
+        concurrency=80,
+        memory="1Gi",
+    )
+    def grid_api() -> object:
+        return object()
+
+    assert isinstance(grid_api, ASGIApp)
+    assert grid_api.project == "grid"
+    assert grid_api.name == "grid-api"
+    assert grid_api.base_path == "/api"
+    assert grid_api.auth == "public"
+    assert grid_api.cloud_run_concurrency == 80
+    assert grid_api.cloud_run_memory == "1Gi"
+    assert grid_api.image_spec == {
+        "kind": "python",
+        "python_version": "3.12",
+        "uv_pip_packages": ["fastapi==0.115.0"],
+        "uv_version": None,
+    }
 
 
 def test_step_helper_defaults_project() -> None:
@@ -152,6 +183,23 @@ def test_deploy_helper_deploys_models(monkeypatch) -> None:
     assert deployed == ["price-forecast"]
 
 
+def test_deploy_helper_deploys_asgi_apps(monkeypatch) -> None:
+    deployed: list[str] = []
+
+    def fake_deploy(self: ASGIApp, *, replace: bool = False) -> ASGIApp:
+        deployed.append(str(self.name))
+        return self
+
+    monkeypatch.setattr(ASGIApp, "deploy", fake_deploy)
+
+    @rb.asgi_app(name="grid-api")
+    def grid_api() -> object:
+        return object()
+
+    assert rb.deploy(grid_api) is grid_api
+    assert deployed == ["grid-api"]
+
+
 def test_get_function_resolves_project_name(monkeypatch) -> None:
     observed: dict[str, Any] = {}
 
@@ -166,6 +214,22 @@ def test_get_function_resolves_project_name(monkeypatch) -> None:
 
     assert handle.name == "normalize-weather"
     assert observed == {"project": "shared-utils", "name": "normalize-weather"}
+
+
+def test_get_asgi_app_resolves_project_name(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_from_name(project: str, name: str) -> ASGIApp:
+        observed["project"] = project
+        observed["name"] = name
+        return ASGIApp(project=project, name=name, asgi_app_id="asgi-app-id")
+
+    monkeypatch.setattr(ASGIApp, "from_name", staticmethod(fake_from_name))
+
+    handle = rb.get_asgi_app("grid/grid-api")
+
+    assert handle.name == "grid-api"
+    assert observed == {"project": "grid", "name": "grid-api"}
 
 
 def test_get_model_returns_predict_handle(monkeypatch) -> None:

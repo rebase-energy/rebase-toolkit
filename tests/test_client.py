@@ -283,6 +283,50 @@ def test_client_uses_fastapi_detail_for_http_errors(monkeypatch) -> None:
     assert str(exc_info.value) == "Rebase Workflows is invite-only."
 
 
+def test_client_formats_credit_exhaustion_errors(monkeypatch) -> None:
+    class CreditErrorResponse(FakeErrorResponse):
+        text = '{"detail":{"code":"workspace_credits_exhausted"}}'
+
+        def json(self) -> dict[str, Any]:
+            return {
+                "detail": {
+                    "code": "workspace_credits_exhausted",
+                    "message": "workspace monthly compute credits are exhausted",
+                    "remaining_cents": 25,
+                    "required_reservation_cents": 50,
+                }
+            }
+
+    monkeypatch.setattr("requests.request", lambda *args, **kwargs: CreditErrorResponse({}))
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    with pytest.raises(rb.RebaseWorkflowError) as exc_info:
+        client.list_my_workspaces()
+
+    assert str(exc_info.value) == (
+        "workspace monthly compute credits are exhausted. Remaining: 0.25 EUR; "
+        "required reservation: 0.50 EUR."
+    )
+
+
+def test_get_workspace_usage_calls_active_workspace_endpoint(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        return FakeResponse({"workspace_id": "beta-team", "monthly_credit_cents": 2000})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    assert client.get_workspace_usage()["monthly_credit_cents"] == 2000
+    assert observed == {
+        "method": "GET",
+        "url": "https://workflows.example.com/workspace/usage",
+    }
+
+
 def test_create_platform_invite_posts_email(monkeypatch) -> None:
     observed: dict[str, Any] = {}
 
@@ -302,6 +346,28 @@ def test_create_platform_invite_posts_email(monkeypatch) -> None:
         "method": "POST",
         "url": "https://workflows.example.com/platform/invites",
         "json": {"email": "new@example.com", "expires_at": None, "workspace_creation_limit": 3},
+    }
+
+
+def test_create_platform_invite_posts_null_workspace_limit(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["json"] = kwargs["json"]
+        return FakeResponse({"id": "invite-id", "email": "new@example.com", "status": "pending"})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    response = client.create_platform_invite("new@example.com", workspace_creation_limit=None)
+
+    assert response["email"] == "new@example.com"
+    assert observed == {
+        "method": "POST",
+        "url": "https://workflows.example.com/platform/invites",
+        "json": {"email": "new@example.com", "expires_at": None, "workspace_creation_limit": None},
     }
 
 
@@ -806,6 +872,82 @@ def test_project_deploy_registers_function_source(monkeypatch) -> None:
     assert observed["execution_backend"] == "cloud_run"
     assert observed["source_mode"] == "rebase_hosted"
     assert normalize_weather.execution_backend == rb.DEFAULT_FUNCTION_BACKEND
+
+
+def test_project_deploy_registers_asgi_app_source(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
+    monkeypatch.setattr(client, "find_asgi_app", lambda name, *, project: None)
+
+    def fake_register_asgi_app(**kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        return {"id": "asgi-app-id", "name": kwargs["name"], "url_path": "/e/default/grid/api"}
+
+    monkeypatch.setattr(client, "register_asgi_app", fake_register_asgi_app)
+
+    project = rb.Project("grid", client=client)
+
+    @project.asgi_app(
+        name="grid-api",
+        base_path="api",
+        auth="public",
+        dependencies=["fastapi==0.115.0"],
+        env={"GRID_ENV": "prod"},
+        secrets={"GRID_TOKEN": "grid-token:latest"},
+        max_instances=2,
+        concurrency=80,
+        timeout_seconds=60,
+        cpu="1",
+        memory="1Gi",
+    )
+    def grid_api() -> object:
+        return object()
+
+    project.deploy()
+
+    assert grid_api.id == "asgi-app-id"
+    assert observed["project"] == "grid"
+    assert observed["name"] == "grid-api"
+    assert observed["entrypoint"] == "grid_api"
+    assert observed["base_path"] == "/api"
+    assert observed["auth"] == "public"
+    assert observed["source_code"].startswith("def grid_api")
+    assert "@project.asgi_app" not in observed["source_code"]
+    assert observed["image_spec"]["uv_pip_packages"] == ["fastapi==0.115.0"]
+    assert observed["env"] == {"GRID_ENV": "prod"}
+    assert observed["secrets"] == {"GRID_TOKEN": "grid-token:latest"}
+    assert observed["cloud_run_max_instances"] == 2
+    assert observed["cloud_run_concurrency"] == 80
+    assert observed["cloud_run_timeout_seconds"] == 60
+    assert observed["cloud_run_cpu"] == "1"
+    assert observed["cloud_run_memory"] == "1Gi"
+    assert observed["source_mode"] == "rebase_hosted"
+
+
+def test_asgi_app_deploy_updates_existing_app(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "find_asgi_app", lambda name, *, project: {"id": "existing-id", "name": name})
+    monkeypatch.setattr(client, "register_asgi_app", lambda **kwargs: pytest.fail("existing ASGI app should update"))
+    monkeypatch.setattr(
+        client,
+        "update_asgi_app",
+        lambda asgi_app_id, **kwargs: observed.update({"asgi_app_id": asgi_app_id, **kwargs})
+        or {"id": asgi_app_id, "name": "grid-api"},
+    )
+
+    @rb.asgi_app(project="grid", name="grid-api", base_path="/api")
+    def grid_api() -> object:
+        return object()
+
+    grid_api.client = client
+    grid_api.deploy()
+
+    assert grid_api.id == "existing-id"
+    assert observed["asgi_app_id"] == "existing-id"
+    assert observed["entrypoint"] == "grid_api"
+    assert observed["base_path"] == "/api"
 
 
 def test_function_endpoint_deploy_sends_endpoint_config(monkeypatch) -> None:

@@ -55,6 +55,7 @@ _EmflowSimulator: Any = _ImportedEmflowSimulator
 _default_client: Client | None = None
 _trace_stack: list[_WorkflowTrace] = []
 _UNSET = object()
+DEFAULT_PROJECT_NAME = "default"
 DEFAULT_API_KEY_PERMISSIONS = [
     "workspace:read",
     "projects:read",
@@ -167,6 +168,16 @@ def _response_error_message(response: requests.Response) -> str:
         detail = payload.get("detail")
         if isinstance(detail, str):
             return detail
+        if isinstance(detail, dict) and detail.get("code") == "workspace_credits_exhausted":
+            remaining = detail.get("remaining_cents")
+            required = detail.get("required_reservation_cents")
+            message = detail.get("message") or "workspace monthly compute credits are exhausted"
+            if isinstance(remaining, int) and isinstance(required, int):
+                return (
+                    f"{message}. Remaining: {remaining / 100:.2f} EUR; "
+                    f"required reservation: {required / 100:.2f} EUR."
+                )
+            return str(message)
         if detail is not None:
             return json.dumps(detail)
     return response.text
@@ -236,6 +247,21 @@ def _validate_deploy_source(source: str | None) -> DeploySource | None:
     if source not in {"rebase", "github"}:
         raise ValueError("deploy_source must be 'rebase' or 'github'")
     return source
+
+
+def _normalize_path(path: str | None, *, field_name: str = "path") -> str:
+    value = (path or "/").strip()
+    if not value:
+        value = "/"
+    if "?" in value or "#" in value:
+        raise ValueError(f"{field_name} must not include query strings or fragments")
+    if not value.startswith("/"):
+        value = f"/{value}"
+    while "//" in value:
+        value = value.replace("//", "/")
+    if len(value) > 1:
+        value = value.rstrip("/")
+    return value
 
 
 def _is_pinned_dependency(package: str) -> bool:
@@ -1012,6 +1038,12 @@ class Client:
             raise RebaseWorkflowError("expected workspace response")
         return response
 
+    def get_workspace_usage(self) -> dict[str, Any]:
+        response = self.request("GET", "/workspace/usage")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected workspace usage response")
+        return response
+
     def list_platform_invites(self) -> list[dict[str, Any]]:
         response = self.request("GET", "/platform/invites")
         if not isinstance(response, list):
@@ -1023,7 +1055,7 @@ class Client:
         email: str,
         *,
         expires_at: str | None = None,
-        workspace_creation_limit: int = 1,
+        workspace_creation_limit: int | None = 1,
     ) -> dict[str, Any]:
         response = self.request(
             "POST",
@@ -1406,6 +1438,153 @@ class Client:
             if function["name"] == name:
                 return function
         return None
+
+    def list_asgi_apps(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
+        resolved_project_id = project_id
+        if resolved_project_id is None:
+            resolved_project_id = self.ensure_project(project or DEFAULT_PROJECT_NAME)["id"]
+        response = self.request("GET", f"/projects/{resolved_project_id}/asgi-apps")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected ASGI app list response")
+        return response
+
+    def find_asgi_app(self, name: str, *, project: str) -> dict[str, Any] | None:
+        for asgi_app in self.list_asgi_apps(project=project):
+            if asgi_app["name"] == name:
+                return asgi_app
+        return None
+
+    def register_asgi_app(
+        self,
+        *,
+        project: str,
+        name: str,
+        source_code: str,
+        entrypoint: str,
+        description: str | None = None,
+        base_path: str = "/",
+        auth: str = "api_key",
+        image_spec: dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
+        cloud_run_min_instances: int | None = None,
+        cloud_run_max_instances: int | None = None,
+        cloud_run_concurrency: int | None = None,
+        cloud_run_timeout_seconds: int | None = None,
+        cloud_run_cpu: str | None = None,
+        cloud_run_memory: str | None = None,
+        enabled: bool = True,
+        source_mode: str | None = None,
+        repo_owner: str | None = None,
+        repo_name: str | None = None,
+        repo_path: str | None = None,
+        source_path: str | None = None,
+        git_commit_sha: str | None = None,
+        git_branch: str | None = None,
+        git_tag: str | None = None,
+        git_dirty: bool | None = None,
+    ) -> dict[str, Any]:
+        project_id = self.ensure_project(project)["id"]
+        response = self.request(
+            "POST",
+            f"/projects/{project_id}/asgi-apps",
+            json={
+                "name": name,
+                "description": description,
+                "source_code": source_code,
+                "entrypoint": entrypoint,
+                "base_path": base_path,
+                "auth": auth,
+                "image_spec": image_spec,
+                "env": env or {},
+                "secrets": secrets or {},
+                "cloud_run_min_instances": cloud_run_min_instances,
+                "cloud_run_max_instances": cloud_run_max_instances,
+                "cloud_run_concurrency": cloud_run_concurrency,
+                "cloud_run_timeout_seconds": cloud_run_timeout_seconds,
+                "cloud_run_cpu": cloud_run_cpu,
+                "cloud_run_memory": cloud_run_memory,
+                "enabled": enabled,
+                "source_mode": source_mode,
+                "repo_owner": repo_owner,
+                "repo_name": repo_name,
+                "repo_path": repo_path,
+                "source_path": source_path,
+                "git_commit_sha": git_commit_sha,
+                "git_branch": git_branch,
+                "git_tag": git_tag,
+                "git_dirty": git_dirty or False,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected ASGI app response")
+        return response
+
+    def update_asgi_app(
+        self,
+        asgi_app_id: str,
+        *,
+        name: str | None = None,
+        source_code: str | None = None,
+        entrypoint: str | None = None,
+        description: str | None = None,
+        base_path: str | None = None,
+        auth: str | None = None,
+        image_spec: dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
+        cloud_run_min_instances: int | None = None,
+        cloud_run_max_instances: int | None = None,
+        cloud_run_concurrency: int | None = None,
+        cloud_run_timeout_seconds: int | None = None,
+        cloud_run_cpu: str | None = None,
+        cloud_run_memory: str | None = None,
+        enabled: bool | None = None,
+        source_mode: str | None = None,
+        repo_owner: str | None = None,
+        repo_name: str | None = None,
+        repo_path: str | None = None,
+        source_path: str | None = None,
+        git_commit_sha: str | None = None,
+        git_branch: str | None = None,
+        git_tag: str | None = None,
+        git_dirty: bool | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            key: value
+            for key, value in {
+                "name": name,
+                "description": description,
+                "source_code": source_code,
+                "entrypoint": entrypoint,
+                "base_path": base_path,
+                "auth": auth,
+                "image_spec": image_spec,
+                "env": env,
+                "secrets": secrets,
+                "cloud_run_min_instances": cloud_run_min_instances,
+                "cloud_run_max_instances": cloud_run_max_instances,
+                "cloud_run_concurrency": cloud_run_concurrency,
+                "cloud_run_timeout_seconds": cloud_run_timeout_seconds,
+                "cloud_run_cpu": cloud_run_cpu,
+                "cloud_run_memory": cloud_run_memory,
+                "enabled": enabled,
+                "source_mode": source_mode,
+                "repo_owner": repo_owner,
+                "repo_name": repo_name,
+                "repo_path": repo_path,
+                "source_path": source_path,
+                "git_commit_sha": git_commit_sha,
+                "git_branch": git_branch,
+                "git_tag": git_tag,
+                "git_dirty": git_dirty,
+            }.items()
+            if value is not None
+        }
+        response = self.request("PATCH", f"/asgi-apps/{asgi_app_id}", json=payload)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected ASGI app response")
+        return response
 
     def register_function(
         self,
@@ -2154,6 +2333,7 @@ class Project:
         self._functions: list[Function] = []
         self._steps: list[Step] = []
         self._workflows: list[Workflow] = []
+        self._asgi_apps: list[ASGIApp] = []
 
     @property
     def _client(self) -> Client:
@@ -2176,6 +2356,8 @@ class Project:
             function.deploy(replace=replace, deploy_source=resolved_deploy_source)
         for workflow in self._workflows:
             workflow.deploy(replace=replace, deploy_source=resolved_deploy_source)
+        for asgi_app in self._asgi_apps:
+            asgi_app.deploy(replace=replace, deploy_source=resolved_deploy_source)
         return self
 
     def function(
@@ -2213,6 +2395,54 @@ class Project:
             )
             self._functions.append(function)
             return function
+
+        return decorator
+
+    def asgi_app(
+        self,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        base_path: str = "/",
+        auth: str = "api_key",
+        dependencies: list[str] | tuple[str, ...] | None = None,
+        image: Image | dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
+        min_instances: int | None = None,
+        max_instances: int | None = None,
+        concurrency: int | None = None,
+        timeout_seconds: int | None = None,
+        cpu: str | None = None,
+        memory: str | None = None,
+        enabled: bool = True,
+        deploy_source: str | None = None,
+    ) -> Callable[[Callable[..., Any]], ASGIApp]:
+        def decorator(fn: Callable[..., Any]) -> ASGIApp:
+            asgi_app = ASGIApp(
+                fn,
+                name=name,
+                project=self.name,
+                description=description,
+                base_path=base_path,
+                auth=auth,
+                dependencies=dependencies,
+                image=image,
+                env=env,
+                secrets=secrets,
+                min_instances=min_instances,
+                max_instances=max_instances,
+                concurrency=concurrency,
+                timeout_seconds=timeout_seconds,
+                cpu=cpu,
+                memory=memory,
+                enabled=enabled,
+                deploy_source=deploy_source if deploy_source is not None else self.deploy_source,
+                project_source_mode=self.source_mode,
+                client=self._client,
+            )
+            self._asgi_apps.append(asgi_app)
+            return asgi_app
 
         return decorator
 
@@ -2292,6 +2522,171 @@ class Project:
             return workflow
 
         return decorator
+
+
+class ASGIApp:
+    def __init__(
+        self,
+        fn: Callable[..., Any] | None = None,
+        *,
+        project: str = DEFAULT_PROJECT_NAME,
+        name: str | None = None,
+        description: str | None = None,
+        base_path: str = "/",
+        auth: str = "api_key",
+        dependencies: list[str] | tuple[str, ...] | None = None,
+        image: Image | dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
+        min_instances: int | None = None,
+        max_instances: int | None = None,
+        concurrency: int | None = None,
+        timeout_seconds: int | None = None,
+        cpu: str | None = None,
+        memory: str | None = None,
+        enabled: bool = True,
+        deploy_source: str | None = None,
+        project_source_mode: str | None = None,
+        client: Client | None = None,
+        asgi_app_id: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        self.fn = fn
+        self.project = project
+        self.description = description
+        self.base_path = _normalize_path(base_path, field_name="base_path")
+        if auth not in {"api_key", "workspace", "public"}:
+            raise ValueError("ASGI app auth must be one of: api_key, workspace, public")
+        self.auth = auth
+        self.env = dict(env or {})
+        self.secrets = dict(secrets or {})
+        self.enabled = enabled
+        self.deploy_source = _validate_deploy_source(deploy_source)
+        self.project_source_mode = project_source_mode
+        self.client = client
+        self.id: str | None = asgi_app_id
+        self.data = data or {}
+        self.name = name or (data["name"] if data else None)
+        self.source_code: str | None = None
+        self.entrypoint: str | None = None
+        self.image_spec: dict[str, Any] | None = data.get("image_spec") if data else None
+        self.image_fingerprint: str | None = data.get("image_fingerprint") if data else None
+        self.cloud_run_min_instances: int | None = data.get("cloud_run_min_instances") if data else None
+        self.cloud_run_max_instances: int | None = data.get("cloud_run_max_instances") if data else None
+        self.cloud_run_concurrency: int | None = data.get("cloud_run_concurrency") if data else None
+        self.cloud_run_timeout_seconds: int | None = data.get("cloud_run_timeout_seconds") if data else None
+        self.cloud_run_cpu: str | None = data.get("cloud_run_cpu") if data else None
+        self.cloud_run_memory: str | None = data.get("cloud_run_memory") if data else None
+        self.source_metadata: dict[str, Any] = {}
+
+        if fn is not None:
+            if not isinstance(fn, FunctionType):
+                raise TypeError("ASGIApp requires a plain Python function")
+            self.name = _target_name(fn, name)
+            self.image_spec = _image_spec_for(image=image, dependencies=dependencies)
+            if min_instances is not None and min_instances < 0:
+                raise ValueError("min_instances must be greater than or equal to 0")
+            if max_instances is not None and max_instances < 0:
+                raise ValueError("max_instances must be greater than or equal to 0")
+            if concurrency is not None and concurrency < 1:
+                raise ValueError("concurrency must be greater than or equal to 1")
+            if timeout_seconds is not None and timeout_seconds < 1:
+                raise ValueError("timeout_seconds must be greater than or equal to 1")
+            self.cloud_run_min_instances = min_instances
+            self.cloud_run_max_instances = max_instances
+            self.cloud_run_concurrency = concurrency
+            self.cloud_run_timeout_seconds = timeout_seconds
+            self.cloud_run_cpu = cpu
+            self.cloud_run_memory = memory
+            self.source_code = _source_for(fn, target="ASGI app")
+            self.entrypoint = fn.__name__
+            self.source_metadata = _git_metadata_for(fn)
+        if self.name is None:
+            raise ValueError("ASGI app name is required")
+
+    @classmethod
+    def from_name(cls, project: str, name: str, *, client: Client | None = None) -> ASGIApp:
+        resolved_client = client or default_client()
+        data = resolved_client.find_asgi_app(name, project=project)
+        if data is None:
+            raise RebaseWorkflowError(f"ASGI app not found: {project}/{name}")
+        return cls(project=project, name=name, client=resolved_client, asgi_app_id=data["id"], data=data)
+
+    @property
+    def _client(self) -> Client:
+        return self.client or default_client()
+
+    def _source_metadata_for_deploy(self, deploy_source: str | None = None) -> dict[str, Any]:
+        resolved_deploy_source = _validate_deploy_source(deploy_source) or self.deploy_source
+        project_source_mode = (
+            _connected_source_mode(
+                self._client,
+                project=self.project,
+                project_source_mode=self.project_source_mode,
+            )
+            if resolved_deploy_source == "github"
+            else self.project_source_mode
+        )
+        return _source_metadata_for_deploy(
+            self.source_metadata,
+            deploy_source=resolved_deploy_source,
+            project_source_mode=project_source_mode,
+        )
+
+    def deploy(self, *, replace: bool = False, deploy_source: str | None = None) -> ASGIApp:
+        if self.source_code is None or self.entrypoint is None:
+            raise RebaseWorkflowError("cannot deploy an ASGI app handle without source_code and entrypoint")
+        if self.name is None:
+            raise RebaseWorkflowError("ASGI app name is required")
+        source_metadata = self._source_metadata_for_deploy(deploy_source)
+        existing = self._client.find_asgi_app(self.name, project=self.project)
+        if existing is not None:
+            asgi_app = self._client.update_asgi_app(
+                existing["id"],
+                description=self.description,
+                source_code=self.source_code,
+                entrypoint=self.entrypoint,
+                base_path=self.base_path,
+                auth=self.auth,
+                image_spec=self.image_spec,
+                env=self.env,
+                secrets=self.secrets,
+                cloud_run_min_instances=self.cloud_run_min_instances,
+                cloud_run_max_instances=self.cloud_run_max_instances,
+                cloud_run_concurrency=self.cloud_run_concurrency,
+                cloud_run_timeout_seconds=self.cloud_run_timeout_seconds,
+                cloud_run_cpu=self.cloud_run_cpu,
+                cloud_run_memory=self.cloud_run_memory,
+                enabled=self.enabled,
+                **source_metadata,
+            )
+            self.id = asgi_app["id"]
+            self.data = asgi_app
+            return self
+
+        asgi_app = self._client.register_asgi_app(
+            project=self.project,
+            name=self.name,
+            description=self.description,
+            source_code=self.source_code,
+            entrypoint=self.entrypoint,
+            base_path=self.base_path,
+            auth=self.auth,
+            image_spec=self.image_spec,
+            env=self.env,
+            secrets=self.secrets,
+            cloud_run_min_instances=self.cloud_run_min_instances,
+            cloud_run_max_instances=self.cloud_run_max_instances,
+            cloud_run_concurrency=self.cloud_run_concurrency,
+            cloud_run_timeout_seconds=self.cloud_run_timeout_seconds,
+            cloud_run_cpu=self.cloud_run_cpu,
+            cloud_run_memory=self.cloud_run_memory,
+            enabled=self.enabled,
+            **source_metadata,
+        )
+        self.id = asgi_app["id"]
+        self.data = asgi_app
+        return self
 
 
 class Function:

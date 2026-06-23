@@ -7,15 +7,19 @@ import pytest
 
 from rebase.auth import AuthSession
 from rebase.cli import _format_duration, deploy_file, main
-from rebase.client import Client, Function, Model, Project, Run, Workflow
+from rebase.client import ASGIApp, Client, Function, Model, Project, Run, Workflow
 
 
 def test_main_without_args_prints_help(capsys) -> None:
     assert main([]) == 0
 
     output = capsys.readouterr().out
+    normalized_output = " ".join(output.split())
     assert "Usage:" in output
-    assert "Rebase Platform toolkit." in output
+    assert (
+        "Rebase Toolkit lets you develop Python workflows and models "
+        "that can then be deployed to the Rebase Platform."
+    ) in normalized_output
     assert "setup" in output
     assert "workspace" in output
     assert "project" in output
@@ -24,6 +28,30 @@ def test_main_without_args_prints_help(capsys) -> None:
     assert "workflow" in output
     assert "deploy" in output
     assert "inspect submitted runs" in output
+    command_order = [
+        "api-key",
+        "deploy",
+        "endpoint",
+        "function",
+        "model",
+        "project",
+        "run",
+        "setup",
+        "tui",
+        "workflow",
+        "workspace",
+    ]
+    positions = [output.index(f"│ {command}") for command in command_order]
+    assert positions == sorted(positions)
+
+
+def test_command_group_help_sorts_commands(capsys) -> None:
+    assert main(["endpoint", "--help"]) == 0
+
+    output = capsys.readouterr().out
+    command_order = ["disable", "get", "invoke", "list", "versions"]
+    positions = [output.index(f"│ {command}") for command in command_order]
+    assert positions == sorted(positions)
 
 
 def test_run_help_shows_execution_and_inspection_commands(capsys) -> None:
@@ -37,6 +65,9 @@ def test_run_help_shows_execution_and_inspection_commands(capsys) -> None:
     assert "--module, -m" in output
     assert "--wait / --no-wait" in output
     assert "Inspection Commands" in output
+    command_order = ["cancel", "get", "list", "logs"]
+    positions = [output.index(command) for command in command_order]
+    assert positions == sorted(positions)
     assert "list" in output
     assert "get" in output
     assert "logs" in output
@@ -179,6 +210,36 @@ workflow = rb.Workflow(forecast, name="site-forecast")
 
     assert deployed == ["site-forecast"]
     assert result == [("workflow", "site-forecast", "site-forecast-id")]
+
+
+def test_deploy_file_deploys_standalone_asgi_app(monkeypatch, tmp_path: Path) -> None:
+    deployed: list[str] = []
+
+    def fake_asgi_app_deploy(self: ASGIApp, *, replace: bool = False) -> ASGIApp:
+        deployed.append(str(self.name))
+        self.id = f"{self.name}-id"
+        self.data = {"url": "https://workflows.example.com/e/default/grid/api"}
+        return self
+
+    monkeypatch.setattr(ASGIApp, "deploy", fake_asgi_app_deploy)
+    api_file = tmp_path / "api.py"
+    api_file.write_text(
+        """
+import rebase as rb
+
+@rb.asgi_app(project="grid", name="grid-api", base_path="/api")
+def grid_api() -> object:
+    return object()
+""",
+        encoding="utf-8",
+    )
+
+    result = deploy_file(api_file)
+
+    assert deployed == ["grid-api"]
+    assert result == [
+        ("asgi_app", "grid-api", "grid-api-id", "https://workflows.example.com/e/default/grid/api")
+    ]
 
 
 def test_deploy_file_deploys_standalone_predictor(monkeypatch, tmp_path: Path) -> None:
@@ -938,6 +999,126 @@ def test_setup_workspace_create_claims_profile_handle_first(monkeypatch) -> None
     ]
 
 
+def test_workspace_create_helper_creates_before_github_prompt(monkeypatch, tmp_path: Path) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[str] = []
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+
+    class FakeClient:
+        def __init__(
+            self,
+            *,
+            api_url: str | None = None,
+            access_token: str | None = None,
+            profile: str | None = None,
+        ) -> None:
+            self.api_url = api_url or "https://api.example.test"
+            self.access_token = access_token
+
+        def setup_config(self) -> dict[str, Any]:
+            calls.append("setup_config")
+            return {"github_app_configured": True}
+
+        def request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+            if (method, path) == ("GET", "/me/profile"):
+                calls.append("get_profile")
+                return {"id": "profile-id", "handle": "sebastian"}
+            raise AssertionError((method, path))
+
+        def create_workspace(self, workspace_id: str, *, name: str | None = None) -> dict[str, Any]:
+            calls.append(f"create_workspace:{workspace_id}:{name}")
+            return {"id": workspace_id, "name": name or workspace_id}
+
+    monkeypatch.setattr(setup_module, "Client", FakeClient)
+    monkeypatch.setattr(setup_module, "_access_token", lambda args, config: "access-token")
+    monkeypatch.setattr(setup_module, "load_session", lambda: SimpleNamespace(email="sebastian@rebase.energy"))
+    monkeypatch.setattr(
+        setup_module,
+        "_confirm",
+        lambda message, *, default: calls.append(f"confirm:{message}") or True,
+    )
+    monkeypatch.setattr(
+        setup_module,
+        "_connect_github",
+        lambda args, client, *, workspace_id: calls.append(f"connect_github:{workspace_id}"),
+    )
+
+    assert (
+        setup_module.run_workspace_create(
+            SimpleNamespace(
+                profile="new",
+                api_url=None,
+                workspace="energy-team",
+                workspace_name="Energy Team",
+                handle=None,
+                github=None,
+            )
+        )
+        == 0
+    )
+
+    assert calls == [
+        "setup_config",
+        "get_profile",
+        "create_workspace:energy-team:Energy Team",
+        "confirm:Connect GitHub now?",
+        "connect_github:energy-team",
+    ]
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data["default_profile"] == "new"
+    assert data["profiles"]["new"]["workspace_id"] == "energy-team"
+
+
+def test_workspace_create_helper_stops_before_github_when_quota_is_exhausted(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[str] = []
+
+    class FakeClient:
+        def __init__(
+            self,
+            *,
+            api_url: str | None = None,
+            access_token: str | None = None,
+            profile: str | None = None,
+        ) -> None:
+            self.api_url = api_url or "https://api.example.test"
+
+        def setup_config(self) -> dict[str, Any]:
+            return {"github_app_configured": True}
+
+        def request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+            if (method, path) == ("GET", "/me/profile"):
+                return {"id": "profile-id", "handle": "sebastian"}
+            raise AssertionError((method, path))
+
+        def create_workspace(self, workspace_id: str, *, name: str | None = None) -> dict[str, Any]:
+            calls.append(f"create_workspace:{workspace_id}")
+            raise setup_module.RebaseWorkflowError("workspace creation limit reached (1/1)")
+
+    monkeypatch.setattr(setup_module, "Client", FakeClient)
+    monkeypatch.setattr(setup_module, "_access_token", lambda args, config: "access-token")
+    monkeypatch.setattr(setup_module, "load_session", lambda: None)
+    monkeypatch.setattr(setup_module, "_confirm", lambda *args, **kwargs: calls.append("confirm") or True)
+    monkeypatch.setattr(setup_module, "_connect_github", lambda *args, **kwargs: calls.append("connect_github"))
+
+    with pytest.raises(setup_module.RebaseWorkflowError, match="You've reached your quota"):
+        setup_module.run_workspace_create(
+            SimpleNamespace(
+                profile="default",
+                api_url=None,
+                workspace="energy-team",
+                workspace_name=None,
+                handle=None,
+                github=None,
+            )
+        )
+
+    assert calls == ["create_workspace:energy-team"]
+
+
 def test_setup_repo_creation_uses_action_selector(monkeypatch) -> None:
     from rebase import setup as setup_module
 
@@ -1303,6 +1484,40 @@ def test_workspace_switch_changes_default_profile(monkeypatch, tmp_path: Path, c
     assert capsys.readouterr().out == "Switched workspace profile to 'prod'\n"
 
 
+def test_workspace_create_command_dispatches_to_setup_helper(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_run_workspace_create(args: Any) -> int:
+        observed.update(vars(args))
+        return 0
+
+    monkeypatch.setattr("rebase.setup.run_workspace_create", fake_run_workspace_create)
+
+    assert (
+        main(
+            [
+                "workspace",
+                "create",
+                "energy-team",
+                "--workspace-name",
+                "Energy Team",
+                "--profile",
+                "energy",
+                "--github",
+                "--repo",
+                "rebase/platform",
+            ]
+        )
+        == 0
+    )
+
+    assert observed["workspace"] == "energy-team"
+    assert observed["workspace_name"] == "Energy Team"
+    assert observed["profile"] == "energy"
+    assert observed["github"] is True
+    assert observed["repo"] == "rebase/platform"
+
+
 def test_workspace_invite_email_target(monkeypatch, capsys) -> None:
     observed: dict[str, Any] = {}
 
@@ -1401,6 +1616,33 @@ def test_workspace_members_lists_members_and_pending_invites(monkeypatch, capsys
     assert "Viewer" in output
     assert "pending" in output
     assert "accepted@example.com" not in output
+
+
+def test_workspace_usage_renders_credit_balance(monkeypatch, capsys) -> None:
+    def fake_get_workspace_usage(self: Client) -> dict[str, Any]:
+        return {
+            "workspace_id": "beta-team",
+            "currency": "EUR",
+            "period_start": "2026-06-01T00:00:00Z",
+            "period_end": "2026-07-01T00:00:00Z",
+            "monthly_credit_cents": 2000,
+            "finalized_spend_cents": 325,
+            "active_reservation_cents": 100,
+            "remaining_cents": 1575,
+            "compute_blocked": False,
+        }
+
+    monkeypatch.setattr(Client, "get_workspace_usage", fake_get_workspace_usage)
+
+    assert main(["workspace", "usage"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Workspace Usage" in output
+    assert "beta-team" in output
+    assert "20.00 EUR" in output
+    assert "3.25 EUR" in output
+    assert "1.00 EUR" in output
+    assert "15.75 EUR" in output
 
 
 def test_api_key_list_command_renders_keys(monkeypatch, capsys) -> None:

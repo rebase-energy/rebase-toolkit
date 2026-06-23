@@ -29,6 +29,10 @@ from rebase.config import write_profile
 JOIN_WORKSPACE = "Join an existing workspace"
 CREATE_WORKSPACE = "Create a new workspace"
 BETA_ENROLLMENT_ERROR = "your account is not enrolled in the beta program. Contact hello@rebase.energy to get enrolled."
+WORKSPACE_CREATION_QUOTA_ERROR = (
+    "You've reached your quota for creating new workspaces, "
+    "please contact us to increase it: hello@rebase.energy"
+)
 HANDLE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{1,37}[a-z0-9])?$")
 
 
@@ -518,20 +522,27 @@ def _is_workspace_creation_permission_error(error: RebaseWorkflowError) -> bool:
     )
 
 
+def _workspace_creation_error(error: RebaseWorkflowError) -> RebaseWorkflowError:
+    if "workspace creation limit reached" in str(error) or "You've reached your quota" in str(error):
+        return RebaseWorkflowError(WORKSPACE_CREATION_QUOTA_ERROR)
+    if _is_workspace_creation_permission_error(error):
+        return RebaseWorkflowError(BETA_ENROLLMENT_ERROR)
+    return error
+
+
 def _create_workspace(args: Any, client: Client, *, session: Any | None) -> dict[str, Any]:
     profile = _ensure_profile_handle(args, client, session=session)
     profile_handle = profile.get("handle")
     default_workspace = profile_handle if isinstance(profile_handle, str) and profile_handle else None
+    requested_workspace = getattr(args, "workspace", None)
     workspace_id = _normalize_handle(
-        _prompt(None, "Workspace handle to create", default=default_workspace),
+        _prompt(requested_workspace, "Workspace handle to create", default=default_workspace),
         label="Workspace handle",
     )
     try:
         return client.create_workspace(workspace_id, name=args.workspace_name)
     except RebaseWorkflowError as exc:
-        if _is_workspace_creation_permission_error(exc):
-            raise RebaseWorkflowError(BETA_ENROLLMENT_ERROR) from exc
-        raise
+        raise _workspace_creation_error(exc) from exc
 
 
 def _select_invited_workspace(workspaces: list[dict[str, Any]]) -> dict[str, Any] | str | None:
@@ -561,9 +572,7 @@ def _select_workspace(args: Any, client: Client, *, session: Any | None) -> dict
             try:
                 return client.create_workspace(workspace_id, name=args.workspace_name or workspace_id)
             except RebaseWorkflowError as exc:
-                if _is_workspace_creation_permission_error(exc):
-                    raise RebaseWorkflowError(BETA_ENROLLMENT_ERROR) from exc
-                raise
+                raise _workspace_creation_error(exc) from exc
         return workspaces_by_id[workspace_id]
     invited_workspace = _select_invited_workspace(workspaces)
     if invited_workspace == CREATE_WORKSPACE:
@@ -792,4 +801,39 @@ def run_setup(args: Any) -> int:
     else:
         _hint("Run `rebase setup` again later to connect GitHub.")
     _success("Setup complete")
+    return 0
+
+
+def run_workspace_create(args: Any) -> int:
+    _restore_terminal_for_prompts()
+    client = Client(api_url=args.api_url, profile=args.profile)
+    config = client.setup_config()
+    token = _access_token(args, config)
+    authed_client = Client(api_url=client.api_url, access_token=token, profile=args.profile)
+    session = load_session()
+    if session is not None:
+        _success(f"Authenticated as {session.email or session.user_id or 'Supabase user'}")
+
+    workspace = _create_workspace(args, authed_client, session=session)
+    workspace_id = str(workspace["id"])
+    path = write_profile(profile=args.profile, api_url=authed_client.api_url, workspace=workspace)
+    _success(f"Created workspace {workspace_id}")
+    _hint(f"Saved Rebase profile '{args.profile}' to {path}")
+
+    if args.github is False:
+        _hint("Run `rebase workspace create` again later with --github to connect GitHub.")
+        _success("Workspace create complete")
+        return 0
+    if not config.get("github_app_configured"):
+        if args.github is True:
+            raise RebaseWorkflowError("GitHub connection is not configured on this workflow API")
+        _hint("GitHub connection is not available on this workflow API.")
+        _success("Workspace create complete")
+        return 0
+    should_connect = args.github is True or _confirm("Connect GitHub now?", default=False)
+    if should_connect:
+        _connect_github(args, authed_client, workspace_id=workspace_id)
+    else:
+        _hint("Run `rebase workspace create` again later with --github to connect GitHub.")
+    _success("Workspace create complete")
     return 0

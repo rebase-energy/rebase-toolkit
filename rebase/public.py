@@ -8,6 +8,7 @@ from rebase.client import (
     DEFAULT_WORKFLOW_BACKEND,
     Agent,
     AgentHandle,
+    ASGIApp,
     Client,
     EndpointConfig,
     Function,
@@ -144,6 +145,102 @@ def function(
             concurrency=concurrency,
             enabled=enabled,
             endpoint=endpoint,
+            deploy_source=deploy_source,
+        )
+
+    if fn is not None:
+        return decorator(fn)
+    return decorator
+
+
+@overload
+def asgi_app(
+    fn: None = None,
+    *,
+    project: str | None = None,
+    name: str | None = None,
+    description: str | None = None,
+    base_path: str = "/",
+    auth: str = "api_key",
+    dependencies: list[str] | tuple[str, ...] | None = None,
+    image: Image | dict[str, Any] | None = None,
+    env: dict[str, str] | None = None,
+    secrets: dict[str, str] | None = None,
+    min_instances: int | None = None,
+    max_instances: int | None = None,
+    concurrency: int | None = None,
+    timeout_seconds: int | None = None,
+    cpu: str | None = None,
+    memory: str | None = None,
+    enabled: bool = True,
+    deploy_source: str | None = None,
+) -> Callable[[Callable[..., Any]], ASGIApp]: ...
+
+
+@overload
+def asgi_app(
+    fn: Callable[..., Any],
+    *,
+    project: str | None = None,
+    name: str | None = None,
+    description: str | None = None,
+    base_path: str = "/",
+    auth: str = "api_key",
+    dependencies: list[str] | tuple[str, ...] | None = None,
+    image: Image | dict[str, Any] | None = None,
+    env: dict[str, str] | None = None,
+    secrets: dict[str, str] | None = None,
+    min_instances: int | None = None,
+    max_instances: int | None = None,
+    concurrency: int | None = None,
+    timeout_seconds: int | None = None,
+    cpu: str | None = None,
+    memory: str | None = None,
+    enabled: bool = True,
+    deploy_source: str | None = None,
+) -> ASGIApp: ...
+
+
+def asgi_app(
+    fn: Callable[..., Any] | None = None,
+    *,
+    project: str | None = None,
+    name: str | None = None,
+    description: str | None = None,
+    base_path: str = "/",
+    auth: str = "api_key",
+    dependencies: list[str] | tuple[str, ...] | None = None,
+    image: Image | dict[str, Any] | None = None,
+    env: dict[str, str] | None = None,
+    secrets: dict[str, str] | None = None,
+    min_instances: int | None = None,
+    max_instances: int | None = None,
+    concurrency: int | None = None,
+    timeout_seconds: int | None = None,
+    cpu: str | None = None,
+    memory: str | None = None,
+    enabled: bool = True,
+    deploy_source: str | None = None,
+) -> Callable[[Callable[..., Any]], ASGIApp] | ASGIApp:
+    def decorator(callable_: Callable[..., Any]) -> ASGIApp:
+        return ASGIApp(
+            callable_,
+            project=project or DEFAULT_PROJECT_NAME,
+            name=name,
+            description=description,
+            base_path=base_path,
+            auth=auth,
+            dependencies=dependencies,
+            image=image,
+            env=env,
+            secrets=secrets,
+            min_instances=min_instances,
+            max_instances=max_instances,
+            concurrency=concurrency,
+            timeout_seconds=timeout_seconds,
+            cpu=cpu,
+            memory=memory,
+            enabled=enabled,
             deploy_source=deploy_source,
         )
 
@@ -304,7 +401,7 @@ def workflow(
     return decorator
 
 
-DeployTarget = Project | Function | Workflow | Model
+DeployTarget = Project | Function | Workflow | Model | ASGIApp
 
 
 def deploy(
@@ -313,7 +410,7 @@ def deploy(
     deploy_source: str | None = None,
 ) -> DeployTarget | list[Any]:
     if not targets:
-        raise RebaseWorkflowError("deploy requires at least one Rebase project, function, workflow, or model")
+        raise RebaseWorkflowError("deploy requires at least one Rebase project, function, workflow, ASGI app, or model")
     deployed = [
         target.deploy(replace=replace)
         if deploy_source is None
@@ -331,6 +428,11 @@ def get_function(project: str, name: str | None = None) -> Function:
 def get_workflow(project: str, name: str | None = None) -> Workflow:
     project_name, workflow_name = _split_ref(project, name=name, target="workflow")
     return Workflow.from_name(project_name, workflow_name)
+
+
+def get_asgi_app(project: str, name: str | None = None) -> ASGIApp:
+    project_name, asgi_app_name = _split_ref(project, name=name, target="ASGI app")
+    return ASGIApp.from_name(project_name, asgi_app_name)
 
 
 def get_model(project: str, name: str | None = None) -> ModelHandle:

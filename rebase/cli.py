@@ -21,6 +21,7 @@ from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
+from typer.core import TyperGroup
 
 from rebase.brand import (
     BRAND_AMBER,
@@ -33,6 +34,7 @@ from rebase.brand import (
 from rebase.client import (
     DEFAULT_API_KEY_PERMISSIONS,
     Agent,
+    ASGIApp,
     Client,
     Function,
     FunctionBackend,
@@ -121,56 +123,75 @@ _apply_typer_brand_styles()
 console = Console(highlight=False, soft_wrap=True, theme=REBASE_THEME)
 error_console = Console(stderr=True, highlight=False, soft_wrap=True, theme=REBASE_THEME)
 
+
+class AlphabeticalTyperGroup(TyperGroup):
+    def __init__(self, *args: Any, commands: dict[str, click.Command] | None = None, **kwargs: Any) -> None:
+        if commands is not None:
+            commands = dict(sorted(commands.items(), key=lambda item: item[0]))
+        super().__init__(*args, commands=commands, **kwargs)
+
+
 app = typer.Typer(
     add_completion=False,
-    help="Rebase Platform toolkit.",
+    cls=AlphabeticalTyperGroup,
+    help=(
+        "Rebase Toolkit lets you develop Python workflows and models that can then be deployed to the Rebase Platform."
+    ),
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
 workspace_app = typer.Typer(
     add_completion=False,
+    cls=AlphabeticalTyperGroup,
     help="Show, list, or switch Rebase workspace profiles.",
     no_args_is_help=False,
     rich_markup_mode="rich",
 )
 api_key_app = typer.Typer(
     add_completion=False,
+    cls=AlphabeticalTyperGroup,
     help="Create, list, and revoke workspace API keys.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
 endpoint_app = typer.Typer(
     add_completion=False,
+    cls=AlphabeticalTyperGroup,
     help="Inspect and invoke Rebase endpoints.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
 project_app = typer.Typer(
     add_completion=False,
+    cls=AlphabeticalTyperGroup,
     help="Inspect Rebase projects.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
 function_app = typer.Typer(
     add_completion=False,
+    cls=AlphabeticalTyperGroup,
     help="Inspect Rebase functions.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
 workflow_app = typer.Typer(
     add_completion=False,
+    cls=AlphabeticalTyperGroup,
     help="Inspect Rebase workflows.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
 model_app = typer.Typer(
     add_completion=False,
+    cls=AlphabeticalTyperGroup,
     help="Deploy and operate Rebase models.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
 run_app = typer.Typer(
     add_completion=False,
+    cls=AlphabeticalTyperGroup,
     help="Run local Rebase targets and inspect submitted runs.",
     no_args_is_help=True,
     rich_markup_mode="rich",
@@ -210,7 +231,7 @@ def _print_run_help() -> None:
     console.print("       rebase run COMMAND [ARGS]...")
     console.print()
     console.print("Run a Rebase function, workflow, or model from local source without deploying it.")
-    console.print("Inspect submitted runs with the list, get, logs, and cancel subcommands.")
+    console.print("Inspect submitted runs with the cancel, get, list, and logs subcommands.")
     console.print()
 
     options = Table(title="Execution Options", box=box.SIMPLE)
@@ -229,10 +250,10 @@ def _print_run_help() -> None:
     commands = Table(title="Inspection Commands", box=box.SIMPLE)
     commands.add_column("Command", style="rebase.value")
     commands.add_column("Description")
-    commands.add_row("list", "List submitted runs in the active workspace.")
-    commands.add_row("get", "Show run metadata.")
-    commands.add_row("logs", "Show persisted run events and workflow step state.")
     commands.add_row("cancel", "Cancellation placeholder. Exits with an unsupported error.")
+    commands.add_row("get", "Show run metadata.")
+    commands.add_row("list", "List submitted runs in the active workspace.")
+    commands.add_row("logs", "Show persisted run events and workflow step state.")
     console.print(commands)
 
 
@@ -738,11 +759,15 @@ def deploy_file(
                 endpoint_url = _deployed_endpoint_url(workflow)
                 if endpoint_url is not None:
                     deployed.append(("workflow", workflow.name or "-", workflow.id, endpoint_url))
+            for asgi_app in project._asgi_apps:
+                endpoint_url = _deployed_endpoint_url(asgi_app)
+                if endpoint_url is not None:
+                    deployed.append(("asgi_app", asgi_app.name or "-", asgi_app.id, endpoint_url))
         return deployed
     if all_projects and selected_names:
         raise RebaseWorkflowError(f"No matching Rebase project found for: {', '.join(sorted(selected_names))}")
 
-    deployables = _unique_named_objects(module, (Workflow, Function, Model))
+    deployables = _unique_named_objects(module, (Workflow, Function, ASGIApp, Model))
     deployables = [(name, item) for name, item in deployables if not isinstance(item, Step)]
     if selected_names:
         deployables = [
@@ -753,7 +778,7 @@ def deploy_file(
     if not deployables:
         raise RebaseWorkflowError(
             "No deployable Rebase objects found. Define a top-level rb.project(...), "
-            "rb.workflow(...), rb.function(...), rb.Predictor, rb.Optimizer, or rb.Agent instance."
+            "rb.workflow(...), rb.function(...), rb.asgi_app(...), rb.Predictor, rb.Optimizer, or rb.Agent instance."
         )
 
     for name, deployable in deployables:
@@ -761,9 +786,12 @@ def deploy_file(
             deployable.deploy()
         else:
             deployable.deploy(deploy_source=deploy_source)
-        target_type = (
-            _model_target_type(deployable) if isinstance(deployable, Model) else deployable.__class__.__name__.lower()
-        )
+        if isinstance(deployable, Model):
+            target_type = _model_target_type(deployable)
+        elif isinstance(deployable, ASGIApp):
+            target_type = "asgi_app"
+        else:
+            target_type = deployable.__class__.__name__.lower()
         endpoint_url = _deployed_endpoint_url(deployable)
         if endpoint_url is not None:
             deployed.append((target_type, deployable.name or name, deployable.id, endpoint_url))
@@ -804,6 +832,33 @@ def _workspace_table(profiles: dict[str, dict[str, Any]], *, active_profile: str
         is_active = profile == active_profile
         style = "rebase.active" if is_active else None
         table.add_row("*" if is_active else "", profile, _workspace_value(data), _workspace_id(data), style=style)
+    return table
+
+
+def _format_cents(value: Any, currency: str = "EUR") -> str:
+    cents = int(value or 0)
+    return f"{cents / 100:.2f} {currency}"
+
+
+def _workspace_usage_table(usage: dict[str, Any]) -> Table:
+    currency = str(usage.get("currency") or "EUR")
+    table = Table(
+        title="Workspace Usage",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Metric", style="rebase.muted")
+    table.add_column("Value", style="rebase.value")
+    table.add_row("Workspace", _format_value(usage.get("workspace_id")))
+    table.add_row("Monthly credits", _format_cents(usage.get("monthly_credit_cents"), currency))
+    table.add_row("Used", _format_cents(usage.get("finalized_spend_cents"), currency))
+    table.add_row("Reserved", _format_cents(usage.get("active_reservation_cents"), currency))
+    table.add_row("Remaining", _format_cents(usage.get("remaining_cents"), currency))
+    table.add_row("Period end", _format_value(usage.get("period_end")))
+    table.add_row("Blocked", "yes" if usage.get("compute_blocked") else "no")
     return table
 
 
@@ -1028,6 +1083,15 @@ def _deployed_endpoint_url(target: Any) -> str | None:
     data = getattr(target, "data", None)
     if not isinstance(data, dict):
         return None
+    url = data.get("url")
+    if isinstance(url, str) and url:
+        return url
+    url_path = data.get("url_path")
+    if isinstance(url_path, str) and url_path:
+        client = getattr(target, "_client", None)
+        api_url = getattr(client, "api_url", None)
+        if isinstance(api_url, str) and api_url:
+            return f"{api_url.rstrip('/')}{url_path}"
     endpoint = data.get("endpoint")
     if not isinstance(endpoint, dict):
         return None
@@ -1530,6 +1594,111 @@ def workspace_list_command() -> None:
     console.print(_workspace_table(profiles, active_profile=active_profile))
 
 
+@workspace_app.command("create")
+def workspace_create_command(
+    workspace: Annotated[
+        str | None,
+        typer.Argument(help="Workspace handle to create."),
+    ] = None,
+    profile: Annotated[str, typer.Option("--profile", help="Credential profile name.")] = DEFAULT_PROFILE,
+    api_url: Annotated[
+        str | None,
+        typer.Option(
+            "--api-url",
+            help="Rebase API URL to store for this profile. Useful for local development with port-forwarding.",
+        ),
+    ] = None,
+    workspace_name: Annotated[
+        str | None,
+        typer.Option("--workspace-name", help="Workspace display name."),
+    ] = None,
+    handle: Annotated[
+        str | None,
+        typer.Option("--handle", help="Unique Rebase user handle to claim before creating the workspace."),
+    ] = None,
+    provider: Annotated[str | None, typer.Option("--provider", help="Supabase social auth provider.")] = None,
+    force_auth: Annotated[
+        bool,
+        typer.Option("--force-auth", help="Ignore any stored Supabase session and authenticate again."),
+    ] = False,
+    callback_port: Annotated[int, typer.Option("--callback-port", help="Local Supabase OAuth callback port.")] = 17658,
+    auth_timeout: Annotated[
+        float,
+        typer.Option("--auth-timeout", help="Seconds to wait for Supabase auth callback."),
+    ] = 300,
+    no_browser: Annotated[
+        bool,
+        typer.Option("--no-browser", help="Print URLs instead of opening the browser."),
+    ] = False,
+    github: Annotated[
+        bool | None,
+        typer.Option("--github/--no-github", help="Connect or skip GitHub after workspace creation."),
+    ] = None,
+    github_installation_id: Annotated[
+        int | None,
+        typer.Option("--github-installation-id", help="Existing GitHub App installation id."),
+    ] = None,
+    github_timeout: Annotated[
+        float,
+        typer.Option("--github-timeout", help="Seconds to wait for GitHub installation."),
+    ] = 300,
+    poll_interval: Annotated[
+        float,
+        typer.Option("--poll-interval", help="Seconds between GitHub setup status checks."),
+    ] = 1.0,
+    repo: Annotated[
+        str | None,
+        typer.Option("--repo", help="GitHub repository full name, for example owner/name."),
+    ] = None,
+    repo_scope: Annotated[
+        str | None,
+        typer.Option("--repo-scope", help="Connect repo at workspace or project level."),
+    ] = None,
+    repo_path: Annotated[
+        str | None,
+        typer.Option("--repo-path", help="Optional path inside the repository."),
+    ] = None,
+    create_repo: Annotated[
+        bool,
+        typer.Option("--create-repo", help="Open GitHub to create a repository during setup."),
+    ] = False,
+    project: Annotated[
+        str | None,
+        typer.Option("--project", help="Project name for project-level repo connections."),
+    ] = None,
+) -> None:
+    """Create a workspace and optionally connect GitHub source backing."""
+    from rebase.setup import run_workspace_create
+
+    try:
+        run_workspace_create(
+            SimpleNamespace(
+                profile=profile,
+                api_url=api_url,
+                workspace=workspace,
+                workspace_name=workspace_name,
+                handle=handle,
+                provider=provider,
+                force_auth=force_auth,
+                callback_port=callback_port,
+                auth_timeout=auth_timeout,
+                no_browser=no_browser,
+                github=github,
+                github_installation_id=github_installation_id,
+                github_timeout=github_timeout,
+                poll_interval=poll_interval,
+                repo=repo,
+                repo_scope=repo_scope,
+                repo_path=repo_path,
+                create_repo=create_repo,
+                project=project,
+            )
+        )
+    except KeyboardInterrupt:
+        error_console.print("Aborted.", style="rebase.error")
+        raise SystemExit(130) from None
+
+
 def _switch_workspace(profile: str) -> None:
     try:
         set_default_profile(profile)
@@ -1616,6 +1785,18 @@ def workspace_members_command(
         _print_json({"members": members, "pending_invites": pending_invites})
         return
     console.print(_workspace_members_table(members, pending_invites))
+
+
+@workspace_app.command("usage")
+def workspace_usage_command(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show monthly compute credits for the active workspace."""
+    usage = Client().get_workspace_usage()
+    if json_output:
+        _print_json(usage)
+        return
+    console.print(_workspace_usage_table(usage))
 
 
 app.add_typer(workspace_app, name="workspace")
