@@ -1595,6 +1595,90 @@ def test_connect_github_helper_resolves_active_profile_when_omitted(monkeypatch)
     assert observed["profile"] == "workspace-profile"
 
 
+def test_connect_github_helper_reconnects_stale_workspace_connection(monkeypatch, capsys) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[str] = []
+    stale_connection = {
+        "scope": "workspace",
+        "project_id": None,
+        "repo_owner": "rebase-energy",
+        "repo_name": "rebase-grid",
+    }
+    active_connection = {
+        "scope": "workspace",
+        "project_id": None,
+        "repo_owner": "rebase-energy",
+        "repo_name": "rebase-workspace",
+    }
+
+    class FakeClient:
+        def __init__(self, *, api_url: str | None = None, profile: str | None = None) -> None:
+            self.workspace_id = "rebase-workspace"
+
+        def setup_config(self) -> dict[str, Any]:
+            return {"github_app_configured": True}
+
+        def get_workspace(self) -> dict[str, Any]:
+            return {
+                "id": "rebase-workspace",
+                "repo_owner": "rebase-energy",
+                "repo_name": "rebase-workspace",
+            }
+
+        def list_github_repo_connections(self) -> list[dict[str, Any]]:
+            calls.append("list_connections")
+            return [stale_connection]
+
+    def fake_connect(args: Any, client: Any, *, workspace_id: str) -> dict[str, Any]:
+        calls.append(f"connect:{workspace_id}:{args.repo}")
+        return active_connection
+
+    monkeypatch.setattr(setup_module, "Client", FakeClient)
+    monkeypatch.setattr(setup_module, "selected_profile_name", lambda: "workspace-profile")
+    monkeypatch.setattr(setup_module, "_connect_github", fake_connect)
+    monkeypatch.setattr(
+        setup_module,
+        "_ensure_local_workspace_repo",
+        lambda selected: calls.append(f"local:{selected['repo_owner']}/{selected['repo_name']}"),
+    )
+    monkeypatch.setattr(
+        setup_module,
+        "_verify_github_app_access",
+        lambda args, client, selected, *, workspace_id: calls.append(
+            f"app:{workspace_id}:{selected['repo_owner']}/{selected['repo_name']}"
+        ),
+    )
+
+    assert (
+        setup_module.run_connect_github(
+            SimpleNamespace(
+                profile=None,
+                api_url=None,
+                no_browser=True,
+                github_installation_id=None,
+                github_timeout=1,
+                poll_interval=0,
+                repo=None,
+                repo_path=None,
+                create_repo=False,
+            )
+        )
+        == 0
+    )
+
+    output = capsys.readouterr().out
+    assert "No workspace-level GitHub repository connection found for rebase-energy/rebase-workspace" in output
+    assert "Workspace is connected to rebase-energy/rebase-grid" not in output
+    assert calls == [
+        "list_connections",
+        "connect:rebase-workspace:rebase-energy/rebase-workspace",
+        "list_connections",
+        "local:rebase-energy/rebase-workspace",
+        "app:rebase-workspace:rebase-energy/rebase-workspace",
+    ]
+
+
 def test_connect_github_helper_creates_missing_workspace_connection(monkeypatch) -> None:
     from rebase import setup as setup_module
 
@@ -1838,7 +1922,7 @@ def test_main_keyboard_interrupt_aborts_cleanly(monkeypatch, capsys) -> None:
     assert "Aborted." in capsys.readouterr().err
 
 
-def test_workspace_lists_profiles(monkeypatch, tmp_path: Path, capsys) -> None:
+def test_workspace_lists_memberships_with_connected_repos(monkeypatch, tmp_path: Path, capsys) -> None:
     config_path = tmp_path / "config.json"
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
     config_path.write_text(
@@ -1846,23 +1930,85 @@ def test_workspace_lists_profiles(monkeypatch, tmp_path: Path, capsys) -> None:
             {
                 "default_profile": "prod",
                 "profiles": {
-                    "dev": {"api_key": "rbw_dev", "workspace_name": "Development"},
-                    "prod": {"api_key": "rbw_prod", "workspace_name": "Production"},
+                    "dev": {"api_key": "rbw_dev", "workspace_id": "dev", "workspace_name": "Development"},
+                    "prod": {"api_key": "rbw_prod", "workspace_id": "prod", "workspace_name": "Production"},
                 },
             }
         ),
         encoding="utf-8",
     )
+    monkeypatch.setattr(
+        Client,
+        "list_my_workspaces",
+        lambda self: [
+            {"id": "dev", "name": "Development", "role": "Developer"},
+            {"id": "prod", "name": "Production", "role": "Owner"},
+        ],
+    )
+
+    def fake_request(self: Client, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        assert (method, path) == ("GET", "/workspace")
+        workspace_id = kwargs["headers"]["X-Rebase-Workspace"]
+        if workspace_id == "dev":
+            return {
+                "id": "dev",
+                "name": "Development",
+                "source_mode": "workspace_repo",
+                "repo_owner": "rebase",
+                "repo_name": "platform-dev",
+                "repo_path": "projects/dev",
+            }
+        return {
+            "id": "prod",
+            "name": "Production",
+            "source_mode": "rebase_hosted",
+            "repo_owner": None,
+            "repo_name": None,
+            "repo_path": None,
+        }
+
+    monkeypatch.setattr(Client, "request", fake_request)
 
     assert main(["workspace", "list"]) == 0
 
     output = capsys.readouterr().out
-    assert "Workspace Profiles" in output
+    assert "Workspaces" in output
     assert "dev" in output
     assert "Development" in output
+    assert "Developer" in output
+    assert "rebase/platform-dev" in output
     assert "prod" in output
     assert "Production" in output
+    assert "Owner" in output
     assert "*" in output
+
+
+def test_workspace_command_lists_memberships(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(tmp_path / "config.json"))
+    monkeypatch.setattr(
+        Client,
+        "list_my_workspaces",
+        lambda self: [{"id": "workspace-id", "name": "ACME", "role": "Owner"}],
+    )
+    monkeypatch.setattr(
+        Client,
+        "request",
+        lambda self, method, path, **kwargs: {
+            "id": "workspace-id",
+            "name": "ACME",
+            "source_mode": "rebase_hosted",
+            "repo_owner": None,
+            "repo_name": None,
+            "repo_path": None,
+        },
+    )
+
+    assert main(["workspace"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Workspaces" in output
+    assert "workspace-id" in output
+    assert "ACME" in output
 
 
 def test_workspace_use_changes_default_profile(monkeypatch, tmp_path: Path, capsys) -> None:

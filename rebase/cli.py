@@ -145,7 +145,7 @@ app = typer.Typer(
 workspace_app = typer.Typer(
     add_completion=False,
     cls=AlphabeticalTyperGroup,
-    help="Show, list, or switch Rebase workspace profiles.",
+    help="List or switch Rebase workspaces.",
     no_args_is_help=False,
     rich_markup_mode="rich",
 )
@@ -813,8 +813,8 @@ def deploy_file(
 
 
 def _workspace_value(data: dict[str, Any]) -> str:
-    workspace_name = data.get("workspace_name")
-    workspace_id = data.get("workspace_id")
+    workspace_name = data.get("name") or data.get("workspace_name")
+    workspace_id = data.get("id") or data.get("workspace_id")
     if isinstance(workspace_name, str) and workspace_name:
         return workspace_name
     if isinstance(workspace_id, str) and workspace_id:
@@ -823,13 +823,36 @@ def _workspace_value(data: dict[str, Any]) -> str:
 
 
 def _workspace_id(data: dict[str, Any]) -> str:
-    workspace_id = data.get("workspace_id")
+    workspace_id = data.get("id") or data.get("workspace_id")
     return workspace_id if isinstance(workspace_id, str) and workspace_id else "-"
 
 
-def _workspace_table(profiles: dict[str, dict[str, Any]], *, active_profile: str) -> Table:
+def _workspace_repo(data: dict[str, Any]) -> str:
+    repo_owner = data.get("repo_owner")
+    repo_name = data.get("repo_name")
+    if isinstance(repo_owner, str) and repo_owner and isinstance(repo_name, str) and repo_name:
+        return f"{repo_owner}/{repo_name}"
+    return "-"
+
+
+def _workspace_details(client: Client, workspace: dict[str, Any]) -> dict[str, Any]:
+    workspace_id = workspace.get("id")
+    if not isinstance(workspace_id, str) or not workspace_id:
+        return workspace
+    details = client.request("GET", "/workspace", headers={"X-Rebase-Workspace": workspace_id})
+    if not isinstance(details, dict):
+        raise RebaseWorkflowError("expected workspace response")
+    return {**details, "role": workspace.get("role"), "default": workspace.get("default", False)}
+
+
+def _workspace_membership_table(
+    workspaces: list[dict[str, Any]],
+    profiles: dict[str, dict[str, Any]],
+    *,
+    active_profile: str,
+) -> Table:
     table = Table(
-        title="Workspace Profiles",
+        title="Workspaces",
         box=box.ASCII,
         border_style="rebase.border",
         header_style="rebase.title",
@@ -837,13 +860,23 @@ def _workspace_table(profiles: dict[str, dict[str, Any]], *, active_profile: str
         title_style="rebase.title",
     )
     table.add_column("Active", justify="center", no_wrap=True, style="rebase.active")
-    table.add_column("Profile", style="rebase.value", no_wrap=True)
     table.add_column("Workspace")
     table.add_column("Workspace ID", style="rebase.muted")
-    for profile, data in sorted(profiles.items()):
-        is_active = profile == active_profile
+    table.add_column("Role", no_wrap=True)
+    table.add_column("Git Repo")
+    active_workspace_id = _workspace_id(profiles.get(active_profile, {}))
+    for workspace in sorted(workspaces, key=lambda item: _workspace_value(item).lower()):
+        workspace_id = _workspace_id(workspace)
+        is_active = workspace_id == active_workspace_id
         style = "rebase.active" if is_active else None
-        table.add_row("*" if is_active else "", profile, _workspace_value(data), _workspace_id(data), style=style)
+        table.add_row(
+            "*" if is_active else "",
+            _workspace_value(workspace),
+            workspace_id,
+            _format_value(workspace.get("role")),
+            _workspace_repo(workspace),
+            style=style,
+        )
     return table
 
 
@@ -1534,31 +1567,27 @@ def tui_command(
     run_tui(project=project, limit=limit)
 
 
-def _show_active_workspace() -> None:
+def _show_workspace_memberships() -> None:
     profiles = list_profiles()
     active_profile = selected_profile_name()
-
-    if not profiles:
-        raise RebaseWorkflowError("no workspace profile configured. Run `rebase setup` first.")
-    data = profiles.get(active_profile, {})
-    console.print(_workspace_table({active_profile: data}, active_profile=active_profile))
+    client = Client()
+    workspaces = [_workspace_details(client, workspace) for workspace in client.list_my_workspaces()]
+    if not workspaces:
+        raise RebaseWorkflowError("no workspace memberships found. Run `rebase workspace create` first.")
+    console.print(_workspace_membership_table(workspaces, profiles, active_profile=active_profile))
 
 
 @workspace_app.callback(invoke_without_command=True)
 def workspace_command(ctx: typer.Context) -> None:
-    """Show the active Rebase workspace profile."""
+    """List Rebase workspaces you belong to."""
     if ctx.invoked_subcommand is None:
-        _show_active_workspace()
+        _show_workspace_memberships()
 
 
 @workspace_app.command("list")
 def workspace_list_command() -> None:
-    """List configured workspace profiles."""
-    profiles = list_profiles()
-    active_profile = selected_profile_name()
-    if not profiles:
-        raise RebaseWorkflowError("no workspace profiles configured. Run `rebase setup` first.")
-    console.print(_workspace_table(profiles, active_profile=active_profile))
+    """List Rebase workspaces you belong to."""
+    _show_workspace_memberships()
 
 
 @workspace_app.command("create")

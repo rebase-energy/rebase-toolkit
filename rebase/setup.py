@@ -802,13 +802,41 @@ def _repo_full_name_from_connection(connection: dict[str, Any]) -> str:
     return f"{repo_owner}/{repo_name}"
 
 
-def _workspace_github_connection(client: Client) -> dict[str, Any] | None:
+def _repo_full_name_from_workspace(workspace: dict[str, Any]) -> str | None:
+    repo_owner = workspace.get("repo_owner")
+    repo_name = workspace.get("repo_name")
+    if isinstance(repo_owner, str) and repo_owner and isinstance(repo_name, str) and repo_name:
+        return f"{repo_owner}/{repo_name}"
+    return None
+
+
+def _workspace_repo_full_name(client: Client) -> str | None:
+    get_workspace = getattr(client, "get_workspace", None)
+    if not callable(get_workspace):
+        return None
+    workspace = get_workspace()
+    if not isinstance(workspace, dict):
+        raise RebaseWorkflowError("expected workspace response")
+    return _repo_full_name_from_workspace(workspace)
+
+
+def _workspace_github_connection(
+    client: Client,
+    *,
+    repo_full_name: str | None = None,
+) -> dict[str, Any] | None:
     connections = client.list_github_repo_connections()
     workspace_connections = [
         connection
         for connection in connections
         if connection.get("scope") == "workspace" and connection.get("project_id") is None
     ]
+    if repo_full_name:
+        expected = repo_full_name.lower()
+        for connection in reversed(workspace_connections):
+            if _repo_full_name_from_connection(connection).lower() == expected:
+                return connection
+        return None
     return workspace_connections[-1] if workspace_connections else None
 
 
@@ -980,7 +1008,7 @@ def _verify_github_app_access(args: Any, client: Client, connection: dict[str, A
     _success(f"Verified Rebase GitHub App access to {repo_full_name}")
 
 
-def _workspace_github_connect_args(args: Any) -> Any:
+def _workspace_github_connect_args(args: Any, *, repo: str | None = None) -> Any:
     return SimpleNamespace(
         profile=args.profile,
         api_url=args.api_url,
@@ -988,10 +1016,10 @@ def _workspace_github_connect_args(args: Any) -> Any:
         github_installation_id=args.github_installation_id,
         github_timeout=args.github_timeout,
         poll_interval=args.poll_interval,
-        repo=args.repo,
+        repo=repo if repo is not None else args.repo,
         repo_scope="workspace",
         repo_path=args.repo_path,
-        create_repo=args.create_repo,
+        create_repo=args.create_repo if repo is None else False,
         project=None,
     )
 
@@ -1215,14 +1243,23 @@ def run_connect_github(args: Any) -> int:
     workspace_id = getattr(client, "workspace_id", None)
     if not isinstance(workspace_id, str) or not workspace_id:
         raise RebaseWorkflowError("no workspace profile configured. Run `rebase setup` first.")
+    workspace_repo = _workspace_repo_full_name(client)
+    expected_repo = args.repo or workspace_repo
 
     total_steps = 3
     _section("Workspace GitHub Repo", step=1, total=total_steps)
-    connection = _workspace_github_connection(client)
+    connection = _workspace_github_connection(client, repo_full_name=expected_repo)
     if connection is None:
-        _hint("No workspace-level GitHub repository connection found.")
-        created_connection = _connect_github(_workspace_github_connect_args(args), client, workspace_id=workspace_id)
-        connection = _workspace_github_connection(client) or created_connection
+        if expected_repo:
+            _hint(f"No workspace-level GitHub repository connection found for {expected_repo}.")
+        else:
+            _hint("No workspace-level GitHub repository connection found.")
+        created_connection = _connect_github(
+            _workspace_github_connect_args(args, repo=expected_repo),
+            client,
+            workspace_id=workspace_id,
+        )
+        connection = _workspace_github_connection(client, repo_full_name=expected_repo) or created_connection
         if connection is None:
             raise RebaseWorkflowError("workspace GitHub repo connection was not saved")
     else:
@@ -1232,6 +1269,11 @@ def run_connect_github(args: Any) -> int:
                 f"active workspace is already connected to {repo_full_name}, but --repo requested {args.repo}"
             )
         _success(f"Workspace is connected to {repo_full_name}")
+    if expected_repo and _repo_full_name_from_connection(connection).lower() != expected_repo.lower():
+        raise RebaseWorkflowError(
+            "workspace GitHub repo connection mismatch: "
+            f"expected {expected_repo}, got {_repo_full_name_from_connection(connection)}"
+        )
 
     _section("Local Git Repository", step=2, total=total_steps)
     _ensure_local_workspace_repo(connection)
