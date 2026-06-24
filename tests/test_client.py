@@ -1007,7 +1007,7 @@ def test_asgi_app_create_and_update_use_deploy_timeout(monkeypatch) -> None:
     observed: list[dict[str, Any]] = []
 
     def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
-        observed.append({"method": method, "url": url, "timeout": kwargs["timeout"]})
+        observed.append({"method": method, "url": url, "timeout": kwargs["timeout"], "json": kwargs["json"]})
         return FakeResponse({"id": "asgi-app-id", "name": "grid-api"})
 
     monkeypatch.setattr("requests.request", fake_request)
@@ -1022,11 +1022,39 @@ def test_asgi_app_create_and_update_use_deploy_timeout(monkeypatch) -> None:
             "method": "POST",
             "url": "https://workflows.example.com/projects/project-id/asgi-apps",
             "timeout": 300,
+            "json": {
+                "name": "grid-api",
+                "description": None,
+                "source_code": "def app(): pass",
+                "entrypoint": "app",
+                "base_path": "/",
+                "auth": "api_key",
+                "image_spec": None,
+                "env": {},
+                "secrets": {},
+                "cloud_run_min_instances": None,
+                "cloud_run_max_instances": None,
+                "cloud_run_concurrency": None,
+                "cloud_run_timeout_seconds": None,
+                "cloud_run_cpu": None,
+                "cloud_run_memory": None,
+                "enabled": True,
+                "source_mode": None,
+                "repo_owner": None,
+                "repo_name": None,
+                "repo_path": None,
+                "source_path": None,
+                "git_commit_sha": None,
+                "git_branch": None,
+                "git_tag": None,
+                "git_dirty": False,
+            },
         },
         {
             "method": "PATCH",
             "url": "https://workflows.example.com/asgi-apps/asgi-app-id",
             "timeout": 300,
+            "json": {"source_code": "def app(): pass"},
         },
     ]
 

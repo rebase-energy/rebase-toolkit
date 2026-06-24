@@ -1234,6 +1234,73 @@ class Client:
             raise RebaseWorkflowError("expected GitHub setup response")
         return response
 
+    def list_environment_policies(self) -> list[dict[str, Any]]:
+        response = self.request("GET", "/workspace/environments")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected workspace environment policy list response")
+        return response
+
+    def update_environment_policy(
+        self,
+        environment: str,
+        *,
+        deploy_mode: str | None = None,
+        protected: bool | None = None,
+        require_pr: bool | None = None,
+        allowed_branches: list[str] | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "PATCH",
+            f"/workspace/environments/{environment}",
+            json={
+                key: value
+                for key, value in {
+                    "deploy_mode": deploy_mode,
+                    "protected": protected,
+                    "require_pr": require_pr,
+                    "allowed_branches": allowed_branches,
+                }.items()
+                if value is not None
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected workspace environment policy response")
+        return response
+
+    def create_gitops_deployment_intent(
+        self,
+        *,
+        environment: str,
+        source_repo: str,
+        repo_owner: str,
+        repo_name: str,
+        source_path: str,
+        git_commit_sha: str,
+        repo_path: str | None = None,
+        git_branch: str | None = None,
+        project_id: str | None = None,
+        plan: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            "/gitops/deployment-intents",
+            json={
+                "environment": environment,
+                "source_repo": source_repo,
+                "repo_owner": repo_owner,
+                "repo_name": repo_name,
+                "repo_path": repo_path,
+                "source_path": source_path,
+                "git_commit_sha": git_commit_sha,
+                "git_branch": git_branch,
+                "project_id": project_id,
+                "plan": plan or {},
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected GitOps deployment intent response")
+        return response
+
     def get_github_setup_session(self, setup_session_id: str) -> dict[str, Any]:
         response = self.request("GET", f"/integrations/github/setup-sessions/{setup_session_id}")
         if not isinstance(response, dict):
@@ -1511,6 +1578,7 @@ class Client:
         cloud_run_cpu: str | None = None,
         cloud_run_memory: str | None = None,
         enabled: bool = True,
+        environment: str = "dev",
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -1578,6 +1646,7 @@ class Client:
         cloud_run_cpu: str | None = None,
         cloud_run_memory: str | None = None,
         enabled: bool | None = None,
+        environment: str | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -1644,6 +1713,7 @@ class Client:
         cloud_run_concurrency: int | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
+        environment: str = "dev",
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -1670,6 +1740,7 @@ class Client:
                 "cloud_run_concurrency": cloud_run_concurrency,
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
+                "environment": environment,
                 "source_mode": source_mode,
                 "repo_owner": repo_owner,
                 "repo_name": repo_name,
@@ -1700,6 +1771,7 @@ class Client:
         cloud_run_concurrency: int | None = None,
         enabled: bool | None = None,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
+        environment: str | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -1724,6 +1796,7 @@ class Client:
                 "cloud_run_concurrency": cloud_run_concurrency,
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
+                "environment": environment,
                 "source_mode": source_mode,
                 "repo_owner": repo_owner,
                 "repo_name": repo_name,
@@ -2142,6 +2215,7 @@ class Client:
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         project: str | None = None,
+        environment: str = "dev",
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -2172,6 +2246,7 @@ class Client:
                 "execution_backend": _validate_workflow_backend(execution_backend),
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
+                "environment": environment,
                 "source_mode": source_mode,
                 "repo_owner": repo_owner,
                 "repo_name": repo_name,
@@ -2203,6 +2278,7 @@ class Client:
         execution_backend: WorkflowBackend | None = None,
         enabled: bool | None = None,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
+        environment: str | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -2226,6 +2302,7 @@ class Client:
                 "execution_backend": _validate_workflow_backend(execution_backend) if execution_backend else None,
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
+                "environment": environment,
                 "source_mode": source_mode,
                 "repo_owner": repo_owner,
                 "repo_name": repo_name,
@@ -2382,7 +2459,7 @@ class Project:
     def _client(self) -> Client:
         return self.client or default_client()
 
-    def deploy(self, *, replace: bool = False, deploy_source: str | None = None) -> Self:
+    def deploy(self, *, replace: bool = False, deploy_source: str | None = None, environment: str = "dev") -> Self:
         for workflow in self._workflows:
             workflow._validate_schedule_defaults()
         resolved_deploy_source = _validate_deploy_source(deploy_source)
@@ -2396,11 +2473,11 @@ class Project:
         )
         self.id = project["id"]
         for function in self._functions:
-            function.deploy(replace=replace, deploy_source=resolved_deploy_source)
+            function.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
         for workflow in self._workflows:
-            workflow.deploy(replace=replace, deploy_source=resolved_deploy_source)
+            workflow.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
         for asgi_app in self._asgi_apps:
-            asgi_app.deploy(replace=replace, deploy_source=resolved_deploy_source)
+            asgi_app.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
         return self
 
     def function(
@@ -2674,7 +2751,7 @@ class ASGIApp:
             project_source_mode=project_source_mode,
         )
 
-    def deploy(self, *, replace: bool = False, deploy_source: str | None = None) -> ASGIApp:
+    def deploy(self, *, replace: bool = False, deploy_source: str | None = None, environment: str = "dev") -> ASGIApp:
         if self.source_code is None or self.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy an ASGI app handle without source_code and entrypoint")
         if self.name is None:
@@ -2699,6 +2776,7 @@ class ASGIApp:
                 cloud_run_cpu=self.cloud_run_cpu,
                 cloud_run_memory=self.cloud_run_memory,
                 enabled=self.enabled,
+                environment=environment,
                 **source_metadata,
             )
             self.id = asgi_app["id"]
@@ -2723,6 +2801,7 @@ class ASGIApp:
             cloud_run_cpu=self.cloud_run_cpu,
             cloud_run_memory=self.cloud_run_memory,
             enabled=self.enabled,
+            environment=environment,
             **source_metadata,
         )
         self.id = asgi_app["id"]
@@ -2824,7 +2903,7 @@ class Function:
             project_source_mode=project_source_mode,
         )
 
-    def deploy(self, *, replace: bool = False, deploy_source: str | None = None) -> Function:
+    def deploy(self, *, replace: bool = False, deploy_source: str | None = None, environment: str = "dev") -> Function:
         if self.source_code is None or self.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy a function handle without source_code and entrypoint")
         if self.name is None:
@@ -2845,6 +2924,7 @@ class Function:
                 cloud_run_concurrency=self.cloud_run_concurrency,
                 enabled=self.enabled,
                 endpoint=self.endpoint,
+                environment=environment,
                 **source_metadata,
             )
             self.id = function["id"]
@@ -2864,6 +2944,7 @@ class Function:
             cloud_run_concurrency=self.cloud_run_concurrency,
             enabled=self.enabled,
             endpoint=self.endpoint,
+            environment=environment,
             **source_metadata,
         )
         self.id = function["id"]
@@ -3820,7 +3901,7 @@ class Workflow:
                 f"Scheduled workflows require defaults for every workflow parameter. Missing defaults: {missing}"
             )
 
-    def deploy(self, *, replace: bool = False, deploy_source: str | None = None) -> Workflow:
+    def deploy(self, *, replace: bool = False, deploy_source: str | None = None, environment: str = "dev") -> Workflow:
         if self.source_code is None or self.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy a workflow handle without source_code and entrypoint")
         if self.name is None:
@@ -3844,6 +3925,7 @@ class Workflow:
                 execution_backend=self.execution_backend,
                 enabled=self.enabled,
                 endpoint=self.endpoint,
+                environment=environment,
                 **source_metadata,
             )
             self.id = workflow["id"]
@@ -3865,6 +3947,7 @@ class Workflow:
             execution_backend=self.execution_backend,
             enabled=self.enabled,
             endpoint=self.endpoint,
+            environment=environment,
             **source_metadata,
         )
         self.id = workflow["id"]
