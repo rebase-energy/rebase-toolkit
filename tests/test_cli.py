@@ -1548,6 +1548,53 @@ def test_connect_github_helper_uses_existing_workspace_connection(monkeypatch) -
     ]
 
 
+def test_connect_github_helper_resolves_active_profile_when_omitted(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    observed: dict[str, Any] = {}
+    connection = {
+        "scope": "workspace",
+        "project_id": None,
+        "repo_owner": "rebase",
+        "repo_name": "workspace-repo",
+    }
+
+    class FakeClient:
+        def __init__(self, *, api_url: str | None = None, profile: str | None = None) -> None:
+            observed["profile"] = profile
+            self.workspace_id = "rebase-workspace"
+
+        def setup_config(self) -> dict[str, Any]:
+            return {"github_app_configured": True}
+
+        def list_github_repo_connections(self) -> list[dict[str, Any]]:
+            return [connection]
+
+    monkeypatch.setattr(setup_module, "Client", FakeClient)
+    monkeypatch.setattr(setup_module, "selected_profile_name", lambda: "workspace-profile")
+    monkeypatch.setattr(setup_module, "_ensure_local_workspace_repo", lambda selected: None)
+    monkeypatch.setattr(setup_module, "_verify_github_app_access", lambda *args, **kwargs: None)
+
+    assert (
+        setup_module.run_connect_github(
+            SimpleNamespace(
+                profile=None,
+                api_url=None,
+                no_browser=True,
+                github_installation_id=None,
+                github_timeout=1,
+                poll_interval=0,
+                repo=None,
+                repo_path=None,
+                create_repo=False,
+            )
+        )
+        == 0
+    )
+
+    assert observed["profile"] == "workspace-profile"
+
+
 def test_connect_github_helper_creates_missing_workspace_connection(monkeypatch) -> None:
     from rebase import setup as setup_module
 

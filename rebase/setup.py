@@ -28,7 +28,7 @@ from rebase.auth import (
 )
 from rebase.brand import BRAND_BRIGHT_GREEN, BRAND_MEDIUM_GRAY
 from rebase.client import Client, RebaseWorkflowError, _parse_github_remote
-from rebase.config import write_profile
+from rebase.config import selected_profile_name, write_profile
 
 JOIN_WORKSPACE = "Join an existing workspace"
 CREATE_WORKSPACE = "Create a new workspace"
@@ -1207,7 +1207,8 @@ def run_workspace_create(args: Any) -> int:
 
 def run_connect_github(args: Any) -> int:
     _restore_terminal_for_prompts()
-    client = Client(api_url=args.api_url, profile=args.profile)
+    profile = args.profile or selected_profile_name()
+    client = Client(api_url=args.api_url, profile=profile)
     config = client.setup_config()
     if not config.get("github_app_configured"):
         raise RebaseWorkflowError("GitHub connection is not configured on this workflow API")
