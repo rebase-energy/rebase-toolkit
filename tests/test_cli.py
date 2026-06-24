@@ -17,8 +17,7 @@ def test_main_without_args_prints_help(capsys) -> None:
     normalized_output = " ".join(output.split())
     assert "Usage:" in output
     assert (
-        "Rebase Toolkit lets you develop Python workflows and models "
-        "that can then be deployed to the Rebase Platform."
+        "Rebase Toolkit lets you develop Python workflows and models that can then be deployed to the Rebase Platform."
     ) in normalized_output
     assert "setup" in output
     assert "workspace" in output
@@ -238,9 +237,7 @@ def grid_api() -> object:
     result = deploy_file(api_file)
 
     assert deployed == ["grid-api"]
-    assert result == [
-        ("asgi_app", "grid-api", "grid-api-id", "https://workflows.example.com/e/default/grid/api")
-    ]
+    assert result == [("asgi_app", "grid-api", "grid-api-id", "https://workflows.example.com/e/default/grid/api")]
 
 
 def test_deploy_file_deploys_standalone_predictor(monkeypatch, tmp_path: Path) -> None:
@@ -1140,7 +1137,7 @@ def test_connect_huggingface_helper_runs_device_flow(monkeypatch) -> None:
         return FakeResponse(200, {"access_token": "hf_oauth_token", "token_type": "bearer"})
 
     monkeypatch.setenv(setup_module.HUGGINGFACE_CLIENT_ID_ENV, "hf-client")
-    monkeypatch.setattr(setup_module, "_huggingface_login_function", lambda: (lambda **kwargs: None))
+    monkeypatch.setattr(setup_module, "_huggingface_login_function", lambda: lambda **kwargs: None)
     monkeypatch.setattr(setup_module.requests, "post", fake_post)
     monkeypatch.setattr(setup_module.webbrowser, "open", lambda url: calls.append(f"open:{url}"))
     monkeypatch.setattr(
@@ -1185,7 +1182,7 @@ def test_connect_huggingface_helper_requires_client_id(monkeypatch) -> None:
 
     monkeypatch.delenv(setup_module.HUGGINGFACE_CLIENT_ID_ENV, raising=False)
     monkeypatch.setattr(setup_module, "Client", FakeClient)
-    monkeypatch.setattr(setup_module, "_huggingface_login_function", lambda: (lambda **kwargs: None))
+    monkeypatch.setattr(setup_module, "_huggingface_login_function", lambda: lambda **kwargs: None)
 
     with pytest.raises(setup_module.RebaseWorkflowError, match="OAuth client id"):
         setup_module.run_connect_huggingface(
@@ -1514,7 +1511,7 @@ def test_connect_github_helper_uses_existing_workspace_connection(monkeypatch) -
     monkeypatch.setattr(
         setup_module,
         "_ensure_local_workspace_repo",
-        lambda selected: calls.append(f"local:{selected['repo_owner']}/{selected['repo_name']}"),
+        lambda selected, **kwargs: calls.append(f"local:{selected['repo_owner']}/{selected['repo_name']}"),
     )
     monkeypatch.setattr(
         setup_module,
@@ -1572,7 +1569,7 @@ def test_connect_github_helper_resolves_active_profile_when_omitted(monkeypatch)
 
     monkeypatch.setattr(setup_module, "Client", FakeClient)
     monkeypatch.setattr(setup_module, "selected_profile_name", lambda: "workspace-profile")
-    monkeypatch.setattr(setup_module, "_ensure_local_workspace_repo", lambda selected: None)
+    monkeypatch.setattr(setup_module, "_ensure_local_workspace_repo", lambda selected, **kwargs: None)
     monkeypatch.setattr(setup_module, "_verify_github_app_access", lambda *args, **kwargs: None)
 
     assert (
@@ -1640,7 +1637,7 @@ def test_connect_github_helper_reconnects_stale_workspace_connection(monkeypatch
     monkeypatch.setattr(
         setup_module,
         "_ensure_local_workspace_repo",
-        lambda selected: calls.append(f"local:{selected['repo_owner']}/{selected['repo_name']}"),
+        lambda selected, **kwargs: calls.append(f"local:{selected['repo_owner']}/{selected['repo_name']}"),
     )
     monkeypatch.setattr(
         setup_module,
@@ -1708,7 +1705,7 @@ def test_connect_github_helper_creates_missing_workspace_connection(monkeypatch)
 
     monkeypatch.setattr(setup_module, "Client", FakeClient)
     monkeypatch.setattr(setup_module, "_connect_github", fake_connect)
-    monkeypatch.setattr(setup_module, "_ensure_local_workspace_repo", lambda selected: calls.append("local"))
+    monkeypatch.setattr(setup_module, "_ensure_local_workspace_repo", lambda selected, **kwargs: calls.append("local"))
     monkeypatch.setattr(setup_module, "_verify_github_app_access", lambda *args, **kwargs: calls.append("app"))
 
     assert (
@@ -1766,6 +1763,7 @@ def test_github_connect_clones_workspace_repo_when_current_folder_has_only_venv(
     )
     monkeypatch.setattr(setup_module, "_current_git_root", lambda: state["root"])
     monkeypatch.setattr(setup_module, "_local_github_remote", lambda cwd=None: "rebase/platform")
+    monkeypatch.setattr(setup_module, "_remote_branch_exists", lambda cwd, branch: branch == "main")
     monkeypatch.setattr(setup_module, "_run_git", fake_run_git)
 
     setup_module._ensure_local_workspace_repo(
@@ -1796,7 +1794,62 @@ def test_github_connect_clones_workspace_repo_when_current_folder_has_only_venv(
             tmp_path,
             "check out origin/main",
             60,
-        )
+        ),
+    ]
+
+
+def test_github_connect_seeds_empty_workspace_repo_before_checkout(monkeypatch, tmp_path: Path) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[tuple[str, object]] = []
+    state: dict[str, object] = {"root": None, "seeded": False}
+    (tmp_path / ".venv").mkdir()
+
+    class FakeClient:
+        def create_github_starter_workflow(self, connection_id: str) -> dict[str, str]:
+            calls.append(("starter", connection_id))
+            state["seeded"] = True
+            return {"path": ".rebase/starter_workflow.py", "commit_sha": "abc123"}
+
+    def fake_run_git(args: list[str], *, cwd: Path, action: str, timeout: float = 60) -> None:
+        calls.append(("git", (args, cwd, action, timeout)))
+        if args == ["init"]:
+            state["root"] = tmp_path
+
+    def fake_remote_branches(cwd: Path) -> list[str]:
+        _ = cwd
+        return ["origin/main"] if state["seeded"] else []
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(setup_module, "_confirm", lambda message, *, default: True)
+    monkeypatch.setattr(
+        setup_module,
+        "_choose",
+        lambda label, values, *, default=None, title=None: "SSH (git@github.com:rebase/platform.git)",
+    )
+    monkeypatch.setattr(setup_module, "_current_git_root", lambda: state["root"])
+    monkeypatch.setattr(setup_module, "_local_github_remote", lambda cwd=None: "rebase/platform")
+    monkeypatch.setattr(setup_module, "_remote_branches", fake_remote_branches)
+    monkeypatch.setattr(setup_module, "_remote_branch_exists", lambda cwd, branch: state["seeded"] and branch == "main")
+    monkeypatch.setattr(setup_module, "_run_git", fake_run_git)
+
+    setup_module._ensure_local_workspace_repo(
+        {
+            "id": "connection-id",
+            "repo_owner": "rebase",
+            "repo_name": "platform",
+            "default_branch": "main",
+        },
+        client=FakeClient(),
+    )
+
+    assert calls == [
+        ("git", (["init"], tmp_path, "initialize a git repository", 60)),
+        ("git", (["remote", "add", "origin", "git@github.com:rebase/platform.git"], tmp_path, "add GitHub origin", 60)),
+        ("git", (["fetch", "origin"], tmp_path, "fetch rebase/platform", 300)),
+        ("starter", "connection-id"),
+        ("git", (["fetch", "origin"], tmp_path, "fetch starter workflow", 300)),
+        ("git", (["checkout", "-B", "main", "origin/main"], tmp_path, "check out origin/main", 60)),
     ]
 
 

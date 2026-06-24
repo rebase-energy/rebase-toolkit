@@ -34,8 +34,7 @@ JOIN_WORKSPACE = "Join an existing workspace"
 CREATE_WORKSPACE = "Create a new workspace"
 BETA_ENROLLMENT_ERROR = "your account is not enrolled in the beta program. Contact hello@rebase.energy to get enrolled."
 WORKSPACE_CREATION_QUOTA_ERROR = (
-    "You've reached your quota for creating new workspaces, "
-    "please contact us to increase it: hello@rebase.energy"
+    "You've reached your quota for creating new workspaces, please contact us to increase it: hello@rebase.energy"
 )
 HANDLE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{1,37}[a-z0-9])?$")
 HUGGINGFACE_CLIENT_ID_ENV = "REBASE_HUGGINGFACE_OAUTH_CLIENT_ID"
@@ -909,30 +908,91 @@ def _detect_remote_default_branch(cwd: Path) -> str:
     remote_head = _git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=cwd)
     if remote_head and remote_head.startswith("origin/"):
         return remote_head.split("/", 1)[1]
-    branches = _git(["branch", "-r", "--format=%(refname:short)"], cwd=cwd)
-    if branches:
-        for branch in branches.splitlines():
-            if branch and branch != "origin/HEAD" and branch.startswith("origin/"):
-                return branch.split("/", 1)[1]
+    for branch in _remote_branches(cwd):
+        if branch.startswith("origin/"):
+            return branch.split("/", 1)[1]
     return "main"
+
+
+def _remote_branches(cwd: Path) -> list[str]:
+    branches = _git(["branch", "-r", "--format=%(refname:short)"], cwd=cwd)
+    if not branches:
+        return []
+    return [
+        branch
+        for branch in branches.splitlines()
+        if branch and branch != "origin/HEAD" and branch.startswith("origin/")
+    ]
+
+
+def _remote_branch_exists(cwd: Path, branch: str) -> bool:
+    return _git(["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"], cwd=cwd) is not None
 
 
 def _checkout_remote_branch(cwd: Path, *, default_branch: str | None) -> None:
     branch = default_branch or _detect_remote_default_branch(cwd)
+    if _remote_branch_exists(cwd, branch):
+        _run_git(
+            ["checkout", "-B", branch, f"origin/{branch}"],
+            cwd=cwd,
+            action=f"check out origin/{branch}",
+            timeout=60,
+        )
+        return
+
+    detected_branch = _detect_remote_default_branch(cwd)
+    if detected_branch != branch and _remote_branch_exists(cwd, detected_branch):
+        _run_git(
+            ["checkout", "-B", detected_branch, f"origin/{detected_branch}"],
+            cwd=cwd,
+            action=f"check out origin/{detected_branch}",
+            timeout=60,
+        )
+        return
+
     _run_git(
-        ["checkout", "-B", branch, f"origin/{branch}"],
+        ["checkout", "-B", branch],
         cwd=cwd,
-        action=f"check out origin/{branch}",
+        action=f"create local branch {branch}",
         timeout=60,
     )
 
 
-def _clone_workspace_repo_into_current_directory(repo_full_name: str, *, default_branch: str | None) -> None:
+def _seed_empty_workspace_repo(client: Client | None, connection: dict[str, Any], *, cwd: Path) -> None:
+    if _remote_branches(cwd):
+        return
+    connection_id = connection.get("id")
+    if client is None or connection_id is None:
+        return
+
+    _hint("GitHub repository has no branches yet. Creating a starter workflow on the default branch.")
+    try:
+        starter = client.create_github_starter_workflow(str(connection_id))
+    except RebaseWorkflowError as exc:
+        raise RebaseWorkflowError(
+            "GitHub repository is empty and Rebase could not create a starter workflow. "
+            "Create an initial commit in the repository, then run `rebase connect github` again."
+        ) from exc
+    path = starter.get("path")
+    commit_sha = starter.get("commit_sha")
+    suffix = f" ({commit_sha})" if isinstance(commit_sha, str) and commit_sha else ""
+    if isinstance(path, str) and path:
+        _success(f"Created starter workflow at {path}{suffix}")
+    else:
+        _success("Created starter workflow")
+    _run_git(["fetch", "origin"], cwd=cwd, action="fetch starter workflow", timeout=300)
+
+
+def _clone_workspace_repo_into_current_directory(
+    connection: dict[str, Any],
+    *,
+    client: Client | None,
+) -> None:
+    repo_full_name = _repo_full_name_from_connection(connection)
     cwd = Path.cwd()
     contents = _directory_listing_for_prompt(cwd)
     if not _confirm(
-        f"Current folder is not a git repository and contains: {contents}. "
-        f"Clone {repo_full_name} into this folder?",
+        f"Current folder is not a git repository and contains: {contents}. Clone {repo_full_name} into this folder?",
         default=True,
     ):
         raise RebaseWorkflowError(
@@ -951,7 +1011,8 @@ def _clone_workspace_repo_into_current_directory(repo_full_name: str, *, default
     else:
         _ensure_workspace_origin_transport(cwd, repo_full_name)
     _run_git(["fetch", "origin"], cwd=cwd, action=f"fetch {repo_full_name}", timeout=300)
-    _checkout_remote_branch(cwd, default_branch=default_branch)
+    _seed_empty_workspace_repo(client, connection, cwd=cwd)
+    _checkout_remote_branch(cwd, default_branch=_connection_default_branch(connection))
     _hint(f"Cloned {repo_full_name} into the current folder.")
 
 
@@ -960,14 +1021,11 @@ def _connection_default_branch(connection: dict[str, Any]) -> str | None:
     return default_branch if isinstance(default_branch, str) and default_branch else None
 
 
-def _ensure_local_workspace_repo(connection: dict[str, Any]) -> None:
+def _ensure_local_workspace_repo(connection: dict[str, Any], *, client: Client | None = None) -> None:
     repo_full_name = _repo_full_name_from_connection(connection)
     git_root = _current_git_root()
     if git_root is None:
-        _clone_workspace_repo_into_current_directory(
-            repo_full_name,
-            default_branch=_connection_default_branch(connection),
-        )
+        _clone_workspace_repo_into_current_directory(connection, client=client)
         git_root = _current_git_root()
         if git_root is None:
             raise RebaseWorkflowError(f"cloned {repo_full_name}, but could not find a git repository")
@@ -1063,8 +1121,7 @@ def _resolve_huggingface_client_id(args: Any) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
     raise RebaseWorkflowError(
-        "Hugging Face OAuth client id is not configured. "
-        f"Set {HUGGINGFACE_CLIENT_ID_ENV} or pass --client-id."
+        f"Hugging Face OAuth client id is not configured. Set {HUGGINGFACE_CLIENT_ID_ENV} or pass --client-id."
     )
 
 
@@ -1276,7 +1333,7 @@ def run_connect_github(args: Any) -> int:
         )
 
     _section("Local Git Repository", step=2, total=total_steps)
-    _ensure_local_workspace_repo(connection)
+    _ensure_local_workspace_repo(connection, client=client)
 
     _section("GitHub App", step=3, total=total_steps)
     _verify_github_app_access(args, client, connection, workspace_id=workspace_id)
