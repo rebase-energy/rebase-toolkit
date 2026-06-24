@@ -66,6 +66,7 @@ DEFAULT_API_KEY_PERMISSIONS = [
     "models:read",
     "runs:read",
 ]
+DEPLOY_REQUEST_TIMEOUT_SECONDS = 300
 
 
 class RebaseWorkflowError(RuntimeError):
@@ -1009,7 +1010,8 @@ class Client:
         self, method: str, path: str, *, auth: bool = True, **kwargs: Any
     ) -> dict[str, Any] | list[dict[str, Any]]:
         headers = self._request_headers(auth=auth, headers=kwargs.pop("headers", {}))
-        response = requests.request(method, f"{self.api_url}{path}", headers=headers, timeout=30, **kwargs)
+        timeout = kwargs.pop("timeout", 30)
+        response = requests.request(method, f"{self.api_url}{path}", headers=headers, timeout=timeout, **kwargs)
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
@@ -1523,6 +1525,7 @@ class Client:
         response = self.request(
             "POST",
             f"/projects/{project_id}/asgi-apps",
+            timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
             json={
                 "name": name,
                 "description": description,
@@ -1616,7 +1619,12 @@ class Client:
             }.items()
             if value is not None
         }
-        response = self.request("PATCH", f"/asgi-apps/{asgi_app_id}", json=payload)
+        response = self.request(
+            "PATCH",
+            f"/asgi-apps/{asgi_app_id}",
+            timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
+            json=payload,
+        )
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected ASGI app response")
         return response

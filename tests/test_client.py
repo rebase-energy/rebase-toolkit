@@ -70,6 +70,27 @@ def test_client_sends_bearer_token(monkeypatch) -> None:
     }
 
 
+def test_client_request_accepts_custom_timeout(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["timeout"] = kwargs["timeout"]
+        return FakeResponse({"ok": True})
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    assert client.request("POST", "/slow", timeout=123, json={}) == {"ok": True}
+
+    assert observed == {
+        "method": "POST",
+        "url": "https://workflows.example.com/slow",
+        "timeout": 123,
+    }
+
+
 def test_stream_request_parses_ndjson(monkeypatch) -> None:
     observed: dict[str, Any] = {}
     response = FakeStreamResponse(
@@ -980,6 +1001,34 @@ def test_project_deploy_registers_asgi_app_source(monkeypatch) -> None:
     assert observed["cloud_run_cpu"] == "1"
     assert observed["cloud_run_memory"] == "1Gi"
     assert observed["source_mode"] == "rebase_hosted"
+
+
+def test_asgi_app_create_and_update_use_deploy_timeout(monkeypatch) -> None:
+    observed: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed.append({"method": method, "url": url, "timeout": kwargs["timeout"]})
+        return FakeResponse({"id": "asgi-app-id", "name": "grid-api"})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "ensure_project", lambda name: {"id": "project-id", "name": name})
+
+    client.register_asgi_app(project="grid", name="grid-api", source_code="def app(): pass", entrypoint="app")
+    client.update_asgi_app("asgi-app-id", source_code="def app(): pass")
+
+    assert observed == [
+        {
+            "method": "POST",
+            "url": "https://workflows.example.com/projects/project-id/asgi-apps",
+            "timeout": 300,
+        },
+        {
+            "method": "PATCH",
+            "url": "https://workflows.example.com/asgi-apps/asgi-app-id",
+            "timeout": 300,
+        },
+    ]
 
 
 def test_asgi_app_deploy_updates_existing_app(monkeypatch) -> None:
