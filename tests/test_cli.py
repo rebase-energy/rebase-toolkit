@@ -1922,6 +1922,20 @@ def test_connect_github_command_dispatches_to_setup_helper(monkeypatch) -> None:
     assert observed["create_repo"] is True
 
 
+def test_connect_github_command_uses_active_workspace_profile_by_default(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_run_connect_github(args: Any) -> int:
+        observed.update(vars(args))
+        return 0
+
+    monkeypatch.setattr("rebase.setup.run_connect_github", fake_run_connect_github)
+
+    assert main(["connect", "github"]) == 0
+
+    assert observed["profile"] is None
+
+
 def test_connect_huggingface_command_dispatches_to_setup_helper(monkeypatch) -> None:
     observed: dict[str, Any] = {}
 

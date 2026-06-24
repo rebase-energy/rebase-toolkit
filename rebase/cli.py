@@ -1726,7 +1726,10 @@ app.add_typer(workspace_app, name="workspace")
 
 @connect_app.command("github")
 def connect_github_command(
-    profile: Annotated[str, typer.Option("--profile", help="Credential profile name.")] = DEFAULT_PROFILE,
+    profile: Annotated[
+        str | None,
+        typer.Option("--profile", help="Credential profile name. Defaults to the active workspace profile."),
+    ] = None,
     api_url: Annotated[
         str | None,
         typer.Option(
