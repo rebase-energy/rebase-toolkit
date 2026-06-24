@@ -929,6 +929,10 @@ def _remote_branch_exists(cwd: Path, branch: str) -> bool:
     return _git(["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"], cwd=cwd) is not None
 
 
+def _has_local_head(cwd: Path) -> bool:
+    return _git(["rev-parse", "--verify", "HEAD"], cwd=cwd) is not None
+
+
 def _checkout_remote_branch(cwd: Path, *, default_branch: str | None) -> None:
     branch = default_branch or _detect_remote_default_branch(cwd)
     if _remote_branch_exists(cwd, branch):
@@ -1016,6 +1020,15 @@ def _clone_workspace_repo_into_current_directory(
     _hint(f"Cloned {repo_full_name} into the current folder.")
 
 
+def _repair_empty_local_workspace_repo(client: Client | None, connection: dict[str, Any], *, cwd: Path) -> None:
+    if _has_local_head(cwd):
+        return
+    repo_full_name = _repo_full_name_from_connection(connection)
+    _run_git(["fetch", "origin"], cwd=cwd, action=f"fetch {repo_full_name}", timeout=300)
+    _seed_empty_workspace_repo(client, connection, cwd=cwd)
+    _checkout_remote_branch(cwd, default_branch=_connection_default_branch(connection))
+
+
 def _connection_default_branch(connection: dict[str, Any]) -> str | None:
     default_branch = connection.get("default_branch")
     return default_branch if isinstance(default_branch, str) and default_branch else None
@@ -1029,6 +1042,8 @@ def _ensure_local_workspace_repo(connection: dict[str, Any], *, client: Client |
         git_root = _current_git_root()
         if git_root is None:
             raise RebaseWorkflowError(f"cloned {repo_full_name}, but could not find a git repository")
+        _success(f"Current folder is inside {repo_full_name}")
+        return
 
     local_repo = _local_github_remote(git_root)
     if local_repo is None:
@@ -1042,6 +1057,7 @@ def _ensure_local_workspace_repo(connection: dict[str, Any], *, client: Client |
             f"The active workspace is connected to {repo_full_name}, but this folder uses {local_repo}."
         )
     _ensure_workspace_origin_transport(git_root, repo_full_name)
+    _repair_empty_local_workspace_repo(client, connection, cwd=git_root)
     _success(f"Current folder is inside {repo_full_name}")
 
 

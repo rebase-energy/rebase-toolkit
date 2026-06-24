@@ -1853,6 +1853,53 @@ def test_github_connect_seeds_empty_workspace_repo_before_checkout(monkeypatch, 
     ]
 
 
+def test_github_connect_repairs_partial_empty_repo_checkout(monkeypatch, tmp_path: Path) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[tuple[str, object]] = []
+    state: dict[str, bool] = {"seeded": False, "head": False}
+
+    class FakeClient:
+        def create_github_starter_workflow(self, connection_id: str) -> dict[str, str]:
+            calls.append(("starter", connection_id))
+            state["seeded"] = True
+            return {"path": ".rebase/starter_workflow.py", "commit_sha": "abc123"}
+
+    def fake_run_git(args: list[str], *, cwd: Path, action: str, timeout: float = 60) -> None:
+        calls.append(("git", (args, cwd, action, timeout)))
+        if args == ["checkout", "-B", "main", "origin/main"]:
+            state["head"] = True
+
+    monkeypatch.setattr(setup_module, "_current_git_root", lambda: tmp_path)
+    monkeypatch.setattr(setup_module, "_local_github_remote", lambda cwd=None: "rebase/platform")
+    monkeypatch.setattr(setup_module, "_ensure_workspace_origin_transport", lambda cwd, repo_full_name: None)
+    monkeypatch.setattr(setup_module, "_has_local_head", lambda cwd: state["head"])
+    monkeypatch.setattr(
+        setup_module,
+        "_remote_branches",
+        lambda cwd: ["origin/main"] if state["seeded"] else [],
+    )
+    monkeypatch.setattr(setup_module, "_remote_branch_exists", lambda cwd, branch: state["seeded"] and branch == "main")
+    monkeypatch.setattr(setup_module, "_run_git", fake_run_git)
+
+    setup_module._ensure_local_workspace_repo(
+        {
+            "id": "connection-id",
+            "repo_owner": "rebase",
+            "repo_name": "platform",
+            "default_branch": "main",
+        },
+        client=FakeClient(),
+    )
+
+    assert calls == [
+        ("git", (["fetch", "origin"], tmp_path, "fetch rebase/platform", 300)),
+        ("starter", "connection-id"),
+        ("git", (["fetch", "origin"], tmp_path, "fetch starter workflow", 300)),
+        ("git", (["checkout", "-B", "main", "origin/main"], tmp_path, "check out origin/main", 60)),
+    ]
+
+
 def test_github_connect_can_clone_workspace_repo_over_https(monkeypatch, tmp_path: Path) -> None:
     from rebase import setup as setup_module
 
@@ -1895,6 +1942,7 @@ def test_github_connect_rewrites_matching_https_origin_to_ssh(monkeypatch, tmp_p
     monkeypatch.setattr(setup_module, "_current_git_root", lambda: tmp_path)
     monkeypatch.setattr(setup_module, "_local_github_remote", lambda cwd=None: "rebase/platform")
     monkeypatch.setattr(setup_module, "_origin_url", lambda cwd: "https://github.com/rebase/platform.git")
+    monkeypatch.setattr(setup_module, "_has_local_head", lambda cwd: True)
     monkeypatch.setattr(
         setup_module,
         "_choose",
