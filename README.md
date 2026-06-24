@@ -173,10 +173,10 @@ Deploy a file from the command line:
 rebase deploy workflow.py
 ```
 
-Run a function from local source and force the Cloud Run backend:
+Run a function from local source and force the interactive backend:
 
 ```bash
-rebase run functions.py::add --backend cloud_run --param a=2 --param b=3
+rebase run functions.py::add --backend interactive --param a=2 --param b=3
 ```
 
 If the file contains exactly one Rebase function, the function name can be omitted:

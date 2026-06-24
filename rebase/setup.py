@@ -9,8 +9,12 @@ import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
+
+import requests
 
 from rebase.auth import (
     AuthError,
@@ -34,6 +38,11 @@ WORKSPACE_CREATION_QUOTA_ERROR = (
     "please contact us to increase it: hello@rebase.energy"
 )
 HANDLE_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{1,37}[a-z0-9])?$")
+HUGGINGFACE_CLIENT_ID_ENV = "REBASE_HUGGINGFACE_OAUTH_CLIENT_ID"
+HUGGINGFACE_DEVICE_URL = "https://huggingface.co/oauth/device"
+HUGGINGFACE_TOKEN_URL = "https://huggingface.co/oauth/token"
+HUGGINGFACE_DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
+HUGGINGFACE_DEFAULT_SCOPES = ("openid", "profile", "email", "write-repos")
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
@@ -104,7 +113,7 @@ BOLD = "\033[1m"
 DIM = "\033[2m"
 SELECTED_MARKER = f"{_ansi_color(BRAND_BRIGHT_GREEN)}●{RESET}"
 UNSELECTED_MARKER = f"{_ansi_color(BRAND_MEDIUM_GRAY)}○{RESET}"
-SETUP_STEPS = ("Authenticate", "Workspace", "GitHub")
+SETUP_STEPS = ("Authenticate", "Workspace")
 SECTION_RULE = "─" * 72
 
 
@@ -114,7 +123,7 @@ def _paint(text: str, *styles: str) -> str:
 
 def _intro() -> None:
     print(_paint("Rebase setup", BOLD, GREEN))
-    print(_paint("Connect your identity, workspace, and source repository.", DIM, MUTED))
+    print(_paint("Connect your identity and workspace.", DIM, MUTED))
     print()
 
 
@@ -402,18 +411,36 @@ def _choose(label: str, values: list[str], *, default: str | None = None, title:
     return selected
 
 
-def _git(args: list[str]) -> str | None:
+def _git(args: list[str], *, cwd: Path | None = None) -> str | None:
     try:
-        completed = subprocess.run(["git", *args], check=True, capture_output=True, text=True, timeout=5)
+        completed = subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
     value = completed.stdout.strip()
     return value or None
 
 
-def _local_github_remote() -> str | None:
-    owner, name = _parse_github_remote(_git(["config", "--get", "remote.origin.url"]))
+def _run_git(args: list[str], *, cwd: Path, action: str, timeout: float = 60) -> None:
+    try:
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True, timeout=timeout)
+    except OSError as exc:
+        raise RebaseWorkflowError(f"failed to {action}: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RebaseWorkflowError(f"timed out while trying to {action}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        suffix = f": {detail}" if detail else ""
+        raise RebaseWorkflowError(f"failed to {action}{suffix}") from exc
+
+
+def _local_github_remote(cwd: Path | None = None) -> str | None:
+    owner, name = _parse_github_remote(_git(["config", "--get", "remote.origin.url"], cwd=cwd))
     return f"{owner}/{name}" if owner and name else None
+
+
+def _current_git_root() -> Path | None:
+    root = _git(["rev-parse", "--show-toplevel"], cwd=Path.cwd())
+    return Path(root).resolve() if root else None
 
 
 def _validate_github_repo_full_name(value: str) -> str:
@@ -703,7 +730,7 @@ def _select_repo_scope(args: Any) -> str:
     return _choose("GitHub connection scope", ["workspace", "project"], default="workspace")
 
 
-def _connect_github(args: Any, client: Client, *, workspace_id: str) -> None:
+def _connect_github(args: Any, client: Client, *, workspace_id: str) -> dict[str, Any]:
     setup_status = {"installation_id": args.github_installation_id} if args.github_installation_id else None
     repo = None
     scope = _select_repo_scope(args)
@@ -740,7 +767,7 @@ def _connect_github(args: Any, client: Client, *, workspace_id: str) -> None:
                 _failure(f"Could not verify GitHub App access to {repo_full_name}")
                 raise RebaseWorkflowError(
                     f"GitHub App cannot access {repo_full_name}. "
-                    "Install or configure the Rebase GitHub App for this repository, then run rebase setup again."
+                    "Install or configure the Rebase GitHub App for this repository, then run rebase connect github."
                 ) from exc
         setup_status = {"installation_id": installation_id}
     installation_id = int(setup_status["installation_id"])
@@ -764,6 +791,375 @@ def _connect_github(args: Any, client: Client, *, workspace_id: str) -> None:
         project_id=project_id,
     )
     _success(f"Connected {connection['repo_owner']}/{connection['repo_name']} at {scope} level")
+    return connection
+
+
+def _repo_full_name_from_connection(connection: dict[str, Any]) -> str:
+    repo_owner = connection.get("repo_owner")
+    repo_name = connection.get("repo_name")
+    if not isinstance(repo_owner, str) or not repo_owner or not isinstance(repo_name, str) or not repo_name:
+        raise RebaseWorkflowError("GitHub repo connection response is missing repo_owner or repo_name")
+    return f"{repo_owner}/{repo_name}"
+
+
+def _workspace_github_connection(client: Client) -> dict[str, Any] | None:
+    connections = client.list_github_repo_connections()
+    workspace_connections = [
+        connection
+        for connection in connections
+        if connection.get("scope") == "workspace" and connection.get("project_id") is None
+    ]
+    return workspace_connections[-1] if workspace_connections else None
+
+
+def _ssh_clone_url(repo_full_name: str) -> str:
+    return f"git@github.com:{repo_full_name}.git"
+
+
+def _https_clone_url(repo_full_name: str) -> str:
+    return f"https://github.com/{repo_full_name}.git"
+
+
+def _origin_url(cwd: Path) -> str | None:
+    return _git(["config", "--get", "remote.origin.url"], cwd=cwd)
+
+
+def _remote_protocol(origin_url: str | None) -> str | None:
+    if origin_url is None:
+        return None
+    if origin_url.startswith("git@github.com:"):
+        return "SSH"
+    if origin_url.startswith("https://github.com/"):
+        return "HTTPS"
+    return None
+
+
+def _select_origin_url(repo_full_name: str, *, default_protocol: str = "SSH") -> str:
+    options = {
+        "SSH": _ssh_clone_url(repo_full_name),
+        "HTTPS": _https_clone_url(repo_full_name),
+    }
+    labels = [f"{protocol} ({url})" for protocol, url in options.items()]
+    default_label = f"{default_protocol} ({options[default_protocol]})"
+    selected = _choose("GitHub transport", labels, default=default_label, title="How should Git connect to GitHub?")
+    protocol = selected.split(" ", 1)[0]
+    return options[protocol]
+
+
+def _ensure_workspace_origin_transport(cwd: Path, repo_full_name: str) -> None:
+    origin_url = _origin_url(cwd)
+    owner, name = _parse_github_remote(origin_url)
+    if origin_url is None or owner is None or name is None:
+        return
+    if f"{owner}/{name}".lower() != repo_full_name.lower():
+        return
+
+    current_protocol = _remote_protocol(origin_url)
+    if current_protocol is None:
+        return
+    selected_url = _select_origin_url(repo_full_name, default_protocol=current_protocol)
+    if selected_url != origin_url:
+        _run_git(
+            ["remote", "set-url", "origin", selected_url],
+            cwd=cwd,
+            action="update GitHub origin",
+        )
+        _hint(f"Updated Git origin to use {_remote_protocol(selected_url)}.")
+
+
+def _directory_listing_for_prompt(path: Path) -> str:
+    names = sorted(entry.name for entry in path.iterdir())
+    if not names:
+        return "empty"
+    shown = ", ".join(names[:5])
+    if len(names) > 5:
+        shown += f", and {len(names) - 5} more"
+    return shown
+
+
+def _detect_remote_default_branch(cwd: Path) -> str:
+    remote_head = _git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=cwd)
+    if remote_head and remote_head.startswith("origin/"):
+        return remote_head.split("/", 1)[1]
+    branches = _git(["branch", "-r", "--format=%(refname:short)"], cwd=cwd)
+    if branches:
+        for branch in branches.splitlines():
+            if branch and branch != "origin/HEAD" and branch.startswith("origin/"):
+                return branch.split("/", 1)[1]
+    return "main"
+
+
+def _checkout_remote_branch(cwd: Path, *, default_branch: str | None) -> None:
+    branch = default_branch or _detect_remote_default_branch(cwd)
+    _run_git(
+        ["checkout", "-B", branch, f"origin/{branch}"],
+        cwd=cwd,
+        action=f"check out origin/{branch}",
+        timeout=60,
+    )
+
+
+def _clone_workspace_repo_into_current_directory(repo_full_name: str, *, default_branch: str | None) -> None:
+    cwd = Path.cwd()
+    contents = _directory_listing_for_prompt(cwd)
+    if not _confirm(
+        f"Current folder is not a git repository and contains: {contents}. "
+        f"Clone {repo_full_name} into this folder?",
+        default=True,
+    ):
+        raise RebaseWorkflowError(
+            "current folder is not a git repository. "
+            f"Run this command inside {repo_full_name}, or rerun it and choose Yes to clone the workspace repo."
+        )
+
+    _hint(f"Initializing current folder as {repo_full_name}. Existing local files are kept.")
+    _run_git(["init"], cwd=cwd, action="initialize a git repository")
+    if _origin_url(cwd) is None:
+        _run_git(
+            ["remote", "add", "origin", _select_origin_url(repo_full_name)],
+            cwd=cwd,
+            action="add GitHub origin",
+        )
+    else:
+        _ensure_workspace_origin_transport(cwd, repo_full_name)
+    _run_git(["fetch", "origin"], cwd=cwd, action=f"fetch {repo_full_name}", timeout=300)
+    _checkout_remote_branch(cwd, default_branch=default_branch)
+    _hint(f"Cloned {repo_full_name} into the current folder.")
+
+
+def _connection_default_branch(connection: dict[str, Any]) -> str | None:
+    default_branch = connection.get("default_branch")
+    return default_branch if isinstance(default_branch, str) and default_branch else None
+
+
+def _ensure_local_workspace_repo(connection: dict[str, Any]) -> None:
+    repo_full_name = _repo_full_name_from_connection(connection)
+    git_root = _current_git_root()
+    if git_root is None:
+        _clone_workspace_repo_into_current_directory(
+            repo_full_name,
+            default_branch=_connection_default_branch(connection),
+        )
+        git_root = _current_git_root()
+        if git_root is None:
+            raise RebaseWorkflowError(f"cloned {repo_full_name}, but could not find a git repository")
+
+    local_repo = _local_github_remote(git_root)
+    if local_repo is None:
+        raise RebaseWorkflowError(
+            "you are not in the same GitHub repo as your Rebase workspace. "
+            f"The active workspace is connected to {repo_full_name}, but this git repository has no GitHub origin."
+        )
+    if local_repo.lower() != repo_full_name.lower():
+        raise RebaseWorkflowError(
+            "you are not in the same GitHub repo as your Rebase workspace. "
+            f"The active workspace is connected to {repo_full_name}, but this folder uses {local_repo}."
+        )
+    _ensure_workspace_origin_transport(git_root, repo_full_name)
+    _success(f"Current folder is inside {repo_full_name}")
+
+
+def _verify_github_app_access(args: Any, client: Client, connection: dict[str, Any], *, workspace_id: str) -> None:
+    repo_full_name = _repo_full_name_from_connection(connection)
+    try:
+        _find_repo_installation(client, repo_full_name)
+    except RebaseWorkflowError:
+        _hint(f"The Rebase GitHub App is not visible for {repo_full_name}.")
+        _hint(f"Select {repo_full_name} when GitHub asks which repositories the Rebase App can access.")
+        _start_github_installation(args, client, workspace_id=workspace_id)
+        _read_input("Press Enter to verify GitHub App access again: ")
+        try:
+            _find_repo_installation(client, repo_full_name)
+        except RebaseWorkflowError as retry_exc:
+            raise RebaseWorkflowError(
+                f"GitHub App cannot access {repo_full_name}. "
+                "Install or configure the Rebase GitHub App for this repository, then run rebase connect github."
+            ) from retry_exc
+        _success(f"Verified Rebase GitHub App access to {repo_full_name}")
+        return
+    _success(f"Verified Rebase GitHub App access to {repo_full_name}")
+
+
+def _workspace_github_connect_args(args: Any) -> Any:
+    return SimpleNamespace(
+        profile=args.profile,
+        api_url=args.api_url,
+        no_browser=args.no_browser,
+        github_installation_id=args.github_installation_id,
+        github_timeout=args.github_timeout,
+        poll_interval=args.poll_interval,
+        repo=args.repo,
+        repo_scope="workspace",
+        repo_path=args.repo_path,
+        create_repo=args.create_repo,
+        project=None,
+    )
+
+
+def _huggingface_error(response: requests.Response, *, default: str) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text or default
+    if isinstance(payload, dict):
+        description = payload.get("error_description")
+        if isinstance(description, str) and description:
+            return description
+        error = payload.get("error")
+        if isinstance(error, str) and error:
+            return error
+    return default
+
+
+def _huggingface_scope_string(scopes: list[str] | None) -> str:
+    selected = scopes or list(HUGGINGFACE_DEFAULT_SCOPES)
+    cleaned: list[str] = []
+    for scope_value in selected:
+        for scope in scope_value.split():
+            if scope and scope not in cleaned:
+                cleaned.append(scope)
+    if not cleaned:
+        raise RebaseWorkflowError("at least one Hugging Face OAuth scope is required")
+    return " ".join(cleaned)
+
+
+def _resolve_huggingface_client_id(args: Any) -> str:
+    configured = getattr(args, "client_id", None) or os.getenv(HUGGINGFACE_CLIENT_ID_ENV)
+    if isinstance(configured, str) and configured.strip():
+        return configured.strip()
+    try:
+        config = Client(api_url=getattr(args, "api_url", None), profile=getattr(args, "profile", None)).setup_config()
+    except RebaseWorkflowError:
+        config = {}
+    value = config.get("huggingface_oauth_client_id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raise RebaseWorkflowError(
+        "Hugging Face OAuth client id is not configured. "
+        f"Set {HUGGINGFACE_CLIENT_ID_ENV} or pass --client-id."
+    )
+
+
+def _create_huggingface_device_code(*, client_id: str, scope: str) -> dict[str, Any]:
+    try:
+        response = requests.post(
+            HUGGINGFACE_DEVICE_URL,
+            data={"client_id": client_id, "scope": scope},
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise RebaseWorkflowError(f"could not start Hugging Face OAuth device flow: {exc}") from exc
+    if response.status_code >= 400:
+        raise RebaseWorkflowError(
+            _huggingface_error(response, default="could not start Hugging Face OAuth device flow")
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RebaseWorkflowError("expected Hugging Face device-code response to be JSON") from exc
+    if not isinstance(payload, dict):
+        raise RebaseWorkflowError("expected Hugging Face device-code response")
+    return payload
+
+
+def _start_huggingface_device_flow(args: Any, *, client_id: str, scope: str) -> dict[str, Any]:
+    device = _create_huggingface_device_code(client_id=client_id, scope=scope)
+    device_code = device.get("device_code")
+    verification_uri = device.get("verification_uri_complete") or device.get("verification_uri")
+    if not isinstance(device_code, str) or not device_code:
+        raise RebaseWorkflowError("Hugging Face device-code response is missing device_code")
+    if not isinstance(verification_uri, str) or not verification_uri:
+        raise RebaseWorkflowError("Hugging Face device-code response is missing verification_uri")
+    if getattr(args, "no_browser", False):
+        _hint("Open this URL to authorize Rebase with Hugging Face:")
+        print(verification_uri)
+    else:
+        webbrowser.open(verification_uri)
+        _hint("Opened browser for Hugging Face authorization")
+    user_code = device.get("user_code")
+    if isinstance(user_code, str) and user_code:
+        _hint("Enter this code in Hugging Face if prompted:")
+        print(user_code)
+    _hint("Waiting for Hugging Face authorization...")
+    return device
+
+
+def _wait_for_huggingface_token(args: Any, *, client_id: str, device: dict[str, Any]) -> str:
+    device_code = device["device_code"]
+    device_interval = device.get("interval")
+    interval = float(getattr(args, "poll_interval", None) or device_interval or 5)
+    expires_in = device.get("expires_in")
+    timeout = float(getattr(args, "timeout", None) or expires_in or 900)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            response = requests.post(
+                HUGGINGFACE_TOKEN_URL,
+                data={
+                    "grant_type": HUGGINGFACE_DEVICE_GRANT_TYPE,
+                    "device_code": device_code,
+                    "client_id": client_id,
+                },
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            raise RebaseWorkflowError(f"could not poll Hugging Face OAuth token: {exc}") from exc
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RebaseWorkflowError("expected Hugging Face token response to be JSON") from exc
+        if response.status_code < 400:
+            if isinstance(payload, dict) and isinstance(payload.get("access_token"), str):
+                return payload["access_token"]
+            raise RebaseWorkflowError("Hugging Face token response is missing access_token")
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if error == "authorization_pending":
+            time.sleep(interval)
+            continue
+        if error == "slow_down":
+            interval += 5
+            time.sleep(interval)
+            continue
+        if error == "expired_token":
+            raise RebaseWorkflowError("Hugging Face authorization expired")
+        if error == "access_denied":
+            raise RebaseWorkflowError("Hugging Face authorization was denied")
+        raise RebaseWorkflowError(
+            _huggingface_error(response, default="could not complete Hugging Face OAuth device flow")
+        )
+    raise RebaseWorkflowError("timed out waiting for Hugging Face authorization")
+
+
+def _save_huggingface_token(token: str, *, add_to_git_credential: bool) -> None:
+    login = _huggingface_login_function()
+    login(token=token, add_to_git_credential=add_to_git_credential, skip_if_logged_in=False)
+
+
+def _huggingface_login_function() -> Any:
+    try:
+        from huggingface_hub import login
+    except ImportError as exc:
+        raise RebaseWorkflowError(
+            "Install the Hugging Face extra before connecting: uv add 'rebase-toolkit[huggingface]' "
+            "or pip install 'rebase-toolkit[huggingface]'."
+        ) from exc
+    return login
+
+
+def run_connect_huggingface(args: Any) -> int:
+    _restore_terminal_for_prompts()
+    _section("Hugging Face")
+    _huggingface_login_function()
+    client_id = _resolve_huggingface_client_id(args)
+    scope = _huggingface_scope_string(getattr(args, "scope", None))
+    device = _start_huggingface_device_flow(args, client_id=client_id, scope=scope)
+    token = _wait_for_huggingface_token(args, client_id=client_id, device=device)
+    _save_huggingface_token(
+        token,
+        add_to_git_credential=bool(getattr(args, "add_to_git_credential", False)),
+    )
+    _success("Hugging Face token saved")
+    return 0
 
 
 def run_setup(args: Any) -> int:
@@ -784,22 +1180,7 @@ def run_setup(args: Any) -> int:
     path = write_profile(profile=args.profile, api_url=authed_client.api_url, workspace=workspace)
     _success(f"Using workspace {workspace_id}")
     _hint(f"Saved Rebase profile '{args.profile}' to {path}")
-    _section("GitHub", step=3, total=total_steps)
-    if args.github is False:
-        _hint("Run `rebase setup` again later to connect GitHub.")
-        _success("Setup complete")
-        return 0
-    if not config.get("github_app_configured"):
-        if args.github is True:
-            raise RebaseWorkflowError("GitHub connection is not configured on this workflow API")
-        _hint("GitHub connection is not available on this workflow API.")
-        _success("Setup complete")
-        return 0
-    should_connect = args.github is True or _confirm("Connect GitHub now?", default=False)
-    if should_connect:
-        _connect_github(args, authed_client, workspace_id=workspace_id)
-    else:
-        _hint("Run `rebase setup` again later to connect GitHub.")
+    _hint("Run `rebase connect github` when you are ready to add source backing.")
     _success("Setup complete")
     return 0
 
@@ -819,21 +1200,43 @@ def run_workspace_create(args: Any) -> int:
     path = write_profile(profile=args.profile, api_url=authed_client.api_url, workspace=workspace)
     _success(f"Created workspace {workspace_id}")
     _hint(f"Saved Rebase profile '{args.profile}' to {path}")
-
-    if args.github is False:
-        _hint("Run `rebase workspace create` again later with --github to connect GitHub.")
-        _success("Workspace create complete")
-        return 0
-    if not config.get("github_app_configured"):
-        if args.github is True:
-            raise RebaseWorkflowError("GitHub connection is not configured on this workflow API")
-        _hint("GitHub connection is not available on this workflow API.")
-        _success("Workspace create complete")
-        return 0
-    should_connect = args.github is True or _confirm("Connect GitHub now?", default=False)
-    if should_connect:
-        _connect_github(args, authed_client, workspace_id=workspace_id)
-    else:
-        _hint("Run `rebase workspace create` again later with --github to connect GitHub.")
+    _hint("Run `rebase connect github` when you are ready to add source backing.")
     _success("Workspace create complete")
+    return 0
+
+
+def run_connect_github(args: Any) -> int:
+    _restore_terminal_for_prompts()
+    client = Client(api_url=args.api_url, profile=args.profile)
+    config = client.setup_config()
+    if not config.get("github_app_configured"):
+        raise RebaseWorkflowError("GitHub connection is not configured on this workflow API")
+    workspace_id = getattr(client, "workspace_id", None)
+    if not isinstance(workspace_id, str) or not workspace_id:
+        raise RebaseWorkflowError("no workspace profile configured. Run `rebase setup` first.")
+
+    total_steps = 3
+    _section("Workspace GitHub Repo", step=1, total=total_steps)
+    connection = _workspace_github_connection(client)
+    if connection is None:
+        _hint("No workspace-level GitHub repository connection found.")
+        created_connection = _connect_github(_workspace_github_connect_args(args), client, workspace_id=workspace_id)
+        connection = _workspace_github_connection(client) or created_connection
+        if connection is None:
+            raise RebaseWorkflowError("workspace GitHub repo connection was not saved")
+    else:
+        repo_full_name = _repo_full_name_from_connection(connection)
+        if args.repo and args.repo.lower() != repo_full_name.lower():
+            raise RebaseWorkflowError(
+                f"active workspace is already connected to {repo_full_name}, but --repo requested {args.repo}"
+            )
+        _success(f"Workspace is connected to {repo_full_name}")
+
+    _section("Local Git Repository", step=2, total=total_steps)
+    _ensure_local_workspace_repo(connection)
+
+    _section("GitHub App", step=3, total=total_steps)
+    _verify_github_app_access(args, client, connection, workspace_id=workspace_id)
+
+    _success("GitHub workspace connection complete")
     return 0

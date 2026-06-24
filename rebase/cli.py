@@ -46,6 +46,8 @@ from rebase.client import (
     Run,
     Step,
     Workflow,
+    _validate_function_backend,
+    _validate_workflow_backend,
 )
 from rebase.config import (
     DEFAULT_PROFILE,
@@ -151,6 +153,13 @@ api_key_app = typer.Typer(
     add_completion=False,
     cls=AlphabeticalTyperGroup,
     help="Create, list, and revoke workspace API keys.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+connect_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Connect external services to the active workspace.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -409,23 +418,26 @@ def _parse_run_parameters(parameters_json: str | None, parameters: Iterable[str]
 def _validate_backend_override(backend: str | None) -> FunctionBackend | None:
     if backend is None:
         return None
-    if backend not in {"modal", "prefect", "prefect_cloud", "cloud_run", "cloud_run_shared", "cloud_run_jobs"}:
+    try:
+        return _validate_function_backend(backend)
+    except ValueError as exc:
         raise RebaseWorkflowError(
-            "backend must be 'modal', 'prefect', 'prefect_cloud', 'cloud_run', "
+            "backend must be 'interactive', 'batch', 'modal', 'prefect', 'prefect_cloud', 'cloud_run', "
             "'cloud_run_shared', or 'cloud_run_jobs'"
-        )
-    return backend
+        ) from exc
 
 
 def _validate_run_backend_override(backend: str | None, target: RunnableTarget) -> str | None:
     if backend is None:
         return None
     if isinstance(target, Workflow):
-        if backend not in {"prefect", "prefect_cloud_run_jobs", "prefect_cloud_run_service"}:
+        try:
+            return _validate_workflow_backend(backend)
+        except ValueError as exc:
             raise RebaseWorkflowError(
-                "workflow backend must be 'prefect', 'prefect_cloud_run_jobs', or 'prefect_cloud_run_service'"
-            )
-        return backend
+                "workflow backend must be 'interactive', 'batch', 'prefect', 'prefect_cloud_run_jobs', "
+                "or 'prefect_cloud_run_service'"
+            ) from exc
     return _validate_backend_override(backend)
 
 
@@ -1450,7 +1462,7 @@ def setup_command(
     ] = 300,
     no_browser: Annotated[
         bool,
-        typer.Option("--no-browser", help="Print URLs instead of opening the browser."),
+        typer.Option("--no-browser", help="Print auth URLs instead of opening the browser."),
     ] = False,
     workspace: Annotated[str | None, typer.Option("--workspace", help="Workspace id to use or create.")] = None,
     workspace_name: Annotated[
@@ -1461,44 +1473,8 @@ def setup_command(
         str | None,
         typer.Option("--handle", help="Unique Rebase user handle to claim during setup."),
     ] = None,
-    github: Annotated[
-        bool | None,
-        typer.Option("--github/--no-github", help="Connect or skip GitHub during setup."),
-    ] = None,
-    github_installation_id: Annotated[
-        int | None,
-        typer.Option("--github-installation-id", help="Existing GitHub App installation id."),
-    ] = None,
-    github_timeout: Annotated[
-        float,
-        typer.Option("--github-timeout", help="Seconds to wait for GitHub installation."),
-    ] = 300,
-    poll_interval: Annotated[
-        float,
-        typer.Option("--poll-interval", help="Seconds between GitHub setup status checks."),
-    ] = 1.0,
-    repo: Annotated[
-        str | None,
-        typer.Option("--repo", help="GitHub repository full name, for example owner/name."),
-    ] = None,
-    repo_scope: Annotated[
-        str | None,
-        typer.Option("--repo-scope", help="Connect repo at workspace or project level."),
-    ] = None,
-    repo_path: Annotated[
-        str | None,
-        typer.Option("--repo-path", help="Optional path inside the repository."),
-    ] = None,
-    create_repo: Annotated[
-        bool,
-        typer.Option("--create-repo", help="Open GitHub to create a repository during setup."),
-    ] = False,
-    project: Annotated[
-        str | None,
-        typer.Option("--project", help="Project name for project-level repo connections."),
-    ] = None,
 ) -> None:
-    """Authenticate and configure Rebase on this computer."""
+    """Authenticate and select a Rebase workspace on this computer."""
     if api_key is None:
         from rebase.setup import run_setup
 
@@ -1515,15 +1491,6 @@ def setup_command(
                     workspace=workspace,
                     workspace_name=workspace_name,
                     handle=handle,
-                    github=github,
-                    github_installation_id=github_installation_id,
-                    github_timeout=github_timeout,
-                    poll_interval=poll_interval,
-                    repo=repo,
-                    repo_scope=repo_scope,
-                    repo_path=repo_path,
-                    create_repo=create_repo,
-                    project=project,
                 )
             )
         except KeyboardInterrupt:
@@ -1628,46 +1595,10 @@ def workspace_create_command(
     ] = 300,
     no_browser: Annotated[
         bool,
-        typer.Option("--no-browser", help="Print URLs instead of opening the browser."),
+        typer.Option("--no-browser", help="Print auth URLs instead of opening the browser."),
     ] = False,
-    github: Annotated[
-        bool | None,
-        typer.Option("--github/--no-github", help="Connect or skip GitHub after workspace creation."),
-    ] = None,
-    github_installation_id: Annotated[
-        int | None,
-        typer.Option("--github-installation-id", help="Existing GitHub App installation id."),
-    ] = None,
-    github_timeout: Annotated[
-        float,
-        typer.Option("--github-timeout", help="Seconds to wait for GitHub installation."),
-    ] = 300,
-    poll_interval: Annotated[
-        float,
-        typer.Option("--poll-interval", help="Seconds between GitHub setup status checks."),
-    ] = 1.0,
-    repo: Annotated[
-        str | None,
-        typer.Option("--repo", help="GitHub repository full name, for example owner/name."),
-    ] = None,
-    repo_scope: Annotated[
-        str | None,
-        typer.Option("--repo-scope", help="Connect repo at workspace or project level."),
-    ] = None,
-    repo_path: Annotated[
-        str | None,
-        typer.Option("--repo-path", help="Optional path inside the repository."),
-    ] = None,
-    create_repo: Annotated[
-        bool,
-        typer.Option("--create-repo", help="Open GitHub to create a repository during setup."),
-    ] = False,
-    project: Annotated[
-        str | None,
-        typer.Option("--project", help="Project name for project-level repo connections."),
-    ] = None,
 ) -> None:
-    """Create a workspace and optionally connect GitHub source backing."""
+    """Create a workspace and save it as a local profile."""
     from rebase.setup import run_workspace_create
 
     try:
@@ -1683,15 +1614,6 @@ def workspace_create_command(
                 callback_port=callback_port,
                 auth_timeout=auth_timeout,
                 no_browser=no_browser,
-                github=github,
-                github_installation_id=github_installation_id,
-                github_timeout=github_timeout,
-                poll_interval=poll_interval,
-                repo=repo,
-                repo_scope=repo_scope,
-                repo_path=repo_path,
-                create_repo=create_repo,
-                project=project,
             )
         )
     except KeyboardInterrupt:
@@ -1800,6 +1722,132 @@ def workspace_usage_command(
 
 
 app.add_typer(workspace_app, name="workspace")
+
+
+@connect_app.command("github")
+def connect_github_command(
+    profile: Annotated[str, typer.Option("--profile", help="Credential profile name.")] = DEFAULT_PROFILE,
+    api_url: Annotated[
+        str | None,
+        typer.Option(
+            "--api-url",
+            help="Rebase API URL to use for this connection. Useful for local development with port-forwarding.",
+        ),
+    ] = None,
+    no_browser: Annotated[
+        bool,
+        typer.Option("--no-browser", help="Print GitHub URLs instead of opening the browser."),
+    ] = False,
+    github_installation_id: Annotated[
+        int | None,
+        typer.Option("--github-installation-id", help="Existing GitHub App installation id."),
+    ] = None,
+    github_timeout: Annotated[
+        float,
+        typer.Option("--github-timeout", help="Seconds to wait for GitHub installation."),
+    ] = 300,
+    poll_interval: Annotated[
+        float,
+        typer.Option("--poll-interval", help="Seconds between GitHub setup status checks."),
+    ] = 1.0,
+    repo: Annotated[
+        str | None,
+        typer.Option("--repo", help="GitHub repository full name, for example owner/name."),
+    ] = None,
+    repo_path: Annotated[
+        str | None,
+        typer.Option("--repo-path", help="Optional path inside the repository."),
+    ] = None,
+    create_repo: Annotated[
+        bool,
+        typer.Option("--create-repo", help="Open GitHub to create a repository before installing the app."),
+    ] = False,
+) -> None:
+    """Connect and verify workspace-level GitHub source backing."""
+    from rebase.setup import run_connect_github
+
+    try:
+        run_connect_github(
+            SimpleNamespace(
+                profile=profile,
+                api_url=api_url,
+                no_browser=no_browser,
+                github_installation_id=github_installation_id,
+                github_timeout=github_timeout,
+                poll_interval=poll_interval,
+                repo=repo,
+                repo_path=repo_path,
+                create_repo=create_repo,
+            )
+        )
+    except KeyboardInterrupt:
+        error_console.print("Aborted.", style="rebase.error")
+        raise SystemExit(130) from None
+
+
+@connect_app.command("huggingface")
+def connect_huggingface_command(
+    profile: Annotated[str, typer.Option("--profile", help="Credential profile name.")] = DEFAULT_PROFILE,
+    api_url: Annotated[
+        str | None,
+        typer.Option(
+            "--api-url",
+            help="Rebase API URL to read setup configuration from. Useful for local development.",
+        ),
+    ] = None,
+    client_id: Annotated[
+        str | None,
+        typer.Option(
+            "--client-id",
+            help="Hugging Face public OAuth app client id. Defaults to REBASE_HUGGINGFACE_OAUTH_CLIENT_ID.",
+        ),
+    ] = None,
+    scope: Annotated[
+        list[str] | None,
+        typer.Option("--scope", help="Hugging Face OAuth scope. Repeat to override the default publish scopes."),
+    ] = None,
+    no_browser: Annotated[
+        bool,
+        typer.Option("--no-browser", help="Print the Hugging Face authorization URL instead of opening a browser."),
+    ] = False,
+    timeout: Annotated[
+        float,
+        typer.Option("--timeout", help="Seconds to wait for Hugging Face authorization."),
+    ] = 900,
+    poll_interval: Annotated[
+        float | None,
+        typer.Option("--poll-interval", help="Seconds between Hugging Face token polls."),
+    ] = None,
+    add_to_git_credential: Annotated[
+        bool,
+        typer.Option(
+            "--add-to-git-credential/--no-add-to-git-credential",
+            help="Also store the token in Git's credential helper for Hugging Face Git operations.",
+        ),
+    ] = False,
+) -> None:
+    """Connect local Hugging Face auth for model publication."""
+    from rebase.setup import run_connect_huggingface
+
+    try:
+        run_connect_huggingface(
+            SimpleNamespace(
+                profile=profile,
+                api_url=api_url,
+                client_id=client_id,
+                scope=scope,
+                no_browser=no_browser,
+                timeout=timeout,
+                poll_interval=poll_interval,
+                add_to_git_credential=add_to_git_credential,
+            )
+        )
+    except KeyboardInterrupt:
+        error_console.print("Aborted.", style="rebase.error")
+        raise SystemExit(130) from None
+
+
+app.add_typer(connect_app, name="connect")
 
 
 @api_key_app.command("list")

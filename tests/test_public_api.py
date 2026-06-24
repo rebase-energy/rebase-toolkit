@@ -1,3 +1,4 @@
+import inspect
 from typing import Any
 
 import pytest
@@ -98,6 +99,12 @@ def test_step_helper_defaults_project() -> None:
     assert isinstance(load_name, Step)
     assert load_name.project == "default"
     assert load_name.name == "load-name"
+
+
+def test_step_public_signatures_do_not_expose_backend() -> None:
+    assert "backend" not in inspect.signature(rb.step).parameters
+    assert "backend" not in inspect.signature(Project.step).parameters
+    assert "backend" not in inspect.signature(Step).parameters
 
 
 def test_workflow_helper_creates_workflow_handle() -> None:

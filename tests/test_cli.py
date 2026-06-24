@@ -30,6 +30,7 @@ def test_main_without_args_prints_help(capsys) -> None:
     assert "inspect submitted runs" in output
     command_order = [
         "api-key",
+        "connect",
         "deploy",
         "endpoint",
         "function",
@@ -740,7 +741,6 @@ def test_setup_wizard_stores_supabase_profile(monkeypatch, tmp_path: Path, capsy
                 "https://workflows.example.com",
                 "--workspace",
                 "default",
-                "--no-github",
             ]
         )
         == 0
@@ -758,9 +758,10 @@ def test_setup_wizard_stores_supabase_profile(monkeypatch, tmp_path: Path, capsy
         },
     }
     output = capsys.readouterr().out
-    assert "Step 1 of 3: Authenticate" in output
-    assert "Step 2 of 3: Workspace" in output
-    assert "Step 3 of 3: GitHub" in output
+    assert "Step 1 of 2: Authenticate" in output
+    assert "Step 2 of 2: Workspace" in output
+    assert "Step 3" not in output
+    assert "rebase connect github" in output
     assert "────────────────" in output
 
 
@@ -999,7 +1000,7 @@ def test_setup_workspace_create_claims_profile_handle_first(monkeypatch) -> None
     ]
 
 
-def test_workspace_create_helper_creates_before_github_prompt(monkeypatch, tmp_path: Path) -> None:
+def test_workspace_create_helper_creates_workspace_without_github_prompt(monkeypatch, tmp_path: Path) -> None:
     from rebase import setup as setup_module
 
     calls: list[str] = []
@@ -1034,16 +1035,8 @@ def test_workspace_create_helper_creates_before_github_prompt(monkeypatch, tmp_p
     monkeypatch.setattr(setup_module, "Client", FakeClient)
     monkeypatch.setattr(setup_module, "_access_token", lambda args, config: "access-token")
     monkeypatch.setattr(setup_module, "load_session", lambda: SimpleNamespace(email="sebastian@rebase.energy"))
-    monkeypatch.setattr(
-        setup_module,
-        "_confirm",
-        lambda message, *, default: calls.append(f"confirm:{message}") or True,
-    )
-    monkeypatch.setattr(
-        setup_module,
-        "_connect_github",
-        lambda args, client, *, workspace_id: calls.append(f"connect_github:{workspace_id}"),
-    )
+    monkeypatch.setattr(setup_module, "_confirm", lambda *args, **kwargs: calls.append("confirm") or True)
+    monkeypatch.setattr(setup_module, "_connect_github", lambda *args, **kwargs: calls.append("connect_github"))
 
     assert (
         setup_module.run_workspace_create(
@@ -1053,7 +1046,6 @@ def test_workspace_create_helper_creates_before_github_prompt(monkeypatch, tmp_p
                 workspace="energy-team",
                 workspace_name="Energy Team",
                 handle=None,
-                github=None,
             )
         )
         == 0
@@ -1063,8 +1055,6 @@ def test_workspace_create_helper_creates_before_github_prompt(monkeypatch, tmp_p
         "setup_config",
         "get_profile",
         "create_workspace:energy-team:Energy Team",
-        "confirm:Connect GitHub now?",
-        "connect_github:energy-team",
     ]
     data = json.loads(config_path.read_text(encoding="utf-8"))
     assert data["default_profile"] == "new"
@@ -1112,11 +1102,104 @@ def test_workspace_create_helper_stops_before_github_when_quota_is_exhausted(mon
                 workspace="energy-team",
                 workspace_name=None,
                 handle=None,
-                github=None,
             )
         )
 
     assert calls == ["create_workspace:energy-team"]
+
+
+def test_connect_huggingface_helper_runs_device_flow(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[str] = []
+
+    class FakeResponse:
+        def __init__(self, status_code: int, payload: dict[str, Any]) -> None:
+            self.status_code = status_code
+            self._payload = payload
+            self.text = json.dumps(payload)
+
+        def json(self) -> dict[str, Any]:
+            return self._payload
+
+    def fake_post(url: str, *, data: dict[str, Any], timeout: int) -> FakeResponse:
+        calls.append(f"post:{url}:{data['client_id']}")
+        if url == setup_module.HUGGINGFACE_DEVICE_URL:
+            assert data["scope"] == "openid profile email write-repos"
+            return FakeResponse(
+                200,
+                {
+                    "device_code": "device-code",
+                    "user_code": "ABCD-EFGH",
+                    "verification_uri": "https://huggingface.co/activate",
+                    "interval": 0,
+                    "expires_in": 300,
+                },
+            )
+        assert url == setup_module.HUGGINGFACE_TOKEN_URL
+        return FakeResponse(200, {"access_token": "hf_oauth_token", "token_type": "bearer"})
+
+    monkeypatch.setenv(setup_module.HUGGINGFACE_CLIENT_ID_ENV, "hf-client")
+    monkeypatch.setattr(setup_module, "_huggingface_login_function", lambda: (lambda **kwargs: None))
+    monkeypatch.setattr(setup_module.requests, "post", fake_post)
+    monkeypatch.setattr(setup_module.webbrowser, "open", lambda url: calls.append(f"open:{url}"))
+    monkeypatch.setattr(
+        setup_module,
+        "_save_huggingface_token",
+        lambda token, *, add_to_git_credential: calls.append(f"save:{token}:{add_to_git_credential}"),
+    )
+
+    assert (
+        setup_module.run_connect_huggingface(
+            SimpleNamespace(
+                profile="default",
+                api_url=None,
+                client_id=None,
+                scope=None,
+                no_browser=False,
+                timeout=10,
+                poll_interval=0,
+                add_to_git_credential=True,
+            )
+        )
+        == 0
+    )
+
+    assert calls == [
+        f"post:{setup_module.HUGGINGFACE_DEVICE_URL}:hf-client",
+        "open:https://huggingface.co/activate",
+        f"post:{setup_module.HUGGINGFACE_TOKEN_URL}:hf-client",
+        "save:hf_oauth_token:True",
+    ]
+
+
+def test_connect_huggingface_helper_requires_client_id(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    class FakeClient:
+        def __init__(self, *, api_url: str | None = None, profile: str | None = None) -> None:
+            pass
+
+        def setup_config(self) -> dict[str, Any]:
+            return {}
+
+    monkeypatch.delenv(setup_module.HUGGINGFACE_CLIENT_ID_ENV, raising=False)
+    monkeypatch.setattr(setup_module, "Client", FakeClient)
+    monkeypatch.setattr(setup_module, "_huggingface_login_function", lambda: (lambda **kwargs: None))
+
+    with pytest.raises(setup_module.RebaseWorkflowError, match="OAuth client id"):
+        setup_module.run_connect_huggingface(
+            SimpleNamespace(
+                profile="default",
+                api_url=None,
+                client_id=None,
+                scope=None,
+                no_browser=True,
+                timeout=10,
+                poll_interval=0,
+                add_to_git_credential=False,
+            )
+        )
 
 
 def test_setup_repo_creation_uses_action_selector(monkeypatch) -> None:
@@ -1401,6 +1484,303 @@ def test_setup_existing_repo_requires_owner_name() -> None:
         raise AssertionError("expected invalid repo format")
 
 
+def test_connect_github_helper_uses_existing_workspace_connection(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[str] = []
+    connection = {
+        "scope": "workspace",
+        "project_id": None,
+        "repo_owner": "rebase",
+        "repo_name": "platform",
+    }
+
+    class FakeClient:
+        def __init__(self, *, api_url: str | None = None, profile: str | None = None) -> None:
+            self.api_url = api_url or "https://api.example.test"
+            self.profile = profile
+            self.workspace_id = "energy-team"
+            calls.append(f"client:{self.api_url}:{profile}")
+
+        def setup_config(self) -> dict[str, Any]:
+            calls.append("setup_config")
+            return {"github_app_configured": True}
+
+        def list_github_repo_connections(self) -> list[dict[str, Any]]:
+            calls.append("list_connections")
+            return [connection]
+
+    monkeypatch.setattr(setup_module, "Client", FakeClient)
+    monkeypatch.setattr(
+        setup_module,
+        "_ensure_local_workspace_repo",
+        lambda selected: calls.append(f"local:{selected['repo_owner']}/{selected['repo_name']}"),
+    )
+    monkeypatch.setattr(
+        setup_module,
+        "_verify_github_app_access",
+        lambda args, client, selected, *, workspace_id: calls.append(f"app:{workspace_id}:{args.repo}"),
+    )
+
+    assert (
+        setup_module.run_connect_github(
+            SimpleNamespace(
+                profile="energy",
+                api_url="https://api.example.test",
+                no_browser=True,
+                github_installation_id=None,
+                github_timeout=1,
+                poll_interval=0,
+                repo="rebase/platform",
+                repo_path=None,
+                create_repo=False,
+            )
+        )
+        == 0
+    )
+
+    assert calls == [
+        "client:https://api.example.test:energy",
+        "setup_config",
+        "list_connections",
+        "local:rebase/platform",
+        "app:energy-team:rebase/platform",
+    ]
+
+
+def test_connect_github_helper_creates_missing_workspace_connection(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[str] = []
+    connection = {
+        "scope": "workspace",
+        "project_id": None,
+        "repo_owner": "rebase",
+        "repo_name": "platform",
+    }
+
+    class FakeClient:
+        def __init__(self, *, api_url: str | None = None, profile: str | None = None) -> None:
+            self.api_url = api_url or "https://api.example.test"
+            self.workspace_id = "energy-team"
+
+        def setup_config(self) -> dict[str, Any]:
+            return {"github_app_configured": True}
+
+        def list_github_repo_connections(self) -> list[dict[str, Any]]:
+            calls.append("list_connections")
+            return []
+
+    def fake_connect(args: Any, client: Any, *, workspace_id: str) -> dict[str, Any]:
+        calls.append(f"connect:{workspace_id}:{args.repo_scope}:{args.project}")
+        return connection
+
+    monkeypatch.setattr(setup_module, "Client", FakeClient)
+    monkeypatch.setattr(setup_module, "_connect_github", fake_connect)
+    monkeypatch.setattr(setup_module, "_ensure_local_workspace_repo", lambda selected: calls.append("local"))
+    monkeypatch.setattr(setup_module, "_verify_github_app_access", lambda *args, **kwargs: calls.append("app"))
+
+    assert (
+        setup_module.run_connect_github(
+            SimpleNamespace(
+                profile="energy",
+                api_url=None,
+                no_browser=True,
+                github_installation_id=None,
+                github_timeout=1,
+                poll_interval=0,
+                repo="rebase/platform",
+                repo_path=None,
+                create_repo=False,
+            )
+        )
+        == 0
+    )
+
+    assert calls == ["list_connections", "connect:energy-team:workspace:None", "list_connections", "local", "app"]
+
+
+def test_github_connect_local_repo_must_match_workspace(monkeypatch, tmp_path: Path) -> None:
+    from rebase import setup as setup_module
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(setup_module, "_current_git_root", lambda: tmp_path)
+    monkeypatch.setattr(setup_module, "_local_github_remote", lambda cwd=None: "rebase/other")
+
+    with pytest.raises(setup_module.RebaseWorkflowError, match="same GitHub repo"):
+        setup_module._ensure_local_workspace_repo({"repo_owner": "rebase", "repo_name": "platform"})
+
+
+def test_github_connect_clones_workspace_repo_when_current_folder_has_only_venv(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[tuple[list[str], Path, str, float]] = []
+    state: dict[str, Path | None] = {"root": None}
+    (tmp_path / ".venv").mkdir()
+
+    def fake_run_git(args: list[str], *, cwd: Path, action: str, timeout: float = 60) -> None:
+        calls.append((args, cwd, action, timeout))
+        if args == ["init"]:
+            state["root"] = tmp_path
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(setup_module, "_confirm", lambda message, *, default: True)
+    monkeypatch.setattr(
+        setup_module,
+        "_choose",
+        lambda label, values, *, default=None, title=None: "SSH (git@github.com:rebase/platform.git)",
+    )
+    monkeypatch.setattr(setup_module, "_current_git_root", lambda: state["root"])
+    monkeypatch.setattr(setup_module, "_local_github_remote", lambda cwd=None: "rebase/platform")
+    monkeypatch.setattr(setup_module, "_run_git", fake_run_git)
+
+    setup_module._ensure_local_workspace_repo(
+        {"repo_owner": "rebase", "repo_name": "platform", "default_branch": "main"}
+    )
+
+    assert calls == [
+        (
+            ["init"],
+            tmp_path,
+            "initialize a git repository",
+            60,
+        ),
+        (
+            ["remote", "add", "origin", "git@github.com:rebase/platform.git"],
+            tmp_path,
+            "add GitHub origin",
+            60,
+        ),
+        (
+            ["fetch", "origin"],
+            tmp_path,
+            "fetch rebase/platform",
+            300,
+        ),
+        (
+            ["checkout", "-B", "main", "origin/main"],
+            tmp_path,
+            "check out origin/main",
+            60,
+        )
+    ]
+
+
+def test_github_connect_can_clone_workspace_repo_over_https(monkeypatch, tmp_path: Path) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[list[str]] = []
+    state: dict[str, Path | None] = {"root": None}
+
+    def fake_run_git(args: list[str], *, cwd: Path, action: str, timeout: float = 60) -> None:
+        _ = cwd, action, timeout
+        calls.append(args)
+        if args == ["init"]:
+            state["root"] = tmp_path
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(setup_module, "_confirm", lambda message, *, default: True)
+    monkeypatch.setattr(
+        setup_module,
+        "_choose",
+        lambda label, values, *, default=None, title=None: "HTTPS (https://github.com/rebase/platform.git)",
+    )
+    monkeypatch.setattr(setup_module, "_current_git_root", lambda: state["root"])
+    monkeypatch.setattr(setup_module, "_local_github_remote", lambda cwd=None: "rebase/platform")
+    monkeypatch.setattr(setup_module, "_run_git", fake_run_git)
+
+    setup_module._ensure_local_workspace_repo(
+        {"repo_owner": "rebase", "repo_name": "platform", "default_branch": "main"}
+    )
+
+    assert ["remote", "add", "origin", "https://github.com/rebase/platform.git"] in calls
+
+
+def test_github_connect_rewrites_matching_https_origin_to_ssh(monkeypatch, tmp_path: Path) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[tuple[list[str], Path, str]] = []
+
+    def fake_run_git(args: list[str], *, cwd: Path, action: str, timeout: float = 60) -> None:
+        _ = timeout
+        calls.append((args, cwd, action))
+
+    monkeypatch.setattr(setup_module, "_current_git_root", lambda: tmp_path)
+    monkeypatch.setattr(setup_module, "_local_github_remote", lambda cwd=None: "rebase/platform")
+    monkeypatch.setattr(setup_module, "_origin_url", lambda cwd: "https://github.com/rebase/platform.git")
+    monkeypatch.setattr(
+        setup_module,
+        "_choose",
+        lambda label, values, *, default=None, title=None: "SSH (git@github.com:rebase/platform.git)",
+    )
+    monkeypatch.setattr(setup_module, "_run_git", fake_run_git)
+
+    setup_module._ensure_local_workspace_repo({"repo_owner": "rebase", "repo_name": "platform"})
+
+    assert calls == [
+        (
+            ["remote", "set-url", "origin", "git@github.com:rebase/platform.git"],
+            tmp_path,
+            "update GitHub origin",
+        )
+    ]
+
+
+def test_github_connect_stops_when_user_declines_clone(monkeypatch, tmp_path: Path) -> None:
+    from rebase import setup as setup_module
+
+    (tmp_path / "workflow.py").write_text("print('hello')\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(setup_module, "_confirm", lambda message, *, default: False)
+    monkeypatch.setattr(setup_module, "_current_git_root", lambda: None)
+
+    with pytest.raises(setup_module.RebaseWorkflowError, match="choose Yes"):
+        setup_module._ensure_local_workspace_repo({"repo_owner": "rebase", "repo_name": "platform"})
+
+
+def test_github_connect_verifies_app_after_install_retry(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[str] = []
+
+    class FakeClient:
+        attempts = 0
+
+        def find_github_repository_installation(self, repo_full_name: str) -> dict[str, Any]:
+            calls.append(f"find:{repo_full_name}")
+            self.attempts += 1
+            if self.attempts == 1:
+                raise setup_module.RebaseWorkflowError("not installed")
+            return {
+                "installation_id": 123,
+                "repository": {"id": 456, "owner": "rebase", "name": "platform"},
+            }
+
+    monkeypatch.setattr(
+        setup_module,
+        "_start_github_installation",
+        lambda args, client, *, workspace_id: calls.append(f"install:{workspace_id}") or {},
+    )
+    monkeypatch.setattr(setup_module, "_read_input", lambda message: calls.append(message) or "")
+
+    setup_module._verify_github_app_access(
+        SimpleNamespace(no_browser=True),
+        FakeClient(),
+        {"repo_owner": "rebase", "repo_name": "platform"},
+        workspace_id="energy-team",
+    )
+
+    assert calls == [
+        "find:rebase/platform",
+        "install:energy-team",
+        "Press Enter to verify GitHub App access again: ",
+        "find:rebase/platform",
+    ]
+
+
 def test_main_keyboard_interrupt_aborts_cleanly(monkeypatch, capsys) -> None:
     def interrupting_app(*args: Any, **kwargs: Any) -> None:
         raise KeyboardInterrupt
@@ -1503,9 +1883,6 @@ def test_workspace_create_command_dispatches_to_setup_helper(monkeypatch) -> Non
                 "Energy Team",
                 "--profile",
                 "energy",
-                "--github",
-                "--repo",
-                "rebase/platform",
             ]
         )
         == 0
@@ -1514,8 +1891,66 @@ def test_workspace_create_command_dispatches_to_setup_helper(monkeypatch) -> Non
     assert observed["workspace"] == "energy-team"
     assert observed["workspace_name"] == "Energy Team"
     assert observed["profile"] == "energy"
-    assert observed["github"] is True
+
+
+def test_connect_github_command_dispatches_to_setup_helper(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_run_connect_github(args: Any) -> int:
+        observed.update(vars(args))
+        return 0
+
+    monkeypatch.setattr("rebase.setup.run_connect_github", fake_run_connect_github)
+
+    assert (
+        main(
+            [
+                "connect",
+                "github",
+                "--profile",
+                "energy",
+                "--repo",
+                "rebase/platform",
+                "--create-repo",
+            ]
+        )
+        == 0
+    )
+
+    assert observed["profile"] == "energy"
     assert observed["repo"] == "rebase/platform"
+    assert observed["create_repo"] is True
+
+
+def test_connect_huggingface_command_dispatches_to_setup_helper(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_run_connect_huggingface(args: Any) -> int:
+        observed.update(vars(args))
+        return 0
+
+    monkeypatch.setattr("rebase.setup.run_connect_huggingface", fake_run_connect_huggingface)
+
+    assert (
+        main(
+            [
+                "connect",
+                "huggingface",
+                "--client-id",
+                "hf-client",
+                "--scope",
+                "openid",
+                "--scope",
+                "write-repos",
+                "--add-to-git-credential",
+            ]
+        )
+        == 0
+    )
+
+    assert observed["client_id"] == "hf-client"
+    assert observed["scope"] == ["openid", "write-repos"]
+    assert observed["add_to_git_credential"] is True
 
 
 def test_workspace_invite_email_target(monkeypatch, capsys) -> None:

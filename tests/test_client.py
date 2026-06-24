@@ -270,6 +270,28 @@ def test_find_github_repository_installation_gets_repo_full_name(monkeypatch) ->
     }
 
 
+def test_list_github_repo_connections_gets_workspace_connections(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["params"] = kwargs["params"]
+        return FakeResponse([{"repo_owner": "rebase", "repo_name": "platform", "scope": "workspace"}])
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    response = client.list_github_repo_connections()
+
+    assert response == [{"repo_owner": "rebase", "repo_name": "platform", "scope": "workspace"}]
+    assert observed == {
+        "method": "GET",
+        "url": "https://workflows.example.com/integrations/github/repo-connections",
+        "params": {},
+    }
+
+
 def test_client_uses_fastapi_detail_for_http_errors(monkeypatch) -> None:
     monkeypatch.setattr(
         "requests.request",
@@ -751,7 +773,8 @@ def test_workflow_deploy_updates_existing_workflow_version(monkeypatch) -> None:
     assert observed["entrypoint"] == "forecast"
     assert observed["source_code"].startswith("def forecast")
     assert observed["step_graph"] is None
-    assert observed["execution_backend"] == rb.DEFAULT_WORKFLOW_BACKEND
+    assert rb.DEFAULT_WORKFLOW_BACKEND == "interactive"
+    assert observed["execution_backend"] == "prefect_cloud_run_service"
 
 
 def test_update_workflow_omits_step_graph_unless_explicit(monkeypatch) -> None:
@@ -795,8 +818,8 @@ def test_workflow_deploy_registers_function_source(monkeypatch) -> None:
     assert observed["entrypoint"] == "add"
     assert "def add(left: float = 0, right: float = 0) -> dict:" in observed["source_code"]
     assert observed["default_parameters"] == {"left": 0, "right": 0}
-    assert observed["execution_backend"] == rb.DEFAULT_WORKFLOW_BACKEND
-    assert workflow.execution_backend == rb.DEFAULT_WORKFLOW_BACKEND
+    assert observed["execution_backend"] == "prefect_cloud_run_service"
+    assert workflow.execution_backend == "prefect_cloud_run_service"
 
 
 def test_workflow_can_use_prefect_cloud_run_jobs_backend(monkeypatch) -> None:
@@ -817,6 +840,39 @@ def test_workflow_can_use_prefect_cloud_run_jobs_backend(monkeypatch) -> None:
 
     assert workflow.execution_backend == "prefect_cloud_run_jobs"
     assert observed["execution_backend"] == "prefect_cloud_run_jobs"
+
+
+def test_workflow_accepts_interactive_and_batch_backend_modes(monkeypatch) -> None:
+    observed: list[dict[str, Any]] = []
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "list_workflows", lambda: [])
+    monkeypatch.setattr(client, "register_workflow", lambda **kwargs: observed.append(kwargs) or {"id": "workflow-id"})
+
+    def interactive_forecast() -> dict:
+        return {"status": "ok"}
+
+    def batch_forecast() -> dict:
+        return {"status": "ok"}
+
+    interactive = rb.Workflow(
+        interactive_forecast,
+        name="interactive-forecast",
+        backend="interactive",
+        client=client,
+    ).deploy()
+    batch = rb.Workflow(
+        batch_forecast,
+        name="batch-forecast",
+        backend="batch",
+        client=client,
+    ).deploy()
+
+    assert interactive.execution_backend == "prefect_cloud_run_service"
+    assert batch.execution_backend == "prefect_cloud_run_jobs"
+    assert [payload["execution_backend"] for payload in observed] == [
+        "prefect_cloud_run_service",
+        "prefect_cloud_run_jobs",
+    ]
 
 
 def test_workflow_rejects_unknown_backend() -> None:
@@ -871,7 +927,8 @@ def test_project_deploy_registers_function_source(monkeypatch) -> None:
     assert observed["default_parameters"] == {"horizon_hours": 24}
     assert observed["execution_backend"] == "cloud_run"
     assert observed["source_mode"] == "rebase_hosted"
-    assert normalize_weather.execution_backend == rb.DEFAULT_FUNCTION_BACKEND
+    assert rb.DEFAULT_FUNCTION_BACKEND == "interactive"
+    assert normalize_weather.execution_backend == "cloud_run"
 
 
 def test_project_deploy_registers_asgi_app_source(monkeypatch) -> None:
@@ -1170,6 +1227,30 @@ def test_project_function_can_use_cloud_run_jobs_backend(monkeypatch) -> None:
     assert observed["execution_backend"] == "cloud_run_jobs"
 
 
+def test_project_function_accepts_interactive_and_batch_backend_modes(monkeypatch) -> None:
+    observed: list[dict[str, Any]] = []
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
+    monkeypatch.setattr(client, "find_function", lambda name, *, project: None)
+    monkeypatch.setattr(client, "register_function", lambda **kwargs: observed.append(kwargs) or {"id": "function-id"})
+
+    project = rb.Project("energy-forecasting", client=client)
+
+    @project.function(name="interactive-function", backend="interactive")
+    def interactive_function() -> dict:
+        return {"status": "ok"}
+
+    @project.function(name="batch-function", backend="batch")
+    def batch_function() -> dict:
+        return {"status": "ok"}
+
+    project.deploy()
+
+    assert interactive_function.execution_backend == "cloud_run"
+    assert batch_function.execution_backend == "cloud_run_jobs"
+    assert [payload["execution_backend"] for payload in observed] == ["cloud_run", "cloud_run_jobs"]
+
+
 def test_project_function_sends_cloud_run_isolation_settings(monkeypatch) -> None:
     observed: dict[str, Any] = {}
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
@@ -1318,7 +1399,7 @@ def test_project_deploy_registers_step_workflow_graph(monkeypatch) -> None:
 
     assert [item["name"] for item in observed_functions] == ["load-weather", "build-forecast"]
     assert [item["execution_backend"] for item in observed_functions] == ["prefect", "prefect"]
-    assert observed_workflow["execution_backend"] == rb.DEFAULT_WORKFLOW_BACKEND
+    assert observed_workflow["execution_backend"] == "prefect_cloud_run_service"
     graph = observed_workflow["step_graph"]
     assert graph["schema_version"] == 1
     assert graph["engine"] == "prefect"
@@ -1970,7 +2051,7 @@ def test_workflow_ephemeral_run_embeds_step_sources_without_deploy(monkeypatch) 
     assert observed["project"] == "hello"
     assert observed["name"] == "hello-workflow"
     assert observed["parameters"] == {"name": "Rebase"}
-    assert observed["execution_backend"] == rb.DEFAULT_WORKFLOW_BACKEND
+    assert observed["execution_backend"] == "prefect_cloud_run_service"
     nodes = observed["step_graph"]["nodes"]
     assert [node["name"] for node in nodes] == ["load-name", "package"]
     assert all(node["function_version_id"] is None for node in nodes)

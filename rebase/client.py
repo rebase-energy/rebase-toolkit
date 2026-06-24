@@ -215,30 +215,58 @@ class Cron:
 
 Schedule = Cron | dict[str, Any]
 FunctionBackend = str
-DEFAULT_FUNCTION_BACKEND: FunctionBackend = "cloud_run"
+DEFAULT_FUNCTION_BACKEND: FunctionBackend = "interactive"
 WorkflowBackend = str
-DEFAULT_WORKFLOW_BACKEND: WorkflowBackend = "prefect_cloud_run_service"
+DEFAULT_WORKFLOW_BACKEND: WorkflowBackend = "interactive"
 DeploySource = str
 DEFAULT_DEPLOY_SOURCE: DeploySource = "rebase"
 DEFAULT_PYTHON_VERSION = "3.13"
 DEFAULT_MODEL_DEPENDENCY = (
     "emflow @ git+https://github.com/rebase-energy/emflow.git@2d0205e1b479d439df72e50c6865735d0b26de8d"
 )
+FUNCTION_BACKEND_ALIASES = {
+    "interactive": "cloud_run",
+    "batch": "cloud_run_jobs",
+}
+WORKFLOW_BACKEND_ALIASES = {
+    "interactive": "prefect_cloud_run_service",
+    "batch": "prefect_cloud_run_jobs",
+    "prefect_cloud_run": "prefect_cloud_run_service",
+}
+
+
+def _normalize_function_backend(backend: FunctionBackend) -> FunctionBackend:
+    return FUNCTION_BACKEND_ALIASES.get(backend, backend)
+
+
+def _normalize_workflow_backend(backend: WorkflowBackend) -> WorkflowBackend:
+    return WORKFLOW_BACKEND_ALIASES.get(backend, backend)
 
 
 def _validate_function_backend(backend: FunctionBackend) -> FunctionBackend:
+    backend = _normalize_function_backend(backend)
     if backend not in {"modal", "prefect", "prefect_cloud", "cloud_run", "cloud_run_shared", "cloud_run_jobs"}:
         raise ValueError(
-            "function backend must be 'modal', 'prefect', 'prefect_cloud', 'cloud_run', "
+            "function backend must be 'interactive', 'batch', 'modal', 'prefect', 'prefect_cloud', 'cloud_run', "
             "'cloud_run_shared', or 'cloud_run_jobs'"
         )
     return backend
 
 
 def _validate_workflow_backend(backend: WorkflowBackend) -> WorkflowBackend:
+    backend = _normalize_workflow_backend(backend)
     if backend not in {"prefect", "prefect_cloud_run_jobs", "prefect_cloud_run_service"}:
-        raise ValueError("workflow backend must be 'prefect', 'prefect_cloud_run_jobs', or 'prefect_cloud_run_service'")
+        raise ValueError(
+            "workflow backend must be 'interactive', 'batch', 'prefect', 'prefect_cloud_run_jobs', "
+            "or 'prefect_cloud_run_service'"
+        )
     return backend
+
+
+def _validate_target_backend(target_type: str, backend: str) -> str:
+    if target_type == "workflow":
+        return _validate_workflow_backend(backend)
+    return _validate_function_backend(backend)
 
 
 def _validate_deploy_source(source: str | None) -> DeploySource | None:
@@ -1226,6 +1254,13 @@ class Client:
             raise RebaseWorkflowError("expected GitHub repository installation response")
         return response
 
+    def list_github_repo_connections(self, *, project_id: str | None = None) -> list[dict[str, Any]]:
+        params = {"project_id": project_id} if project_id else {}
+        response = self.request("GET", "/integrations/github/repo-connections", params=params)
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected GitHub repo connection list response")
+        return response
+
     def connect_github_repo(
         self,
         *,
@@ -1621,7 +1656,7 @@ class Client:
                 "source_code": source_code,
                 "entrypoint": entrypoint,
                 "default_parameters": default_parameters or {},
-                "execution_backend": execution_backend,
+                "execution_backend": _validate_function_backend(execution_backend),
                 "image_spec": image_spec,
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
@@ -1675,7 +1710,7 @@ class Client:
                 "source_code": source_code,
                 "entrypoint": entrypoint,
                 "default_parameters": default_parameters,
-                "execution_backend": execution_backend,
+                "execution_backend": _validate_function_backend(execution_backend) if execution_backend else None,
                 "image_spec": image_spec,
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
@@ -1792,7 +1827,7 @@ class Client:
                 "description": description,
                 "source_code": source_code,
                 "default_parameters": default_parameters or {},
-                "execution_backend": execution_backend,
+                "execution_backend": _validate_function_backend(execution_backend),
                 "image_spec": image_spec,
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
@@ -1850,7 +1885,7 @@ class Client:
                 "description": description,
                 "source_code": source_code,
                 "default_parameters": default_parameters,
-                "execution_backend": execution_backend,
+                "execution_backend": _validate_function_backend(execution_backend) if execution_backend else None,
                 "image_spec": image_spec,
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
@@ -2126,7 +2161,7 @@ class Client:
                 "schedule": schedule,
                 "default_parameters": default_parameters or {},
                 "required_parameters": required_parameters or [],
-                "execution_backend": execution_backend,
+                "execution_backend": _validate_workflow_backend(execution_backend),
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "source_mode": source_mode,
@@ -2180,7 +2215,7 @@ class Client:
                 "entrypoint": entrypoint,
                 "default_parameters": default_parameters,
                 "required_parameters": required_parameters,
-                "execution_backend": execution_backend,
+                "execution_backend": _validate_workflow_backend(execution_backend) if execution_backend else None,
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "source_mode": source_mode,
@@ -2238,7 +2273,7 @@ class Client:
                 "entrypoint": entrypoint,
                 "default_parameters": default_parameters or {},
                 "parameters": parameters or {},
-                "execution_backend": execution_backend,
+                "execution_backend": _validate_target_backend(target_type, execution_backend),
                 "image_spec": image_spec,
                 "step_graph": step_graph,
                 "required_parameters": required_parameters or [],
@@ -2452,7 +2487,6 @@ class Project:
         name: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        backend: FunctionBackend = "prefect",
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         min_instances: int | None = None,
@@ -2471,7 +2505,6 @@ class Project:
                 project=self.name,
                 description=description,
                 default_parameters=default_parameters,
-                backend=backend,
                 dependencies=dependencies,
                 image=image,
                 min_instances=min_instances,
@@ -3567,7 +3600,6 @@ class Step(Function):
         project: str,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        backend: FunctionBackend = "prefect",
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         min_instances: int | None = None,
@@ -3589,7 +3621,7 @@ class Step(Function):
             project=project,
             description=description,
             default_parameters=default_parameters,
-            backend=backend,
+            backend="prefect",
             dependencies=dependencies,
             image=image,
             min_instances=min_instances,
