@@ -23,6 +23,7 @@ from rich.text import Text
 from rich.tree import Tree
 from typer.core import TyperGroup
 
+from rebase.auth import AuthError, auth_file_path, clear_session, load_session
 from rebase.brand import (
     BRAND_AMBER,
     BRAND_BRIGHT_GREEN,
@@ -46,12 +47,15 @@ from rebase.client import (
     Run,
     Step,
     Workflow,
+    _git,
+    _parse_github_remote,
     _validate_function_backend,
     _validate_workflow_backend,
 )
 from rebase.config import (
     DEFAULT_PROFILE,
     DEFAULT_SERVER_URL,
+    config_path,
     list_profiles,
     selected_profile_name,
     set_default_profile,
@@ -149,6 +153,13 @@ workspace_app = typer.Typer(
     no_args_is_help=False,
     rich_markup_mode="rich",
 )
+profile_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Inspect and switch local Rebase CLI profiles.",
+    no_args_is_help=False,
+    rich_markup_mode="rich",
+)
 api_key_app = typer.Typer(
     add_completion=False,
     cls=AlphabeticalTyperGroup,
@@ -160,6 +171,13 @@ connect_app = typer.Typer(
     add_completion=False,
     cls=AlphabeticalTyperGroup,
     help="Connect external services to the active workspace.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+environment_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Inspect and manage deployment environment policies.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -744,6 +762,7 @@ def deploy_file(
     *,
     object_names: Iterable[str] | None = None,
     deploy_source: str | None = None,
+    environment: str = "dev",
 ) -> list[DeployRow]:
     module = _load_module(Path(path))
     selected_names = set(object_names or [])
@@ -759,9 +778,9 @@ def deploy_file(
     if projects:
         for name, project in projects:
             if deploy_source is None:
-                project.deploy()
+                project.deploy(environment=environment)
             else:
-                project.deploy(deploy_source=deploy_source)
+                project.deploy(deploy_source=deploy_source, environment=environment)
             deployed.append(("project", project.name or name, project.id))
             for function in project._functions:
                 endpoint_url = _deployed_endpoint_url(function)
@@ -795,9 +814,9 @@ def deploy_file(
 
     for name, deployable in deployables:
         if deploy_source is None:
-            deployable.deploy()
+            deployable.deploy(environment=environment)
         else:
-            deployable.deploy(deploy_source=deploy_source)
+            deployable.deploy(deploy_source=deploy_source, environment=environment)
         if isinstance(deployable, Model):
             target_type = _model_target_type(deployable)
         elif isinstance(deployable, ASGIApp):
@@ -810,6 +829,82 @@ def deploy_file(
         else:
             deployed.append((target_type, deployable.name or name, deployable.id))
     return deployed
+
+
+def _environment_policy(client: Client, environment: str) -> dict[str, Any]:
+    for policy in client.list_environment_policies():
+        if policy.get("environment") == environment:
+            return policy
+    raise RebaseWorkflowError(f"deployment environment is not configured: {environment}")
+
+
+def _policy_requires_gitops(policy: dict[str, Any]) -> bool:
+    return bool(policy.get("protected")) or policy.get("deploy_mode") == "gitops"
+
+
+def _gitops_source_metadata(path: Path) -> dict[str, str | None]:
+    resolved_path = path.resolve()
+    root = _git(["rev-parse", "--show-toplevel"], cwd=resolved_path.parent)
+    if root is None:
+        raise RebaseWorkflowError("GitOps deploy requires the deploy file to be inside a git repository.")
+    root_path = Path(root).resolve()
+    try:
+        relative_source_path = resolved_path.relative_to(root_path)
+    except ValueError as exc:
+        raise RebaseWorkflowError("GitOps deploy file must be inside the current git repository.") from exc
+    remote = _git(["config", "--get", "remote.origin.url"], cwd=root_path)
+    repo_owner, repo_name = _parse_github_remote(remote)
+    if not repo_owner or not repo_name:
+        raise RebaseWorkflowError("GitOps deploy requires a GitHub origin remote.")
+    dirty = _git(["status", "--porcelain", "--", str(relative_source_path)], cwd=root_path)
+    if dirty:
+        raise RebaseWorkflowError(
+            "GitOps deploy requires the deploy file to be committed and clean. "
+            "Commit or discard changes before deploying to a protected environment."
+        )
+    commit_sha = _git(["rev-parse", "HEAD"], cwd=root_path)
+    if not commit_sha:
+        raise RebaseWorkflowError("GitOps deploy could not resolve the current commit SHA.")
+    branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root_path)
+    if branch == "HEAD":
+        branch = None
+    return {
+        "source_repo": f"{repo_owner}/{repo_name}",
+        "repo_owner": repo_owner,
+        "repo_name": repo_name,
+        "source_path": str(relative_source_path),
+        "git_commit_sha": commit_sha,
+        "git_branch": branch,
+    }
+
+
+def _create_gitops_intent_for_deploy(
+    client: Client,
+    *,
+    file: Path,
+    environment: str,
+    object_names: Iterable[str] | None,
+    deploy_source: str | None,
+) -> dict[str, Any]:
+    metadata = _gitops_source_metadata(file)
+    plan = {
+        "schema_version": 1,
+        "kind": "rebase_deploy",
+        "file": metadata["source_path"],
+        "environment": environment,
+        "object_names": sorted(object_names or []),
+        "deploy_source": deploy_source,
+    }
+    return client.create_gitops_deployment_intent(
+        environment=environment,
+        source_repo=str(metadata["source_repo"]),
+        repo_owner=str(metadata["repo_owner"]),
+        repo_name=str(metadata["repo_name"]),
+        source_path=str(metadata["source_path"]),
+        git_commit_sha=str(metadata["git_commit_sha"]),
+        git_branch=metadata["git_branch"],
+        plan=plan,
+    )
 
 
 def _workspace_value(data: dict[str, Any]) -> str:
@@ -907,6 +1002,32 @@ def _workspace_usage_table(usage: dict[str, Any]) -> Table:
     return table
 
 
+def _environment_policy_table(policies: list[dict[str, Any]]) -> Table:
+    table = Table(
+        title="Workspace Environments",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Environment", style="rebase.value")
+    table.add_column("Mode", no_wrap=True)
+    table.add_column("Protected", no_wrap=True)
+    table.add_column("Require PR", no_wrap=True)
+    table.add_column("Allowed branches", style="rebase.muted")
+    for policy in policies:
+        branches = policy.get("allowed_branches") or []
+        table.add_row(
+            _format_value(policy.get("environment")),
+            _format_value(policy.get("deploy_mode")),
+            "yes" if policy.get("protected") else "no",
+            "yes" if policy.get("require_pr") else "no",
+            ", ".join(str(branch) for branch in branches) if branches else "-",
+        )
+    return table
+
+
 def _workspace_member_identity(data: dict[str, Any]) -> str:
     email = data.get("email")
     if isinstance(email, str) and email:
@@ -955,6 +1076,175 @@ def _workspace_members_table(members: list[dict[str, Any]], pending_invites: lis
             "invite",
             _format_value(invite.get("created_at")),
         )
+    return table
+
+
+def _load_auth_session_for_display() -> tuple[Any | None, str | None]:
+    try:
+        return load_session(), None
+    except AuthError as exc:
+        return None, str(exc)
+
+
+def _profile_workspace_label(profile_data: dict[str, Any]) -> str:
+    workspace_name = profile_data.get("workspace_name")
+    if isinstance(workspace_name, str) and workspace_name:
+        return workspace_name
+    workspace_id = profile_data.get("workspace_id")
+    if isinstance(workspace_id, str) and workspace_id:
+        return workspace_id
+    return "-"
+
+
+def _profile_workspace_id(profile_data: dict[str, Any]) -> str:
+    workspace_id = profile_data.get("workspace_id")
+    return workspace_id if isinstance(workspace_id, str) and workspace_id else "-"
+
+
+def _profile_api_url(profile_data: dict[str, Any]) -> str:
+    api_url = profile_data.get("api_url")
+    return api_url if isinstance(api_url, str) and api_url else DEFAULT_SERVER_URL
+
+
+def _auth_session_data(session: Any | None, auth_error: str | None) -> dict[str, Any]:
+    if session is None:
+        return {
+            "exists": False,
+            "email": None,
+            "user_id": None,
+            "expires_at": None,
+            "error": auth_error,
+            "auth_file": str(auth_file_path()),
+        }
+    expires_at = getattr(session, "expires_at_datetime", None)
+    return {
+        "exists": True,
+        "email": session.email,
+        "user_id": session.user_id,
+        "expires_at": expires_at.isoformat() if expires_at is not None else None,
+        "error": auth_error,
+        "auth_file": str(auth_file_path()),
+    }
+
+
+def _profile_credential_label(profile_data: dict[str, Any], *, has_auth_session: bool) -> str:
+    if profile_data.get("api_key"):
+        return "api key"
+    if has_auth_session:
+        return "supabase session"
+    return "none"
+
+
+def _profile_summary(
+    name: str,
+    profile_data: dict[str, Any],
+    *,
+    active_profile: str,
+    has_auth_session: bool,
+) -> dict[str, Any]:
+    return {
+        "active": name == active_profile,
+        "profile": name,
+        "workspace": _profile_workspace_label(profile_data),
+        "workspace_id": _profile_workspace_id(profile_data),
+        "api_url": _profile_api_url(profile_data),
+        "has_api_key": bool(profile_data.get("api_key")),
+        "credential": _profile_credential_label(profile_data, has_auth_session=has_auth_session),
+    }
+
+
+def _profiles_table(
+    profiles: dict[str, dict[str, Any]],
+    *,
+    active_profile: str,
+    has_auth_session: bool,
+) -> Table:
+    table = Table(
+        title="Profiles",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Active", justify="center", no_wrap=True, style="rebase.active")
+    table.add_column("Profile")
+    table.add_column("Workspace", overflow="fold")
+    table.add_column("Workspace ID", style="rebase.muted", overflow="fold")
+    table.add_column("API URL", overflow="fold")
+    table.add_column("Credential", no_wrap=True)
+    for profile_name, profile_data in sorted(profiles.items()):
+        summary = _profile_summary(
+            profile_name,
+            profile_data,
+            active_profile=active_profile,
+            has_auth_session=has_auth_session,
+        )
+        style = "rebase.active" if summary["active"] else None
+        table.add_row(
+            "*" if summary["active"] else "",
+            profile_name,
+            summary["workspace"],
+            summary["workspace_id"],
+            summary["api_url"],
+            summary["credential"],
+            style=style,
+        )
+    return table
+
+
+def _profile_show_data(profile: str | None = None) -> dict[str, Any]:
+    profiles = list_profiles()
+    active_profile = selected_profile_name()
+    profile_name = profile or active_profile
+    profile_exists = profile_name in profiles
+    if profile and not profile_exists:
+        raise RebaseWorkflowError(f"unknown profile: {profile}. Run `rebase setup --profile {profile}` first.")
+    profile_data = profiles.get(profile_name, {})
+    session, auth_error = _load_auth_session_for_display()
+    auth = _auth_session_data(session, auth_error)
+    summary = _profile_summary(
+        profile_name,
+        profile_data,
+        active_profile=active_profile,
+        has_auth_session=auth["exists"],
+    )
+    return {
+        **summary,
+        "exists": profile_exists,
+        "active_profile": active_profile,
+        "config_file": str(config_path()),
+        "auth": auth,
+    }
+
+
+def _profile_show_table(data: dict[str, Any]) -> Table:
+    table = Table(
+        title="Profile",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=False,
+        title_style="rebase.title",
+    )
+    table.add_column("Field", style="rebase.muted")
+    table.add_column("Value", style="rebase.value", overflow="fold")
+    auth = data.get("auth") if isinstance(data.get("auth"), dict) else {}
+    table.add_row("Active profile", _format_value(data.get("active_profile")))
+    table.add_row("Profile", _format_value(data.get("profile")))
+    table.add_row("Profile exists", "yes" if data.get("exists") else "no")
+    table.add_row("Workspace", _format_value(data.get("workspace")))
+    table.add_row("Workspace ID", _format_value(data.get("workspace_id")))
+    table.add_row("API URL", _format_value(data.get("api_url")))
+    table.add_row("Credential", _format_value(data.get("credential")))
+    table.add_row("API key", "configured" if data.get("has_api_key") else "not configured")
+    table.add_row("Auth email", _format_value(auth.get("email")))
+    table.add_row("Auth user ID", _format_value(auth.get("user_id")))
+    table.add_row("Auth expires", _format_value(auth.get("expires_at")))
+    if auth.get("error"):
+        table.add_row("Auth error", _format_value(auth.get("error")))
+    table.add_row("Config file", _format_value(data.get("config_file")))
+    table.add_row("Auth file", _format_value(auth.get("auth_file")))
     return table
 
 
@@ -1567,6 +1857,103 @@ def tui_command(
     run_tui(project=project, limit=limit)
 
 
+def _profile_list_data() -> dict[str, Any]:
+    profiles = list_profiles()
+    if not profiles:
+        raise RebaseWorkflowError("no Rebase profiles found. Run `rebase setup` first.")
+    active_profile = selected_profile_name()
+    session, auth_error = _load_auth_session_for_display()
+    auth = _auth_session_data(session, auth_error)
+    return {
+        "active_profile": active_profile,
+        "config_file": str(config_path()),
+        "auth": auth,
+        "profiles": [
+            _profile_summary(
+                profile_name,
+                profile_data,
+                active_profile=active_profile,
+                has_auth_session=auth["exists"],
+            )
+            for profile_name, profile_data in sorted(profiles.items())
+        ],
+    }
+
+
+def _show_profile(profile: str | None = None, *, json_output: bool = False) -> None:
+    data = _profile_show_data(profile)
+    if json_output:
+        _print_json(data)
+        return
+    console.print(_profile_show_table(data))
+
+
+def _switch_profile(profile: str, *, workspace_alias: bool = False) -> None:
+    try:
+        set_default_profile(profile)
+    except KeyError as exc:
+        if workspace_alias:
+            raise RebaseWorkflowError(
+                f"unknown workspace profile: {profile}. Run `rebase setup --profile {profile}` first."
+            ) from exc
+        raise RebaseWorkflowError(f"unknown profile: {profile}. Run `rebase setup --profile {profile}` first.") from exc
+    if workspace_alias:
+        console.print(f"Switched workspace profile to '[rebase.value]{profile}[/rebase.value]'")
+        return
+    console.print(f"Switched profile to '[rebase.value]{profile}[/rebase.value]'")
+
+
+@profile_app.callback(invoke_without_command=True)
+def profile_command(ctx: typer.Context) -> None:
+    """Show the active local Rebase CLI profile."""
+    if ctx.invoked_subcommand is None:
+        _show_profile()
+
+
+@profile_app.command("list")
+def profile_list_command(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List local Rebase CLI profiles."""
+    data = _profile_list_data()
+    if json_output:
+        _print_json(data)
+        return
+    profiles = list_profiles()
+    console.print(
+        _profiles_table(
+            profiles,
+            active_profile=data["active_profile"],
+            has_auth_session=bool(data.get("auth", {}).get("exists")),
+        )
+    )
+
+
+@profile_app.command("show")
+def profile_show_command(
+    profile: Annotated[str | None, typer.Argument(help="Profile name. Defaults to the active profile.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show one local Rebase CLI profile."""
+    _show_profile(profile, json_output=json_output)
+
+
+@profile_app.command("switch")
+def profile_switch_command(profile: Annotated[str, typer.Argument(help="Profile name.")]) -> None:
+    """Switch the active local Rebase CLI profile."""
+    _switch_profile(profile)
+
+
+@profile_app.command("logout")
+def profile_logout_command() -> None:
+    """Clear the stored Supabase auth session without removing local profiles."""
+    path = auth_file_path()
+    if clear_session(path=path):
+        console.print(f"Cleared Rebase auth session at [rebase.value]{path}[/rebase.value]")
+        return
+    console.print(f"No Rebase auth session found at [rebase.value]{path}[/rebase.value]")
+
+
 def _show_workspace_memberships() -> None:
     profiles = list_profiles()
     active_profile = selected_profile_name()
@@ -1651,13 +2038,7 @@ def workspace_create_command(
 
 
 def _switch_workspace(profile: str) -> None:
-    try:
-        set_default_profile(profile)
-    except KeyError as exc:
-        raise RebaseWorkflowError(
-            f"unknown workspace profile: {profile}. Run `rebase setup --profile {profile}` first."
-        ) from exc
-    console.print(f"Switched workspace profile to '[rebase.value]{profile}[/rebase.value]'")
+    _switch_profile(profile, workspace_alias=True)
 
 
 @workspace_app.command("switch")
@@ -1750,7 +2131,60 @@ def workspace_usage_command(
     console.print(_workspace_usage_table(usage))
 
 
+@environment_app.command("list")
+def environment_list_command(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List deployment environment policies for the active workspace."""
+    policies = Client().list_environment_policies()
+    if json_output:
+        _print_json(policies)
+        return
+    console.print(_environment_policy_table(policies))
+
+
+@environment_app.command("protect")
+def environment_protect_command(
+    environment: Annotated[str, typer.Argument(help="Environment to protect, for example prod or staging.")],
+    allowed_branch: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--allowed-branch",
+            help="Branch allowed for GitOps reconciliation. Can be passed more than once.",
+        ),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Require GitOps for an environment."""
+    policy = Client().update_environment_policy(
+        environment,
+        deploy_mode="gitops",
+        protected=True,
+        require_pr=True,
+        allowed_branches=allowed_branch or ["main", "master"],
+    )
+    _print_json(policy) if json_output else console.print(_detail_table("Environment Policy", policy))
+
+
+@environment_app.command("unprotect")
+def environment_unprotect_command(
+    environment: Annotated[str, typer.Argument(help="Environment to allow direct deploys for.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Allow direct deploys for an environment."""
+    policy = Client().update_environment_policy(
+        environment,
+        deploy_mode="direct",
+        protected=False,
+        require_pr=False,
+        allowed_branches=[],
+    )
+    _print_json(policy) if json_output else console.print(_detail_table("Environment Policy", policy))
+
+
+app.add_typer(profile_app, name="profile")
 app.add_typer(workspace_app, name="workspace")
+app.add_typer(environment_app, name="environment")
 
 
 @connect_app.command("github")
@@ -2622,9 +3056,57 @@ def deploy_command(
         str | None,
         typer.Option("--source", help="Override deploy source for this command: rebase or github."),
     ] = None,
+    environment: Annotated[str, typer.Option("--env", help="Deployment environment: dev, staging, or prod.")] = "dev",
+    plan: Annotated[bool, typer.Option("--plan", help="Show the deployment path without applying it.")] = False,
+    sync: Annotated[bool, typer.Option("--sync", help="Reserved for reconciler-based GitOps sync.")] = False,
 ) -> None:
     """Deploy Rebase objects from a Python file."""
-    deployed = deploy_file(file, object_names=name, deploy_source=source)
+    client = Client()
+    policy = _environment_policy(client, environment)
+    if _policy_requires_gitops(policy):
+        if source == "rebase":
+            raise RebaseWorkflowError("protected environments require GitHub-backed source; remove `--source rebase`.")
+        if sync:
+            raise RebaseWorkflowError("direct GitOps sync is not available yet; protected deploys create a PR request.")
+        if plan:
+            metadata = _gitops_source_metadata(file)
+            console.print(
+                _detail_table(
+                    "GitOps Deploy Plan",
+                    {
+                        "environment": environment,
+                        "mode": "gitops",
+                        "source_repo": metadata["source_repo"],
+                        "source_path": metadata["source_path"],
+                        "git_commit_sha": metadata["git_commit_sha"],
+                        "git_branch": metadata["git_branch"],
+                    },
+                )
+            )
+            return
+        intent = _create_gitops_intent_for_deploy(
+            client,
+            file=file,
+            environment=environment,
+            object_names=name,
+            deploy_source=source or "github",
+        )
+        console.print(_detail_table("GitOps Deployment Request", intent))
+        return
+    if plan:
+        console.print(
+            _detail_table(
+                "Deploy Plan",
+                {
+                    "environment": environment,
+                    "mode": "direct",
+                    "file": str(file),
+                    "object_names": ", ".join(name or []) if name else "all",
+                },
+            )
+        )
+        return
+    deployed = deploy_file(file, object_names=name, deploy_source=source, environment=environment)
     console.print(_deploy_table(deployed))
 
 

@@ -6,7 +6,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-DEFAULT_SERVER_URL = "https://rebase-workflow-api-1002868894268.europe-north1.run.app"
+DEFAULT_SERVER_URL = "https://rebase-toolkit-api-1002868894268.europe-north1.run.app"
 DEFAULT_API_URL = DEFAULT_SERVER_URL
 DEFAULT_PROFILE = "default"
 CONFIG_PATH_ENV = "REBASE_CONFIG_PATH"

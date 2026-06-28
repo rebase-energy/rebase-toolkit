@@ -428,6 +428,11 @@ def _run_git(args: list[str], *, cwd: Path, action: str, timeout: float = 60) ->
         raise RebaseWorkflowError(f"timed out while trying to {action}") from exc
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or "").strip()
+        if "Password authentication is not supported for Git operations" in detail:
+            detail += (
+                "\nGitHub no longer accepts account passwords for HTTPS Git operations. "
+                "Use SSH, a GitHub token through your credential manager, or switch this repo's origin to SSH."
+            )
         suffix = f": {detail}" if detail else ""
         raise RebaseWorkflowError(f"failed to {action}{suffix}") from exc
 
@@ -873,7 +878,7 @@ def _select_origin_url(repo_full_name: str, *, default_protocol: str = "SSH") ->
     return options[protocol]
 
 
-def _ensure_workspace_origin_transport(cwd: Path, repo_full_name: str) -> None:
+def _ensure_workspace_origin_transport(cwd: Path, repo_full_name: str, *, prompt: bool = False) -> None:
     origin_url = _origin_url(cwd)
     owner, name = _parse_github_remote(origin_url)
     if origin_url is None or owner is None or name is None:
@@ -883,6 +888,8 @@ def _ensure_workspace_origin_transport(cwd: Path, repo_full_name: str) -> None:
 
     current_protocol = _remote_protocol(origin_url)
     if current_protocol is None:
+        return
+    if not prompt:
         return
     selected_url = _select_origin_url(repo_full_name, default_protocol=current_protocol)
     if selected_url != origin_url:
@@ -1013,7 +1020,7 @@ def _clone_workspace_repo_into_current_directory(
             action="add GitHub origin",
         )
     else:
-        _ensure_workspace_origin_transport(cwd, repo_full_name)
+        _ensure_workspace_origin_transport(cwd, repo_full_name, prompt=True)
     _run_git(["fetch", "origin"], cwd=cwd, action=f"fetch {repo_full_name}", timeout=300)
     _seed_empty_workspace_repo(client, connection, cwd=cwd)
     _checkout_remote_branch(cwd, default_branch=_connection_default_branch(connection))

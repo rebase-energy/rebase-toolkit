@@ -2473,6 +2473,8 @@ class Project:
         )
         self.id = project["id"]
         for function in self._functions:
+            if isinstance(function, Step):
+                continue  # Steps are deployed automatically via their workflow
             function.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
         for workflow in self._workflows:
             workflow.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
@@ -2572,15 +2574,10 @@ class Project:
         name: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        dependencies: list[str] | tuple[str, ...] | None = None,
-        image: Image | dict[str, Any] | None = None,
-        min_instances: int | None = None,
-        concurrency: int | None = None,
         enabled: bool = True,
         retries: int = 0,
         timeout_seconds: int | float | None = None,
         cache: bool = False,
-        resources: dict[str, Any] | None = None,
         deploy_source: str | None = None,
     ) -> Callable[[Callable[..., Any]], Step]:
         def decorator(fn: Callable[..., Any]) -> Step:
@@ -2590,10 +2587,6 @@ class Project:
                 project=self.name,
                 description=description,
                 default_parameters=default_parameters,
-                dependencies=dependencies,
-                image=image,
-                min_instances=min_instances,
-                concurrency=concurrency,
                 enabled=enabled,
                 deploy_source=deploy_source if deploy_source is not None else self.deploy_source,
                 project_source_mode=self.source_mode,
@@ -2601,7 +2594,6 @@ class Project:
                 retries=retries,
                 timeout_seconds=timeout_seconds,
                 cache=cache,
-                resources=resources,
             )
             self._steps.append(step)
             self._functions.append(step)
@@ -2620,6 +2612,11 @@ class Project:
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
+        dependencies: list[str] | tuple[str, ...] | None = None,
+        image: Image | dict[str, Any] | None = None,
+        min_instances: int | None = None,
+        concurrency: int | None = None,
+        resources: dict[str, Any] | None = None,
     ) -> Callable[[Callable[..., Any]], Workflow]:
         def decorator(fn: Callable[..., Any]) -> Workflow:
             workflow = Workflow(
@@ -2635,6 +2632,11 @@ class Project:
                 deploy_source=deploy_source if deploy_source is not None else self.deploy_source,
                 project_source_mode=self.source_mode,
                 client=self._client,
+                dependencies=dependencies,
+                image=image,
+                min_instances=min_instances,
+                concurrency=concurrency,
+                resources=resources,
             )
             self._workflows.append(workflow)
             return workflow
@@ -3689,10 +3691,6 @@ class Step(Function):
         project: str,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        dependencies: list[str] | tuple[str, ...] | None = None,
-        image: Image | dict[str, Any] | None = None,
-        min_instances: int | None = None,
-        concurrency: int | None = None,
         enabled: bool = True,
         deploy_source: str | None = None,
         project_source_mode: str | None = None,
@@ -3702,7 +3700,6 @@ class Step(Function):
         retries: int = 0,
         timeout_seconds: int | float | None = None,
         cache: bool = False,
-        resources: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(
             fn,
@@ -3711,10 +3708,10 @@ class Step(Function):
             description=description,
             default_parameters=default_parameters,
             backend="prefect",
-            dependencies=dependencies,
-            image=image,
-            min_instances=min_instances,
-            concurrency=concurrency,
+            dependencies=None,
+            image=None,
+            min_instances=None,
+            concurrency=None,
             enabled=enabled,
             deploy_source=deploy_source,
             project_source_mode=project_source_mode,
@@ -3727,7 +3724,33 @@ class Step(Function):
         self.retries = retries
         self.timeout_seconds = timeout_seconds
         self.cache = cache
-        self.resources = resources or {}
+        self.resources: dict[str, Any] = {}
+
+    def deploy(self, **_kwargs: Any) -> "Step":
+        raise RebaseWorkflowError(
+            "Steps are deployed automatically when their workflow is deployed. "
+            "Use rb.deploy(workflow) instead of deploying steps directly."
+        )
+
+    def _deploy_for_workflow(
+        self,
+        *,
+        image_spec: dict[str, Any] | None,
+        cloud_run_min_instances: int | None,
+        cloud_run_concurrency: int | None,
+        resource_policy: dict[str, Any],
+        replace: bool,
+        deploy_source: str | None,
+        environment: str,
+        client: "Client | None" = None,
+    ) -> None:
+        self.image_spec = image_spec
+        self.cloud_run_min_instances = cloud_run_min_instances
+        self.cloud_run_concurrency = cloud_run_concurrency
+        self.resources = resource_policy
+        if client is not None:
+            self.client = client
+        Function.deploy(self, replace=replace, deploy_source=deploy_source, environment=environment)
 
     def _parameters_from_call(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
         if self.fn is None:
@@ -3769,6 +3792,11 @@ class Workflow:
         client: Client | None = None,
         workflow_id: str | None = None,
         data: dict[str, Any] | None = None,
+        dependencies: list[str] | tuple[str, ...] | None = None,
+        image: Image | dict[str, Any] | None = None,
+        min_instances: int | None = None,
+        concurrency: int | None = None,
+        resources: dict[str, Any] | None = None,
     ) -> None:
         self.fn = fn
         self.project = project
@@ -3794,6 +3822,10 @@ class Workflow:
         )
         self.required_parameters: list[str] = list(data.get("required_parameters", [])) if data else []
         self.source_metadata: dict[str, Any] = {}
+        self.image_spec: dict[str, Any] | None = None
+        self.cloud_run_min_instances: int | None = None
+        self.cloud_run_concurrency: int | None = None
+        self.resource_policy: dict[str, Any] = {}
 
         if fn is not None:
             if not isinstance(fn, FunctionType):
@@ -3806,6 +3838,14 @@ class Workflow:
             self.source_code = _source_for(fn, target="workflow")
             self.entrypoint = fn.__name__
             self.source_metadata = _git_metadata_for(fn)
+            self.image_spec = _image_spec_for(image=image, dependencies=dependencies)
+            if min_instances is not None and min_instances < 0:
+                raise ValueError("min_instances must be greater than or equal to 0")
+            if concurrency is not None and concurrency < 1:
+                raise ValueError("concurrency must be greater than or equal to 1")
+            self.cloud_run_min_instances = min_instances
+            self.cloud_run_concurrency = concurrency
+            self.resource_policy = resources or {}
         if self.name is None:
             raise ValueError("workflow name is required")
 
@@ -3838,15 +3878,17 @@ class Workflow:
             project_source_mode=project_source_mode,
         )
 
-    def _references_step(self) -> bool:
+    def _collect_steps(self) -> list[Step]:
         if self.fn is None:
-            return False
+            return []
         try:
             closure = inspect.getclosurevars(self.fn)
         except TypeError:
-            return False
-        values = [*closure.nonlocals.values(), *closure.globals.values()]
-        return any(isinstance(value, Step) for value in values)
+            return []
+        return [v for v in [*closure.nonlocals.values(), *closure.globals.values()] if isinstance(v, Step)]
+
+    def _references_step(self) -> bool:
+        return bool(self._collect_steps())
 
     def _trace_arguments(self) -> dict[str, _WorkflowParameter]:
         if self.fn is None:
@@ -3908,6 +3950,17 @@ class Workflow:
             raise RebaseWorkflowError("workflow name is required")
         self._validate_schedule_defaults()
         name = self.name
+        for step in self._collect_steps():
+            step._deploy_for_workflow(
+                image_spec=self.image_spec,
+                cloud_run_min_instances=self.cloud_run_min_instances,
+                cloud_run_concurrency=self.cloud_run_concurrency,
+                resource_policy=self.resource_policy,
+                replace=replace,
+                deploy_source=deploy_source,
+                environment=environment,
+                client=self.client,
+            )
         step_graph = self._build_step_graph()
         source_metadata = self._source_metadata_for_deploy(deploy_source)
         existing = self._client.find_workflow(name, project=self.project)

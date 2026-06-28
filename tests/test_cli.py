@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -21,6 +22,7 @@ def test_main_without_args_prints_help(capsys) -> None:
     ) in normalized_output
     assert "setup" in output
     assert "workspace" in output
+    assert "profile" in output
     assert "project" in output
     assert "endpoint" in output
     assert "function" in output
@@ -34,6 +36,7 @@ def test_main_without_args_prints_help(capsys) -> None:
         "endpoint",
         "function",
         "model",
+        "profile",
         "project",
         "run",
         "setup",
@@ -97,7 +100,8 @@ def test_format_duration_uses_two_decimal_places() -> None:
 def test_deploy_file_deploys_top_level_project(monkeypatch, tmp_path: Path) -> None:
     deployed: list[str] = []
 
-    def fake_project_deploy(self: Project, *, replace: bool = False) -> Project:
+    def fake_project_deploy(self: Project, *, replace: bool = False, environment: str = "dev") -> Project:
+        assert environment == "dev"
         deployed.append(self.name)
         self.id = f"{self.name}-id"
         return self
@@ -130,7 +134,8 @@ def forecast(site_id: str) -> dict:
 def test_deploy_file_can_filter_by_project_name(monkeypatch, tmp_path: Path) -> None:
     deployed: list[str] = []
 
-    def fake_project_deploy(self: Project, *, replace: bool = False) -> Project:
+    def fake_project_deploy(self: Project, *, replace: bool = False, environment: str = "dev") -> Project:
+        assert environment == "dev"
         deployed.append(self.name)
         self.id = f"{self.name}-id"
         return self
@@ -161,9 +166,11 @@ def test_deploy_file_passes_source_override(monkeypatch, tmp_path: Path) -> None
         *,
         replace: bool = False,
         deploy_source: str | None = None,
+        environment: str = "dev",
     ) -> Project:
         observed["name"] = self.name
         observed["deploy_source"] = deploy_source
+        observed["environment"] = environment
         self.id = "project-id"
         return self
 
@@ -178,16 +185,17 @@ project = rb.Project("energy-forecasting")
         encoding="utf-8",
     )
 
-    result = deploy_file(workflow_file, deploy_source="github")
+    result = deploy_file(workflow_file, deploy_source="github", environment="staging")
 
-    assert observed == {"name": "energy-forecasting", "deploy_source": "github"}
+    assert observed == {"name": "energy-forecasting", "deploy_source": "github", "environment": "staging"}
     assert result == [("project", "energy-forecasting", "project-id")]
 
 
 def test_deploy_file_deploys_standalone_workflow(monkeypatch, tmp_path: Path) -> None:
     deployed: list[str] = []
 
-    def fake_workflow_deploy(self: Workflow, *, replace: bool = False) -> Workflow:
+    def fake_workflow_deploy(self: Workflow, *, replace: bool = False, environment: str = "dev") -> Workflow:
+        assert environment == "dev"
         deployed.append(str(self.name))
         self.id = f"{self.name}-id"
         return self
@@ -215,7 +223,8 @@ workflow = rb.Workflow(forecast, name="site-forecast")
 def test_deploy_file_deploys_standalone_asgi_app(monkeypatch, tmp_path: Path) -> None:
     deployed: list[str] = []
 
-    def fake_asgi_app_deploy(self: ASGIApp, *, replace: bool = False) -> ASGIApp:
+    def fake_asgi_app_deploy(self: ASGIApp, *, replace: bool = False, environment: str = "dev") -> ASGIApp:
+        assert environment == "dev"
         deployed.append(str(self.name))
         self.id = f"{self.name}-id"
         self.data = {"url": "https://workflows.example.com/e/default/grid/api"}
@@ -243,7 +252,8 @@ def grid_api() -> object:
 def test_deploy_file_deploys_standalone_predictor(monkeypatch, tmp_path: Path) -> None:
     deployed: list[str] = []
 
-    def fake_model_deploy(self: Model, *, replace: bool = False) -> Model:
+    def fake_model_deploy(self: Model, *, replace: bool = False, environment: str = "dev") -> Model:
+        assert environment == "dev"
         deployed.append(str(self.name))
         self.id = f"{self.name}-id"
         return self
@@ -271,7 +281,13 @@ model = PriceForecastPredictor()
     assert result == [("predictor", "price-forecast", "price-forecast-id")]
 
 
-def test_deploy_file_rejects_plain_model(tmp_path: Path, capsys) -> None:
+class _DirectPolicyClient:
+    def list_environment_policies(self) -> list[dict[str, Any]]:
+        return [{"environment": "dev", "deploy_mode": "direct", "protected": False, "require_pr": False}]
+
+
+def test_deploy_file_rejects_plain_model(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.setattr("rebase.cli.Client", _DirectPolicyClient)
     model_file = tmp_path / "model.py"
     model_file.write_text(
         """
@@ -293,11 +309,13 @@ def test_main_prints_deployed_targets(monkeypatch, tmp_path: Path, capsys) -> No
     workflow_file = tmp_path / "workflow.py"
     workflow_file.write_text("import rebase as rb\nproject = rb.Project('energy-forecasting')\n", encoding="utf-8")
 
-    def fake_project_deploy(self: Project, *, replace: bool = False) -> Project:
+    def fake_project_deploy(self: Project, *, replace: bool = False, environment: str = "dev") -> Project:
+        assert environment == "dev"
         self.id = "project-id"
         return self
 
     monkeypatch.setattr(Project, "deploy", fake_project_deploy)
+    monkeypatch.setattr("rebase.cli.Client", _DirectPolicyClient)
 
     assert main(["deploy", str(workflow_file)]) == 0
 
@@ -306,6 +324,58 @@ def test_main_prints_deployed_targets(monkeypatch, tmp_path: Path, capsys) -> No
     assert "project" in output
     assert "energy-forecasting" in output
     assert "project-id" in output
+
+
+def test_deploy_command_creates_gitops_intent_for_protected_environment(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    workflow_file = tmp_path / "workflow.py"
+    workflow_file.write_text("import rebase as rb\nproject = rb.Project('energy-forecasting')\n", encoding="utf-8")
+    observed: dict[str, Any] = {}
+
+    class FakeClient:
+        def list_environment_policies(self) -> list[dict[str, Any]]:
+            return [{"environment": "prod", "deploy_mode": "gitops", "protected": True, "require_pr": True}]
+
+        def create_gitops_deployment_intent(self, **kwargs: Any) -> dict[str, Any]:
+            observed.update(kwargs)
+            return {
+                "id": "intent-id",
+                "environment": kwargs["environment"],
+                "status": "pending_pr",
+                "source_repo": kwargs["source_repo"],
+                "source_path": kwargs["source_path"],
+                "git_commit_sha": kwargs["git_commit_sha"],
+                "pr_url": "https://github.com/rebase/platform/pulls",
+            }
+
+    monkeypatch.setattr("rebase.cli.Client", FakeClient)
+    monkeypatch.setattr(
+        "rebase.cli._gitops_source_metadata",
+        lambda path: {
+            "source_repo": "rebase/platform",
+            "repo_owner": "rebase",
+            "repo_name": "platform",
+            "source_path": "workflow.py",
+            "git_commit_sha": "abc123",
+            "git_branch": "feature/gitops",
+        },
+    )
+    monkeypatch.setattr(
+        "rebase.cli.deploy_file",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("direct deploy should not run")),
+    )
+
+    assert main(["deploy", str(workflow_file), "--env", "prod"]) == 0
+
+    assert observed["environment"] == "prod"
+    assert observed["source_repo"] == "rebase/platform"
+    assert observed["source_path"] == "workflow.py"
+    assert observed["git_commit_sha"] == "abc123"
+    assert observed["plan"]["kind"] == "rebase_deploy"
+    output = capsys.readouterr().out
+    assert "GitOps Deployment Request" in output
+    assert "https://github.com/rebase/platform/pulls" in output
 
 
 def test_run_command_runs_function_on_cloud_run_by_default(monkeypatch, tmp_path: Path, capsys) -> None:
@@ -1930,10 +2000,11 @@ def test_github_connect_can_clone_workspace_repo_over_https(monkeypatch, tmp_pat
     assert ["remote", "add", "origin", "https://github.com/rebase/platform.git"] in calls
 
 
-def test_github_connect_rewrites_matching_https_origin_to_ssh(monkeypatch, tmp_path: Path) -> None:
+def test_github_connect_preserves_matching_https_origin(monkeypatch, tmp_path: Path) -> None:
     from rebase import setup as setup_module
 
     calls: list[tuple[list[str], Path, str]] = []
+    choices: list[tuple[str, list[str]]] = []
 
     def fake_run_git(args: list[str], *, cwd: Path, action: str, timeout: float = 60) -> None:
         _ = timeout
@@ -1946,11 +2017,34 @@ def test_github_connect_rewrites_matching_https_origin_to_ssh(monkeypatch, tmp_p
     monkeypatch.setattr(
         setup_module,
         "_choose",
-        lambda label, values, *, default=None, title=None: "SSH (git@github.com:rebase/platform.git)",
+        lambda label, values, *, default=None, title=None: choices.append((label, values)),
     )
     monkeypatch.setattr(setup_module, "_run_git", fake_run_git)
 
     setup_module._ensure_local_workspace_repo({"repo_owner": "rebase", "repo_name": "platform"})
+
+    assert calls == []
+    assert choices == []
+
+
+def test_github_connect_can_switch_matching_https_origin_when_prompted(monkeypatch, tmp_path: Path) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[tuple[list[str], Path, str]] = []
+
+    def fake_run_git(args: list[str], *, cwd: Path, action: str, timeout: float = 60) -> None:
+        _ = timeout
+        calls.append((args, cwd, action))
+
+    monkeypatch.setattr(setup_module, "_origin_url", lambda cwd: "https://github.com/rebase/platform.git")
+    monkeypatch.setattr(
+        setup_module,
+        "_choose",
+        lambda label, values, *, default=None, title=None: "SSH (git@github.com:rebase/platform.git)",
+    )
+    monkeypatch.setattr(setup_module, "_run_git", fake_run_git)
+
+    setup_module._ensure_workspace_origin_transport(tmp_path, "rebase/platform", prompt=True)
 
     assert calls == [
         (
@@ -1959,6 +2053,26 @@ def test_github_connect_rewrites_matching_https_origin_to_ssh(monkeypatch, tmp_p
             "update GitHub origin",
         )
     ]
+
+
+def test_git_password_auth_failure_adds_github_hint(monkeypatch, tmp_path: Path) -> None:
+    from rebase import setup as setup_module
+
+    def fake_run(*args: Any, **kwargs: Any) -> object:
+        _ = args, kwargs
+        raise subprocess.CalledProcessError(
+            128,
+            ["git", "fetch", "origin"],
+            stderr=(
+                "remote: Invalid username or token. Password authentication is not supported for Git operations.\n"
+                "fatal: Authentication failed"
+            ),
+        )
+
+    monkeypatch.setattr(setup_module.subprocess, "run", fake_run)
+
+    with pytest.raises(setup_module.RebaseWorkflowError, match="GitHub no longer accepts account passwords"):
+        setup_module._run_git(["fetch", "origin"], cwd=tmp_path, action="fetch rebase/platform")
 
 
 def test_github_connect_stops_when_user_declines_clone(monkeypatch, tmp_path: Path) -> None:
@@ -2110,6 +2224,230 @@ def test_workspace_command_lists_memberships(monkeypatch, tmp_path: Path, capsys
     assert "Workspaces" in output
     assert "workspace-id" in output
     assert "ACME" in output
+
+
+def test_profile_command_shows_active_profile_and_auth(monkeypatch, tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "config.json"
+    auth_path = tmp_path / "auth.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("REBASE_AUTH_FILE", str(auth_path))
+    config_path.write_text(
+        json.dumps(
+            {
+                "default_profile": "prod",
+                "profiles": {
+                    "prod": {
+                        "api_url": "https://api.example.test",
+                        "workspace_id": "workspace-id",
+                        "workspace_name": "ACME",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    auth_path.write_text(
+        json.dumps(
+            AuthSession(
+                access_token="access-token",
+                refresh_token="refresh-token",
+                expires_at=1893456000,
+                token_type="bearer",
+                email="joule@rebase.energy",
+                user_id="user-id",
+            ).to_json()
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["profile"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Profile" in output
+    assert "prod" in output
+    assert "ACME" in output
+    assert "joule@rebase.energy" in output
+    assert "Config file" in output
+    assert "Auth file" in output
+    assert "access-token" not in output
+    assert "refresh-token" not in output
+
+
+def test_profile_list_renders_local_profiles(monkeypatch, tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "config.json"
+    auth_path = tmp_path / "auth.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("REBASE_AUTH_FILE", str(auth_path))
+    config_path.write_text(
+        json.dumps(
+            {
+                "default_profile": "dev",
+                "profiles": {
+                    "dev": {"api_url": "https://dev.test", "workspace_id": "dev-workspace"},
+                    "prod": {"api_key": "rbw_prod", "api_url": "https://prod.test", "workspace_id": "prod-workspace"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["profile", "list"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Profiles" in output
+    assert "dev-workspace" in output
+    assert "prod" in output
+    assert "api key" in output
+    assert "rbw_prod" not in output
+
+
+def test_profile_list_json_does_not_leak_api_keys(monkeypatch, tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    config_path.write_text(
+        json.dumps(
+            {
+                "default_profile": "prod",
+                "profiles": {
+                    "prod": {
+                        "api_key": "rbw_secret",
+                        "api_url": "https://api.example.test",
+                        "workspace_id": "workspace-id",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["profile", "list", "--json"]) == 0
+
+    output = capsys.readouterr().out
+    data = json.loads(output)
+    assert data["active_profile"] == "prod"
+    assert data["profiles"] == [
+        {
+            "active": True,
+            "profile": "prod",
+            "workspace": "workspace-id",
+            "workspace_id": "workspace-id",
+            "api_url": "https://api.example.test",
+            "has_api_key": True,
+            "credential": "api key",
+        }
+    ]
+    assert "rbw_secret" not in output
+
+
+def test_profile_show_json_returns_safe_profile_metadata(monkeypatch, tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "config.json"
+    auth_path = tmp_path / "auth.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("REBASE_AUTH_FILE", str(auth_path))
+    config_path.write_text(
+        json.dumps(
+            {
+                "default_profile": "dev",
+                "profiles": {
+                    "dev": {"workspace_id": "dev-workspace"},
+                    "prod": {"api_key": "rbw_prod", "workspace_id": "prod-workspace"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    auth_path.write_text(
+        json.dumps(
+            AuthSession(
+                access_token="access-token",
+                refresh_token="refresh-token",
+                expires_at=1893456000,
+                token_type="bearer",
+                email="sebastian@rebase.energy",
+                user_id="user-id",
+            ).to_json()
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["profile", "show", "prod", "--json"]) == 0
+
+    output = capsys.readouterr().out
+    data = json.loads(output)
+    assert data["profile"] == "prod"
+    assert data["active_profile"] == "dev"
+    assert data["active"] is False
+    assert data["workspace_id"] == "prod-workspace"
+    assert data["has_api_key"] is True
+    assert data["credential"] == "api key"
+    assert data["auth"]["email"] == "sebastian@rebase.energy"
+    assert data["config_file"] == str(config_path)
+    assert data["auth"]["auth_file"] == str(auth_path)
+    assert "rbw_prod" not in output
+    assert "access-token" not in output
+    assert "refresh-token" not in output
+
+
+def test_profile_switch_changes_default_profile(monkeypatch, tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    config_path.write_text(
+        json.dumps(
+            {
+                "default_profile": "dev",
+                "profiles": {
+                    "dev": {"api_key": "rbw_dev"},
+                    "prod": {"api_key": "rbw_prod"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["profile", "switch", "prod"]) == 0
+
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data["default_profile"] == "prod"
+    assert capsys.readouterr().out == "Switched profile to 'prod'\n"
+
+
+def test_profile_logout_clears_auth_session_only(monkeypatch, tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "config.json"
+    auth_path = tmp_path / "auth.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("REBASE_AUTH_FILE", str(auth_path))
+    config_path.write_text(
+        json.dumps({"default_profile": "dev", "profiles": {"dev": {"workspace_id": "workspace-id"}}}),
+        encoding="utf-8",
+    )
+    auth_path.write_text(
+        json.dumps(
+            AuthSession(
+                access_token="access-token",
+                refresh_token="refresh-token",
+                expires_at=1893456000,
+                token_type="bearer",
+            ).to_json()
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["profile", "logout"]) == 0
+
+    assert config_path.exists()
+    assert not auth_path.exists()
+    assert f"Cleared Rebase auth session at {auth_path}" in capsys.readouterr().out
+
+
+def test_profile_show_unknown_profile_errors(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    config_path.write_text(
+        json.dumps({"default_profile": "dev", "profiles": {"dev": {"workspace_id": "workspace-id"}}}),
+        encoding="utf-8",
+    )
+
+    assert main(["profile", "show", "prod"]) == 1
 
 
 def test_workspace_use_changes_default_profile(monkeypatch, tmp_path: Path, capsys) -> None:

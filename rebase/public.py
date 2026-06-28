@@ -257,15 +257,10 @@ def step(
     name: str | None = None,
     description: str | None = None,
     default_parameters: dict[str, Any] | None = None,
-    dependencies: list[str] | tuple[str, ...] | None = None,
-    image: Image | dict[str, Any] | None = None,
-    min_instances: int | None = None,
-    concurrency: int | None = None,
     enabled: bool = True,
     retries: int = 0,
     timeout_seconds: int | float | None = None,
     cache: bool = False,
-    resources: dict[str, Any] | None = None,
     deploy_source: str | None = None,
 ) -> Callable[[Callable[..., Any]], Step]: ...
 
@@ -278,15 +273,10 @@ def step(
     name: str | None = None,
     description: str | None = None,
     default_parameters: dict[str, Any] | None = None,
-    dependencies: list[str] | tuple[str, ...] | None = None,
-    image: Image | dict[str, Any] | None = None,
-    min_instances: int | None = None,
-    concurrency: int | None = None,
     enabled: bool = True,
     retries: int = 0,
     timeout_seconds: int | float | None = None,
     cache: bool = False,
-    resources: dict[str, Any] | None = None,
     deploy_source: str | None = None,
 ) -> Step: ...
 
@@ -298,15 +288,10 @@ def step(
     name: str | None = None,
     description: str | None = None,
     default_parameters: dict[str, Any] | None = None,
-    dependencies: list[str] | tuple[str, ...] | None = None,
-    image: Image | dict[str, Any] | None = None,
-    min_instances: int | None = None,
-    concurrency: int | None = None,
     enabled: bool = True,
     retries: int = 0,
     timeout_seconds: int | float | None = None,
     cache: bool = False,
-    resources: dict[str, Any] | None = None,
     deploy_source: str | None = None,
 ) -> Callable[[Callable[..., Any]], Step] | Step:
     def decorator(callable_: Callable[..., Any]) -> Step:
@@ -316,15 +301,10 @@ def step(
             project=project or DEFAULT_PROJECT_NAME,
             description=description,
             default_parameters=default_parameters,
-            dependencies=dependencies,
-            image=image,
-            min_instances=min_instances,
-            concurrency=concurrency,
             enabled=enabled,
             retries=retries,
             timeout_seconds=timeout_seconds,
             cache=cache,
-            resources=resources,
             deploy_source=deploy_source,
         )
 
@@ -346,6 +326,11 @@ def workflow(
     enabled: bool = True,
     endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
+    dependencies: list[str] | tuple[str, ...] | None = None,
+    image: Image | dict[str, Any] | None = None,
+    min_instances: int | None = None,
+    concurrency: int | None = None,
+    resources: dict[str, Any] | None = None,
 ) -> Callable[[Callable[..., Any]], Workflow]: ...
 
 
@@ -362,6 +347,11 @@ def workflow(
     enabled: bool = True,
     endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
+    dependencies: list[str] | tuple[str, ...] | None = None,
+    image: Image | dict[str, Any] | None = None,
+    min_instances: int | None = None,
+    concurrency: int | None = None,
+    resources: dict[str, Any] | None = None,
 ) -> Workflow: ...
 
 
@@ -377,6 +367,11 @@ def workflow(
     enabled: bool = True,
     endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
+    dependencies: list[str] | tuple[str, ...] | None = None,
+    image: Image | dict[str, Any] | None = None,
+    min_instances: int | None = None,
+    concurrency: int | None = None,
+    resources: dict[str, Any] | None = None,
 ) -> Callable[[Callable[..., Any]], Workflow] | Workflow:
     def decorator(callable_: Callable[..., Any]) -> Workflow:
         return Workflow(
@@ -390,6 +385,11 @@ def workflow(
             enabled=enabled,
             endpoint=endpoint,
             deploy_source=deploy_source,
+            dependencies=dependencies,
+            image=image,
+            min_instances=min_instances,
+            concurrency=concurrency,
+            resources=resources,
         )
 
     if fn is not None:
@@ -404,15 +404,23 @@ def deploy(
     *targets: DeployTarget,
     replace: bool = False,
     deploy_source: str | None = None,
+    environment: str = "dev",
 ) -> DeployTarget | list[Any]:
     if not targets:
         raise RebaseWorkflowError("deploy requires at least one Rebase project, function, workflow, ASGI app, or model")
-    deployed = [
-        target.deploy(replace=replace)
-        if deploy_source is None
-        else target.deploy(replace=replace, deploy_source=deploy_source)
-        for target in targets
-    ]
+    for target in targets:
+        if isinstance(target, Step):
+            raise RebaseWorkflowError(
+                f"Step {getattr(target, 'name', repr(target))!r} cannot be deployed standalone. "
+                "Steps are deployed automatically when their workflow is deployed. "
+                "Use rb.deploy(workflow) instead."
+            )
+    deploy_kwargs: dict[str, Any] = {"replace": replace}
+    if deploy_source is not None:
+        deploy_kwargs["deploy_source"] = deploy_source
+    if environment != "dev":
+        deploy_kwargs["environment"] = environment
+    deployed = [target.deploy(**deploy_kwargs) for target in targets]
     return deployed[0] if len(deployed) == 1 else deployed
 
 
