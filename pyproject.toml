@@ -37,6 +37,10 @@ huggingface = [
 modeling = [
     "emflow",
 ]
+hillclimb = [
+    "rebase-hillclimb[emflow]",
+    "google-cloud-storage>=2.14",
+]
 all = [
     "emflow",
     "energydatamodel",

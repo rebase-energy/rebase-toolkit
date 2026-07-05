@@ -3323,6 +3323,146 @@ def run_cancel_command(
     raise RebaseWorkflowError(f"run cancellation is not supported yet: {run_id}")
 
 
+hillclimb_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Agentic model searches (rebase-hillclimb) — hosted on the platform or local.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+
+def _hillclimb():
+    from rebase import hillclimb as module
+
+    return module
+
+
+def _hillclimb_sync_id(client: "Client", run_id: str) -> str:
+    run = client.get_run(run_id)
+    sync_id = (run.get("parameters") or {}).get("sync_id")
+    if not sync_id:
+        raise RebaseWorkflowError(f"run {run_id} is not a hillclimb search (no sync_id)")
+    return str(sync_id)
+
+
+def _parse_budget_seconds(value: str) -> int:
+    import re as _re
+
+    match = _re.fullmatch(r"(\d+)\s*([hms]?)", value.strip())
+    if not match:
+        raise RebaseWorkflowError(f"cannot parse budget {value!r} (use e.g. 2h, 30m, 3600s)")
+    return int(match.group(1)) * {"h": 3600, "m": 60, "s": 1, "": 1}[match.group(2)]
+
+
+@hillclimb_app.command("start")
+def hillclimb_start_command(
+    target: Annotated[str, typer.Argument(help="Problem target, e.g. emflow://gefcom2014:solar.")],
+    budget: Annotated[str, typer.Option("--budget", help="Wall-clock budget, e.g. 2h / 30m.")] = "2h",
+    name: Annotated[str | None, typer.Option("--name", help="Search name.")] = None,
+    model: Annotated[str | None, typer.Option("--model", help="Agent model, e.g. sonnet.")] = None,
+    project: Annotated[str, typer.Option("--project", help="Project for the platform run.")] = "hillclimb",
+    local: Annotated[bool, typer.Option("--local", help="Run on this machine instead of the platform.")] = False,
+) -> None:
+    """Start a hillclimb search (hosted by default; --local runs it here)."""
+    module = _hillclimb()
+    budget_s = _parse_budget_seconds(budget)
+    if local:
+        outcome = module.run_local_search(
+            target, budget_s=budget_s, name=name, model=model, log=console.print
+        )
+        console.print(f"[bold]{outcome.state}[/bold] {outcome.ref}")
+        if outcome.selected is not None:
+            console.print(
+                f"selected {outcome.selected.candidate_id}: val={outcome.selected.val_score}"
+            )
+        return
+    run = module.start_hosted_search(
+        Client(), target, budget_s=budget_s, name=name, project=project, model=model
+    )
+    console.print(f"Submitted hosted search run [bold]{run.id}[/bold]")
+    console.print(f"  status: rebase hillclimb status {run.id}")
+    console.print(f"  events: rebase run get {run.id}")
+
+
+@hillclimb_app.command("list")
+def hillclimb_list_command(
+    limit: Annotated[int, typer.Option("--limit", min=1, max=500)] = 50,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """List hosted hillclimb search runs."""
+    module = _hillclimb()
+    client = Client()
+    runs = [
+        run
+        for run in client.list_runs(target_type="function", limit=limit)
+        if str(run.get("name", "")).startswith(module.RUN_NAME_PREFIX)
+    ]
+    if json_output:
+        _print_json(runs)
+        return
+    for run in runs:
+        console.print(
+            f"{run.get('id')}  {run.get('status'):<10}  {run.get('name')}  "
+            f"{run.get('created_at', '')}"
+        )
+    if not runs:
+        console.print("no hillclimb runs yet — rebase hillclimb start <target>")
+
+
+@hillclimb_app.command("status")
+def hillclimb_status_command(
+    run_id: Annotated[str, typer.Argument(help="Platform run ID from `hillclimb start`.")],
+    bucket: Annotated[str | None, typer.Option("--bucket", help="Artifacts bucket override.")] = None,
+) -> None:
+    """Live search state (candidates, best score, budget) from synced GCS state."""
+    module = _hillclimb()
+    client = Client()
+    run = client.get_run(run_id)
+    console.print(f"platform run: {run.get('status')}")
+    sync_id = _hillclimb_sync_id(client, run_id)
+    statuses = module.read_hosted_state(sync_id, bucket=bucket)
+    console.print(module.format_hosted_status(statuses))
+
+
+@hillclimb_app.command("stop")
+def hillclimb_stop_command(
+    run_id: Annotated[str, typer.Argument(help="Platform run ID.")],
+    bucket: Annotated[str | None, typer.Option("--bucket")] = None,
+) -> None:
+    """Gracefully stop a hosted search (parks after the current operator)."""
+    module = _hillclimb()
+    sync_id = _hillclimb_sync_id(Client(), run_id)
+    module.request_hosted_stop(sync_id, bucket=bucket)
+    console.print("stop queued: delivered to the search within one sync interval (~30s)")
+
+
+@hillclimb_app.command("promote")
+def hillclimb_promote_command(
+    run_id: Annotated[str, typer.Argument(help="Platform run ID of a finished search.")],
+    dest: Annotated[str, typer.Option("--dest", help="Directory for the model files.")] = "models",
+    bucket: Annotated[str | None, typer.Option("--bucket")] = None,
+) -> None:
+    """Fetch the selected model(s) into the workspace repo (models/<id>.py).
+
+    Commit and open a PR from the workspace repo; protected environments
+    then deploy through the existing gitops flow."""
+    module = _hillclimb()
+    sync_id = _hillclimb_sync_id(Client(), run_id)
+    written = module.fetch_best_solution(sync_id, Path(dest), bucket=bucket)
+    if not written:
+        raise RebaseWorkflowError("no best/solution.py synced yet — is the search finished?")
+    for path in written:
+        console.print(f"wrote {path}")
+    console.print(
+        "review, then: git checkout -b hillclimb-promotion && git add "
+        f"{dest} && git commit && open a PR — protected deploys go through gitops"
+    )
+
+
+app.add_typer(hillclimb_app, name="hillclimb")
+
+
 def _parse_logo_variant(args: list[str]) -> tuple[int, list[str]]:
     """Strip --logo N from args and return (variant, remaining_args)."""
     variant = 1
