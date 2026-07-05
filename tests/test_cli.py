@@ -3204,3 +3204,25 @@ def test_workflow_versions_command_and_name_lookup_error(capsys, monkeypatch) ->
     assert main(["workflow", "versions", "forecast", "--project", "energy", "--json"]) == 0
     output = capsys.readouterr().out
     assert '"version_number": 2' in output
+
+
+def test_hillclimb_promote_local(tmp_path):
+    from rebase.hillclimb import promote_local
+
+    run = tmp_path / "runs" / "20260706-010203-grid-wind-es"
+    best = run / "searches" / "grid-wind-es" / "best"
+    best.mkdir(parents=True)
+    (best / "solution.py").write_text("def get_model():\n    return None\n")
+
+    written = promote_local("latest", tmp_path / "models", runs_dir=tmp_path / "runs")
+    assert [p.name for p in written] == ["grid_wind_es.py"]
+    assert (tmp_path / "models" / "grid_wind_es.py").read_text().startswith("def get_model")
+
+    written = promote_local("wind-es", tmp_path / "models", runs_dir=tmp_path / "runs")
+    assert len(written) == 1
+
+    with pytest.raises(RuntimeError, match="no local run matching"):
+        promote_local("nope", tmp_path / "models", runs_dir=tmp_path / "runs")
+    (best / "solution.py").unlink()
+    with pytest.raises(RuntimeError, match="no searches with a best"):
+        promote_local("latest", tmp_path / "models", runs_dir=tmp_path / "runs")

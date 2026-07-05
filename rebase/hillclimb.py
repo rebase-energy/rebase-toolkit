@@ -299,6 +299,44 @@ def request_hosted_stop(sync_id: str, bucket: str | None = None) -> str:
     return name
 
 
+def promote_local(run_ref: str, dest: Path, runs_dir: Path | None = None) -> list[Path]:
+    """Local-run counterpart of :func:`fetch_best_solution`: copy every
+    search's ``best/solution.py`` from a run under ``runs/`` into ``dest``.
+
+    ``run_ref`` is a run id from ``runs/`` (e.g. ``20260705-203512-grid-...``),
+    a unique substring of one, or ``latest``.
+    """
+    runs_dir = Path(runs_dir or "runs")
+    candidates = sorted(d for d in runs_dir.iterdir() if d.is_dir()) if runs_dir.exists() else []
+    if not candidates:
+        raise RuntimeError(f"no local runs under {runs_dir.resolve()}")
+    if run_ref == "latest":
+        matches = candidates[-1:]
+    else:
+        matches = [d for d in candidates if d.name == run_ref] or \
+                  [d for d in candidates if run_ref in d.name]
+    if not matches:
+        raise RuntimeError(f"no local run matching {run_ref!r} under {runs_dir.resolve()}")
+    if len(matches) > 1:
+        names = ", ".join(d.name for d in matches)
+        raise RuntimeError(f"run ref {run_ref!r} is ambiguous: {names}")
+
+    run_dir = matches[-1]
+    written: list[Path] = []
+    for solution in sorted(run_dir.glob("searches/*/best/solution.py")):
+        search_id = solution.parents[1].name
+        out = dest / f"{search_id.replace(':', '_').replace('-', '_')}.py"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(solution.read_bytes())
+        written.append(out)
+    if not written:
+        raise RuntimeError(
+            f"run {run_dir.name} has no searches with a best/solution.py — "
+            "did the search select a candidate?"
+        )
+    return written
+
+
 def fetch_best_solution(sync_id: str, dest: Path, bucket: str | None = None) -> list[Path]:
     """Download every search's best/solution.py for promotion into the
     workspace repo. Returns the written paths."""

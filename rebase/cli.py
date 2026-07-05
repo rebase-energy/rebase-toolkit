@@ -3444,19 +3444,31 @@ def hillclimb_stop_command(
 
 @hillclimb_app.command("promote")
 def hillclimb_promote_command(
-    run_id: Annotated[str, typer.Argument(help="Platform run ID of a finished search.")],
+    run_id: Annotated[
+        str,
+        typer.Argument(help="Platform run ID, or with --local a runs/ id, unique substring, or 'latest'."),
+    ],
     dest: Annotated[str, typer.Option("--dest", help="Directory for the model files.")] = "models",
     bucket: Annotated[str | None, typer.Option("--bucket")] = None,
+    local: Annotated[
+        bool, typer.Option("--local", help="Promote from a local search (state in ./runs/).")
+    ] = False,
 ) -> None:
     """Fetch the selected model(s) into the workspace repo (models/<id>.py).
 
     Commit and open a PR from the workspace repo; protected environments
     then deploy through the existing gitops flow."""
     module = _hillclimb()
-    sync_id = _hillclimb_sync_id(Client(), run_id)
-    written = module.fetch_best_solution(sync_id, Path(dest), bucket=bucket)
-    if not written:
-        raise RebaseWorkflowError("no best/solution.py synced yet — is the search finished?")
+    if local:
+        try:
+            written = module.promote_local(run_id, Path(dest))
+        except RuntimeError as exc:
+            raise RebaseWorkflowError(str(exc)) from exc
+    else:
+        sync_id = _hillclimb_sync_id(Client(), run_id)
+        written = module.fetch_best_solution(sync_id, Path(dest), bucket=bucket)
+        if not written:
+            raise RebaseWorkflowError("no best/solution.py synced yet — is the search finished?")
     for path in written:
         console.print(f"wrote {path}")
     console.print(
