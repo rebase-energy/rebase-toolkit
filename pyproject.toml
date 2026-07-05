@@ -45,6 +45,8 @@ all = [
     "emflow",
     "energydatamodel",
     "huggingface-hub>=1.20.1",
+    "rebase-hillclimb[emflow]",
+    "google-cloud-storage>=2.14",
 ]
 
 [dependency-groups]

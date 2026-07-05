@@ -64,6 +64,7 @@ Optional data/modeling packages:
 ```bash
 uv pip install "rebase-toolkit[data]"
 uv pip install "rebase-toolkit[modeling]"
+uv pip install "rebase-toolkit[hillclimb]"
 uv pip install "rebase-toolkit[all]"
 ```
 
@@ -211,6 +212,56 @@ Call a deployed model through its generated `predict` endpoint:
 model = rebase.get_predictor("default/price-forecast")
 result = model.predict.remote(zone="SE4")
 ```
+
+## Hillclimb Searches
+
+`rebase hillclimb` runs agentic model searches with
+[rebase-hillclimb](https://github.com/rebase-energy/rebase-hillclimb): coding
+agents draft, debug, improve, and ensemble
+[emflow](https://github.com/rebase-energy/emflow) `Predictor` classes; every
+candidate is backtested leakage-safe on the problem's validation split and the
+winner is selected on a hidden holdout. Requires the `hillclimb` extra.
+
+Start a search — hosted on the platform by default (a long-running Cloud Run
+job), or on your own machine with `--local`:
+
+```bash
+rebase hillclimb start emflow://gefcom2014:solar --budget 2h
+rebase hillclimb start emflow://gefcom2014:solar --budget 2h --local
+```
+
+Any problem in emflow's registry is a valid target (`emflow://<name>`), as are
+plain hillclimb problem folders. `--backend dummy` runs the search loop
+without agent calls (smoke tests).
+
+Watch and control a hosted search — its state (candidate tree, scores, budget)
+syncs to the workspace artifacts bucket every ~30 s:
+
+```bash
+rebase hillclimb list
+rebase hillclimb status <run-id>   # candidates, best score, budget left
+rebase hillclimb stop <run-id>     # graceful: parks after the current operator
+```
+
+When the search finishes, promote the selected model into your workspace repo
+as versioned source, then deploy it like any other model:
+
+```bash
+rebase hillclimb promote <run-id>            # writes models/<problem_id>.py
+# review, commit, open a PR (protected environments deploy through gitops)
+rebase model deploy models/gefcom2014_solar.py
+```
+
+The promoted file exposes `get_model() -> emflow.Predictor` — the same class
+that won the backtest is what serves in production.
+
+Hosted searches bill agent calls to the workspace's configured Claude
+credentials (a `CLAUDE_CODE_OAUTH_TOKEN` for subscription billing, or an
+API key); `--local` searches use your local Claude login. Search state lives
+under `gs://<artifacts-bucket>/hillclimb/<sync-id>/`; set
+`REBASE_HILLCLIMB_BUCKET` to read it from the CLI. Server-side requirements
+(job image, secrets, artifacts bucket) are documented in
+`platform/workflows/HILLCLIMB.md`.
 
 ## Dependencies
 
