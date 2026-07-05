@@ -3361,6 +3361,10 @@ def hillclimb_start_command(
     budget: Annotated[str, typer.Option("--budget", help="Wall-clock budget, e.g. 2h / 30m.")] = "2h",
     name: Annotated[str | None, typer.Option("--name", help="Search name.")] = None,
     model: Annotated[str | None, typer.Option("--model", help="Agent model, e.g. sonnet.")] = None,
+    backend: Annotated[
+        str | None,
+        typer.Option("--backend", help="Operator backend: claude-code (default) | dummy (smoke tests)."),
+    ] = None,
     project: Annotated[str, typer.Option("--project", help="Project for the platform run.")] = "hillclimb",
     local: Annotated[bool, typer.Option("--local", help="Run on this machine instead of the platform.")] = False,
 ) -> None:
@@ -3369,7 +3373,7 @@ def hillclimb_start_command(
     budget_s = _parse_budget_seconds(budget)
     if local:
         outcome = module.run_local_search(
-            target, budget_s=budget_s, name=name, model=model, log=console.print
+            target, budget_s=budget_s, name=name, model=model, backend=backend, log=console.print
         )
         console.print(f"[bold]{outcome.state}[/bold] {outcome.ref}")
         if outcome.selected is not None:
@@ -3378,7 +3382,8 @@ def hillclimb_start_command(
             )
         return
     run = module.start_hosted_search(
-        Client(), target, budget_s=budget_s, name=name, project=project, model=model
+        Client(), target, budget_s=budget_s, name=name, project=project, model=model,
+        backend=backend,
     )
     console.print(f"Submitted hosted search run [bold]{run.id}[/bold]")
     console.print(f"  status: rebase hillclimb status {run.id}")

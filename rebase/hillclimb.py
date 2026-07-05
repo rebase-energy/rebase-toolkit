@@ -149,18 +149,24 @@ def hosted_search(
     name: str | None = None,
     sync_id: str | None = None,
     model: str | None = None,
+    backend: str | None = None,
 ) -> dict[str, Any]:
     """Entry point of the generated search stub (runs inside the job image).
 
-    Runs one hillclimb search with platform-appropriate config (api-key agent
-    auth, image-local runtime venvs) and GCS state sync; returns a summary
-    dict that becomes the platform run's result."""
+    Runs one hillclimb search with platform-appropriate config and GCS state
+    sync; returns a summary dict that becomes the platform run's result.
+    Agent auth: subscription billing when CLAUDE_CODE_OAUTH_TOKEN was injected
+    (Secret Manager), else api-key."""
     hillclimb = _require_hillclimb()
     from hillclimb.config import Config
 
     home = Path(os.environ.get("HILLCLIMB_HOME", "/hillclimb"))
     config = Config()
-    config.backend_auth = "api-key"
+    config.backend_auth = (
+        "subscription" if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") else "api-key"
+    )
+    if backend:
+        config.backend = backend
     if model:
         config.model = model
     config.paths.runs_dir = home / "runs"
@@ -206,11 +212,13 @@ _STUB_TEMPLATE = '''\
 """Generated hillclimb search stub — submitted by `rebase hillclimb start`."""
 
 
-def run(target: str, budget_s: int, name: str, sync_id: str, model: str = ""):
+def run(target: str, budget_s: int, name: str, sync_id: str, model: str = "",
+        backend: str = ""):
     from rebase.hillclimb import hosted_search
 
     return hosted_search(target, budget_s=budget_s, name=name,
-                         sync_id=sync_id, model=model or None)
+                         sync_id=sync_id, model=model or None,
+                         backend=backend or None)
 '''
 
 
@@ -225,6 +233,7 @@ def start_hosted_search(
     name: str | None = None,
     project: str = "hillclimb",
     model: str | None = None,
+    backend: str | None = None,
 ):
     """Submit a hosted search as an ephemeral cloud_run_jobs run. Returns the
     platform Run handle (poll with `rebase run get`, watch state via GCS)."""
@@ -242,6 +251,7 @@ def start_hosted_search(
             "name": name or target,
             "sync_id": sync_id,
             "model": model or "",
+            "backend": backend or "",
         },
         execution_backend="cloud_run_jobs",
         image_spec={"runtime": "hillclimb"},
@@ -254,12 +264,15 @@ def run_local_search(
     budget_s: int,
     name: str | None = None,
     model: str | None = None,
+    backend: str | None = None,
     log=print,
 ):
     """`--local` mode: same command surface, search runs on this machine with
     the user's own hillclimb config (subscription agent auth, local runs/)."""
     hillclimb = _require_hillclimb()
-    return hillclimb.run_search(target, budget_s=budget_s, name=name, model=model, log=log)
+    return hillclimb.run_search(
+        target, budget_s=budget_s, name=name, model=model, backend=backend, log=log
+    )
 
 
 def read_hosted_state(sync_id: str, bucket: str | None = None) -> dict[str, Any]:
