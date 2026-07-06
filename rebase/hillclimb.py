@@ -165,6 +165,10 @@ def hosted_search(
     config.backend_auth = (
         "subscription" if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") else "api-key"
     )
+    # hosted containers run one search with several operator workers; the
+    # machine-wide semaphore is meaningless inside a single-search container
+    config.search.parallel_agents = int(os.environ.get("REBASE_HILLCLIMB_PARALLEL_AGENTS", "3"))
+    config.search.machine_max_agents = 0
     if backend:
         config.backend = backend
     if model:
