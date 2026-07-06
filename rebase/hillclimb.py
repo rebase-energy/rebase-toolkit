@@ -310,7 +310,12 @@ def promote_local(run_ref: str, dest: Path, runs_dir: Path | None = None) -> lis
     ``run_ref`` is a run id from ``runs/`` (e.g. ``20260705-203512-grid-...``),
     a unique substring of one, or ``latest``.
     """
-    runs_dir = Path(runs_dir or "runs")
+    if runs_dir is None:
+        # resolve through the workspace marker, like the engine itself
+        from hillclimb.config import Config
+
+        runs_dir = Config.load(require_workspace=False).paths.runs_dir
+    runs_dir = Path(runs_dir)
     candidates = sorted(d for d in runs_dir.iterdir() if d.is_dir()) if runs_dir.exists() else []
     if not candidates:
         raise RuntimeError(f"no local runs under {runs_dir.resolve()}")
