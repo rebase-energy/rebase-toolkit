@@ -150,6 +150,7 @@ def hosted_search(
     sync_id: str | None = None,
     model: str | None = None,
     backend: str | None = None,
+    seed_solution_code: str | None = None,
 ) -> dict[str, Any]:
     """Entry point of the generated search stub (runs inside the job image).
 
@@ -189,9 +190,16 @@ def hosted_search(
     if bucket and sync_id:
         sync = _StateSync(bucket, sync_id, config.paths.runs_dir)
         sync.start()
+    seed_path = None
+    if seed_solution_code:
+        # incumbent model shipped as a run parameter; scored as the floor
+        # candidate the search must beat
+        seed_path = home / "seed_solution.py"
+        seed_path.write_text(seed_solution_code)
     try:
         outcome = hillclimb.run_search(
-            target, budget_s=budget_s, name=name, config=config, log=print
+            target, budget_s=budget_s, name=name, config=config, log=print,
+            seed_from=seed_path,
         )
     finally:
         if sync is not None:
@@ -234,12 +242,13 @@ _STUB_TEMPLATE = '''\
 
 
 def run(target: str, budget_s: int, name: str, sync_id: str, model: str = "",
-        backend: str = ""):
+        backend: str = "", seed_solution_code: str = ""):
     from rebase.hillclimb import hosted_search
 
     return hosted_search(target, budget_s=budget_s, name=name,
                          sync_id=sync_id, model=model or None,
-                         backend=backend or None)
+                         backend=backend or None,
+                         seed_solution_code=seed_solution_code or None)
 '''
 
 
@@ -255,6 +264,7 @@ def start_hosted_search(
     project: str = "hillclimb",
     model: str | None = None,
     backend: str | None = None,
+    seed_solution_code: str | None = None,
 ):
     """Submit a hosted search as an ephemeral cloud_run_jobs run. Returns the
     platform Run handle (poll with `rebase run get`, watch state via GCS)."""
@@ -273,6 +283,7 @@ def start_hosted_search(
             "sync_id": sync_id,
             "model": model or "",
             "backend": backend or "",
+            "seed_solution_code": seed_solution_code or "",
         },
         execution_backend="cloud_run_jobs",
         image_spec={"runtime": "hillclimb"},
