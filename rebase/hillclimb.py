@@ -33,7 +33,7 @@ from typing import Any
 RUN_NAME_PREFIX = "hillclimb:"
 GCS_ROOT = "hillclimb"
 SYNC_INTERVAL_S = 30
-SYNCED_FILES = ("run.yaml", "search.yaml", "status.json", "journal.jsonl")
+SYNCED_FILES = ("run.yaml", "search.yaml", "status.json", "journal.jsonl", "knowledge_card.yaml")
 SYNCED_DIRS = ("best",)
 
 
@@ -151,6 +151,7 @@ def hosted_search(
     model: str | None = None,
     backend: str | None = None,
     seed_solution_code: str | None = None,
+    knowledge_context: str | None = None,
 ) -> dict[str, Any]:
     """Entry point of the generated search stub (runs inside the job image).
 
@@ -200,6 +201,7 @@ def hosted_search(
         outcome = hillclimb.run_search(
             target, budget_s=budget_s, name=name, config=config, log=print,
             seed_from=seed_path,
+            knowledge_context=knowledge_context or None,
         )
     finally:
         if sync is not None:
@@ -243,13 +245,14 @@ _STUB_TEMPLATE = '''\
 
 
 def run(target: str, budget_s: int, name: str, sync_id: str, model: str = "",
-        backend: str = "", seed_solution_code: str = ""):
+        backend: str = "", seed_solution_code: str = "", knowledge_context: str = ""):
     from rebase.hillclimb import hosted_search
 
     return hosted_search(target, budget_s=budget_s, name=name,
                          sync_id=sync_id, model=model or None,
                          backend=backend or None,
-                         seed_solution_code=seed_solution_code or None)
+                         seed_solution_code=seed_solution_code or None,
+                         knowledge_context=knowledge_context or None)
 '''
 
 
@@ -266,6 +269,7 @@ def start_hosted_search(
     model: str | None = None,
     backend: str | None = None,
     seed_solution_code: str | None = None,
+    knowledge_context: str | None = None,
 ):
     """Submit a hosted search as an ephemeral cloud_run_jobs run. Returns the
     platform Run handle (poll with `rebase run get`, watch state via GCS)."""
@@ -285,6 +289,7 @@ def start_hosted_search(
             "model": model or "",
             "backend": backend or "",
             "seed_solution_code": seed_solution_code or "",
+            "knowledge_context": knowledge_context or "",
         },
         execution_backend="cloud_run_jobs",
         image_spec={"runtime": "hillclimb"},
