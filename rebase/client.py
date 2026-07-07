@@ -999,6 +999,27 @@ def _parse_github_remote(remote: str | None) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _parse_gitlab_remote(remote: str | None) -> tuple[str | None, str | None]:
+    """Parse a GitLab remote (gitlab.com or self-managed) into (namespace, project).
+
+    GitLab namespaces can nest (group/subgroup/project) — owner is the full namespace path.
+    """
+    if remote is None:
+        return None, None
+    patterns = [
+        r"^git@(?P<host>[^:]*gitlab[^:]*):(?P<path>.+?)(?:\.git)?$",
+        r"^https://(?P<host>[^/]*gitlab[^/]*)/(?P<path>.+?)(?:\.git)?$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, remote)
+        if match:
+            path = match.group("path").strip("/")
+            if "/" in path:
+                owner, _, name = path.rpartition("/")
+                return owner, name
+    return None, None
+
+
 def _git_metadata_for(fn: Callable[..., Any]) -> dict[str, Any]:
     source_file = inspect.getsourcefile(fn)
     if source_file is None:
@@ -1470,6 +1491,85 @@ class Client:
         )
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected GitHub repository installation response")
+        return response
+
+    def connect_gitlab_repo(
+        self,
+        *,
+        scope: str,
+        repo: str,
+        token: str,
+        host: str = "gitlab.com",
+        repo_path: str | None = None,
+        default_branch: str | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            "/integrations/gitlab/repo-connections",
+            json={
+                "scope": scope,
+                "repo": repo,
+                "token": token,
+                "host": host,
+                "repo_path": repo_path,
+                "default_branch": default_branch,
+                "project_id": project_id,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected GitLab repo connection response")
+        return response
+
+    def list_gitlab_repo_connections(self, *, project_id: str | None = None) -> list[dict[str, Any]]:
+        params = {"project_id": project_id} if project_id else {}
+        response = self.request("GET", "/integrations/gitlab/repo-connections", params=params)
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected GitLab repo connection list response")
+        return response
+
+    def get_gitlab_repo_file(self, connection_id: str, *, path: str) -> dict[str, Any]:
+        response = self.request(
+            "GET", f"/integrations/gitlab/repo-connections/{connection_id}/file", params={"path": path}
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected GitLab repo file response")
+        return response
+
+    def create_gitlab_starter_workflow(self, connection_id: str, *, path: str | None = None) -> dict[str, Any]:
+        payload = {"path": path} if path else {}
+        response = self.request(
+            "POST", f"/integrations/gitlab/repo-connections/{connection_id}/starter-workflow", json=payload
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected GitLab starter workflow response")
+        return response
+
+    def create_gitlab_promotion_mr(
+        self,
+        connection_id: str,
+        *,
+        path: str,
+        content: str,
+        title: str,
+        body: str = "",
+        branch: str | None = None,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            f"/integrations/gitlab/repo-connections/{connection_id}/promotion-mr",
+            json={
+                "path": path,
+                "content": content,
+                "title": title,
+                "body": body,
+                "branch": branch,
+                "message": message,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected GitLab promotion MR response")
         return response
 
     def list_github_repo_connections(self, *, project_id: str | None = None) -> list[dict[str, Any]]:

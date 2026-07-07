@@ -2258,6 +2258,80 @@ def connect_github_command(
         raise SystemExit(130) from None
 
 
+@connect_app.command("gitlab")
+def connect_gitlab_command(
+    repo: Annotated[
+        str | None,
+        typer.Argument(help="Project path with namespace, e.g. group/project. Defaults to the local git origin."),
+    ] = None,
+    token: Annotated[
+        str | None,
+        typer.Option("--token", "-t", help="GitLab access token. Falls back to $GITLAB_ACCESS_TOKEN, then a prompt."),
+    ] = None,
+    host: Annotated[str, typer.Option("--host", help="GitLab host; self-managed instances supported.")] = "gitlab.com",
+    scope: Annotated[str, typer.Option("--scope", help="Connection scope: workspace or project.")] = "workspace",
+    project: Annotated[str | None, typer.Option("--project", help="Rebase project name (scope=project).")] = None,
+    repo_path: Annotated[
+        str | None, typer.Option("--repo-path", help="Folder inside the repo, e.g. projects/x.")
+    ] = None,
+    branch: Annotated[str | None, typer.Option("--branch", help="Default branch override.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Connect a GitLab repository with an access token.
+
+    The token is validated against GitLab, stored in the platform's Secret Manager
+    (never in the Rebase database), and used for repo reads, starter workflows, and
+    promotion merge requests. Reconnecting rotates the stored token.
+    """
+    import os as _os
+    import subprocess as _subprocess
+
+    if scope not in {"workspace", "project"}:
+        raise RebaseWorkflowError("scope must be workspace or project")
+    resolved_token = token or _os.environ.get("GITLAB_ACCESS_TOKEN")
+    if not resolved_token:
+        resolved_token = typer.prompt("GitLab access token", hide_input=True)
+    if repo is None:
+        try:
+            remote = _subprocess.run(
+                ["git", "remote", "get-url", "origin"], capture_output=True, text=True, check=True
+            ).stdout.strip()
+        except (OSError, _subprocess.CalledProcessError):
+            remote = None
+        from rebase.client import _parse_gitlab_remote
+
+        owner, name = _parse_gitlab_remote(remote)
+        if owner is None or name is None:
+            raise RebaseWorkflowError("pass REPO (group/project): the local git origin is not a GitLab remote")
+        repo = f"{owner}/{name}"
+    client = Client()
+    resolved_project_id = None
+    if scope == "project":
+        if project is None:
+            raise RebaseWorkflowError("--project is required for --scope project")
+        resolved_project_id = str(_resolve_project_by_name(client, project)["id"])
+    connection = client.connect_gitlab_repo(
+        scope=scope,
+        repo=repo,
+        token=resolved_token,
+        host=host,
+        repo_path=repo_path,
+        default_branch=branch,
+        project_id=resolved_project_id,
+    )
+    if json_output:
+        _print_json(connection)
+        return
+    console.print(
+        _detail_table(
+            "Connected GitLab Repository",
+            connection,
+            preferred_keys=["id", "host", "repo_owner", "repo_name", "scope", "default_branch", "enabled"],
+        )
+    )
+    console.print("Token stored in Secret Manager; reconnect any time to rotate it.")
+
+
 @connect_app.command("huggingface")
 def connect_huggingface_command(
     profile: Annotated[str, typer.Option("--profile", help="Credential profile name.")] = DEFAULT_PROFILE,
