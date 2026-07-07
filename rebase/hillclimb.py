@@ -174,8 +174,11 @@ def hosted_search(
     if model:
         config.model = model
     config.paths.runs_dir = home / "runs"
-    config.paths.runtime_python = home / ".runtime-venv/bin/python"
-    config.paths.emflow_runtime_python = home / ".runtime-venv-emflow/bin/python"
+    # venv paths stay None → the hash-keyed machine-cache venv, which the
+    # image prebakes with HILLCLIMB_CACHE_DIR + the vendored emflow source;
+    # matching the source here makes the runtime hash hit the baked venv
+    if Path("/src/emflow").exists():
+        config.emflow.source = "/src/emflow"
     config.paths.runs_dir.mkdir(parents=True, exist_ok=True)
 
     sync: _StateSync | None = None
