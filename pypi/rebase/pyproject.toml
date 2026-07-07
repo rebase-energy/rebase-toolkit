@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rebase"
-version = "0.4.0"
+version = "0.5.0"
 description = "Compatibility package for rebase-toolkit"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -13,7 +13,7 @@ authors = [
     { name = "rebase.energy" },
 ]
 dependencies = [
-    "rebase-toolkit==0.4.0",
+    "rebase-toolkit==0.5.0",
 ]
 
 [project.urls]
@@ -22,31 +22,31 @@ Repository = "https://github.com/rebase-energy/rebase-toolkit"
 
 [project.optional-dependencies]
 data = [
-    "rebase-toolkit[data]==0.4.0",
+    "rebase-toolkit[data]==0.5.0",
 ]
 huggingface = [
-    "rebase-toolkit[huggingface]==0.4.0",
+    "rebase-toolkit[huggingface]==0.5.0",
 ]
 modeling = [
-    "rebase-toolkit[modeling]==0.4.0",
+    "rebase-toolkit[modeling]==0.5.0",
 ]
 snowflake = [
-    "rebase-toolkit[snowflake]==0.4.0",
+    "rebase-toolkit[snowflake]==0.5.0",
 ]
 databricks = [
-    "rebase-toolkit[databricks]==0.4.0",
+    "rebase-toolkit[databricks]==0.5.0",
 ]
 bigquery = [
-    "rebase-toolkit[bigquery]==0.4.0",
+    "rebase-toolkit[bigquery]==0.5.0",
 ]
 fabric = [
-    "rebase-toolkit[fabric]==0.4.0",
+    "rebase-toolkit[fabric]==0.5.0",
 ]
 sources = [
-    "rebase-toolkit[sources]==0.4.0",
+    "rebase-toolkit[sources]==0.5.0",
 ]
 all = [
-    "rebase-toolkit[all]==0.4.0",
+    "rebase-toolkit[all]==0.5.0",
 ]
 
 [tool.setuptools]

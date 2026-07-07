@@ -26,6 +26,7 @@ from rebase.sources.base import (
     DataSourceError,
     WriteResult,
 )
+from rebase.sources.energy import SeriesKey
 
 
 def snowflake(*, connection: str | None = None, **overrides: Any) -> DataSource:
@@ -60,6 +61,7 @@ __all__ = [
     "BitemporalSpec",
     "DataSource",
     "DataSourceError",
+    "SeriesKey",
     "WriteResult",
     "bigquery",
     "databricks",

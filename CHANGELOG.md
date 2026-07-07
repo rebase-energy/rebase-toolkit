@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0 — 2026-07-07
+
+### Added
+
+- **Canonical energy layout for BigQuery** (`rebase.sources.energy`), mirroring rebase's
+  open data model (energydatamodel/timedatamodel) and its ClickHouse persistence: an
+  append-only `series_values` table with three time axes (`valid_time`,
+  `knowledge_time`, `change_time`) plus a `series` catalog keyed by
+  `(path, data_type, name)` with a deterministic `series_id`.
+  `BigQuerySource.ensure_energy_schema` / `register_series` / `write_series` /
+  `read_series` cover schema creation, idempotent registration, SIMPLE/VERSIONED writes
+  (corrections are new rows), and point-in-time reads with timedb semantics: latest,
+  `as_of` knowledge cutoff, `overlapping` (every forecast issue), and the full audit
+  trail. `rebase.sources.SeriesKey` is exported. The `QUALIFY`-based read builder is
+  dialect-portable to Snowflake and Databricks.
+- BigQuery query parameters now support `datetime` values (`TIMESTAMP`).
+
 ## 0.4.0 — 2026-07-07
 
 ### Added
