@@ -1386,6 +1386,17 @@ class Client:
             raise RebaseWorkflowError("expected GitHub starter workflow response")
         return response
 
+    def get_github_repo_file(self, connection_id: str, *, path: str) -> dict[str, Any]:
+        """Read one file from the connected repo: {path, exists, content}."""
+        response = self.request(
+            "GET",
+            f"/integrations/github/repo-connections/{connection_id}/file",
+            params={"path": path},
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected GitHub repo file response")
+        return response
+
     def create_github_promotion_pr(
         self,
         connection_id: str,

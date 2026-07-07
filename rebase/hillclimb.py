@@ -226,6 +226,7 @@ def hosted_search(
         "selected": (
             {
                 "candidate_id": selected.candidate_id,
+                "operator": selected.operator,  # "seed" = incumbent not beaten
                 "val_score": selected.val_score,
                 "holdout_score": selected.holdout_score,
                 "summary": selected.summary,
@@ -389,6 +390,18 @@ def fetch_best_solution(sync_id: str, dest: Path, bucket: str | None = None) -> 
             out.write_bytes(blob.download_as_bytes())
             written.append(out)
     return written
+
+
+def read_best_solution_text(sync_id: str, bucket: str | None = None) -> str | None:
+    """The first synced best/solution.py as text (single-search runs), or
+    None when nothing has synced."""
+    gcs = _gcs_bucket(_bucket_name(bucket))
+    prefix = gcs_prefix(sync_id)
+    for blob in gcs.client.list_blobs(gcs, prefix=prefix):
+        parts = blob.name[len(prefix) + 1:].split("/")
+        if len(parts) >= 4 and parts[-2] == "best" and parts[-1] == "solution.py":
+            return blob.download_as_bytes().decode("utf-8")
+    return None
 
 
 def format_hosted_status(statuses: dict[str, Any]) -> str:
