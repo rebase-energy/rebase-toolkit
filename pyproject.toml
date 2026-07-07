@@ -84,6 +84,10 @@ dev = [
     "ty>=0.0.1a19",
 ]
 
+
+[tool.hatch.build.targets.sdist]
+only-include = ["rebase", "tests", "README.md", "LICENSE", "CHANGELOG.md", "pyproject.toml"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["rebase"]
 
