@@ -169,6 +169,9 @@ def hosted_search(
     # machine-wide semaphore is meaningless inside a single-search container
     config.search.parallel_agents = int(os.environ.get("REBASE_HILLCLIMB_PARALLEL_AGENTS", "3"))
     config.search.machine_max_agents = 0
+    # agent-spend ceiling backing the platform's credit reservation: the
+    # engine parks (resumable) when cumulative backend cost reaches it
+    config.budget.max_cost_usd = float(os.environ.get("REBASE_HILLCLIMB_MAX_COST_USD", "0"))
     if backend:
         config.backend = backend
     if model:
@@ -194,10 +197,21 @@ def hosted_search(
         if sync is not None:
             sync.stop()
 
+    cost_usd = 0.0
+    try:
+        from hillclimb.status import read_status
+
+        final_status = read_status(outcome.search_dir)
+        if final_status is not None:
+            cost_usd = final_status.cost_usd
+    except Exception:  # noqa: BLE001 — cost reporting must never fail a run
+        pass
+
     selected = outcome.selected
     return {
         "state": outcome.state,
         "ref": outcome.ref,
+        "cost_usd": cost_usd,  # settled against the credit reservation
         "target": target,
         "sync_id": sync_id,
         "gcs_prefix": gcs_prefix(sync_id) if bucket and sync_id else None,
@@ -374,12 +388,14 @@ def format_hosted_status(statuses: dict[str, Any]) -> str:
         candidates = status.get("candidates", {})
         best = status.get("best") or {}
         selected = status.get("selected") or {}
+        cost = status.get("cost_usd") or 0.0
         lines.append(
             f"{ref}: {status.get('state', '?')}  "
             f"candidates={candidates.get('total', 0)} ({candidates.get('ok', 0)} ok)  "
             f"best={best.get('val_score', '-')}  "
             f"selected={selected.get('candidate_id', '-')}  "
-            f"budget_left={int(status.get('budget', {}).get('remaining_s', 0))}s"
+            f"budget_left={int(status.get('budget', {}).get('remaining_s', 0))}s  "
+            f"cost=${cost:.2f}"
         )
     return "\n".join(lines)
 
