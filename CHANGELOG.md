@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.0 — 2026-07-07
+
+### Added
+
+- **GitLab integration**: `rebase connect gitlab [group/project]` connects a GitLab
+  repository (gitlab.com or self-managed via `--host`) with an access token — resolved
+  from `--token`, `$GITLAB_ACCESS_TOKEN`, or a hidden prompt, and validated against the
+  GitLab API. The token is stored in the platform's Secret Manager (never in the Rebase
+  database); reconnecting rotates it. Provides the same surface as the GitHub
+  integration: workspace/project source backing, repo file reads, starter workflows,
+  and promotion merge requests. Client wrappers: `connect_gitlab_repo`,
+  `list_gitlab_repo_connections`, `get_gitlab_repo_file`,
+  `create_gitlab_starter_workflow`, `create_gitlab_promotion_mr`.
+
 ## 0.5.0 — 2026-07-07
 
 ### Added
