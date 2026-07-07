@@ -175,8 +175,7 @@ def _response_error_message(response: requests.Response) -> str:
             message = detail.get("message") or "workspace monthly compute credits are exhausted"
             if isinstance(remaining, int) and isinstance(required, int):
                 return (
-                    f"{message}. Remaining: {remaining / 100:.2f} EUR; "
-                    f"required reservation: {required / 100:.2f} EUR."
+                    f"{message}. Remaining: {remaining / 100:.2f} EUR; required reservation: {required / 100:.2f} EUR."
                 )
             return str(message)
         if detail is not None:
@@ -1180,6 +1179,18 @@ class Client:
             raise RebaseWorkflowError("expected API key response")
         return response
 
+    def set_secret(self, name: str, value: str) -> dict[str, Any]:
+        response = self.request("PUT", "/secrets", json={"name": name, "value": value})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected secret response")
+        return response
+
+    def list_secrets(self) -> list[dict[str, Any]]:
+        response = self.request("GET", "/secrets")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected secret list response")
+        return response
+
     def _with_endpoint_url(self, endpoint: dict[str, Any]) -> dict[str, Any]:
         url_path = endpoint.get("url_path")
         if isinstance(url_path, str):
@@ -1373,6 +1384,32 @@ class Client:
         )
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected GitHub starter workflow response")
+        return response
+
+    def create_github_promotion_pr(
+        self,
+        connection_id: str,
+        *,
+        path: str,
+        content: str,
+        title: str,
+        body: str = "",
+        branch: str | None = None,
+    ) -> dict[str, Any]:
+        """Open a PR on the connected repo adding/updating one file — the
+        promotion path for hillclimb-search winners."""
+        payload: dict[str, Any] = {
+            "path": path, "content": content, "title": title, "body": body,
+        }
+        if branch:
+            payload["branch"] = branch
+        response = self.request(
+            "POST",
+            f"/integrations/github/repo-connections/{connection_id}/promotion-pr",
+            json=payload,
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected GitHub promotion PR response")
         return response
 
     def list_projects(self) -> list[dict[str, Any]]:
@@ -1709,6 +1746,8 @@ class Client:
         default_parameters: dict[str, Any] | None = None,
         execution_backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
         image_spec: dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
         enabled: bool = True,
@@ -1736,6 +1775,8 @@ class Client:
                 "default_parameters": default_parameters or {},
                 "execution_backend": _validate_function_backend(execution_backend),
                 "image_spec": image_spec,
+                "env": env or {},
+                "secrets": secrets or {},
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
                 "enabled": enabled,
@@ -1767,6 +1808,8 @@ class Client:
         default_parameters: dict[str, Any] | None = None,
         execution_backend: FunctionBackend | None = None,
         image_spec: dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
         enabled: bool | None = None,
@@ -1792,6 +1835,8 @@ class Client:
                 "default_parameters": default_parameters,
                 "execution_backend": _validate_function_backend(execution_backend) if execution_backend else None,
                 "image_spec": image_spec,
+                "env": env,
+                "secrets": secrets,
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
                 "enabled": enabled,
@@ -1882,6 +1927,8 @@ class Client:
         default_parameters: dict[str, Any] | None = None,
         execution_backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
         image_spec: dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
         enabled: bool = True,
@@ -1910,6 +1957,8 @@ class Client:
                 "default_parameters": default_parameters or {},
                 "execution_backend": _validate_function_backend(execution_backend),
                 "image_spec": image_spec,
+                "env": env or {},
+                "secrets": secrets or {},
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
                 "enabled": enabled,
@@ -1942,6 +1991,8 @@ class Client:
         default_parameters: dict[str, Any] | None = None,
         execution_backend: FunctionBackend | None = None,
         image_spec: dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
         enabled: bool | None = None,
@@ -1968,6 +2019,8 @@ class Client:
                 "default_parameters": default_parameters,
                 "execution_backend": _validate_function_backend(execution_backend) if execution_backend else None,
                 "image_spec": image_spec,
+                "env": env,
+                "secrets": secrets,
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
                 "enabled": enabled,
@@ -2823,6 +2876,8 @@ class Function:
         backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
         enabled: bool = True,
@@ -2837,6 +2892,8 @@ class Function:
         self.project = project
         self.description = description
         self.enabled = enabled
+        self.env = dict(env or (data.get("env") if data else None) or {})
+        self.secrets = dict(secrets or (data.get("secrets") if data else None) or {})
         self.endpoint = _coerce_endpoint(endpoint) or _endpoint_for_callable(fn)
         self.client = client
         self.id: str | None = function_id
@@ -2922,6 +2979,8 @@ class Function:
                 default_parameters=self.default_parameters,
                 execution_backend=self.execution_backend,
                 image_spec=self.image_spec,
+                env=self.env,
+                secrets=self.secrets,
                 cloud_run_min_instances=self.cloud_run_min_instances,
                 cloud_run_concurrency=self.cloud_run_concurrency,
                 enabled=self.enabled,
@@ -2942,6 +3001,8 @@ class Function:
             default_parameters=self.default_parameters,
             execution_backend=self.execution_backend,
             image_spec=self.image_spec,
+            env=self.env,
+            secrets=self.secrets,
             cloud_run_min_instances=self.cloud_run_min_instances,
             cloud_run_concurrency=self.cloud_run_concurrency,
             enabled=self.enabled,
@@ -3305,6 +3366,8 @@ class Model(_EmflowModel):
     backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND
     dependencies: list[str] | tuple[str, ...] | None = None
     image: Image | dict[str, Any] | None = None
+    env: dict[str, str] | None = None
+    secrets: dict[str, str] | None = None
     min_instances: int | None = None
     concurrency: int | None = None
     enabled: bool = True
@@ -3321,6 +3384,8 @@ class Model(_EmflowModel):
         backend: FunctionBackend | None = None,
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
         enabled: bool | None = None,
@@ -3343,6 +3408,8 @@ class Model(_EmflowModel):
         )
         self.dependencies = dependencies if dependencies is not None else getattr(cls, "dependencies", None)
         self.image = image if image is not None else getattr(cls, "image", None)
+        self.env = dict(env if env is not None else (getattr(cls, "env", None) or {}))
+        self.secrets = dict(secrets if secrets is not None else (getattr(cls, "secrets", None) or {}))
         self.cloud_run_min_instances = (
             min_instances if min_instances is not None else getattr(cls, "min_instances", None)
         )
@@ -3570,6 +3637,8 @@ class Model(_EmflowModel):
                 default_parameters=function.default_parameters,
                 execution_backend=function.execution_backend,
                 image_spec=function.image_spec,
+                env=self.env,
+                secrets=self.secrets,
                 cloud_run_min_instances=function.cloud_run_min_instances,
                 cloud_run_concurrency=function.cloud_run_concurrency,
                 enabled=self.enabled,
@@ -3588,6 +3657,8 @@ class Model(_EmflowModel):
                 default_parameters=function.default_parameters,
                 execution_backend=function.execution_backend,
                 image_spec=function.image_spec,
+                env=self.env,
+                secrets=self.secrets,
                 cloud_run_min_instances=function.cloud_run_min_instances,
                 cloud_run_concurrency=function.cloud_run_concurrency,
                 enabled=self.enabled,

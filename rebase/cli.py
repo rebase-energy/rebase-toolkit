@@ -174,6 +174,13 @@ connect_app = typer.Typer(
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
+secret_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Store workspace secrets to reference from secrets= on functions, models, and apps.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
 environment_app = typer.Typer(
     add_completion=False,
     cls=AlphabeticalTyperGroup,
@@ -2316,6 +2323,69 @@ def connect_huggingface_command(
 app.add_typer(connect_app, name="connect")
 
 
+@secret_app.command("set")
+def secret_set_command(
+    name: Annotated[str, typer.Argument(help="Secret name to reference in secrets={ENV: name}.")],
+    value: Annotated[
+        str | None,
+        typer.Option("--value", help="Secret value. Omit to read from --from-file or stdin."),
+    ] = None,
+    from_file: Annotated[
+        str | None,
+        typer.Option("--from-file", help="Read the secret value from this file ('-' for stdin)."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Store a workspace secret in Secret Manager and grant deployed code access.
+
+    The printed reference is what you pass in secrets={"ENV_VAR": "<ref>"} on a function,
+    model, or asgi_app. The value is written to Secret Manager and never stored by Rebase.
+    """
+    if value is not None and from_file is not None:
+        raise RebaseWorkflowError("provide either --value or --from-file, not both")
+    if value is None:
+        if from_file in (None, "-"):
+            value = sys.stdin.read()
+        else:
+            with open(from_file, encoding="utf-8") as handle:
+                value = handle.read()
+    value = value.rstrip("\n")
+    if not value:
+        raise RebaseWorkflowError("secret value is empty")
+    secret = Client().set_secret(name, value)
+    if json_output:
+        _print_json(secret)
+        return
+    console.print(
+        _detail_table(
+            "Stored Secret",
+            secret,
+            preferred_keys=["name", "secret_ref", "service_accounts_granted"],
+        )
+    )
+    reference = secret.get("secret_ref", name)
+    console.print(f'Reference it with: [rebase.value]secrets={{"ENV_VAR": "{reference}"}}[/rebase.value]')
+
+
+@secret_app.command("list")
+def secret_list_command(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List workspace secret references (names only, never values)."""
+    secrets = Client().list_secrets()
+    if json_output:
+        _print_json(secrets)
+        return
+    if not secrets:
+        console.print("No workspace secrets yet.")
+        return
+    for secret in secrets:
+        console.print(f"[rebase.value]{secret.get('secret_ref')}[/rebase.value]  ({secret.get('name')})")
+
+
+app.add_typer(secret_app, name="secret")
+
+
 @api_key_app.command("list")
 def api_key_list_command(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
@@ -3377,12 +3447,15 @@ def hillclimb_start_command(
         )
         console.print(f"[bold]{outcome.state}[/bold] {outcome.ref}")
         if outcome.selected is not None:
-            console.print(
-                f"selected {outcome.selected.candidate_id}: val={outcome.selected.val_score}"
-            )
+            console.print(f"selected {outcome.selected.candidate_id}: val={outcome.selected.val_score}")
         return
     run = module.start_hosted_search(
-        Client(), target, budget_s=budget_s, name=name, project=project, model=model,
+        Client(),
+        target,
+        budget_s=budget_s,
+        name=name,
+        project=project,
+        model=model,
         backend=backend,
     )
     console.print(f"Submitted hosted search run [bold]{run.id}[/bold]")
@@ -3407,10 +3480,7 @@ def hillclimb_list_command(
         _print_json(runs)
         return
     for run in runs:
-        console.print(
-            f"{run.get('id')}  {run.get('status'):<10}  {run.get('name')}  "
-            f"{run.get('created_at', '')}"
-        )
+        console.print(f"{run.get('id')}  {run.get('status'):<10}  {run.get('name')}  {run.get('created_at', '')}")
     if not runs:
         console.print("no hillclimb runs yet — rebase hillclimb start <target>")
 
@@ -3450,14 +3520,13 @@ def hillclimb_promote_command(
     ],
     dest: Annotated[str, typer.Option("--dest", help="Directory for the model files.")] = "models",
     bucket: Annotated[str | None, typer.Option("--bucket")] = None,
-    local: Annotated[
-        bool, typer.Option("--local", help="Promote from a local search (state in ./runs/).")
-    ] = False,
+    local: Annotated[bool, typer.Option("--local", help="Promote from a local search (state in ./runs/).")] = False,
+    pr: Annotated[bool, typer.Option("--pr", help="Open a promotion PR on the connected workspace repo.")] = False,
 ) -> None:
     """Fetch the selected model(s) into the workspace repo (models/<id>.py).
 
-    Commit and open a PR from the workspace repo; protected environments
-    then deploy through the existing gitops flow."""
+    With --pr, the platform opens a pull request on the connected GitHub
+    repo instead of leaving a local commit to you."""
     module = _hillclimb()
     if local:
         try:
@@ -3471,6 +3540,29 @@ def hillclimb_promote_command(
             raise RebaseWorkflowError("no best/solution.py synced yet — is the search finished?")
     for path in written:
         console.print(f"wrote {path}")
+    if pr:
+        client = Client()
+        connections = client.list_github_repo_connections()
+        workspace_conn = next((c for c in connections if c.get("scope") == "workspace"), None)
+        if workspace_conn is None:
+            raise RebaseWorkflowError(
+                "no workspace-scoped GitHub connection — run `rebase connect github` first"
+            )
+        for path in written:
+            repo_path = f"{dest}/{Path(path).name}"
+            result = client.create_github_promotion_pr(
+                workspace_conn["id"],
+                path=repo_path,
+                content=Path(path).read_text(),
+                title=f"hillclimb: promote {Path(path).stem} (run {run_id})",
+                body=(
+                    f"Automated promotion from hillclimb search run `{run_id}`.\n\n"
+                    f"The candidate beat the incumbent on the hidden holdout; "
+                    f"see the run's journal for the full search history."
+                ),
+            )
+            console.print(f"opened PR: {result.get('pr_url')}")
+        return
     console.print(
         "review, then: git checkout -b hillclimb-promotion && git add "
         f"{dest} && git commit && open a PR — protected deploys go through gitops"
