@@ -2323,64 +2323,89 @@ def connect_huggingface_command(
 app.add_typer(connect_app, name="connect")
 
 
-@secret_app.command("set")
-def secret_set_command(
-    name: Annotated[str, typer.Argument(help="Secret name to reference in secrets={ENV: name}.")],
-    value: Annotated[
-        str | None,
-        typer.Option("--value", help="Secret value. Omit to read from --from-file or stdin."),
+def _parse_secret_keyvalues(entries: list[str]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for entry in entries:
+        key, separator, value = entry.partition("=")
+        if not separator or not key:
+            raise RebaseWorkflowError(f"expected KEY=value, got {entry!r}")
+        values[key] = value
+    return values
+
+
+@secret_app.command("create")
+def secret_create_command(
+    name: Annotated[str, typer.Argument(help="Bundle name to reference with rebase.Secret.from_name(...).")],
+    keyvalues: Annotated[
+        list[str] | None,
+        typer.Argument(help="KEY=value pairs. Use KEY=- to read that value from stdin."),
     ] = None,
-    from_file: Annotated[
+    from_dotenv: Annotated[
         str | None,
-        typer.Option("--from-file", help="Read the secret value from this file ('-' for stdin)."),
+        typer.Option("--from-dotenv", help="Read KEY=value pairs from a dotenv file."),
     ] = None,
+    force: Annotated[bool, typer.Option("--force", help="Overwrite the bundle if it already exists.")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
 ) -> None:
-    """Store a workspace secret in Secret Manager and grant deployed code access.
+    """Create a workspace secret bundle: a named set of environment variables.
 
-    The printed reference is what you pass in secrets={"ENV_VAR": "<ref>"} on a function,
-    model, or asgi_app. The value is written to Secret Manager and never stored by Rebase.
+    Values are written to Secret Manager and never stored by Rebase. Attach the bundle in
+    code with secrets=[rebase.Secret.from_name(NAME)]; every key becomes an env var.
     """
-    if value is not None and from_file is not None:
-        raise RebaseWorkflowError("provide either --value or --from-file, not both")
-    if value is None:
-        if from_file in (None, "-"):
-            value = sys.stdin.read()
-        else:
-            with open(from_file, encoding="utf-8") as handle:
-                value = handle.read()
-    value = value.rstrip("\n")
-    if not value:
-        raise RebaseWorkflowError("secret value is empty")
-    secret = Client().set_secret(name, value)
+    values = _parse_secret_keyvalues(keyvalues or [])
+    if from_dotenv is not None:
+        from rebase.client import Secret
+
+        values = {**Secret.from_dotenv(from_dotenv).env_dict, **values}  # type: ignore[dict-item]
+    stdin_keys = [key for key, value in values.items() if value == "-"]
+    if len(stdin_keys) > 1:
+        raise RebaseWorkflowError("only one KEY=- may read from stdin")
+    for key in stdin_keys:
+        values[key] = sys.stdin.read().rstrip("\n")
+    if not values:
+        raise RebaseWorkflowError("provide KEY=value pairs or --from-dotenv")
+    client = Client()
+    if not force and any(existing.get("name") == name for existing in client.list_secrets()):
+        raise RebaseWorkflowError(f"secret {name!r} already exists; pass --force to overwrite")
+    secret = client.set_secret(name, values)
     if json_output:
         _print_json(secret)
         return
+    keys = ", ".join(sorted((secret.get("secret_refs") or {}).keys()))
+    console.print(f"Created secret [rebase.value]{secret.get('name', name)}[/rebase.value] with keys: {keys}")
     console.print(
-        _detail_table(
-            "Stored Secret",
-            secret,
-            preferred_keys=["name", "secret_ref", "service_accounts_granted"],
-        )
+        f'Use it with: [rebase.value]secrets=[rebase.Secret.from_name("{secret.get("name", name)}")][/rebase.value]'
     )
-    reference = secret.get("secret_ref", name)
-    console.print(f'Reference it with: [rebase.value]secrets={{"ENV_VAR": "{reference}"}}[/rebase.value]')
 
 
 @secret_app.command("list")
 def secret_list_command(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
 ) -> None:
-    """List workspace secret references (names only, never values)."""
+    """List workspace secret bundles and their env keys (never values)."""
     secrets = Client().list_secrets()
     if json_output:
         _print_json(secrets)
         return
     if not secrets:
-        console.print("No workspace secrets yet.")
+        console.print("No workspace secrets yet. Create one with: rebase secret create NAME KEY=value")
         return
     for secret in secrets:
-        console.print(f"[rebase.value]{secret.get('secret_ref')}[/rebase.value]  ({secret.get('name')})")
+        keys = ", ".join(secret.get("keys") or [])
+        console.print(f"[rebase.value]{secret.get('name')}[/rebase.value]  ({keys})")
+
+
+@secret_app.command("delete")
+def secret_delete_command(
+    name: Annotated[str, typer.Argument(help="Bundle name to delete.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Delete a workspace secret bundle and all of its keys."""
+    deleted = Client().delete_secret(name)
+    if json_output:
+        _print_json(deleted)
+        return
+    console.print(f"Deleted secret [rebase.value]{deleted.get('name', name)}[/rebase.value]")
 
 
 app.add_typer(secret_app, name="secret")
@@ -3408,7 +3433,7 @@ def _hillclimb():
     return module
 
 
-def _hillclimb_sync_id(client: "Client", run_id: str) -> str:
+def _hillclimb_sync_id(client: Client, run_id: str) -> str:
     run = client.get_run(run_id)
     sync_id = (run.get("parameters") or {}).get("sync_id")
     if not sync_id:
@@ -3545,9 +3570,7 @@ def hillclimb_promote_command(
         connections = client.list_github_repo_connections()
         workspace_conn = next((c for c in connections if c.get("scope") == "workspace"), None)
         if workspace_conn is None:
-            raise RebaseWorkflowError(
-                "no workspace-scoped GitHub connection — run `rebase connect github` first"
-            )
+            raise RebaseWorkflowError("no workspace-scoped GitHub connection — run `rebase connect github` first")
         for path in written:
             repo_path = f"{dest}/{Path(path).name}"
             result = client.create_github_promotion_pr(

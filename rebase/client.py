@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
 import json
 import os
@@ -341,6 +342,103 @@ class Image:
             "uv_pip_packages": packages,
             "uv_version": self.uv_version,
         }
+
+
+class Secret:
+    """A named bundle of environment variables, injected into deployed code.
+
+    Mirrors Modal's secrets: create a bundle once (``rebase secret create acme-snowflake
+    SNOWFLAKE_ACCOUNT=... SNOWFLAKE_PASSWORD=...``), then attach it by name::
+
+        @rb.function(secrets=[rb.Secret.from_name("acme-snowflake")])
+        def load(): ...
+
+    All keys in the bundle become environment variables at run time. Values live in
+    Secret Manager and are injected by Cloud Run; they never pass through the deploy
+    payload or source snapshot.
+    """
+
+    def __init__(self, *, name: str | None = None, env_dict: dict[str, str] | None = None) -> None:
+        if name is None and env_dict is None:
+            raise ValueError("Secret requires a name (from_name) or values (from_dict)")
+        self.name = name
+        self.env_dict = dict(env_dict) if env_dict is not None else None
+
+    @classmethod
+    def from_name(cls, name: str) -> Secret:
+        """Reference an existing workspace secret bundle by name."""
+        if not name or not name.strip():
+            raise ValueError("Secret.from_name requires a non-empty name")
+        return cls(name=name.strip())
+
+    @classmethod
+    def from_dict(cls, env_dict: dict[str, str], *, name: str | None = None) -> Secret:
+        """Create (or update) a bundle from a dict at deploy time, then attach it.
+
+        Without ``name``, a stable content-derived name (``inline-<hash>``) is used.
+        Prefer ``from_name`` with ``rebase secret create`` for shared credentials.
+        """
+        if not env_dict:
+            raise ValueError("Secret.from_dict requires at least one KEY: value entry")
+        return cls(name=name, env_dict=env_dict)
+
+    @classmethod
+    def from_dotenv(cls, path: str | Path = ".env", *, name: str | None = None) -> Secret:
+        """Create a bundle from a local dotenv file at deploy time, then attach it."""
+        values: dict[str, str] = {}
+        for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip().strip("'\"")
+        if not values:
+            raise ValueError(f"no KEY=value entries found in {path}")
+        return cls(name=name, env_dict=values)
+
+    def _resolved_name(self) -> str:
+        if self.name is not None:
+            return self.name
+        canonical = json.dumps(self.env_dict, sort_keys=True, separators=(",", ":"))
+        return f"inline-{hashlib.sha256(canonical.encode()).hexdigest()[:10]}"
+
+    def resolve(self, client: Client) -> dict[str, str]:
+        """Materialize this secret into the env-name -> secret-ref map deploys send."""
+        if self.env_dict is not None:
+            created = client.set_secret(self._resolved_name(), self.env_dict)
+            refs = created.get("secret_refs")
+            if not isinstance(refs, dict):
+                raise RebaseWorkflowError("secret create did not return secret_refs")
+            return refs
+        data = client.get_secret(self._resolved_name())
+        refs = data.get("secret_refs")
+        if not isinstance(refs, dict):
+            raise RebaseWorkflowError(f"secret {self.name!r} did not resolve to secret_refs")
+        return refs
+
+
+def _resolve_secrets_payload(
+    secrets: dict[str, str] | list[Any] | tuple[Any, ...] | None,
+    client: Client | None,
+) -> dict[str, str]:
+    """Normalize ``secrets=`` into the env-name -> secret-ref map the API stores.
+
+    Accepts the Modal-style list form (``[Secret.from_name("x"), "y"]`` — strings are
+    treated as bundle names) or the raw ``{ENV: secret_ref}`` map.
+    """
+    if secrets is None:
+        return {}
+    if isinstance(secrets, dict):
+        return dict(secrets)
+    resolved: dict[str, str] = {}
+    for item in secrets:
+        secret = Secret.from_name(item) if isinstance(item, str) else item
+        if not isinstance(secret, Secret):
+            raise RebaseWorkflowError(f"secrets entries must be rebase.Secret or bundle names, got {type(item)!r}")
+        if client is None:
+            raise RebaseWorkflowError("resolving secrets requires an authenticated client")
+        resolved.update(secret.resolve(client))
+    return resolved
 
 
 class HuggingFacePublishConfig:
@@ -1179,8 +1277,20 @@ class Client:
             raise RebaseWorkflowError("expected API key response")
         return response
 
-    def set_secret(self, name: str, value: str) -> dict[str, Any]:
-        response = self.request("PUT", "/secrets", json={"name": name, "value": value})
+    def set_secret(self, name: str, values: dict[str, str]) -> dict[str, Any]:
+        response = self.request("PUT", "/secrets", json={"name": name, "values": values})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected secret response")
+        return response
+
+    def get_secret(self, name: str) -> dict[str, Any]:
+        response = self.request("GET", f"/secrets/{name}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected secret response")
+        return response
+
+    def delete_secret(self, name: str) -> dict[str, Any]:
+        response = self.request("DELETE", f"/secrets/{name}")
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected secret response")
         return response
@@ -1410,7 +1520,10 @@ class Client:
         """Open a PR on the connected repo adding/updating one file — the
         promotion path for hillclimb-search winners."""
         payload: dict[str, Any] = {
-            "path": path, "content": content, "title": title, "body": body,
+            "path": path,
+            "content": content,
+            "title": title,
+            "body": body,
         }
         if branch:
             payload["branch"] = branch
@@ -2594,7 +2707,7 @@ class Project:
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
-        secrets: dict[str, str] | None = None,
+        secrets: dict[str, str] | list[Secret | str] | None = None,
         min_instances: int | None = None,
         max_instances: int | None = None,
         concurrency: int | None = None,
@@ -2721,7 +2834,7 @@ class ASGIApp:
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
-        secrets: dict[str, str] | None = None,
+        secrets: dict[str, str] | list[Secret | str] | None = None,
         min_instances: int | None = None,
         max_instances: int | None = None,
         concurrency: int | None = None,
@@ -2743,7 +2856,8 @@ class ASGIApp:
             raise ValueError("ASGI app auth must be one of: api_key, workspace, public")
         self.auth = auth
         self.env = dict(env or {})
-        self.secrets = dict(secrets or {})
+        # Kept unresolved (Secret handles or an {ENV: ref} map) until deploy needs a client.
+        self.secrets = secrets if secrets is not None else {}
         self.enabled = enabled
         self.deploy_source = _validate_deploy_source(deploy_source)
         self.project_source_mode = project_source_mode
@@ -2823,6 +2937,7 @@ class ASGIApp:
         if self.name is None:
             raise RebaseWorkflowError("ASGI app name is required")
         source_metadata = self._source_metadata_for_deploy(deploy_source)
+        secrets_payload = _resolve_secrets_payload(self.secrets, self._client)
         existing = self._client.find_asgi_app(self.name, project=self.project)
         if existing is not None:
             asgi_app = self._client.update_asgi_app(
@@ -2834,7 +2949,7 @@ class ASGIApp:
                 auth=self.auth,
                 image_spec=self.image_spec,
                 env=self.env,
-                secrets=self.secrets,
+                secrets=secrets_payload,
                 cloud_run_min_instances=self.cloud_run_min_instances,
                 cloud_run_max_instances=self.cloud_run_max_instances,
                 cloud_run_concurrency=self.cloud_run_concurrency,
@@ -2859,7 +2974,7 @@ class ASGIApp:
             auth=self.auth,
             image_spec=self.image_spec,
             env=self.env,
-            secrets=self.secrets,
+            secrets=secrets_payload,
             cloud_run_min_instances=self.cloud_run_min_instances,
             cloud_run_max_instances=self.cloud_run_max_instances,
             cloud_run_concurrency=self.cloud_run_concurrency,
@@ -2888,7 +3003,7 @@ class Function:
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
-        secrets: dict[str, str] | None = None,
+        secrets: dict[str, str] | list[Secret | str] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
         enabled: bool = True,
@@ -2904,7 +3019,8 @@ class Function:
         self.description = description
         self.enabled = enabled
         self.env = dict(env or (data.get("env") if data else None) or {})
-        self.secrets = dict(secrets or (data.get("secrets") if data else None) or {})
+        # Kept unresolved (Secret handles or an {ENV: ref} map) until deploy needs a client.
+        self.secrets = secrets if secrets is not None else dict((data.get("secrets") if data else None) or {})
         self.endpoint = _coerce_endpoint(endpoint) or _endpoint_for_callable(fn)
         self.client = client
         self.id: str | None = function_id
@@ -2980,6 +3096,7 @@ class Function:
             raise RebaseWorkflowError("function name is required")
         name = self.name
         source_metadata = self._source_metadata_for_deploy(deploy_source)
+        secrets_payload = _resolve_secrets_payload(self.secrets, self._client)
         existing = self._client.find_function(name, project=self.project)
         if existing is not None:
             function = self._client.update_function(
@@ -2991,7 +3108,7 @@ class Function:
                 execution_backend=self.execution_backend,
                 image_spec=self.image_spec,
                 env=self.env,
-                secrets=self.secrets,
+                secrets=secrets_payload,
                 cloud_run_min_instances=self.cloud_run_min_instances,
                 cloud_run_concurrency=self.cloud_run_concurrency,
                 enabled=self.enabled,
@@ -3013,7 +3130,7 @@ class Function:
             execution_backend=self.execution_backend,
             image_spec=self.image_spec,
             env=self.env,
-            secrets=self.secrets,
+            secrets=secrets_payload,
             cloud_run_min_instances=self.cloud_run_min_instances,
             cloud_run_concurrency=self.cloud_run_concurrency,
             enabled=self.enabled,
@@ -3378,7 +3495,7 @@ class Model(_EmflowModel):
     dependencies: list[str] | tuple[str, ...] | None = None
     image: Image | dict[str, Any] | None = None
     env: dict[str, str] | None = None
-    secrets: dict[str, str] | None = None
+    secrets: dict[str, str] | list[Secret | str] | None = None
     min_instances: int | None = None
     concurrency: int | None = None
     enabled: bool = True
@@ -3396,7 +3513,7 @@ class Model(_EmflowModel):
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
-        secrets: dict[str, str] | None = None,
+        secrets: dict[str, str] | list[Secret | str] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
         enabled: bool | None = None,
@@ -3420,7 +3537,8 @@ class Model(_EmflowModel):
         self.dependencies = dependencies if dependencies is not None else getattr(cls, "dependencies", None)
         self.image = image if image is not None else getattr(cls, "image", None)
         self.env = dict(env if env is not None else (getattr(cls, "env", None) or {}))
-        self.secrets = dict(secrets if secrets is not None else (getattr(cls, "secrets", None) or {}))
+        # Kept unresolved (Secret handles or an {ENV: ref} map) until deploy needs a client.
+        self.secrets = secrets if secrets is not None else getattr(cls, "secrets", None) or {}
         self.cloud_run_min_instances = (
             min_instances if min_instances is not None else getattr(cls, "min_instances", None)
         )
@@ -3637,6 +3755,7 @@ class Model(_EmflowModel):
         if function.source_code is None or function.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy a model without source_code and operation entrypoint")
         source_metadata = function._source_metadata_for_deploy(deploy_source)
+        secrets_payload = _resolve_secrets_payload(self.secrets, self._client)
         model = self._client.find_model(str(self.name), project=str(self.project or "default"))
         if model is not None:
             model_data = self._client.update_model(
@@ -3649,7 +3768,7 @@ class Model(_EmflowModel):
                 execution_backend=function.execution_backend,
                 image_spec=function.image_spec,
                 env=self.env,
-                secrets=self.secrets,
+                secrets=secrets_payload,
                 cloud_run_min_instances=function.cloud_run_min_instances,
                 cloud_run_concurrency=function.cloud_run_concurrency,
                 enabled=self.enabled,
@@ -3669,7 +3788,7 @@ class Model(_EmflowModel):
                 execution_backend=function.execution_backend,
                 image_spec=function.image_spec,
                 env=self.env,
-                secrets=self.secrets,
+                secrets=secrets_payload,
                 cloud_run_min_instances=function.cloud_run_min_instances,
                 cloud_run_concurrency=function.cloud_run_concurrency,
                 enabled=self.enabled,
@@ -3808,7 +3927,7 @@ class Step(Function):
         self.cache = cache
         self.resources: dict[str, Any] = {}
 
-    def deploy(self, **_kwargs: Any) -> "Step":
+    def deploy(self, **_kwargs: Any) -> Step:
         raise RebaseWorkflowError(
             "Steps are deployed automatically when their workflow is deployed. "
             "Use rb.deploy(workflow) instead of deploying steps directly."
@@ -3824,7 +3943,7 @@ class Step(Function):
         replace: bool,
         deploy_source: str | None,
         environment: str,
-        client: "Client | None" = None,
+        client: Client | None = None,
     ) -> None:
         self.image_spec = image_spec
         self.cloud_run_min_instances = cloud_run_min_instances
