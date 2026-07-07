@@ -1,4 +1,4 @@
-from rebase import data, modeling
+from rebase import data, modeling, sources
 from rebase.client import (
     DEFAULT_FUNCTION_BACKEND,
     DEFAULT_WORKFLOW_BACKEND,
@@ -94,6 +94,7 @@ __all__ = [
     "modeling",
     "project",
     "projects",
+    "sources",
     "step",
     "update_workspace",
     "workspace",

@@ -23,5 +23,15 @@ def test_rebase_alias_extras_forward_to_toolkit_extras() -> None:
 
     assert alias["optional-dependencies"] == {
         extra: [f"rebase-toolkit[{extra}]=={toolkit['version']}"]
-        for extra in ("data", "huggingface", "modeling", "all")
+        for extra in (
+            "data",
+            "huggingface",
+            "modeling",
+            "snowflake",
+            "databricks",
+            "bigquery",
+            "fabric",
+            "sources",
+            "all",
+        )
     }

@@ -30,6 +30,21 @@ huggingface = [
 modeling = [
     "rebase-toolkit[modeling]==0.2.0",
 ]
+snowflake = [
+    "rebase-toolkit[snowflake]==0.2.0",
+]
+databricks = [
+    "rebase-toolkit[databricks]==0.2.0",
+]
+bigquery = [
+    "rebase-toolkit[bigquery]==0.2.0",
+]
+fabric = [
+    "rebase-toolkit[fabric]==0.2.0",
+]
+sources = [
+    "rebase-toolkit[sources]==0.2.0",
+]
 all = [
     "rebase-toolkit[all]==0.2.0",
 ]
