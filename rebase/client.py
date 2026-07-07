@@ -270,6 +270,34 @@ def _validate_target_backend(target_type: str, backend: str) -> str:
     return _validate_function_backend(backend)
 
 
+def _cloud_run_cpu_value(value: float | int | str | None) -> str | None:
+    """Normalize Modal-style cpu (cores as a number) or a Cloud Run string ("2000m")."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if not value.strip():
+            raise ValueError("cpu must be a positive number of cores or a Cloud Run cpu string")
+        return value.strip()
+    cores = float(value)
+    if cores <= 0:
+        raise ValueError("cpu must be greater than 0")
+    return f"{int(round(cores * 1000))}m"
+
+
+def _cloud_run_memory_value(value: int | float | str | None) -> str | None:
+    """Normalize Modal-style memory (MiB as a number) or a Cloud Run string ("1Gi")."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if not value.strip():
+            raise ValueError("memory must be MiB as a number or a Cloud Run memory string")
+        return value.strip()
+    mib = int(value)
+    if mib <= 0:
+        raise ValueError("memory must be greater than 0")
+    return f"{mib}Mi"
+
+
 def _validate_deploy_source(source: str | None) -> DeploySource | None:
     if source is None:
         return None
@@ -1874,6 +1902,8 @@ class Client:
         secrets: dict[str, str] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
+        cloud_run_cpu: str | None = None,
+        cloud_run_memory: str | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         environment: str = "dev",
@@ -1903,6 +1933,8 @@ class Client:
                 "secrets": secrets or {},
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
+                "cloud_run_cpu": cloud_run_cpu,
+                "cloud_run_memory": cloud_run_memory,
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "environment": environment,
@@ -1936,6 +1968,8 @@ class Client:
         secrets: dict[str, str] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
+        cloud_run_cpu: str | None = None,
+        cloud_run_memory: str | None = None,
         enabled: bool | None = None,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         environment: str | None = None,
@@ -1963,6 +1997,8 @@ class Client:
                 "secrets": secrets,
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
+                "cloud_run_cpu": cloud_run_cpu,
+                "cloud_run_memory": cloud_run_memory,
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "environment": environment,
@@ -2055,6 +2091,8 @@ class Client:
         secrets: dict[str, str] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
+        cloud_run_cpu: str | None = None,
+        cloud_run_memory: str | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         environment: str | None = "dev",
@@ -2085,6 +2123,8 @@ class Client:
                 "secrets": secrets or {},
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
+                "cloud_run_cpu": cloud_run_cpu,
+                "cloud_run_memory": cloud_run_memory,
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "environment": environment,
@@ -2119,6 +2159,8 @@ class Client:
         secrets: dict[str, str] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
+        cloud_run_cpu: str | None = None,
+        cloud_run_memory: str | None = None,
         enabled: bool | None = None,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         environment: str | None = None,
@@ -2147,6 +2189,8 @@ class Client:
                 "secrets": secrets,
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
+                "cloud_run_cpu": cloud_run_cpu,
+                "cloud_run_memory": cloud_run_memory,
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "environment": environment,
@@ -2670,6 +2714,8 @@ class Project:
         image: Image | dict[str, Any] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
+        cpu: float | int | str | None = None,
+        memory: int | float | str | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
@@ -2686,6 +2732,8 @@ class Project:
                 image=image,
                 min_instances=min_instances,
                 concurrency=concurrency,
+                cpu=cpu,
+                memory=memory,
                 enabled=enabled,
                 endpoint=endpoint,
                 deploy_source=deploy_source if deploy_source is not None else self.deploy_source,
@@ -3006,6 +3054,8 @@ class Function:
         secrets: dict[str, str] | list[Secret | str] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
+        cpu: float | int | str | None = None,
+        memory: int | float | str | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
@@ -3038,6 +3088,10 @@ class Function:
         self.image_fingerprint: str | None = data.get("image_fingerprint") if data else None
         self.cloud_run_min_instances: int | None = data.get("cloud_run_min_instances") if data else None
         self.cloud_run_concurrency: int | None = data.get("cloud_run_concurrency") if data else None
+        self.cloud_run_cpu: str | None = _cloud_run_cpu_value(cpu) or (data.get("cloud_run_cpu") if data else None)
+        self.cloud_run_memory: str | None = _cloud_run_memory_value(memory) or (
+            data.get("cloud_run_memory") if data else None
+        )
         self.source_metadata: dict[str, Any] = {}
 
         if fn is not None:
@@ -3111,6 +3165,8 @@ class Function:
                 secrets=secrets_payload,
                 cloud_run_min_instances=self.cloud_run_min_instances,
                 cloud_run_concurrency=self.cloud_run_concurrency,
+                cloud_run_cpu=self.cloud_run_cpu,
+                cloud_run_memory=self.cloud_run_memory,
                 enabled=self.enabled,
                 endpoint=self.endpoint,
                 environment=environment,
@@ -3133,6 +3189,8 @@ class Function:
             secrets=secrets_payload,
             cloud_run_min_instances=self.cloud_run_min_instances,
             cloud_run_concurrency=self.cloud_run_concurrency,
+            cloud_run_cpu=self.cloud_run_cpu,
+            cloud_run_memory=self.cloud_run_memory,
             enabled=self.enabled,
             endpoint=self.endpoint,
             environment=environment,
@@ -3498,6 +3556,8 @@ class Model(_EmflowModel):
     secrets: dict[str, str] | list[Secret | str] | None = None
     min_instances: int | None = None
     concurrency: int | None = None
+    cpu: float | int | str | None = None
+    memory: int | float | str | None = None
     enabled: bool = True
     endpoint: EndpointConfig | dict[str, Any] | None = None
     deploy_source: str | None = None
@@ -3516,6 +3576,8 @@ class Model(_EmflowModel):
         secrets: dict[str, str] | list[Secret | str] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
+        cpu: float | int | str | None = None,
+        memory: int | float | str | None = None,
         enabled: bool | None = None,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
@@ -3543,6 +3605,8 @@ class Model(_EmflowModel):
             min_instances if min_instances is not None else getattr(cls, "min_instances", None)
         )
         self.cloud_run_concurrency = concurrency if concurrency is not None else getattr(cls, "concurrency", None)
+        self.cloud_run_cpu = _cloud_run_cpu_value(cpu if cpu is not None else getattr(cls, "cpu", None))
+        self.cloud_run_memory = _cloud_run_memory_value(memory if memory is not None else getattr(cls, "memory", None))
         self.enabled = enabled if enabled is not None else bool(getattr(cls, "enabled", True))
         self.endpoint = _coerce_endpoint(endpoint if endpoint is not None else getattr(cls, "endpoint", None))
         self.deploy_source = _validate_deploy_source(
@@ -3771,6 +3835,8 @@ class Model(_EmflowModel):
                 secrets=secrets_payload,
                 cloud_run_min_instances=function.cloud_run_min_instances,
                 cloud_run_concurrency=function.cloud_run_concurrency,
+                cloud_run_cpu=self.cloud_run_cpu,
+                cloud_run_memory=self.cloud_run_memory,
                 enabled=self.enabled,
                 environment=environment,
                 endpoint=self.endpoint,
@@ -3791,6 +3857,8 @@ class Model(_EmflowModel):
                 secrets=secrets_payload,
                 cloud_run_min_instances=function.cloud_run_min_instances,
                 cloud_run_concurrency=function.cloud_run_concurrency,
+                cloud_run_cpu=self.cloud_run_cpu,
+                cloud_run_memory=self.cloud_run_memory,
                 enabled=self.enabled,
                 environment=environment,
                 endpoint=self.endpoint,

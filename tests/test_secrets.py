@@ -88,3 +88,52 @@ def test_predictor_class_attribute_accepts_secret_list() -> None:
     model = P()
     assert isinstance(model.secrets, list)
     assert model.secrets[0].name == "acme"
+
+
+def test_function_cpu_memory_normalize_modal_style() -> None:
+    @rb.function(name="heavy", cpu=2, memory=1024)
+    def heavy() -> dict:
+        return {}
+
+    assert heavy.cloud_run_cpu == "2000m"
+    assert heavy.cloud_run_memory == "1024Mi"
+
+    @rb.function(name="strings", cpu="500m", memory="1Gi")
+    def strings() -> dict:
+        return {}
+
+    assert strings.cloud_run_cpu == "500m"
+    assert strings.cloud_run_memory == "1Gi"
+
+
+def test_function_cpu_memory_default_none() -> None:
+    @rb.function(name="light")
+    def light() -> dict:
+        return {}
+
+    assert light.cloud_run_cpu is None
+    assert light.cloud_run_memory is None
+
+
+def test_function_rejects_nonpositive_resources() -> None:
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+
+        @rb.function(name="bad", cpu=0)
+        def bad() -> dict:
+            return {}
+
+
+def test_predictor_class_cpu_memory() -> None:
+    class Heavy(rb.Predictor):
+        name = "heavy-model"
+        cpu = 0.5
+        memory = 2048
+
+        def predict(self) -> dict:
+            return {}
+
+    model = Heavy()
+    assert model.cloud_run_cpu == "500m"
+    assert model.cloud_run_memory == "2048Mi"

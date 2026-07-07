@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0 — 2026-07-07
+
+### Added
+
+- **Per-function `cpu=` / `memory=`**, Modal-style, on functions and models (including
+  `Predictor` and the other model classes): `@rb.function(cpu=2, memory=1024)` (cores /
+  MiB as numbers) or Cloud Run strings (`cpu="500m"`, `memory="1Gi"`), and as class
+  attributes on models. Applies to both the isolated Cloud Run service and Cloud Run
+  Jobs backends; requests are clamped by the workspace compute policy. Unset means the
+  platform defaults.
+
 ## 0.3.0 — 2026-07-07
 
 ### Added
