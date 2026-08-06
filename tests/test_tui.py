@@ -6,18 +6,30 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from textual.widgets import DataTable, Header, Static
+from textual.coordinate import Coordinate
+from textual.widgets import DataTable, Header, Static, TabbedContent
 
+from rebase.brand import BRAND_MEDIUM_GRAY
 from rebase.client import Client, RebaseWorkflowError
-from rebase.tui import RebaseTuiApp, RebaseTuiData, compact_id, format_json_summary, format_timestamp, status_style
+from rebase.tui import (
+    RebaseTuiApp,
+    RebaseTuiData,
+    compact_id,
+    endpoints_by_target,
+    format_endpoint,
+    format_json_summary,
+    format_timestamp,
+    status_style,
+)
 
 
 class FakeClient:
     def __init__(self) -> None:
+        self.api_url = "https://api.example.com"
         self.run_calls: list[dict[str, Any]] = []
         self.projects = [
             {"id": "project-id", "name": "energy"},
@@ -45,6 +57,37 @@ class FakeClient:
                 "updated_at": "2026-06-16T13:00:00Z",
             }
         ]
+        self.endpoints = [
+            {
+                "id": "endpoint-id",
+                "project_id": "project-id",
+                "project_name": "energy",
+                "name": "forecast",
+                "method": "POST",
+                "path": "/forecast",
+                "auth": "workspace",
+                "mode": "async",
+                "target_type": "workflow",
+                "target_id": "workflow-id",
+                "enabled": True,
+                "url_path": "/e/energy-workspace/energy/forecast",
+                "url": "https://api.example.com/e/energy-workspace/energy/forecast",
+                "updated_at": "2026-06-16T13:30:00Z",
+            }
+        ]
+        self.asgi_apps = [
+            {
+                "id": "asgi-app-id",
+                "project_id": "project-id",
+                "name": "grid-api",
+                "base_path": "/api",
+                "auth": "api_key",
+                "enabled": True,
+                "current_version_id": "asgi-version-id-123456",
+                "url_path": "/e/energy-workspace/energy/api",
+                "updated_at": "2026-06-16T13:45:00Z",
+            }
+        ]
         self.runs = [
             {
                 "id": "run-id",
@@ -68,6 +111,13 @@ class FakeClient:
     def list_workflows(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
         assert project is None
         return [item for item in self.workflows if project_id is None or item["project_id"] == project_id]
+
+    def list_project_endpoints(self, project_id: str) -> list[dict[str, Any]]:
+        return [item for item in self.endpoints if item["project_id"] == project_id]
+
+    def list_asgi_apps(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
+        assert project is None
+        return [item for item in self.asgi_apps if project_id is None or item["project_id"] == project_id]
 
     def list_runs(
         self,
@@ -124,6 +174,11 @@ class FakeClient:
         ]
 
 
+def fake_tui_data(client: Any, **kwargs: Any) -> RebaseTuiData:
+    """FakeClient duck-types Client; the cast keeps the type checker honest at that seam."""
+    return RebaseTuiData(cast(Client, client), **kwargs)
+
+
 def test_tui_format_helpers() -> None:
     assert compact_id("123456789abcdef") == "12345678..."
     assert format_timestamp("2026-06-16T12:00:00Z") == "2026-06-16 12:00:00"
@@ -133,7 +188,7 @@ def test_tui_format_helpers() -> None:
 
 def test_tui_data_loads_project_filtered_overview_and_runs() -> None:
     client = FakeClient()
-    data = RebaseTuiData(client, project="energy", limit=10)
+    data = fake_tui_data(client, project="energy", limit=10)
 
     overview = data.load_workspace_overview()
     assert [summary.project["name"] for summary in overview.project_summaries] == ["energy", "trading"]
@@ -159,15 +214,56 @@ def test_tui_data_loads_project_filtered_overview_and_runs() -> None:
     }
 
 
+def test_tui_data_loads_endpoints_and_asgi_apps() -> None:
+    data = fake_tui_data(FakeClient(), project="energy")
+    overview = data.load_workspace_overview()
+
+    targets = data.load_project_targets(overview.project_summaries[0].project)
+    assert [item["name"] for item in targets.endpoints] == ["forecast"]
+    assert [item["name"] for item in targets.asgi_apps] == ["grid-api"]
+
+    grouped = endpoints_by_target(targets.endpoints)
+    assert list(grouped) == [("workflow", "workflow-id")]
+    assert str(format_endpoint(grouped[("workflow", "workflow-id")])) == "POST /forecast"
+    assert str(format_endpoint([])) == "-"
+
+
+def test_tui_endpoint_column_counts_extra_endpoints_and_dims_disabled() -> None:
+    disabled = {"method": "POST", "path": "/a", "enabled": False}
+    extra = {"method": "GET", "path": "/b", "enabled": True}
+
+    assert str(format_endpoint([disabled])) == "POST /a"
+    assert format_endpoint([disabled]).style == BRAND_MEDIUM_GRAY
+    assert format_endpoint([extra]).style == ""
+    assert str(format_endpoint([extra, disabled])) == "GET /b (+1)"
+
+
+def test_tui_data_tolerates_missing_endpoint_and_asgi_routes() -> None:
+    class Unsupported(FakeClient):
+        def list_project_endpoints(self, project_id: str) -> list[dict[str, Any]]:
+            raise RebaseWorkflowError("404 Not Found")
+
+        def list_asgi_apps(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
+            raise RebaseWorkflowError("404 Not Found")
+
+    data = fake_tui_data(Unsupported(), project="energy")
+    overview = data.load_workspace_overview()
+
+    targets = data.load_project_targets(overview.project_summaries[0].project)
+    assert targets.endpoints == []
+    assert targets.asgi_apps == []
+    assert [item["name"] for item in targets.workflows] == ["forecast"]
+
+
 def test_tui_data_reports_missing_project() -> None:
     with pytest.raises(RebaseWorkflowError, match="project not found: missing"):
-        RebaseTuiData(FakeClient(), project="missing").load_workspace_overview()
+        fake_tui_data(FakeClient(), project="missing").load_workspace_overview()
 
 
 def test_tui_app_mounts_and_renders_selected_workflow_run() -> None:
     async def scenario() -> None:
         client = FakeClient()
-        app = RebaseTuiApp(data=RebaseTuiData(client, project="energy", limit=5))
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
 
         async with app.run_test(size=(140, 42)) as pilot:
             await pilot.pause(0.2)
@@ -233,6 +329,59 @@ def test_tui_app_mounts_and_renders_selected_workflow_run() -> None:
     asyncio.run(scenario())
 
 
+def test_tui_app_shows_endpoint_column_and_asgi_apps_tab() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", DataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+
+            workflows = app.query_one("#workflows-table", DataTable)
+            functions = app.query_one("#functions-table", DataTable)
+            assert str(workflows.get_cell_at(Coordinate(0, 3))) == "POST /forecast"
+            assert str(functions.get_cell_at(Coordinate(0, 3))) == "-"
+
+            # Selecting the workflow surfaces its endpoint and full URL in the detail panel.
+            workflows.focus()
+            workflows.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            target_detail = str(app.query_one("#target-detail", Static).content)
+            assert "Endpoint: POST /forecast | auth: workspace | mode: async | enabled" in target_detail
+            assert "URL: https://api.example.com/e/energy-workspace/energy/forecast" in target_detail
+
+            # tab cycles workflows -> functions -> asgi apps.
+            tabs = app.query_one("#target-tabs", TabbedContent)
+            assert tabs.active == "workflows-tab"
+            await pilot.press("tab")
+            await pilot.pause(0.1)
+            assert tabs.active == "functions-tab"
+            await pilot.press("tab")
+            await pilot.pause(0.1)
+            assert tabs.active == "asgi-apps-tab"
+
+            asgi_apps = app.query_one("#asgi-apps-table", DataTable)
+            assert asgi_apps.row_count == 1
+            asgi_apps.focus()
+            asgi_apps.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+
+            asgi_detail = str(app.query_one("#target-detail", Static).content)
+            assert "ASGI app grid-api" in asgi_detail
+            # ASGI apps only carry url_path, so the TUI joins it onto the client's api_url.
+            assert "URL: https://api.example.com/e/energy-workspace/energy/api" in asgi_detail
+            assert app.query_one("#runs-table", DataTable).row_count == 0
+            assert "no runs" in str(app.query_one("#run-detail", Static).content)
+
+    asyncio.run(scenario())
+
+
 @contextmanager
 def local_rebase_api() -> Iterator[tuple[str, list[tuple[str, dict[str, list[str]], str | None]]]]:
     seen_requests: list[tuple[str, dict[str, list[str]], str | None]] = []
@@ -257,6 +406,36 @@ def local_rebase_api() -> Iterator[tuple[str, list[tuple[str, dict[str, list[str
             "enabled": True,
             "current_version_id": "workflow-version-id",
             "updated_at": "2026-06-16T13:00:00Z",
+        }
+    ]
+    endpoints = [
+        {
+            "id": "endpoint-id",
+            "project_id": "project-id",
+            "project_name": "energy",
+            "name": "forecast",
+            "method": "POST",
+            "path": "/forecast",
+            "auth": "workspace",
+            "mode": "async",
+            "target_type": "workflow",
+            "target_id": "workflow-id",
+            "enabled": True,
+            "url_path": "/e/energy-workspace/energy/forecast",
+            "updated_at": "2026-06-16T13:30:00Z",
+        }
+    ]
+    asgi_apps = [
+        {
+            "id": "asgi-app-id",
+            "project_id": "project-id",
+            "name": "grid-api",
+            "base_path": "/api",
+            "auth": "api_key",
+            "enabled": True,
+            "current_version_id": "asgi-version-id",
+            "url_path": "/e/energy-workspace/energy/api",
+            "updated_at": "2026-06-16T13:45:00Z",
         }
     ]
     run = {
@@ -303,6 +482,10 @@ def local_rebase_api() -> Iterator[tuple[str, list[tuple[str, dict[str, list[str
                 payload = functions
             elif parsed.path == "/projects/project-id/workflows":
                 payload = workflows
+            elif parsed.path == "/projects/project-id/endpoints":
+                payload = endpoints
+            elif parsed.path == "/projects/project-id/asgi-apps":
+                payload = asgi_apps
             elif parsed.path == "/runs":
                 payload = [run] if query.get("workflow_id") == ["workflow-id"] else []
             elif parsed.path == "/runs/run-id":

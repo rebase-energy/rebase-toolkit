@@ -238,6 +238,8 @@ run_app = typer.Typer(
     rich_markup_mode="rich",
 )
 
+WORKSPACE_ROLES = ("Viewer", "Developer", "Admin", "Owner")
+
 KNOWN_PERMISSIONS = frozenset(
     {
         "workspace:read",
@@ -2129,6 +2131,35 @@ def workspace_use_command(profile: Annotated[str, typer.Argument(help="Profile n
     _switch_workspace(profile)
 
 
+def _validate_workspace_role(role: str) -> None:
+    if role not in WORKSPACE_ROLES:
+        raise RebaseWorkflowError(f"role must be one of: {', '.join(WORKSPACE_ROLES)}")
+
+
+def _resolve_workspace_member(client: Client, target: str) -> dict[str, Any]:
+    """Find a workspace member by email, GitHub username, or profile id."""
+    needle = target.strip().lstrip("@").lower()
+    if not needle:
+        raise RebaseWorkflowError("provide a member email, GitHub username, or profile id")
+    members = client.list_workspace_members()
+    matches = [
+        member
+        for member in members
+        if needle
+        in {
+            str(member.get("email") or "").lower(),
+            str(member.get("github_username") or "").lower(),
+            str(member.get("profile_id") or "").lower(),
+        }
+    ]
+    if not matches:
+        known = ", ".join(sorted(_workspace_member_identity(member) for member in members)) or "none"
+        raise RebaseWorkflowError(f"no workspace member matches {target!r}. Current members: {known}")
+    if len(matches) > 1:
+        raise RebaseWorkflowError(f"{target!r} matches more than one member; use the profile id instead")
+    return matches[0]
+
+
 def _workspace_invite_identity(
     target: str | None,
     *,
@@ -2161,8 +2192,7 @@ def workspace_invite_command(
     ] = "Viewer",
 ) -> None:
     """Invite a person to the active workspace."""
-    if role not in {"Viewer", "Developer", "Admin", "Owner"}:
-        raise RebaseWorkflowError("role must be one of: Viewer, Developer, Admin, Owner")
+    _validate_workspace_role(role)
     invite_email, invite_github_username = _workspace_invite_identity(
         target,
         email=email,
@@ -2178,6 +2208,38 @@ def workspace_invite_command(
     console.print(
         f"Invited [rebase.value]{identity}[/rebase.value] to workspace as "
         f"[rebase.value]{invite.get('role', role)}[/rebase.value] ([rebase.value]{status}[/rebase.value])"
+    )
+
+
+@workspace_app.command("set-role")
+def workspace_set_role_command(
+    target: Annotated[
+        str,
+        typer.Argument(help="Member email, GitHub username, or profile id."),
+    ],
+    role: Annotated[
+        str,
+        typer.Option("--role", help="Workspace role: Viewer, Developer, Admin, or Owner."),
+    ],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Change an existing workspace member's role.
+
+    Requires members:write (Owner or Admin). Only an Owner can assign the Owner
+    role or modify another Owner, and the last active Owner cannot be demoted.
+    """
+    _validate_workspace_role(role)
+    client = Client()
+    member = _resolve_workspace_member(client, target)
+    previous_role = _format_value(member.get("role"))
+    updated = client.update_workspace_member(str(member["profile_id"]), role=role)
+    if json_output:
+        _print_json(updated)
+        return
+    identity = _workspace_member_identity(updated)
+    console.print(
+        f"Changed [rebase.value]{identity}[/rebase.value] from [rebase.value]{previous_role}[/rebase.value] "
+        f"to [rebase.value]{_format_value(updated.get('role', role))}[/rebase.value]"
     )
 
 

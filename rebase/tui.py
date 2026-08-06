@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -9,6 +10,7 @@ from typing import Any, Literal
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Vertical
 from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
 
@@ -46,6 +48,8 @@ class ProjectTargetsData:
     project: dict[str, Any]
     functions: list[dict[str, Any]]
     workflows: list[dict[str, Any]]
+    endpoints: list[dict[str, Any]]
+    asgi_apps: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,13 @@ class RunDetailData:
     run: dict[str, Any]
     events: list[dict[str, Any]]
     steps: list[dict[str, Any]]
+
+
+def _optional_list(load: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    try:
+        return load()
+    except RebaseWorkflowError:
+        return []
 
 
 class RebaseTuiData:
@@ -88,6 +99,9 @@ class RebaseTuiData:
             project=project,
             functions=self.client.list_functions(project_id=project_id),
             workflows=self.client.list_workflows(project_id=project_id),
+            # Supplementary data: never let it take down the function/workflow view.
+            endpoints=_optional_list(lambda: self.client.list_project_endpoints(project_id)),
+            asgi_apps=_optional_list(lambda: self.client.list_asgi_apps(project_id=project_id)),
         )
 
     def load_target_runs(self, target_type: TargetType, target_id: str) -> list[dict[str, Any]]:
@@ -151,6 +165,60 @@ def format_json_summary(value: Any, *, max_length: int = 180) -> str:
     return text if len(text) <= max_length else f"{text[: max_length - 3]}..."
 
 
+def endpoints_by_target(endpoints: list[dict[str, Any]]) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """Index endpoints by the (target_type, target_id) pair they are attached to."""
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for endpoint in endpoints:
+        target_type = endpoint.get("target_type")
+        target_id = endpoint.get("target_id")
+        if not isinstance(target_type, str) or target_id is None:
+            continue
+        grouped.setdefault((target_type, str(target_id)), []).append(endpoint)
+    return grouped
+
+
+def format_endpoint(endpoints: list[dict[str, Any]]) -> Text:
+    """Render the route of a target's primary endpoint, dimmed when it is disabled.
+
+    The API can hold several endpoints per target (the deploy upsert keys on name,
+    not on target), so surface the newest one and count the rest.
+    """
+    if not endpoints:
+        return Text("-")
+    primary = endpoints[0]
+    label = f"{primary.get('method', '-')} {primary.get('path', '-')}"
+    extra = len(endpoints) - 1
+    if extra > 0:
+        label = f"{label} (+{extra})"
+    return Text(label, style="" if primary.get("enabled", True) else BRAND_MEDIUM_GRAY)
+
+
+def format_endpoint_detail(endpoints: list[dict[str, Any]], *, api_url: str) -> list[str]:
+    if not endpoints:
+        return ["Endpoint: none"]
+    primary = endpoints[0]
+    lines = [
+        f"Endpoint: {primary.get('method', '-')} {primary.get('path', '-')} | "
+        f"auth: {primary.get('auth', '-')} | mode: {primary.get('mode', '-')} | "
+        f"{format_bool(primary.get('enabled'))}",
+        f"URL: {format_url(primary, api_url=api_url)}",
+    ]
+    if len(endpoints) > 1:
+        others = ", ".join(f"{item.get('method', '-')} {item.get('path', '-')}" for item in endpoints[1:])
+        lines.append(f"Also: {others}")
+    return lines
+
+
+def format_url(item: dict[str, Any], *, api_url: str) -> str:
+    url = item.get("url")
+    if isinstance(url, str) and url:
+        return url
+    url_path = item.get("url_path")
+    if isinstance(url_path, str) and url_path:
+        return f"{api_url}{url_path}"
+    return "-"
+
+
 def status_style(status: Any) -> str:
     normalized = str(status or "unknown").lower()
     if normalized in {"completed", "succeeded", "success"}:
@@ -183,7 +251,8 @@ class RebaseTuiApp(App[None]):
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
         ("b", "back", "Back"),
-        ("tab", "toggle_target_tab", "Switch target"),
+        # priority: the screen's default `tab` -> focus_next otherwise shadows this.
+        Binding("tab", "toggle_target_tab", "Switch target", priority=True),
     ]
     CSS = f"""
     Screen {{
@@ -221,6 +290,7 @@ class RebaseTuiApp(App[None]):
     #projects-table,
     #workflows-table,
     #functions-table,
+    #asgi-apps-table,
     #runs-table,
     #events-table,
     #steps-table {{
@@ -261,6 +331,10 @@ class RebaseTuiApp(App[None]):
         height: 4;
         padding: 0 1;
         border-bottom: solid {BRAND_MEDIUM_GRAY};
+    }}
+
+    #target-detail {{
+        height: 7;
     }}
 
     #runs-table {{
@@ -308,6 +382,8 @@ class RebaseTuiApp(App[None]):
         self._profile_rows: dict[str, dict[str, Any]] = {}
         self._function_rows: dict[str, dict[str, Any]] = {}
         self._workflow_rows: dict[str, dict[str, Any]] = {}
+        self._asgi_app_rows: dict[str, dict[str, Any]] = {}
+        self._endpoints_by_target: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._run_rows: dict[str, dict[str, Any]] = {}
 
     def compose(self) -> ComposeResult:
@@ -324,6 +400,8 @@ class RebaseTuiApp(App[None]):
                     yield DataTable(id="workflows-table")
                 with TabPane("Functions", id="functions-tab"):
                     yield DataTable(id="functions-table")
+                with TabPane("ASGI apps", id="asgi-apps-tab"):
+                    yield DataTable(id="asgi-apps-table")
             yield Static("Select a workflow or function.", id="target-detail", classes="panel")
             yield DataTable(id="runs-table")
             yield Static("Select a run.", id="run-detail", classes="panel")
@@ -351,12 +429,17 @@ class RebaseTuiApp(App[None]):
         functions = self.query_one("#functions-table", DataTable)
         functions.cursor_type = "row"
         functions.zebra_stripes = True
-        functions.add_columns("Name", "Run type", "State", "Version", "Updated", "ID")
+        functions.add_columns("Name", "Run type", "State", "Endpoint", "Version", "Updated")
 
         workflows = self.query_one("#workflows-table", DataTable)
         workflows.cursor_type = "row"
         workflows.zebra_stripes = True
-        workflows.add_columns("Name", "Run type", "State", "Schedule", "Next run", "Version", "Updated", "ID")
+        workflows.add_columns("Name", "Run type", "State", "Endpoint", "Schedule", "Next run", "Version", "Updated")
+
+        asgi_apps = self.query_one("#asgi-apps-table", DataTable)
+        asgi_apps.cursor_type = "row"
+        asgi_apps.zebra_stripes = True
+        asgi_apps.add_columns("Name", "Base path", "Auth", "State", "URL path", "Updated")
 
         runs = self.query_one("#runs-table", DataTable)
         runs.cursor_type = "row"
@@ -407,7 +490,9 @@ class RebaseTuiApp(App[None]):
 
     def action_toggle_target_tab(self) -> None:
         tabs = self.query_one("#target-tabs", TabbedContent)
-        tabs.active = "workflows-tab" if tabs.active == "functions-tab" else "functions-tab"
+        order = ["workflows-tab", "functions-tab", "asgi-apps-tab"]
+        current = order.index(tabs.active) if tabs.active in order else 0
+        tabs.active = order[(current + 1) % len(order)]
 
     async def _load_workspace_overview(self) -> None:
         try:
@@ -492,6 +577,8 @@ class RebaseTuiApp(App[None]):
     def _render_project_targets(self, targets: ProjectTargetsData) -> None:
         self._function_rows = {str(item["id"]): item for item in targets.functions if item.get("id") is not None}
         self._workflow_rows = {str(item["id"]): item for item in targets.workflows if item.get("id") is not None}
+        self._asgi_app_rows = {str(item["id"]): item for item in targets.asgi_apps if item.get("id") is not None}
+        self._endpoints_by_target = endpoints_by_target(targets.endpoints)
 
         functions = self.query_one("#functions-table", DataTable)
         functions.clear()
@@ -500,9 +587,9 @@ class RebaseTuiApp(App[None]):
                 str(function.get("name", "-")),
                 str(function.get("run_type") or "-"),
                 format_bool(function.get("enabled")),
+                format_endpoint(self._target_endpoints("function", function_id)),
                 compact_id(function.get("current_version_id")),
                 format_timestamp(function.get("updated_at")),
-                compact_id(function_id),
                 key=function_id,
             )
 
@@ -513,16 +600,32 @@ class RebaseTuiApp(App[None]):
                 str(workflow.get("name", "-")),
                 str(workflow.get("run_type") or "-"),
                 format_bool(workflow.get("enabled")),
+                format_endpoint(self._target_endpoints("workflow", workflow_id)),
                 format_schedule(workflow.get("schedule")),
                 format_timestamp(workflow.get("next_run_at")),
                 compact_id(workflow.get("current_version_id")),
                 format_timestamp(workflow.get("updated_at")),
-                compact_id(workflow_id),
                 key=workflow_id,
             )
 
+        asgi_apps = self.query_one("#asgi-apps-table", DataTable)
+        asgi_apps.clear()
+        for asgi_app_id, asgi_app in self._asgi_app_rows.items():
+            asgi_apps.add_row(
+                str(asgi_app.get("name", "-")),
+                str(asgi_app.get("base_path") or "-"),
+                str(asgi_app.get("auth") or "-"),
+                format_bool(asgi_app.get("enabled")),
+                str(asgi_app.get("url_path") or "-"),
+                format_timestamp(asgi_app.get("updated_at")),
+                key=asgi_app_id,
+            )
+
         self._clear_target_detail(clear_project=False)
-        self.query_one("#target-detail", Static).update("Select a workflow or function.")
+        self.query_one("#target-detail", Static).update("Select a workflow, function, or ASGI app.")
+
+    def _target_endpoints(self, target_type: str, target_id: str) -> list[dict[str, Any]]:
+        return self._endpoints_by_target.get((target_type, target_id), [])
 
     def _render_runs(self, runs: list[dict[str, Any]]) -> None:
         self._run_rows = {str(item["id"]): item for item in runs if item.get("id") is not None}
@@ -583,9 +686,12 @@ class RebaseTuiApp(App[None]):
             self.query_one("#project-detail", Static).update("Select a project.")
             self.query_one("#functions-table", DataTable).clear()
             self.query_one("#workflows-table", DataTable).clear()
+            self.query_one("#asgi-apps-table", DataTable).clear()
             self._function_rows = {}
             self._workflow_rows = {}
-        self.query_one("#target-detail", Static).update("Select a workflow or function.")
+            self._asgi_app_rows = {}
+            self._endpoints_by_target = {}
+        self.query_one("#target-detail", Static).update("Select a workflow, function, or ASGI app.")
         self.query_one("#runs-table", DataTable).clear()
         self.query_one("#run-detail", Static).update("Select a run.")
         self.query_one("#events-table", DataTable).clear()
@@ -669,6 +775,8 @@ class RebaseTuiApp(App[None]):
         self._project_rows = {}
         self._function_rows = {}
         self._workflow_rows = {}
+        self._asgi_app_rows = {}
+        self._endpoints_by_target = {}
         self._run_rows = {}
         self._update_workspace_title()
         self._clear_target_detail()
@@ -683,7 +791,28 @@ class RebaseTuiApp(App[None]):
             f"{format_bool(target.get('enabled'))} | Current version: {compact_id(target.get('current_version_id'))}",
             f"ID: {target.get('id', '-')}",
         ]
+        lines.extend(
+            format_endpoint_detail(
+                self._target_endpoints(target_type, str(target.get("id", ""))),
+                api_url=self._api_url(),
+            )
+        )
         self.query_one("#target-detail", Static).update("\n".join(lines))
+
+    def _render_asgi_app_detail(self, asgi_app: dict[str, Any]) -> None:
+        lines = [
+            f"ASGI app {asgi_app.get('name', '-')}",
+            f"Project: {self._project_name(asgi_app)} | Base path: {asgi_app.get('base_path') or '-'} | "
+            f"Auth: {asgi_app.get('auth') or '-'}",
+            f"State: {format_bool(asgi_app.get('enabled'))} | "
+            f"Current version: {compact_id(asgi_app.get('current_version_id'))}",
+            f"ID: {asgi_app.get('id', '-')}",
+            f"URL: {format_url(asgi_app, api_url=self._api_url())}",
+        ]
+        self.query_one("#target-detail", Static).update("\n".join(lines))
+
+    def _api_url(self) -> str:
+        return str(getattr(self.data.client, "api_url", ""))
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         row_id = event.row_key.value
@@ -707,6 +836,16 @@ class RebaseTuiApp(App[None]):
             self.selected_target = target
             self._render_target_detail("workflow", target)
             self.run_worker(self._load_runs("workflow", row_id), name="runs", group="tui", exclusive=True)
+        elif event.data_table.id == "asgi-apps-table":
+            asgi_app = self._asgi_app_rows.get(row_id)
+            if asgi_app is None:
+                return
+            # ASGI apps serve HTTP directly, so they have no runs to drill into.
+            self.selected_target_type = None
+            self.selected_target = None
+            self._render_asgi_app_detail(asgi_app)
+            self._render_runs([])
+            self.query_one("#run-detail", Static).update("ASGI apps serve requests directly and have no runs.")
         elif event.data_table.id == "runs-table" and row_id in self._run_rows:
             self.run_worker(self._load_run_detail(row_id), name="run-detail", group="tui", exclusive=True)
         elif event.data_table.id == "workspace-profiles-table":
