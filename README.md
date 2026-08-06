@@ -306,6 +306,67 @@ combined = rb.stitch(
 combined, sources = rb.stitch([...], issue_time=..., return_sources=True)
 ```
 
+## HTTP Endpoints
+
+`rb.endpoint` gives a deployed function, model, or workflow a stable HTTP route.
+Auth defaults to `api_key`, so endpoints are not public unless you say so
+(`auth` also accepts `"workspace"` and `"public"`):
+
+```python
+@rb.endpoint(method="POST", path="/forecast")
+@rb.function(project="forecasting")
+def forecast(zone: str = "SE3") -> dict:
+    return {"zone": zone}
+```
+
+```bash
+rebase api-key create forecast-agent
+curl -X POST "$ENDPOINT_URL" -H "Authorization: Bearer rb_..." \
+  -H "Content-Type: application/json" -d '{"zone": "SE3"}'
+```
+
+## ASGI Apps
+
+`rb.asgi_app` deploys a whole FastAPI/Starlette app instead of a single route.
+The decorated function builds and returns the app:
+
+```python
+image = rb.Image.python("3.12").uv_pip_install("fastapi==0.141.1")
+
+
+@rb.asgi_app(project="grid", name="grid-api", image=image)
+def grid_api():
+    from fastapi import FastAPI
+
+    web_app = FastAPI()
+
+    @web_app.get("/zones/{zone}")
+    def read_zone(zone: str):
+        return {"zone": zone}
+
+    return web_app
+
+
+rb.deploy(grid_api)
+```
+
+Two things to know when writing the app function, because its source is shipped
+and re-executed remotely:
+
+- Import inside the function — module-scope imports must also resolve on the
+  machine running `deploy`.
+- FastAPI resolves annotations against module globals, so a name imported inside
+  the function is invisible to it. `Header`/`Query`/`Body` parameters with plain
+  types work; a `request: Request` parameter is silently read as a query
+  parameter instead.
+
+If the app does its own auth (`auth="public"`), carry the credential in a header
+other than `Authorization`: Rebase invokes the app with its own Google service
+account, whose token occupies `Authorization`. FastAPI's `HTTPBearer` and
+`OAuth2PasswordBearer` read that header and would validate the platform's token
+rather than your caller's. See
+[ASGI Apps](https://rebase-platform-docs.fly.dev/docs/documentation/asgi-apps).
+
 ## Dependencies
 
 Function dependencies are declared with a Modal-like image builder:
