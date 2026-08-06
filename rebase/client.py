@@ -1851,6 +1851,23 @@ class Client:
             raise RebaseWorkflowError("expected workspace member list response")
         return response
 
+    def update_workspace_member(
+        self,
+        profile_id: str,
+        *,
+        role: str | None = None,
+        enabled: bool | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if role is not None:
+            payload["role"] = role
+        if enabled is not None:
+            payload["enabled"] = enabled
+        response = self.request("PATCH", f"/workspace/members/{profile_id}", json=payload)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected workspace member response")
+        return response
+
     def create_workspace_invite(
         self,
         *,

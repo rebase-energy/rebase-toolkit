@@ -8,7 +8,7 @@ import pytest
 
 from rebase.auth import AuthSession
 from rebase.cli import _format_duration, deploy_file, main
-from rebase.client import ASGIApp, Client, Function, Model, Project, Run, Workflow
+from rebase.client import ASGIApp, Client, Function, Model, Project, RebaseWorkflowError, Run, Workflow
 
 
 def test_main_without_args_prints_help(capsys) -> None:
@@ -2981,6 +2981,102 @@ def test_workspace_invite_requires_one_target(capsys) -> None:
     assert main(["workspace", "invite"]) == 1
 
     assert "provide exactly one invite target" in capsys.readouterr().err
+
+
+def _member(email: str, *, role: str, github_username: str | None = None) -> dict[str, Any]:
+    return {
+        "profile_id": f"profile-{email.split('@')[0]}",
+        "email": email,
+        "github_username": github_username,
+        "role": role,
+        "enabled": True,
+        "created_at": "2026-06-22T22:00:00Z",
+    }
+
+
+def _fake_members(*members: dict[str, Any]):
+    def fake_list_workspace_members(self: Client) -> list[dict[str, Any]]:
+        return list(members)
+
+    return fake_list_workspace_members
+
+
+def test_workspace_set_role_promotes_member_by_email(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_update_workspace_member(self: Client, profile_id: str, **kwargs: Any) -> dict[str, Any]:
+        observed.update({"profile_id": profile_id, **kwargs})
+        return {"profile_id": profile_id, "email": "sebastian@rebase.energy", "role": kwargs["role"]}
+
+    monkeypatch.setattr(
+        Client,
+        "list_workspace_members",
+        _fake_members(_member("sebastian@rebase.energy", role="Viewer")),
+    )
+    monkeypatch.setattr(Client, "update_workspace_member", fake_update_workspace_member)
+
+    assert main(["workspace", "set-role", "sebastian@rebase.energy", "--role", "Owner"]) == 0
+
+    assert observed == {"profile_id": "profile-sebastian", "role": "Owner"}
+    output = capsys.readouterr().out
+    assert "sebastian@rebase.energy" in output
+    assert "Viewer" in output
+    assert "Owner" in output
+
+
+def test_workspace_set_role_resolves_github_username(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_update_workspace_member(self: Client, profile_id: str, **kwargs: Any) -> dict[str, Any]:
+        observed.update({"profile_id": profile_id, **kwargs})
+        return {"profile_id": profile_id, "github_username": "sebaheg", "role": kwargs["role"]}
+
+    monkeypatch.setattr(
+        Client,
+        "list_workspace_members",
+        _fake_members(_member("sebastian@rebase.energy", role="Viewer", github_username="sebaheg")),
+    )
+    monkeypatch.setattr(Client, "update_workspace_member", fake_update_workspace_member)
+
+    assert main(["workspace", "set-role", "@sebaheg", "--role", "Admin"]) == 0
+
+    assert observed == {"profile_id": "profile-sebastian", "role": "Admin"}
+
+
+def test_workspace_set_role_rejects_unknown_role(capsys) -> None:
+    assert main(["workspace", "set-role", "sebastian@rebase.energy", "--role", "owner"]) == 1
+
+    assert "role must be one of: Viewer, Developer, Admin, Owner" in capsys.readouterr().err
+
+
+def test_workspace_set_role_reports_unknown_member(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "list_workspace_members",
+        _fake_members(_member("davide@rebase.energy", role="Developer")),
+    )
+
+    assert main(["workspace", "set-role", "mihai@rebase.energy", "--role", "Owner"]) == 1
+
+    error = capsys.readouterr().err
+    assert "no workspace member matches 'mihai@rebase.energy'" in error
+    assert "davide@rebase.energy" in error
+
+
+def test_workspace_set_role_surfaces_server_permission_error(monkeypatch, capsys) -> None:
+    def fake_update_workspace_member(self: Client, profile_id: str, **kwargs: Any) -> dict[str, Any]:
+        raise RebaseWorkflowError("only Owner can assign Owner role")
+
+    monkeypatch.setattr(
+        Client,
+        "list_workspace_members",
+        _fake_members(_member("sebastian@rebase.energy", role="Viewer")),
+    )
+    monkeypatch.setattr(Client, "update_workspace_member", fake_update_workspace_member)
+
+    assert main(["workspace", "set-role", "sebastian@rebase.energy", "--role", "Owner"]) == 1
+
+    assert "only Owner can assign Owner role" in capsys.readouterr().err
 
 
 def test_workspace_members_lists_members_and_pending_invites(monkeypatch, capsys) -> None:
