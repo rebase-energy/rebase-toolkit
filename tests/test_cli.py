@@ -64,17 +64,18 @@ def test_run_help_shows_execution_and_inspection_commands(capsys) -> None:
     assert "Usage: rebase run [OPTIONS] TARGET_REF" in output
     assert "--param, -p" in output
     assert "--parameters-json" in output
-    assert "--backend" in output
+    assert "--run-type" in output
     assert "--module, -m" in output
     assert "--wait / --no-wait" in output
     assert "Inspection Commands" in output
-    command_order = ["cancel", "get", "list", "logs"]
+    command_order = ["cancel", "get", "list", "logs", "replay"]
     positions = [output.index(command) for command in command_order]
     assert positions == sorted(positions)
     assert "list" in output
     assert "get" in output
     assert "logs" in output
     assert "cancel" in output
+    assert "replay" in output
 
 
 def test_tui_command_invokes_textual_app(monkeypatch) -> None:
@@ -326,9 +327,7 @@ def test_main_prints_deployed_targets(monkeypatch, tmp_path: Path, capsys) -> No
     assert "project-id" in output
 
 
-def test_deploy_command_creates_gitops_intent_for_protected_environment(
-    monkeypatch, tmp_path: Path, capsys
-) -> None:
+def test_deploy_command_creates_gitops_intent_for_protected_environment(monkeypatch, tmp_path: Path, capsys) -> None:
     workflow_file = tmp_path / "workflow.py"
     workflow_file.write_text("import rebase as rb\nproject = rb.Project('energy-forecasting')\n", encoding="utf-8")
     observed: dict[str, Any] = {}
@@ -427,7 +426,7 @@ def add(a: int, b: int) -> dict:
         "project": "math",
         "name": "add",
         "entrypoint": "add",
-        "execution_backend": "cloud_run",
+        "run_type": "quick",
         "parameters": {"a": 1, "b": 2},
         "default_parameters": {},
         "image_spec": {"kind": "python", "python_version": "3.13", "uv_pip_packages": [], "uv_version": None},
@@ -489,7 +488,7 @@ def test_run_command_can_submit_without_waiting(monkeypatch, tmp_path: Path, cap
         """
 import rebase as rb
 
-@rb.function(project="math", name="add", backend="cloud_run")
+@rb.function(project="math", name="add", run_type="quick")
 def add(a: int, b: int) -> dict:
     return {"sum": a + b}
 """,
@@ -573,7 +572,7 @@ def hello_workflow(name: str = "World") -> dict:
     assert observed["project"] == "hello"
     assert observed["name"] == "hello-workflow"
     assert observed["parameters"] == {"name": "Rebase"}
-    assert observed["execution_backend"] == "prefect_cloud_run_service"
+    assert observed["run_type"] == "quick"
     assert [node["name"] for node in observed["step_graph"]["nodes"]] == ["load-name", "package"]
     assert all(node["source_code"] for node in observed["step_graph"]["nodes"])
     output = capsys.readouterr().out
@@ -650,7 +649,7 @@ def test_run_get_command_renders_detail(monkeypatch, capsys) -> None:
     assert "backend_execution_seconds" in output
 
 
-def test_run_logs_command_renders_events_and_steps_without_following(monkeypatch, capsys) -> None:
+def test_run_logs_command_renders_events_steps_and_log_lines_without_following(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         Client,
         "get_run",
@@ -666,6 +665,20 @@ def test_run_logs_command_renders_events_and_steps_without_following(monkeypatch
         "list_run_steps",
         lambda self, run_id: [{"id": "step-id", "name": "load-name", "status": "succeeded"}],
     )
+    monkeypatch.setattr(
+        Client,
+        "get_run_logs",
+        lambda self, run_id, since=None, limit=None: {
+            "run_id": run_id,
+            "source": "cloud_logging",
+            "entries": [
+                {"timestamp": "2026-07-11T10:00:01Z", "severity": "INFO", "message": "hello from user code"},
+                {"timestamp": "2026-07-11T10:00:02Z", "severity": "ERROR", "message": "something went wrong"},
+            ],
+            "next_since": "2026-07-11T10:00:02Z",
+            "message": None,
+        },
+    )
 
     assert main(["run", "logs", "run-id", "--no-follow"]) == 0
 
@@ -673,6 +686,33 @@ def test_run_logs_command_renders_events_and_steps_without_following(monkeypatch
     assert "Accepted run request." in output
     assert "Step load-name completed." in output
     assert "Run completed." in output
+    assert "hello from user code" in output
+    assert "something went wrong" in output
+
+
+def test_run_logs_command_prints_unsupported_backend_message_once(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "get_run",
+        lambda self, run_id: {"id": run_id, "target_type": "function", "status": "succeeded"},
+    )
+    monkeypatch.setattr(Client, "list_run_events", lambda self, run_id: [])
+    monkeypatch.setattr(
+        Client,
+        "get_run_logs",
+        lambda self, run_id, since=None, limit=None: {
+            "run_id": run_id,
+            "source": "none",
+            "entries": [],
+            "next_since": None,
+            "message": "Log retrieval is not supported for this backend yet.",
+        },
+    )
+
+    assert main(["run", "logs", "run-id", "--no-follow"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Log retrieval is not supported for this backend yet." in output
 
 
 def test_run_logs_command_can_print_json(monkeypatch, capsys) -> None:
@@ -683,6 +723,11 @@ def test_run_logs_command_can_print_json(monkeypatch, capsys) -> None:
     )
     monkeypatch.setattr(Client, "list_run_events", lambda self, run_id: [{"id": "event-id"}])
     monkeypatch.setattr(Client, "list_run_steps", lambda self, run_id: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(
+        Client,
+        "get_run_logs",
+        lambda self, run_id, since=None, limit=None: {"run_id": run_id, "source": "none", "entries": []},
+    )
 
     assert main(["run", "logs", "run-id", "--json"]) == 0
 
@@ -690,13 +735,296 @@ def test_run_logs_command_can_print_json(monkeypatch, capsys) -> None:
     assert '"run"' in output
     assert '"events"' in output
     assert '"steps": []' in output
+    assert '"logs"' in output
 
 
-def test_run_cancel_command_is_explicitly_unsupported(capsys) -> None:
+def test_run_cancel_command_prints_cancelled_run(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "cancel_run",
+        lambda self, run_id: {
+            "id": run_id,
+            "status": "cancelled",
+            "target_type": "workflow",
+            "execution_backend": "prefect_cloud_run_service",
+            "error": "cancelled by user",
+        },
+    )
+
+    assert main(["run", "cancel", "run-id"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Cancelled Run" in output
+    assert "cancelled" in output
+
+
+def test_run_cancel_command_surfaces_server_conflict(monkeypatch, capsys) -> None:
+    from rebase.client import RebaseWorkflowError
+
+    def fake_cancel(self, run_id):
+        raise RebaseWorkflowError("run already finished with status succeeded")
+
+    monkeypatch.setattr(Client, "cancel_run", fake_cancel)
+
     assert main(["run", "cancel", "run-id"]) == 1
 
     output = capsys.readouterr().err
-    assert "run cancellation is not supported yet: run-id" in output
+    assert "run already finished with status succeeded" in output
+
+
+def test_run_replay_help_routes_through_run_app(capsys) -> None:
+    # Proves "replay" is wired into RUN_INSPECTION_COMMANDS: without it the run
+    # target executor would swallow the subcommand.
+    assert main(["run", "replay", "--help"]) == 0
+
+    output = capsys.readouterr().out
+    assert "--workflow" in output
+    assert "--code" in output
+    assert "--compare" in output
+
+
+def test_run_replay_requires_exactly_one_mode(capsys) -> None:
+    assert main(["run", "replay"]) == 1
+    assert "RUN_ID" in capsys.readouterr().err
+
+    assert main(["run", "replay", "run-id", "--workflow", "energy/forecast"]) == 1
+    assert "not both" in capsys.readouterr().err
+
+
+def test_run_replay_single_submits_and_prints_detail(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_replay_run(self, run_id, *, version=None, parameters=None):
+        observed.update({"run_id": run_id, "version": version, "parameters": parameters})
+        data = {"id": "replay-id", "status": "queued", "replay_of": run_id, "target_version_id": "version-1"}
+        return Run("replay-id", client=self, data=data)
+
+    monkeypatch.setattr(Client, "replay_run", fake_replay_run)
+
+    assert main(["run", "replay", "run-id", "--no-wait"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Replay Run" in output
+    assert "replay-id" in output
+    assert "run-id" in output
+    assert observed == {"run_id": "run-id", "version": None, "parameters": None}
+
+
+def test_run_replay_code_latest_and_params_are_forwarded(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_replay_run(self, run_id, *, version=None, parameters=None):
+        observed.update({"version": version, "parameters": parameters})
+        return Run("replay-id", client=self, data={"id": "replay-id", "status": "queued", "replay_of": run_id})
+
+    monkeypatch.setattr(Client, "replay_run", fake_replay_run)
+
+    assert main(["run", "replay", "run-id", "--code", "latest", "-p", "horizon=48", "--no-wait"]) == 0
+
+    assert observed == {"version": "latest", "parameters": {"horizon": 48}}
+
+
+def _patch_replay_wait(monkeypatch, *, original_result, replay_result, replay_status="succeeded") -> None:
+    def fake_replay_run(self, run_id, *, version=None, parameters=None):
+        return Run("replay-id", client=self, data={"id": "replay-id", "status": "queued", "replay_of": run_id})
+
+    def fake_get_run(self, run_id):
+        if run_id == "replay-id":
+            return {
+                "id": "replay-id",
+                "status": replay_status,
+                "result": replay_result,
+                "error": "boom" if replay_status == "failed" else None,
+                "started_at": "2026-07-11T09:00:00+00:00",
+                "finished_at": "2026-07-11T09:00:05+00:00",
+            }
+        return {
+            "id": run_id,
+            "status": "succeeded",
+            "result": original_result,
+            "started_at": "2026-07-10T09:00:00+00:00",
+            "finished_at": "2026-07-10T09:00:04+00:00",
+        }
+
+    monkeypatch.setattr(Client, "replay_run", fake_replay_run)
+    monkeypatch.setattr(Client, "get_run", fake_get_run)
+
+
+def test_run_replay_wait_reports_identical_results(monkeypatch, capsys) -> None:
+    _patch_replay_wait(monkeypatch, original_result={"forecast": 42.0}, replay_result={"forecast": 42.0})
+
+    assert main(["run", "replay", "run-id"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Replay Comparison" in output
+    assert "identical" in output
+    assert "succeeded -> succeeded" in output
+
+
+def test_run_replay_wait_reports_differing_keys(monkeypatch, capsys) -> None:
+    _patch_replay_wait(
+        monkeypatch,
+        original_result={"forecast": 42.0, "site": "a"},
+        replay_result={"forecast": 43.5, "site": "a"},
+    )
+
+    assert main(["run", "replay", "run-id"]) == 0
+
+    output = capsys.readouterr().out
+    assert "differs" in output
+    assert "forecast" in output
+
+
+def test_run_replay_wait_exits_nonzero_when_replay_fails(monkeypatch, capsys) -> None:
+    _patch_replay_wait(monkeypatch, original_result={"forecast": 42.0}, replay_result=None, replay_status="failed")
+
+    assert main(["run", "replay", "run-id"]) == 1
+
+    output = capsys.readouterr().out
+    assert "succeeded -> failed" in output
+
+
+def _patch_batch_workflow(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "rebase.cli._resolve_workflow_selector",
+        lambda client, name, workflow_id=None, project_name=None: {"id": "workflow-id", "name": name},
+    )
+
+
+def test_run_replay_batch_excludes_replays_and_compares(monkeypatch, capsys) -> None:
+    replayed: list[str] = []
+    _patch_batch_workflow(monkeypatch)
+
+    def fake_list_runs(self, **kwargs):
+        assert kwargs["workflow_id"] == "workflow-id"
+        assert kwargs["target_type"] == "workflow"
+        assert kwargs["limit"] == 500
+        assert kwargs["since"] is not None
+        return [
+            {"id": "run-1", "status": "succeeded", "trigger_source": "schedule", "created_at": "2026-07-09T09:00:00Z"},
+            {"id": "run-2", "status": "succeeded", "trigger_source": "api", "created_at": "2026-07-10T09:00:00Z"},
+            {"id": "run-3", "status": "succeeded", "trigger_source": "replay", "created_at": "2026-07-10T10:00:00Z"},
+        ]
+
+    def fake_replay_run(self, run_id, *, version=None, parameters=None):
+        replayed.append(run_id)
+        replay_id = f"replay-{run_id}"
+        return Run(replay_id, client=self, data={"id": replay_id, "status": "queued", "replay_of": run_id})
+
+    results = {
+        "run-1": {"forecast": 1.0},
+        "replay-run-1": {"forecast": 1.0},
+        "run-2": {"forecast": 2.0},
+        "replay-run-2": {"forecast": 99.0},
+    }
+
+    monkeypatch.setattr(Client, "list_runs", fake_list_runs)
+    monkeypatch.setattr(Client, "replay_run", fake_replay_run)
+    monkeypatch.setattr(
+        Client, "get_run", lambda self, run_id: {"id": run_id, "status": "succeeded", "result": results[run_id]}
+    )
+
+    assert main(["run", "replay", "--workflow", "energy/forecast", "--since", "7d", "--yes"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Replay Candidates" in output
+    assert "Replays" in output
+    assert replayed == ["run-1", "run-2"]  # the run-3 replay is never replayed again
+    assert "identical" in output
+    assert "differs" in output
+    assert "forecast" in output
+
+
+def test_run_replay_batch_json_rows_and_failure_exit_code(monkeypatch, capsys) -> None:
+    _patch_batch_workflow(monkeypatch)
+    monkeypatch.setattr(
+        Client,
+        "list_runs",
+        lambda self, **kwargs: [{"id": "run-1", "status": "succeeded", "trigger_source": "api"}],
+    )
+    monkeypatch.setattr(
+        Client,
+        "replay_run",
+        lambda self, run_id, **kwargs: Run(
+            "replay-run-1", client=self, data={"id": "replay-run-1", "status": "queued", "replay_of": run_id}
+        ),
+    )
+
+    def fake_get_run(self, run_id):
+        if run_id == "replay-run-1":
+            return {"id": run_id, "status": "failed", "error": "boom"}
+        return {"id": run_id, "status": "succeeded", "result": {"forecast": 1.0}}
+
+    monkeypatch.setattr(Client, "get_run", fake_get_run)
+
+    assert main(["run", "replay", "--workflow", "energy/forecast", "--since", "24h", "--yes", "--json"]) == 1
+
+    rows = json.loads(capsys.readouterr().out)
+    assert rows == [
+        {
+            "original": "run-1",
+            "replay": "replay-run-1",
+            "original_status": "succeeded",
+            "replay_status": "failed",
+            "result_identical": None,
+            "differing_keys": None,
+        }
+    ]
+
+
+def test_run_replay_batch_no_compare_submits_and_exits_zero(monkeypatch, capsys) -> None:
+    _patch_batch_workflow(monkeypatch)
+    monkeypatch.setattr(
+        Client,
+        "list_runs",
+        lambda self, **kwargs: [{"id": "run-1", "status": "failed", "trigger_source": "api"}],
+    )
+    monkeypatch.setattr(
+        Client,
+        "replay_run",
+        lambda self, run_id, **kwargs: Run(
+            "replay-run-1", client=self, data={"id": "replay-run-1", "status": "queued", "replay_of": run_id}
+        ),
+    )
+    monkeypatch.setattr(Client, "get_run", lambda self, run_id: (_ for _ in ()).throw(AssertionError("no polling")))
+
+    assert main(["run", "replay", "--workflow", "energy/forecast", "--since", "24h", "--yes", "--no-compare"]) == 0
+
+    output = capsys.readouterr().out
+    assert "replay-run-1" in output
+
+
+def test_run_replay_batch_decline_aborts_without_replaying(monkeypatch, capsys) -> None:
+    import click
+
+    _patch_batch_workflow(monkeypatch)
+    monkeypatch.setattr(
+        Client,
+        "list_runs",
+        lambda self, **kwargs: [{"id": "run-1", "status": "succeeded", "trigger_source": "api"}],
+    )
+    monkeypatch.setattr(
+        Client,
+        "replay_run",
+        lambda self, run_id, **kwargs: (_ for _ in ()).throw(AssertionError("declined confirm must not replay")),
+    )
+    monkeypatch.setattr("typer.confirm", lambda *args, **kwargs: (_ for _ in ()).throw(click.Abort()))
+
+    assert main(["run", "replay", "--workflow", "energy/forecast", "--since", "24h"]) == 1
+
+
+def test_run_replay_batch_requires_since(capsys) -> None:
+    assert main(["run", "replay", "--workflow", "energy/forecast"]) == 1
+    assert "--since" in capsys.readouterr().err
+
+
+def test_run_replay_batch_no_candidates_is_friendly(monkeypatch, capsys) -> None:
+    _patch_batch_workflow(monkeypatch)
+    monkeypatch.setattr(Client, "list_runs", lambda self, **kwargs: [])
+
+    assert main(["run", "replay", "--workflow", "energy/forecast", "--since", "7d"]) == 0
+
+    assert "No matching runs" in capsys.readouterr().out
 
 
 def test_setup_stores_api_key(monkeypatch, tmp_path: Path, capsys) -> None:
@@ -3226,3 +3554,996 @@ def test_hillclimb_promote_local(tmp_path):
     (best / "solution.py").unlink()
     with pytest.raises(RuntimeError, match="no searches with a best"):
         promote_local("latest", tmp_path / "models", runs_dir=tmp_path / "runs")
+
+
+def _stub_workflow_lookup(monkeypatch) -> None:
+    monkeypatch.setattr(
+        Client,
+        "get_workflow",
+        lambda self, workflow_id: {
+            "id": workflow_id,
+            "name": "forecast",
+            "project_id": "project-id",
+            "enabled": True,
+            "current_version_id": "version-id",
+        },
+    )
+
+
+def test_workflow_schedule_show_command(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    monkeypatch.setattr(
+        Client,
+        "get_workflow_schedule",
+        lambda self, workflow_id: {
+            "workflow_id": workflow_id,
+            "version_id": "version-id",
+            "schedule": {"type": "cron", "cron": "0 * * * *", "timezone": "Europe/Stockholm"},
+            "active": True,
+            "next_run_at": "2026-07-11T11:00:00Z",
+        },
+    )
+
+    assert main(["workflow", "schedule", "show", "--id", "workflow-id"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Workflow Schedule" in output
+    assert "0 * * * *" in output
+    assert "Europe/Stockholm" in output
+    assert "2026-07-11T11:00:00Z" in output
+
+
+def test_workflow_schedule_show_without_schedule(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    monkeypatch.setattr(
+        Client,
+        "get_workflow_schedule",
+        lambda self, workflow_id: {
+            "workflow_id": workflow_id,
+            "version_id": "version-id",
+            "schedule": None,
+            "active": None,
+            "next_run_at": None,
+        },
+    )
+
+    assert main(["workflow", "schedule", "show", "--id", "workflow-id"]) == 0
+    assert "has no schedule" in capsys.readouterr().out
+
+
+def test_workflow_schedule_set_command(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    def fake_update_workflow(self, workflow_id, **kwargs):
+        observed["workflow_id"] = workflow_id
+        observed["schedule"] = kwargs.get("schedule")
+        return {"id": workflow_id}
+
+    monkeypatch.setattr(Client, "update_workflow", fake_update_workflow)
+    monkeypatch.setattr(
+        Client,
+        "get_workflow_schedule",
+        lambda self, workflow_id: {
+            "workflow_id": workflow_id,
+            "version_id": "version-id",
+            "schedule": {"type": "cron", "cron": "0 15 * * *", "timezone": "Europe/London"},
+            "active": True,
+            "next_run_at": "2026-07-11T14:00:00Z",
+        },
+    )
+
+    assert (
+        main(
+            [
+                "workflow",
+                "schedule",
+                "set",
+                "--id",
+                "workflow-id",
+                "--cron",
+                "0 15 * * *",
+                "--timezone",
+                "Europe/London",
+            ]
+        )
+        == 0
+    )
+
+    assert observed["schedule"] == {
+        "type": "cron",
+        "cron": "0 15 * * *",
+        "timezone": "Europe/London",
+        "day_or": True,
+        "active": True,
+    }
+    assert "Schedule Set" in capsys.readouterr().out
+
+
+def test_workflow_schedule_set_requires_cron(monkeypatch, capsys) -> None:
+    assert main(["workflow", "schedule", "set", "--id", "workflow-id"]) == 1
+    assert "--cron is required" in capsys.readouterr().err
+
+
+def test_workflow_schedule_set_rejects_invalid_cron(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    assert main(["workflow", "schedule", "set", "--id", "workflow-id", "--cron", "not-a-cron"]) == 1
+    assert "cron" in capsys.readouterr().err
+
+
+def test_workflow_schedule_pause_and_resume_toggle_active(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    schedules: list[dict[str, Any]] = []
+
+    def fake_update_workflow(self, workflow_id, **kwargs):
+        schedules.append(dict(kwargs["schedule"]))
+        return {"id": workflow_id}
+
+    monkeypatch.setattr(Client, "update_workflow", fake_update_workflow)
+    monkeypatch.setattr(
+        Client,
+        "get_workflow_schedule",
+        lambda self, workflow_id: {
+            "workflow_id": workflow_id,
+            "version_id": "version-id",
+            "schedule": {"type": "cron", "cron": "0 * * * *", "active": True},
+            "active": True,
+            "next_run_at": None,
+        },
+    )
+
+    assert main(["workflow", "schedule", "pause", "--id", "workflow-id"]) == 0
+    assert schedules[-1]["active"] is False
+    assert "Schedule Paused" in capsys.readouterr().out
+
+    assert main(["workflow", "schedule", "resume", "--id", "workflow-id"]) == 0
+    assert schedules[-1]["active"] is True
+    assert "Schedule Resumed" in capsys.readouterr().out
+
+
+def test_workflow_schedule_pause_without_schedule_errors(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    monkeypatch.setattr(
+        Client,
+        "get_workflow_schedule",
+        lambda self, workflow_id: {"workflow_id": workflow_id, "schedule": None},
+    )
+
+    assert main(["workflow", "schedule", "pause", "--id", "workflow-id"]) == 1
+    assert "has no schedule" in capsys.readouterr().err
+
+
+def test_workflow_schedule_clear_command(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    observed: dict[str, Any] = {"called": False}
+
+    def fake_update_workflow(self, workflow_id, **kwargs):
+        observed["called"] = True
+        observed["schedule"] = kwargs.get("schedule", "MISSING")
+        return {"id": workflow_id}
+
+    monkeypatch.setattr(Client, "update_workflow", fake_update_workflow)
+    monkeypatch.setattr(
+        Client,
+        "get_workflow_schedule",
+        lambda self, workflow_id: {
+            "workflow_id": workflow_id,
+            "schedule": {"type": "cron", "cron": "0 * * * *"},
+        },
+    )
+
+    assert main(["workflow", "schedule", "clear", "--id", "workflow-id"]) == 0
+    assert observed["called"] is True
+    assert observed["schedule"] is None
+    assert "Schedule removed" in capsys.readouterr().out
+
+
+def test_workflow_schedule_trigger_command(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    def fake_run_workflow(self, workflow_id, parameters=None):
+        observed["workflow_id"] = workflow_id
+        observed["parameters"] = parameters
+        return Run(
+            "run-id",
+            client=self,
+            data={"id": "run-id", "status": "queued", "target_type": "workflow"},
+        )
+
+    monkeypatch.setattr(Client, "run_workflow", fake_run_workflow)
+
+    assert main(["workflow", "schedule", "trigger", "--id", "workflow-id", "-p", 'site_id="site-1"']) == 0
+
+    assert observed["workflow_id"] == "workflow-id"
+    assert observed["parameters"] == {"site_id": "site-1"}
+    output = capsys.readouterr().out
+    assert "Run Submitted" in output
+    assert "run-id" in output
+
+
+def test_workflow_schedule_list_command(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "list_workflows",
+        lambda self, *, project=None, project_id=None: [
+            {
+                "id": "workflow-1",
+                "name": "forecast",
+                "schedule": {"type": "cron", "cron": "0 * * * *", "timezone": "UTC", "active": True},
+                "next_run_at": "2026-07-11T11:00:00Z",
+            },
+            {"id": "workflow-2", "name": "unscheduled", "schedule": None},
+        ],
+    )
+
+    assert main(["workflow", "schedule", "list"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Workflow Schedules" in output
+    assert "forecast" in output
+    assert "unscheduled" not in output
+
+
+def _stub_workflow_trigger(monkeypatch, trigger: dict[str, Any] | None) -> None:
+    monkeypatch.setattr(
+        Client,
+        "get_workflow_trigger",
+        lambda self, workflow_id: {
+            "workflow_id": workflow_id,
+            "version_id": "version-id",
+            "trigger": trigger,
+            "active": (trigger or {}).get("active"),
+            "last_fired_at": "2026-07-11T08:00:00Z" if trigger else None,
+            "next_deadline_at": "2026-07-11T09:00:00Z" if trigger else None,
+            "state": [
+                {
+                    "source_type": "dataset",
+                    "source": "nordpool/prices",
+                    "on_status": None,
+                    "pending": True,
+                    "pending_since": "2026-07-11T07:30:00Z",
+                    "last_event_at": "2026-07-11T07:30:00Z",
+                    "last_consumed_watermark": "w-41",
+                    "last_consumed_at": "2026-07-10T09:00:00Z",
+                }
+            ]
+            if trigger
+            else [],
+        },
+    )
+
+
+def test_workflow_trigger_show_command(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    _stub_workflow_trigger(
+        monkeypatch,
+        {"type": "on_update", "datasets": ["nordpool/prices"], "require": "all", "active": True},
+    )
+
+    assert main(["workflow", "trigger", "show", "--id", "workflow-id"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Workflow Trigger" in output
+    assert "on_update" in output
+    assert "nordpool/prices" in output
+    assert "2026-07-11T09:00:00Z" in output
+    assert "Trigger State" in output
+
+
+def test_workflow_trigger_show_without_trigger(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    _stub_workflow_trigger(monkeypatch, None)
+
+    assert main(["workflow", "trigger", "show", "--id", "workflow-id"]) == 0
+    assert "has no trigger" in capsys.readouterr().out
+
+
+def test_workflow_trigger_set_on_workflow(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    def fake_update_workflow(self, workflow_id, **kwargs):
+        observed["workflow_id"] = workflow_id
+        observed["trigger"] = kwargs.get("trigger")
+        return {"id": workflow_id}
+
+    monkeypatch.setattr(Client, "update_workflow", fake_update_workflow)
+    _stub_workflow_trigger(
+        monkeypatch,
+        {"type": "on_workflow", "source": "energy/ingest-prices", "on": "failure", "active": True},
+    )
+
+    assert (
+        main(
+            [
+                "workflow",
+                "trigger",
+                "set",
+                "--id",
+                "workflow-id",
+                "--on-workflow",
+                "energy/ingest-prices",
+                "--on",
+                "failure",
+            ]
+        )
+        == 0
+    )
+
+    assert observed["trigger"] == {
+        "type": "on_workflow",
+        "source": "energy/ingest-prices",
+        "on": "failure",
+        "active": True,
+    }
+    assert "Trigger Set" in capsys.readouterr().out
+
+
+def test_workflow_trigger_set_on_update(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    def fake_update_workflow(self, workflow_id, **kwargs):
+        observed["trigger"] = kwargs.get("trigger")
+        return {"id": workflow_id}
+
+    monkeypatch.setattr(Client, "update_workflow", fake_update_workflow)
+    _stub_workflow_trigger(
+        monkeypatch,
+        {"type": "on_update", "datasets": ["nordpool/prices", "weather/ecmwf"], "require": "any", "active": True},
+    )
+
+    assert (
+        main(
+            [
+                "workflow",
+                "trigger",
+                "set",
+                "--id",
+                "workflow-id",
+                "--on-update",
+                "nordpool/prices,weather/ecmwf",
+                "--require",
+                "any",
+                "--at-most-every",
+                "15m",
+                "--deadline-cron",
+                "0 9 * * *",
+                "--deadline-timezone",
+                "Europe/Stockholm",
+            ]
+        )
+        == 0
+    )
+
+    assert observed["trigger"] == {
+        "type": "on_update",
+        "datasets": ["nordpool/prices", "weather/ecmwf"],
+        "require": "any",
+        "at_most_every": "15m",
+        "deadline": {
+            "type": "cron",
+            "cron": "0 9 * * *",
+            "timezone": "Europe/Stockholm",
+            "day_or": True,
+            "active": True,
+        },
+        "active": True,
+    }
+    assert "Trigger Set" in capsys.readouterr().out
+
+
+def test_workflow_trigger_set_requires_exactly_one_mode(monkeypatch, capsys) -> None:
+    assert main(["workflow", "trigger", "set", "--id", "workflow-id"]) == 1
+    assert "exactly one of" in capsys.readouterr().err
+
+    assert (
+        main(
+            [
+                "workflow",
+                "trigger",
+                "set",
+                "--id",
+                "workflow-id",
+                "--on-workflow",
+                "energy/ingest-prices",
+                "--on-update",
+                "nordpool/prices",
+            ]
+        )
+        == 1
+    )
+    assert "exactly one of" in capsys.readouterr().err
+
+
+def test_workflow_trigger_clear_command(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    observed: dict[str, Any] = {"called": False}
+
+    def fake_update_workflow(self, workflow_id, **kwargs):
+        observed["called"] = True
+        observed["trigger"] = kwargs.get("trigger", "MISSING")
+        return {"id": workflow_id}
+
+    monkeypatch.setattr(Client, "update_workflow", fake_update_workflow)
+    _stub_workflow_trigger(monkeypatch, {"type": "on_workflow", "source": "energy/ingest-prices", "active": True})
+
+    assert main(["workflow", "trigger", "clear", "--id", "workflow-id"]) == 0
+    assert observed["called"] is True
+    assert observed["trigger"] is None
+    assert "Trigger removed" in capsys.readouterr().out
+
+
+def test_workflow_trigger_pause_and_resume_toggle_active(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    triggers: list[dict[str, Any]] = []
+
+    def fake_update_workflow(self, workflow_id, **kwargs):
+        triggers.append(dict(kwargs["trigger"]))
+        return {"id": workflow_id}
+
+    monkeypatch.setattr(Client, "update_workflow", fake_update_workflow)
+    _stub_workflow_trigger(
+        monkeypatch,
+        {"type": "on_update", "datasets": ["nordpool/prices"], "require": "all", "active": True},
+    )
+
+    assert main(["workflow", "trigger", "pause", "--id", "workflow-id"]) == 0
+    assert triggers[-1]["active"] is False
+    assert "Trigger Paused" in capsys.readouterr().out
+
+    assert main(["workflow", "trigger", "resume", "--id", "workflow-id"]) == 0
+    assert triggers[-1]["active"] is True
+    assert "Trigger Resumed" in capsys.readouterr().out
+
+
+def test_workflow_trigger_pause_without_trigger_errors(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    _stub_workflow_trigger(monkeypatch, None)
+
+    assert main(["workflow", "trigger", "pause", "--id", "workflow-id"]) == 1
+    assert "has no trigger" in capsys.readouterr().err
+
+
+def test_workflow_trigger_list_command(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "list_workflows",
+        lambda self, *, project=None, project_id=None: [
+            {
+                "id": "workflow-1",
+                "name": "forecast",
+                "trigger": {"type": "on_update", "datasets": ["nordpool/prices"], "active": True},
+            },
+            {"id": "workflow-2", "name": "untriggered", "trigger": None},
+        ],
+    )
+
+    assert main(["workflow", "trigger", "list"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Workflow Triggers" in output
+    assert "forecast" in output
+    assert "untriggered" not in output
+
+
+def test_dataset_create_and_get_commands(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "create_dataset",
+        lambda self, name, description=None: {
+            "id": "dataset-id",
+            "name": name,
+            "description": description,
+            "watermark": None,
+        },
+    )
+
+    assert main(["dataset", "create", "nordpool/prices", "--description", "Day-ahead prices"]) == 0
+    output = capsys.readouterr().out
+    assert "Dataset" in output
+    assert "nordpool/prices" in output
+    assert "Day-ahead prices" in output
+
+    monkeypatch.setattr(
+        Client,
+        "get_dataset",
+        lambda self, name: {"id": "dataset-id", "name": name, "watermark": "w-42"},
+    )
+
+    assert main(["dataset", "get", "nordpool/prices"]) == 0
+    output = capsys.readouterr().out
+    assert "nordpool/prices" in output
+    assert "w-42" in output
+
+
+def test_dataset_list_command(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "list_datasets",
+        lambda self: [
+            {
+                "name": "nordpool/prices",
+                "watermark": "w-42",
+                "last_updated_at": "2026-07-11T09:00:00Z",
+                "created_at": "2026-07-01T00:00:00Z",
+            }
+        ],
+    )
+
+    assert main(["dataset", "list"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Datasets" in output
+    assert "nordpool/prices" in output
+
+
+def test_dataset_signal_command_parses_watermark(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_signal_dataset(self, name, *, watermark=None, source="sdk", run_id=None):
+        observed["name"] = name
+        observed["watermark"] = watermark
+        observed["source"] = source
+        return {"dataset": name, "fired": ["run-1"]}
+
+    monkeypatch.setattr(Client, "signal_dataset", fake_signal_dataset)
+
+    assert main(["dataset", "signal", "nordpool/prices", "--watermark", '{"as_of": "2026-07-11"}']) == 0
+    assert observed == {"name": "nordpool/prices", "watermark": {"as_of": "2026-07-11"}, "source": "cli"}
+    output = capsys.readouterr().out
+    assert "Signaled dataset nordpool/prices" in output
+    assert "Fired 1 run(s)" in output
+
+    assert main(["dataset", "signal", "nordpool/prices", "--watermark", "w-42"]) == 0
+    assert observed["watermark"] == "w-42"
+
+
+def test_dataset_delete_command(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(Client, "delete_dataset", lambda self, name: {"deleted": name})
+
+    assert main(["dataset", "delete", "nordpool/prices", "--yes"]) == 0
+    assert "Deleted dataset nordpool/prices" in capsys.readouterr().out
+
+
+def test_dataset_listeners_command(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(Client, "list_dataset_listeners", lambda self, name: ["energy/forecast"])
+
+    assert main(["dataset", "listeners", "nordpool/prices"]) == 0
+    assert "energy/forecast" in capsys.readouterr().out
+
+    monkeypatch.setattr(Client, "list_dataset_listeners", lambda self, name: [])
+
+    assert main(["dataset", "listeners", "nordpool/prices"]) == 0
+    assert "No workflows listen" in capsys.readouterr().out
+
+
+def test_run_local_executes_function_in_process(monkeypatch, tmp_path: Path, capsys) -> None:
+    function_file = tmp_path / "functions.py"
+    function_file.write_text(
+        """
+import rebase as rb
+
+@rb.function(project="math", name="add")
+def add(a: int = 0, b: int = 0) -> dict:
+    return {"sum": a + b}
+""",
+        encoding="utf-8",
+    )
+
+    def fail_run_ephemeral(self, **kwargs):
+        raise AssertionError("--local must not submit a cloud run")
+
+    monkeypatch.setattr(Client, "run_ephemeral", fail_run_ephemeral)
+
+    assert main(["run", str(function_file), "--local", "-p", "a=2", "-p", "b=3"]) == 0
+
+    output = capsys.readouterr().out
+    assert '"sum": 5' in output
+
+
+def test_run_local_executes_workflow_steps_in_process(monkeypatch, tmp_path: Path, capsys) -> None:
+    workflow_file = tmp_path / "workflow.py"
+    workflow_file.write_text(
+        """
+import rebase as rb
+
+project = rb.project("hello")
+
+@project.step()
+def load_name(name: str = "World") -> dict:
+    return {"name": name}
+
+@project.workflow()
+def hello_workflow(name: str = "World") -> dict:
+    payload = load_name(name)
+    return {"message": f"Hello, {payload['name']}!"}
+""",
+        encoding="utf-8",
+    )
+
+    assert main(["run", str(workflow_file), "--local", "-p", 'name="Rebase"']) == 0
+
+    output = capsys.readouterr().out
+    assert "Hello, Rebase!" in output
+
+
+def test_run_local_scalar_results_are_wrapped(tmp_path: Path, capsys) -> None:
+    function_file = tmp_path / "scalar.py"
+    function_file.write_text(
+        """
+import rebase as rb
+
+@rb.function(project="math", name="answer")
+def answer() -> int:
+    return 42
+""",
+        encoding="utf-8",
+    )
+
+    assert main(["run", str(function_file), "--local"]) == 0
+    assert '"value": 42' in capsys.readouterr().out
+
+
+def test_run_local_rejects_conflicting_flags(tmp_path: Path, capsys) -> None:
+    target = tmp_path / "f.py"
+    target.write_text("", encoding="utf-8")
+
+    assert main(["run", str(target), "--local", "--run-type", "long"]) == 1
+    assert "--run-type selects a cloud run type" in capsys.readouterr().err
+
+    assert main(["run", str(target), "--local", "--no-wait"]) == 1
+    assert "--local always runs synchronously" in capsys.readouterr().err
+
+
+def test_run_local_rejects_models(tmp_path: Path, capsys) -> None:
+    model_file = tmp_path / "model.py"
+    model_file.write_text(
+        """
+import rebase as rb
+
+class PricePredictor(rb.Predictor):
+    name = "price"
+    project = "energy"
+
+    def predict(self, zone: str = "SE3") -> dict:
+        return {"zone": zone}
+
+model = PricePredictor()
+""",
+        encoding="utf-8",
+    )
+
+    assert main(["run", str(model_file), "--local"]) == 1
+    assert "Models cannot run with --local" in capsys.readouterr().err
+
+
+def test_workspace_notifications_show_command(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "get_workspace_notifications",
+        lambda self: {
+            "workspace_id": "default",
+            "notify_on_failure": True,
+            "webhook_url": "https://hooks.example.com/rebase",
+            "has_webhook_secret": True,
+            "updated_at": "2026-07-11T10:00:00Z",
+        },
+    )
+
+    assert main(["workspace", "notifications", "show"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Notification Settings" in output
+    assert "hooks.example.com" in output
+
+
+def test_workspace_notifications_set_command(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_update(self, **kwargs):
+        observed.update(kwargs)
+        return {
+            "workspace_id": "default",
+            "notify_on_failure": True,
+            "webhook_url": kwargs.get("webhook_url"),
+            "has_webhook_secret": True,
+            "updated_at": "2026-07-11T10:00:00Z",
+        }
+
+    monkeypatch.setattr(Client, "update_workspace_notifications", fake_update)
+
+    assert (
+        main(
+            [
+                "workspace",
+                "notifications",
+                "set",
+                "--webhook-url",
+                "https://hooks.example.com/rebase",
+                "--webhook-secret",
+                "s3cret",
+                "--on-failure",
+            ]
+        )
+        == 0
+    )
+
+    assert observed == {
+        "notify_on_failure": True,
+        "webhook_url": "https://hooks.example.com/rebase",
+        "webhook_secret": "s3cret",
+    }
+
+
+def test_workspace_notifications_set_requires_an_option(capsys) -> None:
+    assert main(["workspace", "notifications", "set"]) == 1
+    assert "nothing to update" in capsys.readouterr().err
+
+
+def test_workspace_notifications_clear_webhook(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_update(self, **kwargs):
+        observed.update(kwargs)
+        return {
+            "workspace_id": "default",
+            "notify_on_failure": False,
+            "webhook_url": None,
+            "has_webhook_secret": False,
+            "updated_at": "2026-07-11T10:00:00Z",
+        }
+
+    monkeypatch.setattr(Client, "update_workspace_notifications", fake_update)
+
+    assert main(["workspace", "notifications", "set", "--clear-webhook"]) == 0
+    assert observed == {"webhook_url": None, "webhook_secret": None}
+
+
+def test_volume_create_and_list_commands(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "create_volume",
+        lambda self, name: {"name": name, "provider": "gcs", "bucket": "rebase-vol-p-w", "prefix": f"{name}/"},
+    )
+    monkeypatch.setattr(
+        Client,
+        "list_volumes",
+        lambda self: [
+            {"name": "model-cache", "provider": "gcs", "bucket": "rebase-vol-p-w", "created_at": "2026-07-11T00:00:00Z"}
+        ],
+    )
+
+    assert main(["volume", "create", "model-cache"]) == 0
+    output = capsys.readouterr().out
+    assert "Volume" in output
+    assert "model-cache" in output
+
+    assert main(["volume", "list"]) == 0
+    output = capsys.readouterr().out
+    assert "Volumes" in output
+    assert "model-cache" in output
+
+
+def test_volume_ls_put_download_rm_commands(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "list_volume_objects",
+        lambda self, name, prefix="", limit=None: [
+            {"path": "model.pkl", "size": 2048, "updated": "2026-07-11T00:00:00Z"}
+        ],
+    )
+    monkeypatch.setattr(
+        Client,
+        "create_volume_upload_url",
+        lambda self, name, path: {"url": "https://signed.example.com/up", "method": "PUT", "expires_seconds": 3600},
+    )
+    monkeypatch.setattr(
+        Client,
+        "create_volume_download_url",
+        lambda self, name, path: {"url": "https://signed.example.com/down", "method": "GET", "expires_seconds": 3600},
+    )
+    deleted: list[str] = []
+    monkeypatch.setattr(Client, "delete_volume_object", lambda self, name, path: deleted.append(path))
+
+    class FakeTransferResponse:
+        status_code = 200
+        text = ""
+        content = b"weights"
+
+    monkeypatch.setattr("requests.put", lambda url, data=None, timeout=None: FakeTransferResponse())
+    monkeypatch.setattr("requests.get", lambda url, timeout=None: FakeTransferResponse())
+
+    assert main(["volume", "ls", "model-cache"]) == 0
+    output = capsys.readouterr().out
+    assert "model.pkl" in output
+    assert "2.0 KiB" in output
+
+    local = tmp_path / "model.pkl"
+    local.write_bytes(b"weights")
+    assert main(["volume", "put", "model-cache", str(local), "nested/model.pkl"]) == 0
+    assert "Uploaded" in capsys.readouterr().out
+
+    target = tmp_path / "downloaded.pkl"
+    assert main(["volume", "download", "model-cache", "model.pkl", str(target)]) == 0
+    assert target.read_bytes() == b"weights"
+    capsys.readouterr()
+
+    assert main(["volume", "rm", "model-cache", "/model.pkl"]) == 0
+    assert deleted == ["model.pkl"]
+
+
+def test_volume_delete_requires_confirmation(monkeypatch, capsys) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(Client, "delete_volume", lambda self, name: calls.append(name))
+
+    assert main(["volume", "delete", "model-cache", "--force"]) == 0
+    assert calls == ["model-cache"]
+    assert "Deleted volume model-cache" in capsys.readouterr().out
+
+
+def test_dataset_freshness_set_command(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_update_dataset(self, name, **kwargs):
+        observed["name"] = name
+        observed.update(kwargs)
+        return {"name": name, "freshness": kwargs.get("freshness"), "freshness_status": "fresh"}
+
+    monkeypatch.setattr(Client, "update_dataset", fake_update_dataset)
+
+    assert (
+        main(
+            [
+                "dataset",
+                "freshness",
+                "set",
+                "nordpool/prices",
+                "--max-age",
+                "45m",
+                "--check-at",
+                "15 9 * * *",
+                "--timezone",
+                "Europe/Stockholm",
+            ]
+        )
+        == 0
+    )
+
+    assert observed["name"] == "nordpool/prices"
+    assert observed["freshness"]["max_age"] == "45m"
+    assert observed["freshness"]["check_at"]["cron"] == "15 9 * * *"
+    assert observed["freshness"]["check_at"]["timezone"] == "Europe/Stockholm"
+    assert "Dataset Freshness" in capsys.readouterr().out
+
+
+def test_dataset_freshness_show_command(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "get_dataset",
+        lambda self, name: {
+            "name": name,
+            "freshness": {"max_age": "45m"},
+            "freshness_status": "stale",
+            "stale_since": "2026-07-11T08:00:00Z",
+        },
+    )
+
+    assert main(["dataset", "freshness", "show", "nordpool/prices"]) == 0
+    output = capsys.readouterr().out
+    assert "stale" in output
+    assert "45m" in output
+
+    monkeypatch.setattr(Client, "get_dataset", lambda self, name: {"name": name, "freshness": None})
+    assert main(["dataset", "freshness", "show", "nordpool/prices"]) == 0
+    assert "no freshness policy" in capsys.readouterr().out
+
+
+def test_dataset_freshness_clear_command(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_update_dataset(self, name, **kwargs):
+        observed["name"] = name
+        observed.update(kwargs)
+        return {"name": name}
+
+    monkeypatch.setattr(Client, "update_dataset", fake_update_dataset)
+
+    assert main(["dataset", "freshness", "clear", "nordpool/prices"]) == 0
+    assert observed == {"name": "nordpool/prices", "freshness": None}
+    assert "Cleared freshness policy" in capsys.readouterr().out
+
+
+_CLI_CONTRACT = {
+    "$schema": "rebase/contract-v1",
+    "properties": {
+        "price": {"type": "number", "minimum": -500, "maximum": 4000, "x-not-null": True},
+        "area": {"type": "string", "enum": ["SE1", "SE2"], "x-not-null": True},
+        "delivery_start": {"type": "string", "format": "date-time", "x-not-null": True},
+    },
+    "required": ["price", "area", "delivery_start"],
+    "x-rebase": {
+        "primary_key": ["delivery_start", "area"],
+        "extra": "ignore",
+        "on_violation": "fail",
+        "require_contract": False,
+        "min_rows": 1,
+        "watermark_column": "delivery_start",
+    },
+}
+
+
+def test_dataset_contract_show_command(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(Client, "get_dataset", lambda self, name: {"name": name, "contract": _CLI_CONTRACT})
+
+    assert main(["dataset", "contract", "show", "nordpool/prices"]) == 0
+    output = capsys.readouterr().out
+    assert "Contract Columns" in output
+    assert "price" in output
+    assert "timestamp" in output
+    assert "Contract Policies" in output
+
+    monkeypatch.setattr(Client, "get_dataset", lambda self, name: {"name": name, "contract": None})
+    assert main(["dataset", "contract", "show", "nordpool/prices"]) == 0
+    assert "has no contract" in capsys.readouterr().out
+
+
+def test_dataset_contract_clear_command(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_update_dataset(self, name, **kwargs):
+        observed["name"] = name
+        observed.update(kwargs)
+        return {"name": name}
+
+    monkeypatch.setattr(Client, "update_dataset", fake_update_dataset)
+
+    assert main(["dataset", "contract", "clear", "nordpool/prices", "--yes"]) == 0
+    assert observed == {"name": "nordpool/prices", "contract": None}
+    assert "Cleared contract" in capsys.readouterr().out
+
+
+def test_dataset_validate_command(monkeypatch, capsys, tmp_path) -> None:
+    pytest.importorskip("pandas")
+    monkeypatch.setattr(Client, "get_dataset", lambda self, name: {"name": name, "contract": _CLI_CONTRACT})
+
+    good = tmp_path / "good.csv"
+    good.write_text("price,area,delivery_start\n10.0,SE1,2026-07-11T09:00:00Z\n")
+    bad = tmp_path / "bad.csv"
+    bad.write_text("price,area,delivery_start\n9999.0,XX,2026-07-11T09:00:00Z\n")
+
+    assert main(["dataset", "validate", "nordpool/prices", str(good)]) == 0
+    assert "passed" in capsys.readouterr().out
+
+    assert main(["dataset", "validate", "nordpool/prices", str(bad)]) == 1
+    output = capsys.readouterr().out
+    assert "FAILED" in output
+    assert "range" in output
+    assert "isin" in output
+
+
+def test_dataset_validate_command_rejects_unknown_extension(monkeypatch, capsys, tmp_path) -> None:
+    pytest.importorskip("pandas")
+    path = tmp_path / "data.txt"
+    path.write_text("hello")
+
+    assert main(["dataset", "validate", "nordpool/prices", str(path)]) == 1
+    assert ".parquet or .csv" in capsys.readouterr().err
+
+
+def test_workspace_notifications_set_on_stale(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_update(self, **kwargs):
+        observed.update(kwargs)
+        return {"workspace_id": "default", "notify_on_failure": True, "notify_on_stale": kwargs.get("notify_on_stale")}
+
+    monkeypatch.setattr(Client, "update_workspace_notifications", fake_update)
+
+    assert main(["workspace", "notifications", "set", "--on-stale"]) == 0
+    assert observed == {"notify_on_stale": True}
+
+    observed.clear()
+    assert main(["workspace", "notifications", "set", "--no-on-stale"]) == 0
+    assert observed == {"notify_on_stale": False}

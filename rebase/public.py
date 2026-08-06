@@ -4,15 +4,13 @@ from collections.abc import Callable
 from typing import Any, overload
 
 from rebase.client import (
-    DEFAULT_FUNCTION_BACKEND,
-    DEFAULT_WORKFLOW_BACKEND,
+    DEFAULT_RUN_TYPE,
     Agent,
     AgentHandle,
     ASGIApp,
     Client,
     EndpointConfig,
     Function,
-    FunctionBackend,
     Image,
     Model,
     ModelHandle,
@@ -22,11 +20,13 @@ from rebase.client import (
     PredictorHandle,
     Project,
     RebaseWorkflowError,
+    RunType,
     Schedule,
     Secret,
     Step,
+    Trigger,
+    Volume,
     Workflow,
-    WorkflowBackend,
 )
 
 DEFAULT_PROJECT_NAME = "default"
@@ -86,11 +86,12 @@ def function(
     name: str | None = None,
     description: str | None = None,
     default_parameters: dict[str, Any] | None = None,
-    backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
+    run_type: RunType = DEFAULT_RUN_TYPE,
     dependencies: list[str] | tuple[str, ...] | None = None,
     image: Image | dict[str, Any] | None = None,
     env: dict[str, str] | None = None,
     secrets: dict[str, str] | list[Secret | str] | None = None,
+    volumes: dict[str, Volume | str] | list[dict[str, Any]] | None = None,
     min_instances: int | None = None,
     concurrency: int | None = None,
     cpu: float | int | str | None = None,
@@ -98,6 +99,7 @@ def function(
     enabled: bool = True,
     endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
+    backend: str | None = None,
 ) -> Callable[[Callable[..., Any]], Function]: ...
 
 
@@ -109,11 +111,12 @@ def function(
     name: str | None = None,
     description: str | None = None,
     default_parameters: dict[str, Any] | None = None,
-    backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
+    run_type: RunType = DEFAULT_RUN_TYPE,
     dependencies: list[str] | tuple[str, ...] | None = None,
     image: Image | dict[str, Any] | None = None,
     env: dict[str, str] | None = None,
     secrets: dict[str, str] | list[Secret | str] | None = None,
+    volumes: dict[str, Volume | str] | list[dict[str, Any]] | None = None,
     min_instances: int | None = None,
     concurrency: int | None = None,
     cpu: float | int | str | None = None,
@@ -121,6 +124,7 @@ def function(
     enabled: bool = True,
     endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
+    backend: str | None = None,
 ) -> Function: ...
 
 
@@ -131,11 +135,12 @@ def function(
     name: str | None = None,
     description: str | None = None,
     default_parameters: dict[str, Any] | None = None,
-    backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
+    run_type: RunType = DEFAULT_RUN_TYPE,
     dependencies: list[str] | tuple[str, ...] | None = None,
     image: Image | dict[str, Any] | None = None,
     env: dict[str, str] | None = None,
     secrets: dict[str, str] | list[Secret | str] | None = None,
+    volumes: dict[str, Volume | str] | list[dict[str, Any]] | None = None,
     min_instances: int | None = None,
     concurrency: int | None = None,
     cpu: float | int | str | None = None,
@@ -143,6 +148,7 @@ def function(
     enabled: bool = True,
     endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
+    backend: str | None = None,
 ) -> Callable[[Callable[..., Any]], Function] | Function:
     def decorator(callable_: Callable[..., Any]) -> Function:
         return Function(
@@ -151,11 +157,13 @@ def function(
             project=project or DEFAULT_PROJECT_NAME,
             description=description,
             default_parameters=default_parameters,
+            run_type=run_type,
             backend=backend,
             dependencies=dependencies,
             image=image,
             env=env,
             secrets=secrets,
+            volumes=volumes,
             min_instances=min_instances,
             concurrency=concurrency,
             cpu=cpu,
@@ -183,6 +191,7 @@ def asgi_app(
     image: Image | dict[str, Any] | None = None,
     env: dict[str, str] | None = None,
     secrets: dict[str, str] | list[Secret | str] | None = None,
+    volumes: dict[str, Volume | str] | list[dict[str, Any]] | None = None,
     min_instances: int | None = None,
     max_instances: int | None = None,
     concurrency: int | None = None,
@@ -207,6 +216,7 @@ def asgi_app(
     image: Image | dict[str, Any] | None = None,
     env: dict[str, str] | None = None,
     secrets: dict[str, str] | list[Secret | str] | None = None,
+    volumes: dict[str, Volume | str] | list[dict[str, Any]] | None = None,
     min_instances: int | None = None,
     max_instances: int | None = None,
     concurrency: int | None = None,
@@ -230,6 +240,7 @@ def asgi_app(
     image: Image | dict[str, Any] | None = None,
     env: dict[str, str] | None = None,
     secrets: dict[str, str] | list[Secret | str] | None = None,
+    volumes: dict[str, Volume | str] | list[dict[str, Any]] | None = None,
     min_instances: int | None = None,
     max_instances: int | None = None,
     concurrency: int | None = None,
@@ -251,6 +262,7 @@ def asgi_app(
             image=image,
             env=env,
             secrets=secrets,
+            volumes=volumes,
             min_instances=min_instances,
             max_instances=max_instances,
             concurrency=concurrency,
@@ -338,8 +350,9 @@ def workflow(
     name: str | None = None,
     description: str | None = None,
     schedule: Schedule | None = None,
+    trigger: Trigger | None = None,
     default_parameters: dict[str, Any] | None = None,
-    backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
+    run_type: RunType = DEFAULT_RUN_TYPE,
     enabled: bool = True,
     endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
@@ -348,6 +361,7 @@ def workflow(
     min_instances: int | None = None,
     concurrency: int | None = None,
     resources: dict[str, Any] | None = None,
+    backend: str | None = None,
 ) -> Callable[[Callable[..., Any]], Workflow]: ...
 
 
@@ -359,8 +373,9 @@ def workflow(
     name: str | None = None,
     description: str | None = None,
     schedule: Schedule | None = None,
+    trigger: Trigger | None = None,
     default_parameters: dict[str, Any] | None = None,
-    backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
+    run_type: RunType = DEFAULT_RUN_TYPE,
     enabled: bool = True,
     endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
@@ -369,6 +384,7 @@ def workflow(
     min_instances: int | None = None,
     concurrency: int | None = None,
     resources: dict[str, Any] | None = None,
+    backend: str | None = None,
 ) -> Workflow: ...
 
 
@@ -379,8 +395,9 @@ def workflow(
     name: str | None = None,
     description: str | None = None,
     schedule: Schedule | None = None,
+    trigger: Trigger | None = None,
     default_parameters: dict[str, Any] | None = None,
-    backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
+    run_type: RunType = DEFAULT_RUN_TYPE,
     enabled: bool = True,
     endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
@@ -389,6 +406,7 @@ def workflow(
     min_instances: int | None = None,
     concurrency: int | None = None,
     resources: dict[str, Any] | None = None,
+    backend: str | None = None,
 ) -> Callable[[Callable[..., Any]], Workflow] | Workflow:
     def decorator(callable_: Callable[..., Any]) -> Workflow:
         return Workflow(
@@ -397,7 +415,9 @@ def workflow(
             project=project or DEFAULT_PROJECT_NAME,
             description=description,
             schedule=schedule,
+            trigger=trigger,
             default_parameters=default_parameters,
+            run_type=run_type,
             backend=backend,
             enabled=enabled,
             endpoint=endpoint,

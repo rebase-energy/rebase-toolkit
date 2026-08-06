@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import getpass
 import importlib
 import importlib.util
@@ -7,6 +8,8 @@ import json
 import sys
 import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Annotated, Any
@@ -37,20 +40,23 @@ from rebase.client import (
     Agent,
     ASGIApp,
     Client,
+    Cron,
     Function,
-    FunctionBackend,
     Model,
+    OnUpdate,
+    OnWorkflow,
     Optimizer,
     Predictor,
     Project,
     RebaseWorkflowError,
     Run,
     Step,
+    Volume,
     Workflow,
+    _flatten_config,
     _git,
     _parse_github_remote,
-    _validate_function_backend,
-    _validate_workflow_backend,
+    _validate_run_type,
 )
 from rebase.config import (
     DEFAULT_PROFILE,
@@ -61,6 +67,7 @@ from rebase.config import (
     set_default_profile,
     write_profile,
 )
+from rebase.contract import Freshness, validate_frame
 
 _BANNER_LINES = [
     "██████╗  ███████╗ ██████╗   █████╗  ███████╗ ███████╗",
@@ -265,7 +272,7 @@ def _print_run_help() -> None:
     console.print("       rebase run COMMAND [ARGS]...")
     console.print()
     console.print("Run a Rebase function, workflow, or model from local source without deploying it.")
-    console.print("Inspect submitted runs with the cancel, get, list, and logs subcommands.")
+    console.print("Inspect submitted runs with the cancel, get, list, logs, and replay subcommands.")
     console.print()
 
     options = Table(title="Execution Options", box=box.SIMPLE)
@@ -273,7 +280,10 @@ def _print_run_help() -> None:
     options.add_column("Description")
     options.add_row("--param, -p", "Target parameter as name=json_value. Can be passed more than once.")
     options.add_row("--parameters-json", "JSON object with target parameters.")
-    options.add_row("--backend", "Override the cloud execution backend for this ephemeral run.")
+    options.add_row(
+        "--run-type",
+        "Override the run type for this ephemeral run: quick, quick_shared (functions only), or long.",
+    )
     options.add_row("--module, -m", "Interpret the target source as a Python module path instead of a file.")
     options.add_row("--wait / --no-wait", "Wait for the function result before exiting. Defaults to --wait.")
     options.add_row("--timeout", "Maximum seconds to wait for the result. Defaults to 600.")
@@ -288,6 +298,7 @@ def _print_run_help() -> None:
     commands.add_row("get", "Show run metadata.")
     commands.add_row("list", "List submitted runs in the active workspace.")
     commands.add_row("logs", "Show persisted run events and workflow step state.")
+    commands.add_row("replay", "Replay a run (or a period of workflow runs) with its original knowledge-time bound.")
     console.print(commands)
 
 
@@ -440,30 +451,14 @@ def _parse_run_parameters(parameters_json: str | None, parameters: Iterable[str]
     return parsed
 
 
-def _validate_backend_override(backend: str | None) -> FunctionBackend | None:
-    if backend is None:
+def _validate_run_type_override(run_type: str | None, target: RunnableTarget) -> str | None:
+    if run_type is None:
         return None
+    target_type = "workflow" if isinstance(target, Workflow) else "function"
     try:
-        return _validate_function_backend(backend)
+        return _validate_run_type(run_type, target_type=target_type)
     except ValueError as exc:
-        raise RebaseWorkflowError(
-            "backend must be 'interactive', 'batch', 'modal', 'prefect', 'prefect_cloud', 'cloud_run', "
-            "'cloud_run_shared', or 'cloud_run_jobs'"
-        ) from exc
-
-
-def _validate_run_backend_override(backend: str | None, target: RunnableTarget) -> str | None:
-    if backend is None:
-        return None
-    if isinstance(target, Workflow):
-        try:
-            return _validate_workflow_backend(backend)
-        except ValueError as exc:
-            raise RebaseWorkflowError(
-                "workflow backend must be 'interactive', 'batch', 'prefect', 'prefect_cloud_run_jobs', "
-                "or 'prefect_cloud_run_service'"
-            ) from exc
-    return _validate_backend_override(backend)
+        raise RebaseWorkflowError(str(exc)) from exc
 
 
 def _run_table(run_id: str, status: str) -> Table:
@@ -493,7 +488,7 @@ def _runs_table(runs: list[dict[str, Any]], *, project_names: dict[str, str]) ->
     table.add_column("ID", style="rebase.muted")
     table.add_column("Target")
     table.add_column("Status", style="rebase.value")
-    table.add_column("Backend")
+    table.add_column("Run type")
     table.add_column("Project")
     table.add_column("Created", style="rebase.muted")
     table.add_column("Finished", style="rebase.muted")
@@ -503,7 +498,7 @@ def _runs_table(runs: list[dict[str, Any]], *, project_names: dict[str, str]) ->
             str(run.get("id", "-")),
             _format_value(run.get("target_type")),
             _format_value(run.get("status")),
-            _format_value(run.get("execution_backend")),
+            _format_value(run.get("run_type")),
             project_names.get(project_id, project_id or "-"),
             _format_value(run.get("created_at")),
             _format_value(run.get("finished_at")),
@@ -600,6 +595,10 @@ class _LineRunProgressReporter:
         prefix, style = _progress_prefix("failed")
         console.print(f"{prefix} {message}", style=style)
 
+    def log(self, timestamp: str, message: str, severity: str = "INFO") -> None:
+        style = "rebase.error" if severity in {"ERROR", "CRITICAL", "WARNING"} else None
+        console.print(f"[rebase.muted]{timestamp}[/rebase.muted] {message}", style=style, highlight=False)
+
     def step(self, name: str, status: str) -> None:
         if status == "running":
             self.update(f"Running step {name}.")
@@ -652,6 +651,10 @@ class _TerminalRunProgressReporter:
         self._header = Text.from_markup(f"[red]✗[/red] {message}")
         self._refresh()
 
+    def log(self, timestamp: str, message: str, severity: str = "INFO") -> None:
+        style = "rebase.error" if severity in {"ERROR", "CRITICAL", "WARNING"} else None
+        self._live.console.print(f"[rebase.muted]{timestamp}[/rebase.muted] {message}", style=style, highlight=False)
+
     def _workflow_steps_tree(self) -> Tree:
         if self._steps_tree is None:
             self._steps_tree = self._tree.add("[rebase.title]Workflow steps[/rebase.title]")
@@ -681,6 +684,40 @@ def _run_progress_reporter() -> _TerminalRunProgressReporter | _LineRunProgressR
     return _LineRunProgressReporter()
 
 
+class _RunLogFollower:
+    """Incrementally fetches run stdout/stderr and prints new lines via the reporter."""
+
+    def __init__(self, run: Run) -> None:
+        self._run = run
+        self._since: str | None = None
+        self._active = True
+        self._printed_message = False
+
+    def poll(self, reporter: _TerminalRunProgressReporter | _LineRunProgressReporter) -> None:
+        if not self._active:
+            return
+        try:
+            payload = self._run.logs(since=self._since)
+        except RebaseWorkflowError:
+            self._active = False
+            return
+        for entry in payload.get("entries") or []:
+            reporter.log(
+                str(entry.get("timestamp") or ""),
+                str(entry.get("message") or ""),
+                str(entry.get("severity") or "INFO"),
+            )
+        next_since = payload.get("next_since")
+        if next_since:
+            self._since = str(next_since)
+        message = payload.get("message")
+        if payload.get("source") == "none" and message:
+            if not self._printed_message:
+                self._printed_message = True
+                reporter.log("", str(message), "INFO")
+            self._active = False
+
+
 def _stream_run_result(
     run: Run,
     *,
@@ -691,6 +728,7 @@ def _stream_run_result(
     timeout: int,
     poll_interval: float,
     return_result: bool = True,
+    log_follower: _RunLogFollower | None = None,
 ) -> dict[str, Any] | None:
     deadline = time.monotonic() + timeout
     seen_event_ids: set[str] = set()
@@ -738,10 +776,16 @@ def _stream_run_result(
             except RebaseWorkflowError:
                 steps_supported = False
 
+        if log_follower is not None:
+            log_follower.poll(reporter)
+
         data = run.data if first_iteration and run.data else run.refresh()
         first_iteration = False
         status = str(data.get("status") or "queued")
         if status in terminal_statuses:
+            if log_follower is not None:
+                # Final fetch: log-store ingestion can lag the terminal status.
+                log_follower.poll(reporter)
             if status == "succeeded":
                 if return_result:
                     reporter.finish(f"Run completed in {_format_duration(time.monotonic() - started_at)} seconds.")
@@ -1521,7 +1565,7 @@ def _function_table(functions: list[dict[str, Any]], *, project_names: dict[str,
     )
     table.add_column("Name", style="rebase.value")
     table.add_column("Project")
-    table.add_column("Backend")
+    table.add_column("Run type")
     table.add_column("Enabled")
     table.add_column("ID", style="rebase.muted")
     table.add_column("Updated", style="rebase.muted")
@@ -1530,7 +1574,7 @@ def _function_table(functions: list[dict[str, Any]], *, project_names: dict[str,
         table.add_row(
             str(function.get("name", "-")),
             project_names.get(project_id, project_id or "-"),
-            _format_value(function.get("execution_backend")),
+            _format_value(function.get("run_type")),
             _format_value(function.get("enabled")),
             str(function.get("id", "-")),
             _format_value(function.get("updated_at")),
@@ -1549,8 +1593,9 @@ def _workflow_table(workflows: list[dict[str, Any]], *, project_names: dict[str,
     )
     table.add_column("Name", style="rebase.value")
     table.add_column("Project")
-    table.add_column("Backend")
+    table.add_column("Run type")
     table.add_column("Enabled")
+    table.add_column("Schedule")
     table.add_column("ID", style="rebase.muted")
     table.add_column("Updated", style="rebase.muted")
     for workflow in workflows:
@@ -1558,12 +1603,36 @@ def _workflow_table(workflows: list[dict[str, Any]], *, project_names: dict[str,
         table.add_row(
             str(workflow.get("name", "-")),
             project_names.get(project_id, project_id or "-"),
-            _format_value(workflow.get("execution_backend")),
+            _format_value(workflow.get("run_type")),
             _format_value(workflow.get("enabled")),
+            _format_schedule(workflow.get("schedule")),
             str(workflow.get("id", "-")),
             _format_value(workflow.get("updated_at")),
         )
     return table
+
+
+def _format_schedule(schedule: Any) -> str:
+    if not isinstance(schedule, dict):
+        return "-"
+    cron = str(schedule.get("cron") or "-")
+    if not schedule.get("active", True):
+        return f"{cron} (paused)"
+    return cron
+
+
+def _format_trigger(trigger: Any) -> str:
+    if not isinstance(trigger, dict):
+        return "-"
+    if trigger.get("type") == "on_workflow":
+        detail = f"{trigger.get('source', '-')} ({trigger.get('on', 'success')})"
+    elif trigger.get("type") == "on_update":
+        detail = ", ".join(str(dataset) for dataset in trigger.get("datasets") or []) or "-"
+    else:
+        detail = str(trigger.get("type") or "-")
+    if not trigger.get("active", True):
+        return f"{detail} (paused)"
+    return detail
 
 
 def _model_table(models: list[dict[str, Any]], *, project_names: dict[str, str]) -> Table:
@@ -1579,7 +1648,7 @@ def _model_table(models: list[dict[str, Any]], *, project_names: dict[str, str])
     table.add_column("Project")
     table.add_column("Kind")
     table.add_column("Operation")
-    table.add_column("Backend")
+    table.add_column("Run type")
     table.add_column("ID", style="rebase.muted")
     table.add_column("Updated", style="rebase.muted")
     for model in models:
@@ -1589,7 +1658,7 @@ def _model_table(models: list[dict[str, Any]], *, project_names: dict[str, str])
             project_names.get(project_id, project_id or "-"),
             _format_value(model.get("kind")),
             _format_value(model.get("operation_name")),
-            _format_value(model.get("execution_backend")),
+            _format_value(model.get("run_type")),
             str(model.get("id", "-")),
             _format_value(model.get("updated_at")),
         )
@@ -1662,14 +1731,14 @@ def _version_table(title: str, versions: list[dict[str, Any]]) -> Table:
     table.add_column("Version", style="rebase.value")
     table.add_column("ID", style="rebase.muted")
     table.add_column("Fingerprint")
-    table.add_column("Backend")
+    table.add_column("Run type")
     table.add_column("Created", style="rebase.muted")
     for version in versions:
         table.add_row(
             _format_value(version.get("version_number")),
             str(version.get("id", "-")),
             _format_value(version.get("fingerprint")),
-            _format_value(version.get("execution_backend")),
+            _format_value(version.get("run_type")),
             _format_value(version.get("created_at")),
         )
     return table
@@ -2138,6 +2207,88 @@ def workspace_usage_command(
     console.print(_workspace_usage_table(usage))
 
 
+notifications_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Configure run failure notifications for the active workspace.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+NOTIFICATION_DETAIL_KEYS = [
+    "workspace_id",
+    "notify_on_failure",
+    "notify_on_stale",
+    "webhook_url",
+    "has_webhook_secret",
+    "updated_at",
+]
+
+
+@notifications_app.command("show")
+def workspace_notifications_show_command(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show the workspace's failure notification settings."""
+    policy = Client().get_workspace_notifications()
+    if json_output:
+        _print_json(policy)
+        return
+    console.print(_detail_table("Notification Settings", policy, preferred_keys=NOTIFICATION_DETAIL_KEYS))
+
+
+@notifications_app.command("set")
+def workspace_notifications_set_command(
+    webhook_url: Annotated[
+        str | None, typer.Option("--webhook-url", help="HTTPS URL that receives run.failed webhooks.")
+    ] = None,
+    webhook_secret: Annotated[
+        str | None,
+        typer.Option("--webhook-secret", help="Secret for the HMAC-SHA256 X-Rebase-Signature header."),
+    ] = None,
+    on_failure: Annotated[
+        bool | None,
+        typer.Option("--on-failure/--no-on-failure", help="Enable or disable run failure notifications."),
+    ] = None,
+    on_stale: Annotated[
+        bool | None,
+        typer.Option("--on-stale/--no-on-stale", help="Enable or disable stale dataset notifications."),
+    ] = None,
+    clear_webhook: Annotated[
+        bool, typer.Option("--clear-webhook", help="Remove the stored webhook URL and secret.")
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Update the workspace's failure notification settings."""
+    if clear_webhook and (webhook_url is not None or webhook_secret is not None):
+        raise RebaseWorkflowError("--clear-webhook cannot be combined with --webhook-url/--webhook-secret")
+    if not clear_webhook and webhook_url is None and webhook_secret is None and on_failure is None and on_stale is None:
+        raise RebaseWorkflowError(
+            "nothing to update; pass --webhook-url, --webhook-secret, --on-failure, --on-stale, or --clear-webhook"
+        )
+    kwargs: dict[str, Any] = {}
+    if on_failure is not None:
+        kwargs["notify_on_failure"] = on_failure
+    if on_stale is not None:
+        kwargs["notify_on_stale"] = on_stale
+    if clear_webhook:
+        kwargs["webhook_url"] = None
+        kwargs["webhook_secret"] = None
+    else:
+        if webhook_url is not None:
+            kwargs["webhook_url"] = webhook_url
+        if webhook_secret is not None:
+            kwargs["webhook_secret"] = webhook_secret
+    policy = Client().update_workspace_notifications(**kwargs)
+    if json_output:
+        _print_json(policy)
+        return
+    console.print(_detail_table("Notification Settings", policy, preferred_keys=NOTIFICATION_DETAIL_KEYS))
+
+
+workspace_app.add_typer(notifications_app, name="notifications")
+
+
 @environment_app.command("list")
 def environment_list_command(
     json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
@@ -2482,7 +2633,664 @@ def secret_delete_command(
     console.print(f"Deleted secret [rebase.value]{deleted.get('name', name)}[/rebase.value]")
 
 
+volume_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Persistent file volumes mounted into deployed functions and apps.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+VOLUME_DETAIL_KEYS = ["name", "provider", "bucket", "prefix", "workspace_id", "created_at"]
+
+
+@volume_app.command("create")
+def volume_create_command(
+    name: Annotated[str, typer.Argument(help="Volume name (lowercase letters, digits, '.', '_', '-').")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Create a volume (idempotent: returns the existing one if present)."""
+    volume = Client().create_volume(name)
+    if json_output:
+        _print_json(volume)
+        return
+    console.print(_detail_table("Volume", volume, preferred_keys=VOLUME_DETAIL_KEYS))
+
+
+@volume_app.command("list")
+def volume_list_command(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List volumes in the active workspace."""
+    volumes = Client().list_volumes()
+    if json_output:
+        _print_json(volumes)
+        return
+    table = Table(
+        title="Volumes",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Name", style="rebase.value")
+    table.add_column("Provider")
+    table.add_column("Bucket", style="rebase.muted")
+    table.add_column("Created", style="rebase.muted")
+    for volume in volumes:
+        table.add_row(
+            str(volume.get("name", "-")),
+            _format_value(volume.get("provider")),
+            str(volume.get("bucket", "-")),
+            _format_value(volume.get("created_at")),
+        )
+    console.print(table)
+
+
+@volume_app.command("get")
+def volume_get_command(
+    name: Annotated[str, typer.Argument(help="Volume name.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show volume metadata."""
+    volume = Client().get_volume(name)
+    if json_output:
+        _print_json(volume)
+        return
+    console.print(_detail_table("Volume", volume, preferred_keys=VOLUME_DETAIL_KEYS))
+
+
+@volume_app.command("ls")
+def volume_ls_command(
+    name: Annotated[str, typer.Argument(help="Volume name.")],
+    path: Annotated[str, typer.Argument(help="Path prefix inside the volume.")] = "",
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List files in a volume."""
+    objects = Client().list_volume_objects(name, prefix=path)
+    if json_output:
+        _print_json(objects)
+        return
+    if not objects:
+        console.print(f"[rebase.muted]Volume {name} has no files{f' under {path}' if path else ''}.[/rebase.muted]")
+        return
+    table = Table(
+        title=f"Volume {name}",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Path", style="rebase.value")
+    table.add_column("Size", justify="right")
+    table.add_column("Updated", style="rebase.muted")
+    for item in objects:
+        table.add_row(
+            str(item.get("path", "-")),
+            _format_bytes(item.get("size")),
+            _format_value(item.get("updated")),
+        )
+    console.print(table)
+
+
+def _format_bytes(value: Any) -> str:
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return "-"
+
+
+@volume_app.command("put")
+def volume_put_command(
+    name: Annotated[str, typer.Argument(help="Volume name.")],
+    local_path: Annotated[str, typer.Argument(help="Local file or directory to upload.")],
+    remote_path: Annotated[
+        str | None, typer.Argument(help="Destination path in the volume. Defaults to the local name.")
+    ] = None,
+) -> None:
+    """Upload a file or directory into a volume."""
+    volume = Volume(name, client=Client())
+    source = Path(local_path)
+    if source.is_dir():
+        written = volume.put_directory(source, remote_path or "")
+        console.print(f"[rebase.success]Uploaded {len(written)} files to volume {name}.[/rebase.success]")
+        return
+    written_path = volume.put_file(source, remote_path)
+    console.print(f"[rebase.success]Uploaded {local_path} to {name}/{written_path}.[/rebase.success]")
+
+
+@volume_app.command("download")
+def volume_download_command(
+    name: Annotated[str, typer.Argument(help="Volume name.")],
+    remote_path: Annotated[str, typer.Argument(help="Path inside the volume.")],
+    local_path: Annotated[
+        str | None, typer.Argument(help="Local destination. Defaults to the remote file name.")
+    ] = None,
+) -> None:
+    """Download a file from a volume."""
+    volume = Volume(name, client=Client())
+    destination = Path(local_path) if local_path else Path(Path(remote_path).name)
+    volume.get_file(remote_path, destination)
+    console.print(f"[rebase.success]Downloaded {name}/{remote_path.lstrip('/')} to {destination}.[/rebase.success]")
+
+
+@volume_app.command("rm")
+def volume_rm_command(
+    name: Annotated[str, typer.Argument(help="Volume name.")],
+    remote_path: Annotated[str, typer.Argument(help="Path inside the volume.")],
+) -> None:
+    """Delete one file from a volume."""
+    Client().delete_volume_object(name, remote_path.lstrip("/"))
+    console.print(f"[rebase.success]Deleted {name}/{remote_path.lstrip('/')}.[/rebase.success]")
+
+
+@volume_app.command("delete")
+def volume_delete_command(
+    name: Annotated[str, typer.Argument(help="Volume name.")],
+    force: Annotated[bool, typer.Option("--force", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Delete a volume and every file stored in it."""
+    if not force and not typer.confirm(f"Delete volume {name} and ALL of its files?"):
+        raise typer.Abort()
+    Client().delete_volume(name)
+    console.print(f"[rebase.success]Deleted volume {name}.[/rebase.success]")
+
+
+dataset_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Named datasets that signal on-update workflow triggers when fresh data lands.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+DATASET_DETAIL_KEYS = [
+    "name",
+    "id",
+    "description",
+    "watermark",
+    "freshness_status",
+    "stale_since",
+    "last_validation",
+    "last_updated_at",
+    "last_signal_run_id",
+    "workspace_id",
+    "created_at",
+    "updated_at",
+]
+
+
+def _freshness_status_label(dataset: dict[str, Any]) -> str:
+    status = dataset.get("freshness_status")
+    if status == "stale":
+        since = dataset.get("stale_since")
+        return f"stale (since {since})" if since else "stale"
+    if status == "fresh":
+        return "fresh"
+    return "unknown"
+
+
+def _last_validation_label(dataset: dict[str, Any]) -> str:
+    validation = dataset.get("last_validation")
+    if not isinstance(validation, dict):
+        return "-"
+    if validation.get("skipped"):
+        return "skipped"
+    return "passed" if validation.get("passed") else "failed"
+
+
+@dataset_app.command("create")
+def dataset_create_command(
+    name: Annotated[str, typer.Argument(help="Dataset name, e.g. 'nordpool/prices'.")],
+    description: Annotated[str | None, typer.Option("--description", help="Human-readable description.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Create a dataset (idempotent: returns the existing one if present)."""
+    dataset = Client().create_dataset(name, description=description)
+    if json_output:
+        _print_json(dataset)
+        return
+    console.print(_detail_table("Dataset", dataset, preferred_keys=DATASET_DETAIL_KEYS))
+
+
+@dataset_app.command("list")
+def dataset_list_command(
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List datasets in the active workspace."""
+    datasets = Client().list_datasets()
+    if json_output:
+        _print_json(datasets)
+        return
+    table = Table(
+        title="Datasets",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Name", style="rebase.value", no_wrap=True)
+    table.add_column("Watermark")
+    table.add_column("Freshness")
+    table.add_column("Validation")
+    table.add_column("Last Updated", style="rebase.muted")
+    for dataset in datasets:
+        table.add_row(
+            str(dataset.get("name", "-")),
+            _format_value(dataset.get("watermark")),
+            _freshness_status_label(dataset),
+            _last_validation_label(dataset),
+            _format_value(dataset.get("last_updated_at")),
+        )
+    console.print(table)
+
+
+@dataset_app.command("get")
+def dataset_get_command(
+    name: Annotated[str, typer.Argument(help="Dataset name.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show dataset metadata, including its current watermark."""
+    dataset = Client().get_dataset(name)
+    if json_output:
+        _print_json(dataset)
+        return
+    console.print(_detail_table("Dataset", dataset, preferred_keys=DATASET_DETAIL_KEYS))
+
+
+@dataset_app.command("delete")
+def dataset_delete_command(
+    name: Annotated[str, typer.Argument(help="Dataset name.")],
+    yes: Annotated[bool, typer.Option("--yes", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Delete a dataset (fails while workflow triggers still watch it)."""
+    if not yes and not typer.confirm(f"Delete dataset {name}?"):
+        raise typer.Abort()
+    deleted = Client().delete_dataset(name)
+    console.print(f"[rebase.success]Deleted dataset {deleted.get('deleted', name)}.[/rebase.success]")
+
+
+@dataset_app.command("signal")
+def dataset_signal_command(
+    name: Annotated[str, typer.Argument(help="Dataset name.")],
+    watermark: Annotated[
+        str | None,
+        typer.Option("--watermark", help="New watermark as JSON (falls back to a raw string)."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Signal that fresh data landed, firing any listening on-update triggers."""
+    parsed: Any = None
+    if watermark is not None:
+        try:
+            parsed = json.loads(watermark)
+        except ValueError:
+            parsed = watermark
+    result = Client().signal_dataset(name, watermark=parsed, source="cli")
+    if json_output:
+        _print_json(result)
+        return
+    fired = result.get("fired") or []
+    console.print(f"[rebase.success]Signaled dataset {result.get('dataset', name)}.[/rebase.success]")
+    if fired:
+        console.print(f"Fired {len(fired)} run(s): {', '.join(str(run_id) for run_id in fired)}")
+    else:
+        console.print("[rebase.muted]No triggers fired.[/rebase.muted]")
+
+
+@dataset_app.command("listeners")
+def dataset_listeners_command(
+    name: Annotated[str, typer.Argument(help="Dataset name.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List workflows whose triggers watch this dataset."""
+    listeners = Client().list_dataset_listeners(name)
+    if json_output:
+        _print_json(listeners)
+        return
+    if not listeners:
+        console.print(f"[rebase.muted]No workflows listen to dataset {name}.[/rebase.muted]")
+        return
+    for listener in listeners:
+        console.print(f"[rebase.value]{listener}[/rebase.value]")
+
+
+@dataset_app.command("validate")
+def dataset_validate_command(
+    name: Annotated[str, typer.Argument(help="Dataset name.")],
+    file: Annotated[str, typer.Argument(help="Local .parquet or .csv file to validate.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Validate a local file against the dataset's stored contract (exit code 1 on failure)."""
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise RebaseWorkflowError(
+            "'rebase dataset validate' needs pandas; install it with e.g. pip install 'rebase-toolkit[sources]'"
+        ) from exc
+    path = Path(file)
+    if not path.exists():
+        raise RebaseWorkflowError(f"file not found: {file}")
+    if path.suffix == ".parquet":
+        df = pd.read_parquet(path)
+    elif path.suffix == ".csv":
+        df = pd.read_csv(path)
+    else:
+        raise RebaseWorkflowError("file must be a .parquet or .csv file")
+    contract = Client().get_dataset(name).get("contract")
+    if not contract:
+        raise RebaseWorkflowError(f"dataset {name} has no contract; set one via rb.Contract or the write pipeline")
+    if path.suffix == ".csv":
+        # CSV has no datetime types; coerce the contract's timestamp/date columns so the
+        # dtype checks assess the values rather than the file format.
+        for column_name, prop in (contract.get("properties") or {}).items():
+            if not isinstance(prop, dict) or column_name not in df.columns:
+                continue
+            if prop.get("type") == "string" and prop.get("format") in {"date-time", "date"}:
+                # Unparseable values stay as-is and the dtype check reports them.
+                with contextlib.suppress(ValueError, TypeError):
+                    df[column_name] = pd.to_datetime(df[column_name])
+    report = validate_frame(df, contract, dataset_name=name)
+    if json_output:
+        _print_json(report.to_payload())
+    else:
+        summary = "passed" if report.passed else "FAILED"
+        console.print(
+            f"Validation {summary}: {len(report.failures)} of {report.checks} checks failed ({report.row_count} rows)."
+        )
+        if report.failures:
+            table = Table(
+                title="Contract Failures",
+                box=box.ASCII,
+                border_style="rebase.border",
+                header_style="rebase.title",
+                show_header=True,
+                title_style="rebase.title",
+            )
+            table.add_column("Check", style="rebase.value")
+            table.add_column("Column")
+            table.add_column("Rows", justify="right")
+            table.add_column("Detail", style="rebase.muted")
+            for failure in report.failures:
+                table.add_row(failure.check, failure.column or "-", str(failure.count), failure.detail)
+            console.print(table)
+    if not report.passed:
+        raise typer.Exit(code=1)
+
+
+def _collect_declared_datasets(file: str) -> list[Any]:
+    """Import a Python file and return the configured datasets it declared.
+
+    Importing populates the process-level dataset registry, so this catches
+    datasets constructed anywhere at import time, not just module attributes.
+    """
+    from rebase.client import _dataset_registry
+
+    before = set(_dataset_registry)
+    _load_module(Path(file))
+    declared = [dataset for name, dataset in _dataset_registry.items() if name not in before]
+    if not declared:
+        raise RebaseWorkflowError(
+            f"{file} declares no datasets with a contract or freshness config "
+            "(rb.Dataset.from_name(..., contract=..., freshness=...))"
+        )
+    return declared
+
+
+def _dataset_config_rows(datasets: list[Any], client: Client) -> tuple[list[tuple[str, str, str, str]], bool, bool]:
+    """Diff each dataset against the platform. Returns (rows, has_drift, has_error)."""
+    from rebase.client import _config_diff_lines
+
+    rows: list[tuple[str, str, str, str]] = []
+    has_drift = False
+    has_error = False
+    for dataset in datasets:
+        try:
+            diff = dataset.config_diff(client)
+        except Exception as exc:
+            rows.append((dataset.name, "-", "error", str(exc)))
+            has_error = True
+            continue
+        if not diff:
+            rows.append((dataset.name, "-", "in-sync", ""))
+            continue
+        for key, (stored, local) in sorted(diff.items()):
+            if stored is None:
+                rows.append((dataset.name, key, "new", "declared in code, not yet published"))
+            else:
+                has_drift = True
+                rows.append((dataset.name, key, "drift", "; ".join(_config_diff_lines(key, stored, local))))
+    return rows, has_drift, has_error
+
+
+def _render_dataset_config_rows(rows: list[tuple[str, str, str, str]], *, title: str) -> None:
+    table = Table(
+        title=title,
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Dataset", style="rebase.value")
+    table.add_column("Key")
+    table.add_column("Status")
+    table.add_column("Detail", style="rebase.muted")
+    for row in rows:
+        table.add_row(*row)
+    console.print(table)
+
+
+@dataset_app.command("check")
+def dataset_check_command(
+    file: Annotated[str, typer.Argument(help="Python file declaring rb.Dataset configs (imported, not run).")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Diff in-code dataset contracts/freshness against the platform (CI gate; exit 1 on drift)."""
+    datasets = _collect_declared_datasets(file)
+    rows, has_drift, has_error = _dataset_config_rows(datasets, Client())
+    if json_output:
+        _print_json([{"dataset": d, "key": k, "status": s, "detail": detail} for d, k, s, detail in rows])
+    else:
+        _render_dataset_config_rows(rows, title="Dataset Config Check")
+        if has_drift:
+            console.print("Drift found. Review and apply with: rebase dataset sync " + file)
+    if has_drift or has_error:
+        raise typer.Exit(code=1)
+
+
+@dataset_app.command("sync")
+def dataset_sync_command(
+    file: Annotated[str, typer.Argument(help="Python file declaring rb.Dataset configs (imported, not run).")],
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Apply without confirmation.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Publish in-code dataset contracts/freshness to the platform (diff, confirm, apply)."""
+    client = Client()
+    datasets = _collect_declared_datasets(file)
+    rows, has_drift, has_error = _dataset_config_rows(datasets, client)
+    if has_error:
+        _render_dataset_config_rows(rows, title="Dataset Config Sync")
+        raise typer.Exit(code=1)
+    pending = [dataset for dataset in datasets if dataset.config_diff(client)]
+    if not pending:
+        if json_output:
+            _print_json({"applied": []})
+        else:
+            _render_dataset_config_rows(rows, title="Dataset Config Sync")
+            console.print("All dataset configs are in sync; nothing to apply.")
+        return
+    if not json_output:
+        _render_dataset_config_rows(rows, title="Dataset Config Sync")
+    if not yes and not typer.confirm(f"Apply {len(pending)} dataset config change(s)?"):
+        raise typer.Exit(code=1)
+    applied = []
+    for dataset in pending:
+        dataset.push_config(client)
+        applied.append(dataset.name)
+    if json_output:
+        _print_json({"applied": applied})
+    else:
+        console.print(f"Applied: {', '.join(applied)}")
+
+
+freshness_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Configure how recently a dataset must have been signalled.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+FRESHNESS_DETAIL_KEYS = ["name", "freshness", "freshness_status", "stale_since", "last_updated_at", "watermark"]
+
+
+@freshness_app.command("set")
+def dataset_freshness_set_command(
+    name: Annotated[str, typer.Argument(help="Dataset name.")],
+    max_age: Annotated[str, typer.Option("--max-age", help="Maximum age before the dataset is stale, e.g. '45m'.")],
+    check_at: Annotated[
+        str | None,
+        typer.Option("--check-at", help="Optional five-field cron expression for when to check, e.g. '15 9 * * *'."),
+    ] = None,
+    timezone: Annotated[
+        str | None, typer.Option("--timezone", help="IANA timezone for --check-at, e.g. 'Europe/Stockholm'.")
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Set the dataset's freshness policy."""
+    cron = Cron(check_at, timezone=timezone) if check_at is not None else None
+    freshness = Freshness(max_age, check_at=cron).to_dict()
+    dataset = Client().update_dataset(name, freshness=freshness)
+    if json_output:
+        _print_json(dataset)
+        return
+    console.print(_detail_table("Dataset Freshness", dataset, preferred_keys=FRESHNESS_DETAIL_KEYS))
+
+
+@freshness_app.command("show")
+def dataset_freshness_show_command(
+    name: Annotated[str, typer.Argument(help="Dataset name.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show the dataset's freshness policy and current status."""
+    dataset = Client().get_dataset(name)
+    details = {
+        "name": dataset.get("name", name),
+        "freshness": dataset.get("freshness"),
+        "freshness_status": _freshness_status_label(dataset),
+        "stale_since": dataset.get("stale_since"),
+        "last_updated_at": dataset.get("last_updated_at"),
+        "watermark": dataset.get("watermark"),
+    }
+    if json_output:
+        _print_json(details)
+        return
+    if not dataset.get("freshness"):
+        console.print(f"[rebase.muted]Dataset {name} has no freshness policy.[/rebase.muted]")
+        return
+    console.print(_detail_table("Dataset Freshness", details, preferred_keys=FRESHNESS_DETAIL_KEYS))
+
+
+@freshness_app.command("clear")
+def dataset_freshness_clear_command(
+    name: Annotated[str, typer.Argument(help="Dataset name.")],
+) -> None:
+    """Remove the dataset's freshness policy."""
+    Client().update_dataset(name, freshness=None)
+    console.print(f"[rebase.success]Cleared freshness policy on dataset {name}.[/rebase.success]")
+
+
+contract_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Inspect and manage the schema contract stored on a dataset.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+
+def _contract_constraints_label(prop: dict[str, Any]) -> str:
+    constraints: list[str] = []
+    if prop.get("minimum") is not None or prop.get("maximum") is not None:
+        low = prop.get("minimum", "-inf") if prop.get("minimum") is not None else "-inf"
+        high = prop.get("maximum", "inf") if prop.get("maximum") is not None else "inf"
+        constraints.append(f"between [{low}, {high}]")
+    if prop.get("enum"):
+        constraints.append(f"isin {list(prop['enum'])}")
+    return "; ".join(constraints) or "-"
+
+
+@contract_app.command("show")
+def dataset_contract_show_command(
+    name: Annotated[str, typer.Argument(help="Dataset name.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show the dataset's stored contract: columns and table-level policies."""
+    from rebase.contract import _property_dtype_label
+
+    contract = Client().get_dataset(name).get("contract")
+    if json_output:
+        _print_json(contract)
+        return
+    if not contract:
+        console.print(f"[rebase.muted]Dataset {name} has no contract.[/rebase.muted]")
+        return
+    required = set(contract.get("required") or [])
+    columns_table = Table(
+        title=f"Contract Columns ({name})",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    columns_table.add_column("Name", style="rebase.value")
+    columns_table.add_column("Type")
+    columns_table.add_column("Nullable")
+    columns_table.add_column("Constraints", style="rebase.muted")
+    for column_name, prop in (contract.get("properties") or {}).items():
+        prop = prop if isinstance(prop, dict) else {}
+        not_null = column_name in required or bool(prop.get("x-not-null"))
+        columns_table.add_row(
+            str(column_name),
+            _property_dtype_label(prop),
+            "no" if not_null else "yes",
+            _contract_constraints_label(prop),
+        )
+    console.print(columns_table)
+    policies = dict(contract.get("x-rebase") or {})
+    if policies:
+        console.print(_detail_table("Contract Policies", policies))
+
+
+@contract_app.command("clear")
+def dataset_contract_clear_command(
+    name: Annotated[str, typer.Argument(help="Dataset name.")],
+    yes: Annotated[bool, typer.Option("--yes", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Remove the dataset's contract."""
+    if not yes and not typer.confirm(f"Clear the contract on dataset {name}?"):
+        raise typer.Abort()
+    Client().update_dataset(name, contract=None)
+    console.print(f"[rebase.success]Cleared contract on dataset {name}.[/rebase.success]")
+
+
+dataset_app.add_typer(freshness_app, name="freshness")
+dataset_app.add_typer(contract_app, name="contract")
+
+
 app.add_typer(secret_app, name="secret")
+app.add_typer(volume_app, name="volume")
+app.add_typer(dataset_app, name="dataset")
 
 
 @api_key_app.command("list")
@@ -2792,7 +3600,7 @@ def function_get_command(
                 "workspace_id",
                 "description",
                 "entrypoint",
-                "execution_backend",
+                "run_type",
                 "enabled",
                 "default_parameters",
                 "image_spec",
@@ -2882,7 +3690,7 @@ def workflow_get_command(
                 "description",
                 "entrypoint",
                 "flow_ref",
-                "execution_backend",
+                "run_type",
                 "enabled",
                 "default_parameters",
                 "current_version_id",
@@ -2914,6 +3722,504 @@ def workflow_versions_command(
     console.print(_version_table("Workflow Versions", versions))
 
 
+schedule_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Manage workflow cron schedules.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+SCHEDULE_DETAIL_KEYS = ["workflow", "cron", "timezone", "day_or", "active", "next_run_at", "workflow_id", "version_id"]
+
+
+def _schedule_detail(workflow: dict[str, Any], schedule_data: dict[str, Any]) -> dict[str, Any]:
+    schedule = schedule_data.get("schedule") or {}
+    return {
+        "workflow": workflow.get("name"),
+        "cron": schedule.get("cron"),
+        "timezone": schedule.get("timezone"),
+        "day_or": schedule.get("day_or", True),
+        "active": schedule_data.get("active"),
+        "next_run_at": schedule_data.get("next_run_at"),
+        "workflow_id": schedule_data.get("workflow_id"),
+        "version_id": schedule_data.get("version_id"),
+    }
+
+
+def _require_schedule(client: Client, workflow: dict[str, Any]) -> dict[str, Any]:
+    schedule_data = client.get_workflow_schedule(str(workflow["id"]))
+    if schedule_data.get("schedule") is None:
+        raise RebaseWorkflowError(
+            f"workflow {workflow.get('name')} has no schedule; set one with 'rebase workflow schedule set'"
+        )
+    return schedule_data
+
+
+def _set_schedule_active(
+    name: str | None,
+    project: str | None,
+    workflow_id: str | None,
+    json_output: bool,
+    *,
+    active: bool,
+) -> None:
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    schedule_data = _require_schedule(client, workflow)
+    schedule = dict(schedule_data["schedule"])
+    schedule["active"] = active
+    client.update_workflow(str(workflow["id"]), schedule=schedule)
+    refreshed = client.get_workflow_schedule(str(workflow["id"]))
+    if json_output:
+        _print_json(refreshed)
+        return
+    title = "Schedule Resumed" if active else "Schedule Paused"
+    console.print(_detail_table(title, _schedule_detail(workflow, refreshed), preferred_keys=SCHEDULE_DETAIL_KEYS))
+
+
+@schedule_app.command("show")
+def workflow_schedule_show_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show a workflow's schedule and next run time."""
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    schedule_data = client.get_workflow_schedule(str(workflow["id"]))
+    if json_output:
+        _print_json(schedule_data)
+        return
+    if schedule_data.get("schedule") is None:
+        console.print(f"[rebase.muted]Workflow {workflow.get('name')} has no schedule.[/rebase.muted]")
+        return
+    console.print(
+        _detail_table(
+            "Workflow Schedule", _schedule_detail(workflow, schedule_data), preferred_keys=SCHEDULE_DETAIL_KEYS
+        )
+    )
+
+
+@schedule_app.command("set")
+def workflow_schedule_set_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    cron: Annotated[str, typer.Option("--cron", help='Five-field cron expression, e.g. "0 * * * *".')] = "",
+    timezone: Annotated[str | None, typer.Option("--timezone", help="IANA timezone, e.g. Europe/Stockholm.")] = None,
+    day_and: Annotated[
+        bool, typer.Option("--day-and", help="Require day-of-month AND day-of-week to match (default OR).")
+    ] = False,
+    inactive: Annotated[bool, typer.Option("--inactive", help="Register the schedule paused.")] = False,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Set or replace a workflow's cron schedule."""
+    if not cron.strip():
+        raise RebaseWorkflowError("--cron is required (five-field cron expression)")
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    try:
+        schedule = Cron(cron, timezone=timezone, day_or=not day_and, active=not inactive).to_dict()
+    except ValueError as exc:
+        raise RebaseWorkflowError(str(exc)) from exc
+    client.update_workflow(str(workflow["id"]), schedule=schedule)
+    refreshed = client.get_workflow_schedule(str(workflow["id"]))
+    if json_output:
+        _print_json(refreshed)
+        return
+    console.print(
+        _detail_table("Schedule Set", _schedule_detail(workflow, refreshed), preferred_keys=SCHEDULE_DETAIL_KEYS)
+    )
+
+
+@schedule_app.command("clear")
+def workflow_schedule_clear_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+) -> None:
+    """Remove a workflow's schedule."""
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    _require_schedule(client, workflow)
+    client.update_workflow(str(workflow["id"]), schedule=None)
+    console.print(f"[rebase.success]Schedule removed from workflow {workflow.get('name')}.[/rebase.success]")
+
+
+@schedule_app.command("pause")
+def workflow_schedule_pause_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Pause a schedule (keeps it registered; no runs fire)."""
+    _set_schedule_active(name, project, workflow_id, json_output, active=False)
+
+
+@schedule_app.command("resume")
+def workflow_schedule_resume_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Resume a paused schedule."""
+    _set_schedule_active(name, project, workflow_id, json_output, active=True)
+
+
+@schedule_app.command("trigger")
+def workflow_schedule_trigger_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    parameter: Annotated[
+        list[str] | None,
+        typer.Option("--param", "-p", help="Run parameter as name=json_value. Can be repeated."),
+    ] = None,
+    parameters_json: Annotated[
+        str | None, typer.Option("--parameters-json", help="JSON object with run parameters.")
+    ] = None,
+    wait: Annotated[bool, typer.Option("--wait/--no-wait", help="Follow the run until it finishes.")] = False,
+    timeout: Annotated[int, typer.Option("--timeout", help="Maximum seconds to wait with --wait.")] = 600,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Trigger a deployed workflow run now."""
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    parameters = _parse_run_parameters(parameters_json, parameter)
+    run = client.run_workflow(str(workflow["id"]), parameters=parameters)
+    if json_output:
+        _print_json(run.data)
+        return
+    if not wait:
+        console.print(
+            _detail_table(
+                "Run Submitted",
+                run.data,
+                preferred_keys=["id", "status", "target_type", "run_type", "execution_backend", "created_at"],
+            )
+        )
+        return
+    with _run_progress_reporter() as reporter:
+        result = _stream_run_result(
+            run,
+            target_type="workflow",
+            reporter=reporter,
+            started_at=time.monotonic(),
+            timeout=timeout,
+            poll_interval=1.0,
+        )
+    console.print_json(data=result)
+
+
+@schedule_app.command("list")
+def workflow_schedule_list_command(
+    project: Annotated[str | None, typer.Option("--project", help="Filter by project name.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List workflows that have schedules."""
+    client = Client()
+    if project is not None:
+        project_data = _resolve_project_by_name(client, project)
+        workflows = client.list_workflows(project_id=str(project_data["id"]))
+    else:
+        workflows = client.list_workflows()
+    scheduled = [workflow for workflow in workflows if workflow.get("schedule")]
+    if json_output:
+        _print_json(scheduled)
+        return
+    table = Table(
+        title="Workflow Schedules",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Workflow", style="rebase.value")
+    table.add_column("Cron")
+    table.add_column("Timezone")
+    table.add_column("Active")
+    table.add_column("Next run")
+    table.add_column("ID", style="rebase.muted")
+    for workflow in scheduled:
+        schedule = workflow.get("schedule") or {}
+        table.add_row(
+            str(workflow.get("name", "-")),
+            str(schedule.get("cron", "-")),
+            _format_value(schedule.get("timezone")),
+            _format_value(schedule.get("active", True)),
+            _format_value(workflow.get("next_run_at")),
+            str(workflow.get("id", "-")),
+        )
+    console.print(table)
+
+
+trigger_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Manage workflow event triggers (on-workflow and on-update).",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+TRIGGER_DETAIL_KEYS = [
+    "workflow",
+    "type",
+    "source",
+    "on",
+    "datasets",
+    "require",
+    "at_most_every",
+    "deadline",
+    "active",
+    "last_fired_at",
+    "next_deadline_at",
+    "workflow_id",
+    "version_id",
+]
+
+
+def _trigger_detail(workflow: dict[str, Any], trigger_data: dict[str, Any]) -> dict[str, Any]:
+    trigger = trigger_data.get("trigger") or {}
+    detail: dict[str, Any] = {"workflow": workflow.get("name")}
+    detail.update({key: value for key, value in trigger.items() if key != "active"})
+    detail["active"] = trigger_data.get("active")
+    detail["last_fired_at"] = trigger_data.get("last_fired_at")
+    detail["next_deadline_at"] = trigger_data.get("next_deadline_at")
+    detail["workflow_id"] = trigger_data.get("workflow_id")
+    detail["version_id"] = trigger_data.get("version_id")
+    return detail
+
+
+def _trigger_state_table(state: list[dict[str, Any]]) -> Table:
+    table = Table(
+        title="Trigger State",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Source", style="rebase.value")
+    table.add_column("Type")
+    table.add_column("On")
+    table.add_column("Pending")
+    table.add_column("Pending Since", style="rebase.muted")
+    table.add_column("Last Event", style="rebase.muted")
+    table.add_column("Last Consumed Watermark")
+    table.add_column("Last Consumed", style="rebase.muted")
+    for entry in state:
+        table.add_row(
+            str(entry.get("source", "-")),
+            _format_value(entry.get("source_type")),
+            _format_value(entry.get("on_status")),
+            _format_value(entry.get("pending")),
+            _format_value(entry.get("pending_since")),
+            _format_value(entry.get("last_event_at")),
+            _format_value(entry.get("last_consumed_watermark")),
+            _format_value(entry.get("last_consumed_at")),
+        )
+    return table
+
+
+def _require_trigger(client: Client, workflow: dict[str, Any]) -> dict[str, Any]:
+    trigger_data = client.get_workflow_trigger(str(workflow["id"]))
+    if trigger_data.get("trigger") is None:
+        raise RebaseWorkflowError(
+            f"workflow {workflow.get('name')} has no trigger; set one with 'rebase workflow trigger set'"
+        )
+    return trigger_data
+
+
+def _set_trigger_active(
+    name: str | None,
+    project: str | None,
+    workflow_id: str | None,
+    json_output: bool,
+    *,
+    active: bool,
+) -> None:
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    trigger_data = _require_trigger(client, workflow)
+    trigger = dict(trigger_data["trigger"])
+    trigger["active"] = active
+    client.update_workflow(str(workflow["id"]), trigger=trigger)
+    refreshed = client.get_workflow_trigger(str(workflow["id"]))
+    if json_output:
+        _print_json(refreshed)
+        return
+    title = "Trigger Resumed" if active else "Trigger Paused"
+    console.print(_detail_table(title, _trigger_detail(workflow, refreshed), preferred_keys=TRIGGER_DETAIL_KEYS))
+
+
+@trigger_app.command("show")
+def workflow_trigger_show_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show a workflow's trigger, per-source state, and next deadline."""
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    trigger_data = client.get_workflow_trigger(str(workflow["id"]))
+    if json_output:
+        _print_json(trigger_data)
+        return
+    if trigger_data.get("trigger") is None:
+        console.print(f"[rebase.muted]Workflow {workflow.get('name')} has no trigger.[/rebase.muted]")
+        return
+    console.print(
+        _detail_table("Workflow Trigger", _trigger_detail(workflow, trigger_data), preferred_keys=TRIGGER_DETAIL_KEYS)
+    )
+    state = trigger_data.get("state") or []
+    if state:
+        console.print(_trigger_state_table(state))
+
+
+@trigger_app.command("set")
+def workflow_trigger_set_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    on_workflow: Annotated[
+        str | None,
+        typer.Option("--on-workflow", help="Fire after another workflow, as 'project/workflow'."),
+    ] = None,
+    on: Annotated[
+        str, typer.Option("--on", help="Upstream status to fire on: success, failure, or completion.")
+    ] = "success",
+    on_update: Annotated[
+        list[str] | None,
+        typer.Option("--on-update", help="Dataset name to watch. Repeat or comma-separate for several."),
+    ] = None,
+    require: Annotated[
+        str, typer.Option("--require", help="Fire when 'all' or 'any' watched datasets have updated.")
+    ] = "all",
+    at_most_every: Annotated[
+        str | None, typer.Option("--at-most-every", help='Debounce window, e.g. "15m" or "1h".')
+    ] = None,
+    deadline_cron: Annotated[
+        str | None, typer.Option("--deadline-cron", help='Five-field cron deadline, e.g. "0 9 * * *".')
+    ] = None,
+    deadline_timezone: Annotated[
+        str | None, typer.Option("--deadline-timezone", help="IANA timezone for the deadline cron.")
+    ] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Set or replace a workflow's event trigger."""
+    if bool(on_workflow) == bool(on_update):
+        raise RebaseWorkflowError("provide exactly one of --on-workflow or --on-update")
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    try:
+        if on_workflow:
+            trigger = OnWorkflow(on_workflow, on=on).to_dict()
+        else:
+            datasets = [part.strip() for item in on_update or [] for part in item.split(",") if part.strip()]
+            deadline = Cron(deadline_cron, timezone=deadline_timezone) if deadline_cron else None
+            trigger = OnUpdate(
+                datasets,
+                require=require,
+                at_most_every=at_most_every,
+                deadline=deadline,
+            ).to_dict()
+    except (TypeError, ValueError) as exc:
+        raise RebaseWorkflowError(str(exc)) from exc
+    client.update_workflow(str(workflow["id"]), trigger=trigger)
+    refreshed = client.get_workflow_trigger(str(workflow["id"]))
+    if json_output:
+        _print_json(refreshed)
+        return
+    console.print(
+        _detail_table("Trigger Set", _trigger_detail(workflow, refreshed), preferred_keys=TRIGGER_DETAIL_KEYS)
+    )
+
+
+@trigger_app.command("clear")
+def workflow_trigger_clear_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+) -> None:
+    """Remove a workflow's trigger."""
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    _require_trigger(client, workflow)
+    client.update_workflow(str(workflow["id"]), trigger=None)
+    console.print(f"[rebase.success]Trigger removed from workflow {workflow.get('name')}.[/rebase.success]")
+
+
+@trigger_app.command("pause")
+def workflow_trigger_pause_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Pause a trigger (keeps it registered; no runs fire)."""
+    _set_trigger_active(name, project, workflow_id, json_output, active=False)
+
+
+@trigger_app.command("resume")
+def workflow_trigger_resume_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Resume a paused trigger."""
+    _set_trigger_active(name, project, workflow_id, json_output, active=True)
+
+
+@trigger_app.command("list")
+def workflow_trigger_list_command(
+    project: Annotated[str | None, typer.Option("--project", help="Filter by project name.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List workflows that have event triggers."""
+    client = Client()
+    if project is not None:
+        project_data = _resolve_project_by_name(client, project)
+        workflows = client.list_workflows(project_id=str(project_data["id"]))
+    else:
+        workflows = client.list_workflows()
+    triggered = [workflow for workflow in workflows if workflow.get("trigger")]
+    if json_output:
+        _print_json(triggered)
+        return
+    table = Table(
+        title="Workflow Triggers",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Workflow", style="rebase.value")
+    table.add_column("Type")
+    table.add_column("Trigger")
+    table.add_column("Active")
+    table.add_column("ID", style="rebase.muted")
+    for workflow in triggered:
+        trigger = workflow.get("trigger") or {}
+        table.add_row(
+            str(workflow.get("name", "-")),
+            _format_value(trigger.get("type")),
+            _format_trigger(trigger),
+            _format_value(trigger.get("active", True)),
+            str(workflow.get("id", "-")),
+        )
+    console.print(table)
+
+
+workflow_app.add_typer(schedule_app, name="schedule")
+workflow_app.add_typer(trigger_app, name="trigger")
 app.add_typer(workflow_app, name="workflow")
 
 
@@ -2962,7 +4268,7 @@ def model_get_command(
                 "kind",
                 "operation_name",
                 "description",
-                "execution_backend",
+                "run_type",
                 "enabled",
                 "default_parameters",
                 "image_spec",
@@ -3279,7 +4585,45 @@ def deploy_command(
     console.print(_deploy_table(deployed))
 
 
-RUN_INSPECTION_COMMANDS = {"list", "get", "logs", "cancel"}
+def _normalize_local_result(result: Any) -> dict[str, Any]:
+    # Mirrors the server-side importer.normalize_result contract so --local
+    # output has the same shape as a cloud run result.
+    if result is None:
+        return {}
+    if isinstance(result, dict):
+        return result
+    return {"value": result}
+
+
+def _run_local_target(
+    target_ref: str,
+    *,
+    as_module: bool,
+    parameters_json: str | None,
+    parameter: list[str] | None,
+) -> None:
+    import asyncio
+    import inspect
+
+    target = _resolve_run_target(target_ref, as_module=as_module)
+    if isinstance(target, Model):
+        raise RebaseWorkflowError("Models cannot run with --local; submit a cloud run instead")
+    if getattr(target, "fn", None) is None:
+        raise RebaseWorkflowError("remote handles cannot run with --local; run against the source file")
+    parameters = _parse_run_parameters(parameters_json, parameter)
+    kind = "workflow" if isinstance(target, Workflow) else "function"
+    console.print(f"[rebase.muted]Running {kind} {target.name or target_ref} locally...[/rebase.muted]")
+    result = target(**parameters)
+    if inspect.isawaitable(result):
+        result = asyncio.run(_await_value(result))
+    console.print_json(data=_normalize_local_result(result))
+
+
+async def _await_value(value: Any) -> Any:
+    return await value
+
+
+RUN_INSPECTION_COMMANDS = {"list", "get", "logs", "cancel", "replay"}
 
 
 @app.command("run")
@@ -3302,11 +4646,11 @@ def run_command(
         str | None,
         typer.Option("--parameters-json", help="JSON object with target parameters."),
     ] = None,
-    backend: Annotated[
+    run_type: Annotated[
         str | None,
         typer.Option(
-            "--backend",
-            help="Override the cloud execution backend for this ephemeral run.",
+            "--run-type",
+            help="Override the run type for this ephemeral run: quick, quick_shared (functions only), or long.",
         ),
     ] = None,
     module: Annotated[
@@ -3322,8 +4666,20 @@ def run_command(
         float,
         typer.Option("--poll-interval", help="Seconds between run status polls."),
     ] = 1.0,
+    local: Annotated[
+        bool,
+        typer.Option("--local", help="Execute the target in this process instead of submitting a cloud run."),
+    ] = False,
 ) -> None:
     """Run local Rebase targets and inspect submitted runs."""
+    if local:
+        if run_type is not None:
+            raise RebaseWorkflowError("--local runs in-process; --run-type selects a cloud run type")
+        if not wait:
+            raise RebaseWorkflowError("--local always runs synchronously; drop --no-wait")
+        _run_local_target(target_ref, as_module=module, parameters_json=parameters_json, parameter=parameter)
+        return
+
     run: Run | None = None
     result: dict[str, Any] | None = None
     wait_for_result = wait
@@ -3333,9 +4689,9 @@ def run_command(
         target = _resolve_run_target(target_ref, as_module=module)
         reporter.complete("Loaded local Rebase target.")
 
-        backend_override = _validate_run_backend_override(backend, target)
-        if backend_override is not None:
-            target.execution_backend = backend_override
+        run_type_override = _validate_run_type_override(run_type, target)
+        if run_type_override is not None:
+            target.run_type = run_type_override
 
         parameters = _parse_run_parameters(parameters_json, parameter)
         if isinstance(target, Workflow):
@@ -3427,6 +4783,7 @@ def run_get_command(
                 "id",
                 "target_type",
                 "status",
+                "run_type",
                 "execution_backend",
                 "project_id",
                 "workflow_id",
@@ -3459,19 +4816,22 @@ def run_logs_command(
     timeout: Annotated[int, typer.Option("--timeout", help="Maximum seconds to follow the run.")] = 600,
     json_output: Annotated[bool, typer.Option("--json", help="Print raw event and step JSON output.")] = False,
 ) -> None:
-    """Show persisted run events and workflow step state."""
+    """Show run events, workflow step state, and captured stdout/stderr logs."""
     client = Client()
     run_data = client.get_run(run_id)
     events = client.list_run_events(run_id)
     steps = client.list_run_steps(run_id) if run_data.get("target_type") == "workflow" else []
     if json_output:
-        _print_json(_raw_run_logs(run_data, events, steps))
+        payload = _raw_run_logs(run_data, events, steps)
+        payload["logs"] = client.get_run_logs(run_id)
+        _print_json(payload)
         return
 
     run = Run(run_id, client=client, data=run_data)
     with _run_progress_reporter() as reporter:
         if not follow:
             _render_run_snapshot(run=run_data, events=events, steps=steps, reporter=reporter)
+            _RunLogFollower(run).poll(reporter)
             return
         _stream_run_result(
             run,
@@ -3481,15 +4841,403 @@ def run_logs_command(
             timeout=timeout,
             poll_interval=poll_interval,
             return_result=False,
+            log_follower=_RunLogFollower(run),
         )
 
 
 @run_app.command("cancel")
 def run_cancel_command(
     run_id: Annotated[str, typer.Argument(help="Run ID.")],
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Cancel a run."""
-    raise RebaseWorkflowError(f"run cancellation is not supported yet: {run_id}")
+    client = Client()
+    cancelled = client.cancel_run(run_id)
+    if json_output:
+        _print_json(cancelled)
+        return
+    console.print(
+        _detail_table(
+            "Cancelled Run",
+            cancelled,
+            preferred_keys=["id", "status", "target_type", "run_type", "execution_backend", "error", "finished_at"],
+        )
+    )
+
+
+def _parse_since(value: str) -> datetime:
+    """Parse --since: a duration back from now (7d, 24h, 90m) or an ISO datetime."""
+    import re as _re
+
+    match = _re.fullmatch(r"(\d+)\s*([dhm])", value.strip())
+    if match:
+        seconds = int(match.group(1)) * {"d": 86400, "h": 3600, "m": 60}[match.group(2)]
+        return datetime.now(UTC) - timedelta(seconds=seconds)
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise RebaseWorkflowError(
+            f"cannot parse --since {value!r} (use a duration like 7d, 24h, 90m, or an ISO datetime)"
+        ) from exc
+
+
+def _parse_until(value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise RebaseWorkflowError(f"cannot parse --until {value!r} (use an ISO datetime)") from exc
+
+
+def _await_replay(replay: Run, *, timeout: int, poll_interval: float) -> tuple[str, Any]:
+    """Poll a replay run to a terminal state, returning (status, result). Never raises for failed runs."""
+    try:
+        result = replay.result(timeout=timeout, poll_interval=poll_interval)
+        return str(replay.data.get("status") or "succeeded"), result
+    except (RebaseWorkflowError, TimeoutError):
+        return str(replay.data.get("status") or "failed"), None
+
+
+def _compare_results(original: Any, replay: Any) -> tuple[bool, list[str]]:
+    """Compare two run results; when they differ, return the first three differing flattened keys."""
+    if json.dumps(original, sort_keys=True, default=str) == json.dumps(replay, sort_keys=True, default=str):
+        return True, []
+    flat_original = _flatten_config(original)
+    flat_replay = _flatten_config(replay)
+    differing = [
+        key
+        for key in sorted(set(flat_original) | set(flat_replay))
+        if flat_original.get(key, "<absent>") != flat_replay.get(key, "<absent>")
+    ]
+    return False, differing[:3]
+
+
+def _run_duration(run: dict[str, Any]) -> str:
+    try:
+        started = datetime.fromisoformat(str(run.get("started_at")))
+        finished = datetime.fromisoformat(str(run.get("finished_at")))
+    except ValueError:
+        return "-"
+    return f"{(finished - started).total_seconds():.2f}s"
+
+
+def _replay_candidates_table(runs: list[dict[str, Any]]) -> Table:
+    table = Table(
+        title="Replay Candidates",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("ID", style="rebase.muted")
+    table.add_column("Status", style="rebase.value")
+    table.add_column("Trigger")
+    table.add_column("Created", style="rebase.muted")
+    for run in runs:
+        table.add_row(
+            str(run.get("id", "-")),
+            _format_value(run.get("status")),
+            _format_value(run.get("trigger_source")),
+            _format_value(run.get("created_at")),
+        )
+    return table
+
+
+def _replay_result_cell(row: dict[str, Any]) -> str:
+    if row.get("result_identical") is True:
+        return "identical"
+    if row.get("result_identical") is False:
+        differing = row.get("differing_keys") or []
+        return f"differs: {differing[0]}" if differing else "differs"
+    return "-"
+
+
+def _replay_compare_table(rows: list[dict[str, Any]]) -> Table:
+    table = Table(
+        title="Replays",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Original", style="rebase.muted")
+    table.add_column("Replay", style="rebase.value")
+    table.add_column("Status")
+    table.add_column("Result")
+    table.add_column("Created", style="rebase.muted")
+    for row in rows:
+        table.add_row(
+            str(row.get("original", "-")),
+            str(row.get("replay") or "-"),
+            f"{row.get('original_status') or '-'} -> {row.get('replay_status') or '-'}",
+            _replay_result_cell(row),
+            _format_value(row.get("created_at")),
+        )
+    return table
+
+
+def _replay_single(
+    client: Client,
+    run_id: str,
+    *,
+    version: str | None,
+    parameters: dict[str, Any],
+    wait: bool,
+    timeout: int,
+    poll_interval: float,
+    json_output: bool,
+) -> None:
+    replay = client.replay_run(run_id, version=version, parameters=parameters or None)
+    detail = {
+        "id": replay.id,
+        "replay_of": replay.data.get("replay_of"),
+        "target_version_id": replay.data.get("target_version_id"),
+        "status": replay.data.get("status"),
+    }
+    if not json_output:
+        console.print(_detail_table("Replay Run", detail, preferred_keys=list(detail)))
+    if not wait:
+        if json_output:
+            _print_json(replay.data)
+        return
+
+    replay_status, replay_result = _await_replay(replay, timeout=timeout, poll_interval=poll_interval)
+    original = client.get_run(run_id)
+    original_status = str(original.get("status") or "-")
+    identical: bool | None = None
+    differing: list[str] = []
+    if replay_status == "succeeded" and original_status == "succeeded":
+        identical, differing = _compare_results(original.get("result"), replay_result)
+    if json_output:
+        _print_json(
+            {
+                "original": run_id,
+                "replay": replay.id,
+                "original_status": original_status,
+                "replay_status": replay_status,
+                "result_identical": identical,
+                "differing_keys": differing or None,
+            }
+        )
+    else:
+        if identical is True:
+            result_cell = "identical"
+        elif identical is False:
+            result_cell = f"differs: {', '.join(differing)}" if differing else "differs"
+        else:
+            result_cell = "-"
+        comparison = {
+            "status": f"{original_status} -> {replay_status}",
+            "result": result_cell,
+            "original_duration": _run_duration(original),
+            "replay_duration": _run_duration(replay.data),
+        }
+        console.print(_detail_table("Replay Comparison", comparison, preferred_keys=list(comparison)))
+    if replay_status != "succeeded":
+        raise typer.Exit(1)
+
+
+def _replay_batch(
+    client: Client,
+    *,
+    workflow: str,
+    project: str | None,
+    version: str | None,
+    parameters: dict[str, Any],
+    since: str | None,
+    until: str | None,
+    status: str | None,
+    trigger_source: str | None,
+    max_parallel: int,
+    compare: bool,
+    yes: bool,
+    timeout: int,
+    poll_interval: float,
+    json_output: bool,
+) -> None:
+    if since is None:
+        raise RebaseWorkflowError("batch replay requires --since (e.g. --since 7d)")
+    if "/" in workflow:
+        project_name, _, workflow_name = workflow.partition("/")
+    else:
+        project_name, workflow_name = project, workflow
+    workflow_data = _resolve_workflow_selector(client, workflow_name, project_name=project_name)
+
+    runs = client.list_runs(
+        workflow_id=str(workflow_data["id"]),
+        target_type="workflow",
+        since=_parse_since(since),
+        until=_parse_until(until) if until is not None else None,
+        status=status,
+        trigger_source=trigger_source,
+        limit=500,
+    )
+    if trigger_source != "replay":
+        # Never replay replays unless explicitly asked to.
+        runs = [run for run in runs if run.get("trigger_source") != "replay"]
+    if not runs:
+        console.print("No matching runs to replay.")
+        return
+    if not json_output:
+        console.print(_replay_candidates_table(runs))
+    if not yes:
+        typer.confirm(f"Replay {len(runs)} runs?", abort=True)
+
+    def _replay_one(original: dict[str, Any]) -> dict[str, Any]:
+        original_id = str(original.get("id"))
+        row: dict[str, Any] = {
+            "original": original_id,
+            "replay": None,
+            "original_status": original.get("status"),
+            "replay_status": None,
+            "result_identical": None,
+            "differing_keys": None,
+            "created_at": original.get("created_at"),
+        }
+        try:
+            replay = client.replay_run(original_id, version=version, parameters=parameters or None)
+        except RebaseWorkflowError as exc:
+            row["replay_status"] = f"error: {exc}"
+            return row
+        row["replay"] = replay.id
+        row["replay_status"] = replay.data.get("status")
+        if not compare:
+            return row
+        replay_status, replay_result = _await_replay(replay, timeout=timeout, poll_interval=poll_interval)
+        row["replay_status"] = replay_status
+        original_detail = client.get_run(original_id)
+        row["original_status"] = original_detail.get("status")
+        if replay_status == "succeeded" and original_detail.get("status") == "succeeded":
+            identical, differing = _compare_results(original_detail.get("result"), replay_result)
+            row["result_identical"] = identical
+            row["differing_keys"] = differing or None
+        return row
+
+    with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+        rows = list(executor.map(_replay_one, runs))
+
+    if json_output:
+        keys = ("original", "replay", "original_status", "replay_status", "result_identical", "differing_keys")
+        _print_json([{key: row.get(key) for key in keys} for row in rows])
+    else:
+        console.print(_replay_compare_table(rows))
+        if not compare:
+            console.print("[rebase.muted]Replays submitted; results not compared (--no-compare).[/rebase.muted]")
+    submission_failed = any(row["replay"] is None for row in rows)
+    replay_failed = compare and any(row["replay_status"] != "succeeded" for row in rows)
+    if submission_failed or replay_failed:
+        raise typer.Exit(1)
+
+
+@run_app.command("replay")
+def run_replay_command(
+    run_id: Annotated[
+        str | None,
+        typer.Argument(help="Run ID to replay. Omit when using batch mode with --workflow."),
+    ] = None,
+    workflow: Annotated[
+        str | None,
+        typer.Option(
+            "--workflow",
+            help="Batch mode: replay runs of this workflow ('project/name', or a bare name with --project).",
+        ),
+    ] = None,
+    project: Annotated[
+        str | None,
+        typer.Option("--project", help="Project name when --workflow is a bare workflow name."),
+    ] = None,
+    code: Annotated[
+        str | None,
+        typer.Option(
+            "--code",
+            help="Code to run: omit for the original pinned version, 'latest' for the current one, or a version ID.",
+        ),
+    ] = None,
+    parameter: Annotated[
+        list[str] | None,
+        typer.Option("--param", "-p", help="Parameter override as name=json_value. Can be passed more than once."),
+    ] = None,
+    since: Annotated[
+        str | None,
+        typer.Option(
+            "--since", help="Batch mode: runs created after this ISO datetime or duration (e.g. 7d, 24h, 90m)."
+        ),
+    ] = None,
+    until: Annotated[
+        str | None,
+        typer.Option("--until", help="Batch mode: runs created before this ISO datetime."),
+    ] = None,
+    status: Annotated[
+        str | None,
+        typer.Option("--status", help="Batch mode: only replay runs with this status (e.g. succeeded, failed)."),
+    ] = None,
+    trigger_source: Annotated[
+        str | None,
+        typer.Option(
+            "--trigger-source", help="Batch mode: filter candidates by trigger source (api, schedule, trigger, replay)."
+        ),
+    ] = None,
+    max_parallel: Annotated[
+        int,
+        typer.Option("--max-parallel", min=1, help="Batch mode: maximum concurrent replays."),
+    ] = 4,
+    compare: Annotated[
+        bool,
+        typer.Option(
+            "--compare/--no-compare",
+            help="Batch mode: wait for each replay and compare its result with the original run.",
+        ),
+    ] = True,
+    yes: Annotated[bool, typer.Option("--yes", help="Batch mode: skip the confirmation prompt.")] = False,
+    wait: Annotated[
+        bool,
+        typer.Option("--wait/--no-wait", help="Wait for the replay result and compare it with the original run."),
+    ] = True,
+    timeout: Annotated[int, typer.Option("--timeout", help="Maximum seconds to wait for each replay result.")] = 600,
+    poll_interval: Annotated[
+        float,
+        typer.Option("--poll-interval", help="Seconds between run status polls."),
+    ] = 5.0,
+    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Replay a run — or a period of workflow runs — bounded to what was knowable at the time."""
+    if run_id is not None and workflow is not None:
+        raise RebaseWorkflowError("provide either a RUN_ID or --workflow, not both")
+    if run_id is None and workflow is None:
+        raise RebaseWorkflowError("provide a RUN_ID to replay, or --workflow with --since for batch mode")
+
+    client = Client()
+    parameters = _parse_run_parameters(None, parameter)
+    if run_id is not None:
+        _replay_single(
+            client,
+            run_id,
+            version=code,
+            parameters=parameters,
+            wait=wait,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            json_output=json_output,
+        )
+        return
+    _replay_batch(
+        client,
+        workflow=workflow,
+        project=project,
+        version=code,
+        parameters=parameters,
+        since=since,
+        until=until,
+        status=status,
+        trigger_source=trigger_source,
+        max_parallel=max_parallel,
+        compare=compare,
+        yes=yes,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        json_output=json_output,
+    )
 
 
 hillclimb_app = typer.Typer(
@@ -3709,10 +5457,11 @@ def main(argv: list[str] | None = None) -> int:
             _print_run_help()
             return 0
         if len(args) > 1 and args[0] == "run" and args[1] in RUN_INSPECTION_COMMANDS:
-            run_app(args=args[1:], prog_name="rebase run", standalone_mode=False)
+            result = run_app(args=args[1:], prog_name="rebase run", standalone_mode=False)
         else:
-            app(args=args, prog_name="rebase", standalone_mode=False)
-        return 0
+            result = app(args=args, prog_name="rebase", standalone_mode=False)
+        # With standalone_mode=False click returns typer.Exit codes instead of raising.
+        return int(result) if isinstance(result, int) else 0
     except RebaseWorkflowError as exc:
         error_console.print(f"Error: {exc}", style="rebase.error")
         return 1

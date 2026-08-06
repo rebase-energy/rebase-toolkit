@@ -263,6 +263,49 @@ under `gs://<artifacts-bucket>/hillclimb/<sync-id>/`; set
 (job image, secrets, artifacts bucket) are documented in
 `platform/workflows/HILLCLIMB.md`.
 
+## Stitching and Forecast Windows
+
+`rebase.ForecastWindow` is the standard vocabulary for a forecast run's target
+range: offsets relative to an issue time, in ISO-8601 durations (the compact
+`"45m"`/`"2h"` style also works). It survives the JSON round-trip through
+workflow parameters, and scheduled runs resolve it against `ctx.fired_at` so
+replays reproduce the original window:
+
+```python
+import rebase as rb
+from datetime import UTC, datetime
+
+project = rb.project("forecasting")
+
+
+@project.workflow(schedule=rb.Cron("0 * * * *"))
+def forecast(ctx=None, window=rb.ForecastWindow(start="PT1H", end="P10D")) -> dict:
+    window = rb.ForecastWindow.coerce(window)
+    start, end = window.resolve(ctx.fired_at if ctx and ctx.fired_at else datetime.now(UTC))
+    ...
+```
+
+`rebase.stitch` composes prioritised time series layers (pandas required):
+the first layer whose window covers a timestamp and whose value is non-null
+wins, lower layers only fill the gaps. Windows are `[start, end)` offsets
+relative to the issue time, or absolute timezone-aware datetimes.
+`rebase.Exclude` blocks fallback inside a window — deliberate nulls that lower
+layers must not fill (e.g. masking a storm week out of training data):
+
+```python
+combined = rb.stitch(
+    [
+        rb.Layer(forecast_df, start="PT0H", name="forecast"),
+        rb.Layer(history_df, end="PT0H", name="history"),
+        rb.Exclude(start=uri_start, end=uri_end),
+        rb.Layer(climatology_df, name="climatology"),
+    ],
+    issue_time=ctx.fired_at,
+)
+
+combined, sources = rb.stitch([...], issue_time=..., return_sources=True)
+```
+
 ## Dependencies
 
 Function dependencies are declared with a Modal-like image builder:

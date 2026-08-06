@@ -14,21 +14,38 @@ bitemporal mapping so that data pulled from a warehouse can be backtested honest
 
 from __future__ import annotations
 
+import logging
 import os
 import warnings
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from rebase.client import Dataset
 
 # Frames are pandas DataFrames at runtime. We keep the annotation as ``Any`` so the toolkit
 # core stays import-light: pandas ships only with the per-warehouse extras, never as a core
 # dependency, mirroring how ``rebase.data``/``rebase.modeling`` gate their heavy deps.
 Frame = Any
 
+_UNSET = object()
+
+_logger = logging.getLogger("rebase.sources")
+
 
 class DataSourceError(RuntimeError):
     """Raised when a data source is misconfigured or a warehouse call fails."""
+
+
+@dataclass(frozen=True)
+class SignalOutcome:
+    """Whether the post-write dataset signal was delivered, and what it fired."""
+
+    sent: bool
+    error: str | None = None
+    fired: list = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -38,6 +55,9 @@ class WriteResult:
     table: str
     rows_written: int
     mode: str
+    validation: Any = None  # rebase.ValidationReport | None
+    signal: Any = None  # SignalOutcome | None
+    watermark: Any = None
 
 
 @dataclass(frozen=True)
@@ -71,9 +91,34 @@ class BitemporalSpec:
             raise ValueError("Set at most one of knowledge_time or knowledge_delay, not both.")
 
 
+def _replay_knowledge_time() -> datetime | None:
+    """The knowledge-time bound of the current replay run, or ``None`` outside replays.
+
+    Replay runs are launched with ``REBASE_REPLAY_KNOWLEDGE_TIME`` set to the original
+    run's creation time (ISO 8601, UTC assumed when naive). Parsed on every call — never
+    cached at import — so a process can observe the variable appearing or changing.
+    """
+    raw = os.environ.get("REBASE_REPLAY_KNOWLEDGE_TIME")
+    if not raw:
+        return None
+    try:
+        bound = datetime.fromisoformat(raw)
+    except ValueError:
+        warnings.warn(
+            f"REBASE_REPLAY_KNOWLEDGE_TIME is not an ISO 8601 datetime: {raw!r}; ignoring the replay bound.",
+            stacklevel=2,
+        )
+        return None
+    if bound.tzinfo is None:
+        bound = bound.replace(tzinfo=UTC)
+    return bound
+
+
 def _resolve_now() -> datetime:
-    # Isolated so tests can monkeypatch a deterministic ingestion clock.
-    return datetime.now(UTC)
+    # Isolated so tests can monkeypatch a deterministic ingestion clock. During a replay
+    # the ingestion-time fallback stamps the replay's knowledge-time bound instead of
+    # wall-clock now, so the post-read replay filter keeps fallback rows.
+    return _replay_knowledge_time() or datetime.now(UTC)
 
 
 def apply_bitemporal(df: Frame, spec: BitemporalSpec) -> Frame:
@@ -162,8 +207,8 @@ class DataSource(ABC):
     """Uniform read/write surface over a customer data warehouse.
 
     Subclasses implement :meth:`_read_frame` (run a query, return a pandas DataFrame) and
-    :meth:`write`. The base class layers the bitemporal mapping and context-manager lifecycle
-    on top so every warehouse behaves identically to callers.
+    :meth:`_write`. The base class layers the bitemporal mapping, dataset signalling and
+    context-manager lifecycle on top so every warehouse behaves identically to callers.
     """
 
     #: Short provider identifier, e.g. ``"snowflake"``.
@@ -180,7 +225,7 @@ class DataSource(ABC):
         """Execute ``query`` and return the result as a pandas DataFrame."""
 
     @abstractmethod
-    def write(self, df: Frame, table: str, *, mode: str = "append") -> WriteResult:
+    def _write(self, df: Frame, table: str, mode: str) -> WriteResult:
         """Write a DataFrame to ``table``. ``mode`` is ``"append"`` or ``"replace"``."""
 
     def close(self) -> None:  # noqa: B027 - optional override; sources without a live handle need no cleanup
@@ -197,12 +242,152 @@ class DataSource(ABC):
         except Exception as exc:  # noqa: BLE001 - normalise every driver's error type
             raise DataSourceError(f"{self.provider} read failed: {exc}") from exc
 
+    def write(
+        self,
+        df: Frame,
+        table: str,
+        *,
+        mode: str = "append",
+        dataset: Dataset | str | None = None,
+        watermark: Any = _UNSET,
+        on_violation: str | None = None,
+        validate: bool = True,
+    ) -> WriteResult:
+        """Write a DataFrame to ``table``. ``mode`` is ``"append"`` or ``"replace"``.
+
+        Pass ``dataset`` (a :class:`rebase.Dataset` or a dataset name) to run the pipeline
+        ``resolve contract -> validate -> write -> signal``: the frame is validated against
+        the dataset's contract (in-code, else the one stored on the platform), the write only
+        happens when validation passes (or the effective policy is ``"warn"``), and the
+        dataset is signalled afterwards with the validation report and a watermark. The
+        signal is best-effort: a failure never fails the write itself.
+
+        ``watermark`` overrides the value derived from the contract's ``watermark_column``
+        (pass ``None`` explicitly to signal a null watermark). ``on_violation`` overrides the
+        contract's policy (``"fail"`` or ``"warn"``); ``validate=False`` skips validation and
+        flags the signal as skipped.
+        """
+        replay_bound = _replay_knowledge_time()
+        if dataset is None:
+            if replay_bound is not None:
+                _logger.warning(
+                    "replay run: writing to %r — guard with ctx.is_replay if replays should not write", table
+                )
+            return self._write(df, table, mode)
+
+        # 1. Resolve the dataset and its contract.
+        # Local import: the toolkit's client stays out of the sources import path.
+        from rebase.client import Dataset
+
+        resolved = Dataset.from_name(dataset) if isinstance(dataset, str) else dataset
+        dataset_name = getattr(resolved, "name", str(dataset))
+        contract: dict | None = None
+        if validate:
+            contract = getattr(resolved, "contract", None)
+            if contract is None:
+                fetch = getattr(resolved, "_stored_contract", None)
+                if callable(fetch):
+                    contract = fetch()  # cached per instance; fetch errors are swallowed
+        # Note: the stored format reserves ``x-rebase.require_contract`` for the backend to
+        # enforce contract presence on signals; the SDK write path intentionally does not
+        # enforce it (an unresolvable contract simply skips validation).
+
+        # 2. Validate.
+        report: Any = None
+        if not validate:
+            from rebase.contract import ValidationReport
+
+            row_count = len(df) if hasattr(df, "__len__") else 0
+            report = ValidationReport(passed=False, checks=0, row_count=int(row_count), failures=[], skipped=True)
+        elif contract:
+            from rebase.contract import ContractViolation, validate_frame, violation_message
+
+            report = validate_frame(df, contract, dataset_name=dataset_name)
+            if not report.passed:
+                policy = on_violation or (contract.get("x-rebase") or {}).get("on_violation") or "fail"
+                if policy not in {"fail", "warn"}:
+                    raise DataSourceError(f"on_violation must be 'fail' or 'warn', got {policy!r}")
+                if policy == "fail":
+                    raise ContractViolation(
+                        violation_message(dataset_name, report, nothing_written=True),
+                        report=report,
+                    )
+                _logger.warning(
+                    "%s: %s failed %d of %d contract checks; writing anyway (on_violation='warn')",
+                    self.provider,
+                    dataset_name,
+                    len(report.failures),
+                    report.checks,
+                )
+
+        # 3. Write.
+        if replay_bound is not None:
+            _logger.warning("replay run: writing to %r — guard with ctx.is_replay if replays should not write", table)
+        result = self._write(df, table, mode)
+
+        # 4. Signal (best-effort; suppressed entirely during replays so they never fire triggers).
+        watermark_value = watermark if watermark is not _UNSET else self._derive_watermark(df, contract)
+        if replay_bound is not None:
+            return replace(
+                result,
+                validation=report,
+                signal=SignalOutcome(sent=False, error="suppressed: replay"),
+                watermark=watermark_value,
+            )
+        validation_payload = report.to_payload() if report is not None else None
+        run_id = os.environ.get("REBASE_RUN_ID")
+        signal_kwargs = {
+            "watermark": watermark_value,
+            "validation": validation_payload,
+            "source": "source_write",
+            "run_id": run_id,
+        }
+        try:
+            try:
+                response = resolved.mark_updated(**signal_kwargs)
+            except Exception:  # noqa: BLE001 - one blanket retry keeps transient API hiccups quiet
+                response = resolved.mark_updated(**signal_kwargs)
+            fired = list(response.get("fired") or []) if isinstance(response, dict) else []
+            signal = SignalOutcome(sent=True, fired=fired)
+        except Exception as exc:  # noqa: BLE001 - the write already succeeded; only warn
+            warnings.warn(
+                f"{self.provider}: dataset signal after writing {table!r} failed: {exc}",
+                stacklevel=2,
+            )
+            signal = SignalOutcome(sent=False, error=repr(exc))
+        return replace(result, validation=report, signal=signal, watermark=watermark_value)
+
+    @staticmethod
+    def _derive_watermark(df: Frame, contract: dict | None) -> Any:
+        """Derive a watermark from the contract's ``x-rebase.watermark_column``, if any."""
+        if not contract:
+            return None
+        column = (contract.get("x-rebase") or {}).get("watermark_column")
+        if not column or not hasattr(df, "columns") or column not in df.columns:
+            return None
+        try:
+            value = df[column].max()
+        except Exception:  # noqa: BLE001 - a bad column must not block the signal
+            return None
+        if value is None or value != value:  # NaN/NaT
+            return None
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        return str(value)
+
     def read_bitemporal(self, query: str, spec: BitemporalSpec, *, params: Any | None = None) -> Frame:
         """Run ``query`` and normalise it to canonical ``valid_time``/``knowledge_time`` columns.
 
         The returned frame is ready to feed to ``emflow`` for a leakage-safe backtest.
+        During a replay run, rows whose ``knowledge_time`` is after the replay's
+        knowledge-time bound are filtered out, so the run sees exactly what the
+        original run could have seen.
         """
-        return apply_bitemporal(self.read(query, params=params), spec)
+        df = apply_bitemporal(self.read(query, params=params), spec)
+        bound = _replay_knowledge_time()
+        if bound is not None:
+            df = df[df["knowledge_time"] <= bound]
+        return df
 
     def __enter__(self) -> DataSource:
         return self

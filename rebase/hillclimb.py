@@ -291,7 +291,7 @@ def start_hosted_search(
             "seed_solution_code": seed_solution_code or "",
             "knowledge_context": knowledge_context or "",
         },
-        execution_backend="cloud_run_jobs",
+        run_type="long",
         image_spec={"runtime": "hillclimb"},
     )
 

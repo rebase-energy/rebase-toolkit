@@ -70,7 +70,7 @@ class FabricSource(DataSource):
             return pd.read_sql(query, conn, params=params)
         return pd.read_sql(query, conn)
 
-    def write(self, df: Frame, table: str, *, mode: str = "append") -> WriteResult:
+    def _write(self, df: Frame, table: str, mode: str) -> WriteResult:
         columns = list(df.columns)
         conn = self._get_conn()
         cur = conn.cursor()

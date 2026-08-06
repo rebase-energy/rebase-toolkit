@@ -1,5 +1,6 @@
 import json
 import sys
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -347,8 +348,7 @@ def test_client_formats_credit_exhaustion_errors(monkeypatch) -> None:
         client.list_my_workspaces()
 
     assert str(exc_info.value) == (
-        "workspace monthly compute credits are exhausted. Remaining: 0.25 EUR; "
-        "required reservation: 0.50 EUR."
+        "workspace monthly compute credits are exhausted. Remaining: 0.25 EUR; required reservation: 0.50 EUR."
     )
 
 
@@ -645,6 +645,123 @@ def test_client_lists_runs_with_filters(monkeypatch) -> None:
     }
 
 
+def test_client_lists_runs_serializes_time_and_source_filters(monkeypatch) -> None:
+    from datetime import UTC, datetime
+
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["params"] = kwargs["params"]
+        return FakeResponse([])
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    client.list_runs(
+        workflow_id="workflow-id",
+        since=datetime(2026, 7, 4, 9, tzinfo=UTC),
+        until="2026-07-11T09:00:00+00:00",
+        status="succeeded",
+        trigger_source="schedule",
+        limit=500,
+    )
+
+    assert observed["params"] == {
+        "workflow_id": "workflow-id",
+        "since": "2026-07-04T09:00:00+00:00",
+        "until": "2026-07-11T09:00:00+00:00",
+        "status": "succeeded",
+        "trigger_source": "schedule",
+        "limit": 500,
+    }
+
+    # None filters are omitted entirely
+    client.list_runs()
+    assert observed["params"] == {"limit": 100}
+
+
+def _fake_replay_endpoint(monkeypatch, observed: dict[str, Any]) -> None:
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["json"] = kwargs["json"]
+        return FakeResponse(
+            {"id": "replay-run-id", "status": "queued", "replay_of": "run-id", "trigger_source": "replay"}
+        )
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+
+def test_client_replay_run_defaults_to_original_version(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    _fake_replay_endpoint(monkeypatch, observed)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    run = client.replay_run("run-id")
+
+    assert observed["method"] == "POST"
+    assert observed["url"] == "https://workflows.example.com/runs/run-id/replay"
+    assert observed["json"] == {"parameters": {}}
+    assert run.id == "replay-run-id"
+    assert run.data["replay_of"] == "run-id"
+
+
+def test_client_replay_run_latest_sets_use_current_version(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    _fake_replay_endpoint(monkeypatch, observed)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    client.replay_run("run-id", version="latest")
+    assert observed["json"] == {"parameters": {}, "use_current_version": True}
+
+    client.replay_run("run-id", version="current")
+    assert observed["json"] == {"parameters": {}, "use_current_version": True}
+
+
+def test_client_replay_run_pins_explicit_version_and_parameters(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    _fake_replay_endpoint(monkeypatch, observed)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    client.replay_run("run-id", version="version-uuid", parameters={"horizon": 48})
+
+    assert observed["json"] == {"parameters": {"horizon": 48}, "target_version_id": "version-uuid"}
+
+
+def test_run_replay_delegates_to_client(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+    _fake_replay_endpoint(monkeypatch, observed)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    run = rb.Run("run-id", client=client)
+    replay = run.replay(version="latest", parameters={"a": 1})
+
+    assert observed["url"] == "https://workflows.example.com/runs/run-id/replay"
+    assert observed["json"] == {"parameters": {"a": 1}, "use_current_version": True}
+    assert replay.id == "replay-run-id"
+
+
+def test_trigger_context_parses_replay_fields() -> None:
+    payload = {
+        "reason": "api",
+        "is_replay": True,
+        "replay": {"of_run_id": "run-id", "knowledge_time": "2026-07-10T09:00:00+00:00", "code": "original"},
+    }
+    ctx = rb.TriggerContext.from_payload(payload)
+
+    assert ctx.is_replay is True
+    assert ctx.replay["of_run_id"] == "run-id"
+    assert ctx.replay["code"] == "original"
+    assert ctx.raw == payload
+
+
+def test_trigger_context_replay_fields_default_when_absent() -> None:
+    ctx = rb.TriggerContext.from_payload({"reason": "datasets_ready"})
+
+    assert ctx.is_replay is False
+    assert ctx.replay == {}
+
+
 def test_client_uses_hosted_api_url_by_default(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(tmp_path / "missing-config.json"))
 
@@ -794,8 +911,8 @@ def test_workflow_deploy_updates_existing_workflow_version(monkeypatch) -> None:
     assert observed["entrypoint"] == "forecast"
     assert observed["source_code"].startswith("def forecast")
     assert observed["step_graph"] is None
-    assert rb.DEFAULT_WORKFLOW_BACKEND == "interactive"
-    assert observed["execution_backend"] == "prefect_cloud_run_service"
+    assert rb.DEFAULT_RUN_TYPE == "quick"
+    assert observed["run_type"] == "quick"
 
 
 def test_update_workflow_omits_step_graph_unless_explicit(monkeypatch) -> None:
@@ -839,11 +956,11 @@ def test_workflow_deploy_registers_function_source(monkeypatch) -> None:
     assert observed["entrypoint"] == "add"
     assert "def add(left: float = 0, right: float = 0) -> dict:" in observed["source_code"]
     assert observed["default_parameters"] == {"left": 0, "right": 0}
-    assert observed["execution_backend"] == "prefect_cloud_run_service"
-    assert workflow.execution_backend == "prefect_cloud_run_service"
+    assert observed["run_type"] == "quick"
+    assert workflow.run_type == "quick"
 
 
-def test_workflow_can_use_prefect_cloud_run_jobs_backend(monkeypatch) -> None:
+def test_workflow_can_use_long_run_type(monkeypatch) -> None:
     observed: dict[str, Any] = {}
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     monkeypatch.setattr(client, "list_workflows", lambda: [])
@@ -855,53 +972,69 @@ def test_workflow_can_use_prefect_cloud_run_jobs_backend(monkeypatch) -> None:
     workflow = rb.Workflow(
         forecast,
         name="cloud-run-forecast",
-        backend="prefect_cloud_run_jobs",
+        run_type="long",
         client=client,
     ).deploy()
 
-    assert workflow.execution_backend == "prefect_cloud_run_jobs"
-    assert observed["execution_backend"] == "prefect_cloud_run_jobs"
+    assert workflow.run_type == "long"
+    assert observed["run_type"] == "long"
 
 
-def test_workflow_accepts_interactive_and_batch_backend_modes(monkeypatch) -> None:
+def test_workflow_accepts_quick_and_long_run_types(monkeypatch) -> None:
     observed: list[dict[str, Any]] = []
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     monkeypatch.setattr(client, "list_workflows", lambda: [])
     monkeypatch.setattr(client, "register_workflow", lambda **kwargs: observed.append(kwargs) or {"id": "workflow-id"})
 
-    def interactive_forecast() -> dict:
+    def quick_forecast() -> dict:
         return {"status": "ok"}
 
-    def batch_forecast() -> dict:
+    def long_forecast() -> dict:
         return {"status": "ok"}
 
-    interactive = rb.Workflow(
-        interactive_forecast,
-        name="interactive-forecast",
-        backend="interactive",
+    quick = rb.Workflow(
+        quick_forecast,
+        name="quick-forecast",
+        run_type="quick",
         client=client,
     ).deploy()
-    batch = rb.Workflow(
-        batch_forecast,
-        name="batch-forecast",
-        backend="batch",
+    long = rb.Workflow(
+        long_forecast,
+        name="long-forecast",
+        run_type="long",
         client=client,
     ).deploy()
 
-    assert interactive.execution_backend == "prefect_cloud_run_service"
-    assert batch.execution_backend == "prefect_cloud_run_jobs"
-    assert [payload["execution_backend"] for payload in observed] == [
-        "prefect_cloud_run_service",
-        "prefect_cloud_run_jobs",
+    assert quick.run_type == "quick"
+    assert long.run_type == "long"
+    assert [payload["run_type"] for payload in observed] == [
+        "quick",
+        "long",
     ]
 
 
-def test_workflow_rejects_unknown_backend() -> None:
+def test_workflow_rejects_unknown_run_type() -> None:
     def forecast() -> dict:
         return {"status": "ok"}
 
-    with pytest.raises(ValueError, match="workflow backend"):
-        rb.Workflow(forecast, project="energy", backend="unknown")
+    with pytest.raises(ValueError, match="run_type must be"):
+        rb.Workflow(forecast, project="energy", run_type="unknown")
+
+
+def test_workflow_rejects_quick_shared_run_type() -> None:
+    def forecast() -> dict:
+        return {"status": "ok"}
+
+    with pytest.raises(ValueError, match="run_type must be"):
+        rb.Workflow(forecast, project="energy", run_type="quick_shared")
+
+
+def test_workflow_rejects_legacy_backend_parameter() -> None:
+    def forecast() -> dict:
+        return {"status": "ok"}
+
+    with pytest.raises(ValueError, match="'backend' parameter was removed"):
+        rb.Workflow(forecast, project="energy", backend="interactive")
 
 
 def test_workflow_explicit_defaults_override_function_defaults(monkeypatch) -> None:
@@ -946,10 +1079,10 @@ def test_project_deploy_registers_function_source(monkeypatch) -> None:
     assert "@project.function" not in observed["source_code"]
     assert "def normalize_weather(site_id: str, horizon_hours: int = 24) -> dict:" in observed["source_code"]
     assert observed["default_parameters"] == {"horizon_hours": 24}
-    assert observed["execution_backend"] == "cloud_run"
+    assert observed["run_type"] == "quick"
     assert observed["source_mode"] == "rebase_hosted"
-    assert rb.DEFAULT_FUNCTION_BACKEND == "interactive"
-    assert normalize_weather.execution_backend == "cloud_run"
+    assert rb.DEFAULT_RUN_TYPE == "quick"
+    assert normalize_weather.run_type == "quick"
 
 
 def test_project_deploy_registers_asgi_app_source(monkeypatch) -> None:
@@ -1032,6 +1165,7 @@ def test_asgi_app_create_and_update_use_deploy_timeout(monkeypatch) -> None:
                 "image_spec": None,
                 "env": {},
                 "secrets": {},
+                "volumes": [],
                 "cloud_run_min_instances": None,
                 "cloud_run_max_instances": None,
                 "cloud_run_concurrency": None,
@@ -1067,8 +1201,9 @@ def test_asgi_app_deploy_updates_existing_app(monkeypatch) -> None:
     monkeypatch.setattr(
         client,
         "update_asgi_app",
-        lambda asgi_app_id, **kwargs: observed.update({"asgi_app_id": asgi_app_id, **kwargs})
-        or {"id": asgi_app_id, "name": "grid-api"},
+        lambda asgi_app_id, **kwargs: (
+            observed.update({"asgi_app_id": asgi_app_id, **kwargs}) or {"id": asgi_app_id, "name": "grid-api"}
+        ),
     )
 
     @rb.asgi_app(project="grid", name="grid-api", base_path="/api")
@@ -1209,7 +1344,7 @@ def test_project_deploy_preserves_target_deploy_source_override(monkeypatch) -> 
     assert observed["git_commit_sha"] == "abc123"
 
 
-def test_project_function_can_use_prefect_backend(monkeypatch) -> None:
+def test_project_function_can_use_quick_run_type(monkeypatch) -> None:
     observed: dict[str, Any] = {}
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
@@ -1218,17 +1353,17 @@ def test_project_function_can_use_prefect_backend(monkeypatch) -> None:
 
     project = rb.Project("energy-forecasting", client=client)
 
-    @project.function(name="legacy-function", backend="prefect")
-    def legacy_function() -> dict:
+    @project.function(name="quick-function", run_type="quick")
+    def quick_function() -> dict:
         return {"status": "ok"}
 
     project.deploy()
 
-    assert legacy_function.execution_backend == "prefect"
-    assert observed["execution_backend"] == "prefect"
+    assert quick_function.run_type == "quick"
+    assert observed["run_type"] == "quick"
 
 
-def test_project_function_can_use_prefect_cloud_backend(monkeypatch) -> None:
+def test_project_function_can_use_quick_shared_run_type(monkeypatch) -> None:
     observed: dict[str, Any] = {}
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
@@ -1237,17 +1372,17 @@ def test_project_function_can_use_prefect_cloud_backend(monkeypatch) -> None:
 
     project = rb.Project("energy-forecasting", client=client)
 
-    @project.function(name="prefect-cloud-function", backend="prefect_cloud")
-    def prefect_cloud_function() -> dict:
+    @project.function(name="quick-shared-function", run_type="quick_shared")
+    def quick_shared_function() -> dict:
         return {"status": "ok"}
 
     project.deploy()
 
-    assert prefect_cloud_function.execution_backend == "prefect_cloud"
-    assert observed["execution_backend"] == "prefect_cloud"
+    assert quick_shared_function.run_type == "quick_shared"
+    assert observed["run_type"] == "quick_shared"
 
 
-def test_project_function_can_use_cloud_run_backend(monkeypatch) -> None:
+def test_project_function_can_use_long_run_type(monkeypatch) -> None:
     observed: dict[str, Any] = {}
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
@@ -1256,76 +1391,24 @@ def test_project_function_can_use_cloud_run_backend(monkeypatch) -> None:
 
     project = rb.Project("energy-forecasting", client=client)
 
-    @project.function(name="cloud-run-function", backend="cloud_run")
-    def cloud_run_function() -> dict:
+    @project.function(name="long-function", run_type="long")
+    def long_function() -> dict:
         return {"status": "ok"}
 
     project.deploy()
 
-    assert cloud_run_function.execution_backend == "cloud_run"
-    assert observed["execution_backend"] == "cloud_run"
+    assert long_function.run_type == "long"
+    assert observed["run_type"] == "long"
 
 
-def test_project_function_can_use_cloud_run_shared_backend(monkeypatch) -> None:
-    observed: dict[str, Any] = {}
-    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
-    monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
-    monkeypatch.setattr(client, "find_function", lambda name, *, project: None)
-    monkeypatch.setattr(client, "register_function", lambda **kwargs: observed.update(kwargs) or {"id": "function-id"})
+def test_project_function_rejects_legacy_backend_parameter() -> None:
+    project = rb.Project("energy-forecasting")
 
-    project = rb.Project("energy-forecasting", client=client)
+    with pytest.raises(ValueError, match="'backend' parameter was removed"):
 
-    @project.function(name="cloud-run-shared-function", backend="cloud_run_shared")
-    def cloud_run_shared_function() -> dict:
-        return {"status": "ok"}
-
-    project.deploy()
-
-    assert cloud_run_shared_function.execution_backend == "cloud_run_shared"
-    assert observed["execution_backend"] == "cloud_run_shared"
-
-
-def test_project_function_can_use_cloud_run_jobs_backend(monkeypatch) -> None:
-    observed: dict[str, Any] = {}
-    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
-    monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
-    monkeypatch.setattr(client, "find_function", lambda name, *, project: None)
-    monkeypatch.setattr(client, "register_function", lambda **kwargs: observed.update(kwargs) or {"id": "function-id"})
-
-    project = rb.Project("energy-forecasting", client=client)
-
-    @project.function(name="cloud-run-job-function", backend="cloud_run_jobs")
-    def cloud_run_job_function() -> dict:
-        return {"status": "ok"}
-
-    project.deploy()
-
-    assert cloud_run_job_function.execution_backend == "cloud_run_jobs"
-    assert observed["execution_backend"] == "cloud_run_jobs"
-
-
-def test_project_function_accepts_interactive_and_batch_backend_modes(monkeypatch) -> None:
-    observed: list[dict[str, Any]] = []
-    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
-    monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
-    monkeypatch.setattr(client, "find_function", lambda name, *, project: None)
-    monkeypatch.setattr(client, "register_function", lambda **kwargs: observed.append(kwargs) or {"id": "function-id"})
-
-    project = rb.Project("energy-forecasting", client=client)
-
-    @project.function(name="interactive-function", backend="interactive")
-    def interactive_function() -> dict:
-        return {"status": "ok"}
-
-    @project.function(name="batch-function", backend="batch")
-    def batch_function() -> dict:
-        return {"status": "ok"}
-
-    project.deploy()
-
-    assert interactive_function.execution_backend == "cloud_run"
-    assert batch_function.execution_backend == "cloud_run_jobs"
-    assert [payload["execution_backend"] for payload in observed] == ["cloud_run", "cloud_run_jobs"]
+        @project.function(name="legacy-function", backend="cloud_run")
+        def legacy_function() -> dict:
+            return {"status": "ok"}
 
 
 def test_project_function_sends_cloud_run_isolation_settings(monkeypatch) -> None:
@@ -1337,7 +1420,7 @@ def test_project_function_sends_cloud_run_isolation_settings(monkeypatch) -> Non
 
     project = rb.Project("energy-forecasting", client=client)
 
-    @project.function(name="cloud-run-function", backend="cloud_run", min_instances=1, concurrency=1)
+    @project.function(name="cloud-run-function", run_type="quick", min_instances=1, concurrency=1)
     def cloud_run_function() -> dict:
         return {"status": "ok"}
 
@@ -1347,13 +1430,13 @@ def test_project_function_sends_cloud_run_isolation_settings(monkeypatch) -> Non
     assert observed["cloud_run_concurrency"] == 1
 
 
-def test_project_function_rejects_unknown_backend() -> None:
+def test_project_function_rejects_unknown_run_type() -> None:
     project = rb.Project("energy-forecasting")
 
-    with pytest.raises(ValueError, match="function backend"):
+    with pytest.raises(ValueError, match="run_type must be"):
 
-        @project.function(backend="unknown")
-        def bad_backend() -> dict:
+        @project.function(run_type="unknown")
+        def bad_run_type() -> dict:
             return {"status": "ok"}
 
 
@@ -1399,7 +1482,7 @@ def test_function_deploy_sends_default_image_spec_when_dependencies_removed(monk
     def add(a: int = 0, b: int = 0) -> dict[str, int]:
         return {"sum": a + b}
 
-    rb.Function(add, project="math", backend="cloud_run", client=client).deploy()
+    rb.Function(add, project="math", run_type="quick", client=client).deploy()
 
     assert observed["image_spec"] == {
         "kind": "python",
@@ -1475,8 +1558,8 @@ def test_project_deploy_registers_step_workflow_graph(monkeypatch) -> None:
     project.deploy()
 
     assert [item["name"] for item in observed_functions] == ["load-weather", "build-forecast"]
-    assert [item["execution_backend"] for item in observed_functions] == ["prefect", "prefect"]
-    assert observed_workflow["execution_backend"] == "prefect_cloud_run_service"
+    assert [item["run_type"] for item in observed_functions] == ["quick", "quick"]
+    assert observed_workflow["run_type"] == "quick"
     graph = observed_workflow["step_graph"]
     assert graph["schema_version"] == 1
     assert graph["engine"] == "prefect"
@@ -1552,6 +1635,260 @@ def test_scheduled_workflow_requires_defaults(monkeypatch) -> None:
 
     with pytest.raises(rb.RebaseWorkflowError, match="Missing defaults: site_id"):
         project.deploy()
+
+
+def test_on_workflow_to_dict_and_validation() -> None:
+    trigger = rb.OnWorkflow("energy/ingest-prices", on="failure", active=False)
+
+    assert trigger.to_dict() == {
+        "type": "on_workflow",
+        "source": "energy/ingest-prices",
+        "on": "failure",
+        "active": False,
+    }
+    with pytest.raises(ValueError, match="non-empty"):
+        rb.OnWorkflow("   ")
+    with pytest.raises(ValueError, match="on must be"):
+        rb.OnWorkflow("energy/ingest-prices", on="crashed")
+
+
+def test_on_update_to_dict_and_validation() -> None:
+    trigger = rb.OnUpdate(
+        ["nordpool/prices", rb.Dataset.from_name("weather/ecmwf")],
+        require="any",
+        at_most_every="15m",
+        deadline=rb.Cron("0 9 * * *", timezone="Europe/Stockholm"),
+    )
+
+    assert trigger.to_dict() == {
+        "type": "on_update",
+        "datasets": ["nordpool/prices", "weather/ecmwf"],
+        "require": "any",
+        "at_most_every": "15m",
+        "deadline": {
+            "type": "cron",
+            "cron": "0 9 * * *",
+            "timezone": "Europe/Stockholm",
+            "day_or": True,
+            "active": True,
+        },
+        "active": True,
+    }
+    assert rb.OnUpdate(["a"], at_most_every=timedelta(minutes=15)).to_dict()["at_most_every"] == "900s"
+    assert rb.OnUpdate(["a"], at_most_every=900).to_dict()["at_most_every"] == "900s"
+    assert "at_most_every" not in rb.OnUpdate(["a"]).to_dict()
+    assert "deadline" not in rb.OnUpdate(["a"]).to_dict()
+    with pytest.raises(ValueError, match="at least one dataset"):
+        rb.OnUpdate([])
+    with pytest.raises(ValueError, match="unique"):
+        rb.OnUpdate(["a", "a"])
+    with pytest.raises(ValueError, match="require must be"):
+        rb.OnUpdate(["a"], require="most")
+    with pytest.raises(TypeError, match="dataset names or rebase.Dataset"):
+        rb.OnUpdate([42])
+    with pytest.raises(TypeError, match="deadline must be"):
+        rb.OnUpdate(["a"], deadline="0 9 * * *")
+
+
+def test_workflow_trigger_dict_rejects_parameters() -> None:
+    def forecast(site_id: str = "site-001") -> dict:
+        return {"site_id": site_id}
+
+    with pytest.raises(TypeError, match="Triggers do not accept parameters"):
+        rb.Workflow(forecast, trigger={"type": "on_workflow", "source": "energy/ingest", "parameters": {}})
+
+
+def test_project_workflow_deploy_sends_trigger(monkeypatch) -> None:
+    observed_workflow: dict[str, Any] = {}
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
+    monkeypatch.setattr(client, "find_workflow", lambda name, *, project=None: None)
+    monkeypatch.setattr(client, "register_workflow", lambda **kwargs: observed_workflow.update(kwargs) or {"id": "id"})
+
+    project = rb.Project("energy-forecasting", client=client)
+
+    @project.workflow(
+        name="triggered-forecast",
+        trigger=rb.OnUpdate(["nordpool/prices"], at_most_every="15m"),
+    )
+    def triggered_forecast(ctx=None, site_id: str = "site-001") -> dict:
+        return {"ctx": ctx, "site_id": site_id}
+
+    project.deploy()
+
+    assert triggered_forecast.trigger == {
+        "type": "on_update",
+        "datasets": ["nordpool/prices"],
+        "require": "all",
+        "at_most_every": "15m",
+        "active": True,
+    }
+    assert observed_workflow["trigger"] == triggered_forecast.trigger
+    assert observed_workflow["default_parameters"] == {"site_id": "site-001"}
+    assert observed_workflow["required_parameters"] == []
+
+
+def test_triggered_workflow_requires_defaults(monkeypatch) -> None:
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        raise AssertionError("triggered workflow validation should run before API calls")
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    project = rb.Project("energy-forecasting", client=client)
+
+    @project.workflow(
+        name="triggered-forecast",
+        trigger=rb.OnWorkflow("energy/ingest-prices"),
+    )
+    def triggered_forecast(site_id: str, ctx=None) -> dict:
+        return {"site_id": site_id, "ctx": ctx}
+
+    with pytest.raises(rb.RebaseWorkflowError, match="Triggered workflows require defaults.*site_id"):
+        project.deploy()
+
+
+def test_workflow_deploy_updates_existing_workflow_with_trigger(monkeypatch) -> None:
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "list_workflows", lambda: [{"id": "workflow-id", "name": "forecast"}])
+    observed: dict[str, Any] = {}
+
+    def fake_update_workflow(workflow_id: str, **kwargs: Any) -> dict[str, Any]:
+        observed["workflow_id"] = workflow_id
+        observed.update(kwargs)
+        return {"id": workflow_id, "name": "forecast", "current_version_id": "version-id"}
+
+    monkeypatch.setattr(client, "update_workflow", fake_update_workflow)
+
+    def forecast(ctx=None, site_id: str = "site-001") -> dict:
+        return {"site_id": site_id, "ctx": ctx}
+
+    workflow = rb.Workflow(forecast, trigger=rb.OnWorkflow("energy/ingest-prices"), client=client).deploy()
+
+    assert workflow.id == "workflow-id"
+    assert observed["trigger"] == {
+        "type": "on_workflow",
+        "source": "energy/ingest-prices",
+        "on": "success",
+        "active": True,
+    }
+    assert observed["default_parameters"] == {"site_id": "site-001"}
+    assert observed["required_parameters"] == []
+
+
+def test_update_workflow_omits_trigger_unless_explicit(monkeypatch) -> None:
+    observed_payloads: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed_payloads.append(kwargs["json"])
+        return FakeResponse({"id": "workflow-id", "name": "forecast"})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.update_workflow("workflow-id", description="Updated")
+    client.update_workflow("workflow-id", trigger=None)
+    client.update_workflow("workflow-id", trigger={"type": "on_workflow", "source": "energy/ingest"})
+
+    assert observed_payloads[0] == {"description": "Updated"}
+    assert observed_payloads[1] == {"trigger": None}
+    assert observed_payloads[2] == {"trigger": {"type": "on_workflow", "source": "energy/ingest"}}
+
+
+def test_dataset_client_methods_hit_expected_endpoints(monkeypatch) -> None:
+    observed: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed.append({"method": method, "url": url, "json": kwargs.get("json")})
+        if url.endswith("/listeners"):
+            return FakeResponse(["energy/forecast"])
+        if method == "GET" and url.endswith("/datasets"):
+            return FakeResponse([])
+        if url.endswith("/signal"):
+            return FakeResponse({"dataset": "nordpool/prices", "fired": ["run-id"]})
+        if method == "DELETE":
+            return FakeResponse({"deleted": "nordpool/prices"})
+        return FakeResponse({"id": "dataset-id", "name": "nordpool/prices"})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.create_dataset("nordpool/prices", description="Day-ahead prices")
+    assert client.list_datasets() == []
+    client.get_dataset("nordpool/prices")
+    signalled = client.signal_dataset("nordpool/prices", watermark="2026-07-11T09:00:00Z", run_id="run-id")
+    assert client.list_dataset_listeners("nordpool/prices") == ["energy/forecast"]
+    client.delete_dataset("nordpool/prices")
+    client.get_workflow_trigger("workflow-id")
+
+    assert signalled == {"dataset": "nordpool/prices", "fired": ["run-id"]}
+    assert [(item["method"], item["url"]) for item in observed] == [
+        ("POST", "https://workflows.example.com/datasets"),
+        ("GET", "https://workflows.example.com/datasets"),
+        ("GET", "https://workflows.example.com/datasets/nordpool/prices"),
+        ("POST", "https://workflows.example.com/datasets/nordpool/prices/signal"),
+        ("GET", "https://workflows.example.com/datasets/nordpool/prices/listeners"),
+        ("DELETE", "https://workflows.example.com/datasets/nordpool/prices"),
+        ("GET", "https://workflows.example.com/workflows/workflow-id/trigger"),
+    ]
+    assert observed[0]["json"] == {"name": "nordpool/prices", "description": "Day-ahead prices"}
+    assert observed[3]["json"] == {"watermark": "2026-07-11T09:00:00Z", "source": "sdk", "run_id": "run-id"}
+
+
+def test_dataset_mark_updated_signals(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["json"] = kwargs.get("json")
+        return FakeResponse({"dataset": "nordpool/prices", "fired": []})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    dataset = rb.Dataset("nordpool/prices", client=client)
+    result = dataset.mark_updated(watermark={"as_of": "2026-07-11"})
+
+    assert result == {"dataset": "nordpool/prices", "fired": []}
+    assert observed["method"] == "POST"
+    assert observed["url"] == "https://workflows.example.com/datasets/nordpool/prices/signal"
+    assert observed["json"] == {"watermark": {"as_of": "2026-07-11"}, "source": "sdk", "run_id": None}
+
+
+def test_trigger_context_from_payload() -> None:
+    context = rb.TriggerContext.from_payload(None)
+
+    assert context.reason == "api"
+    assert context.fired_at is None
+    assert context.source_run_id is None
+    assert context.source_workflow is None
+    assert context.since == {}
+    assert context.latest == {}
+    assert context.missing == []
+    assert context.deadline is None
+    assert context.raw == {}
+
+    payload = {
+        "reason": "dataset_update",
+        "fired_at": "2026-07-11T09:00:00Z",
+        "source_workflow": "energy/ingest-prices",
+        "since": {"nordpool/prices": "w-41"},
+        "latest": {"nordpool/prices": "w-42"},
+        "missing": ["weather/ecmwf"],
+        "deadline": "2026-07-11T09:00:00Z",
+    }
+    context = rb.TriggerContext.from_payload(payload)
+
+    assert context.reason == "dataset_update"
+    assert context.fired_at == "2026-07-11T09:00:00Z"
+    assert context.source_workflow == "energy/ingest-prices"
+    assert context.since == {"nordpool/prices": "w-41"}
+    assert context.latest == {"nordpool/prices": "w-42"}
+    assert context.missing == ["weather/ecmwf"]
+    assert context.deadline == "2026-07-11T09:00:00Z"
+    assert context.raw == payload
 
 
 def test_project_deploy_sends_source_settings(monkeypatch) -> None:
@@ -1672,7 +2009,7 @@ def test_function_ephemeral_run_sends_source_without_deploy(monkeypatch) -> None
     assert observed["name"] == "add"
     assert observed["entrypoint"] == "add"
     assert observed["parameters"] == {"a": 1, "b": 2}
-    assert observed["execution_backend"] == "cloud_run"
+    assert observed["run_type"] == "quick"
     assert "def add(a: int, b: int) -> dict:" in observed["source_code"]
 
 
@@ -1690,7 +2027,7 @@ def test_predictor_as_function_generates_predict_wrapper() -> None:
     assert function.name == "price-forecast"
     assert function.entrypoint == "predict"
     assert function.default_parameters == {"zone": "SE3", "horizon_hours": 24}
-    assert function.execution_backend == "cloud_run"
+    assert function.run_type == "quick"
     assert function.image_spec is not None
     assert "boltons==25.0.0" in function.image_spec["uv_pip_packages"]
     assert any("emflow" in package for package in function.image_spec["uv_pip_packages"])
@@ -1726,7 +2063,7 @@ def test_predictor_deploy_registers_model(monkeypatch) -> None:
     assert observed["operation_name"] == "predict"
     assert observed["environment"] == "dev"
     assert observed["default_parameters"] == {"zone": "SE3"}
-    assert observed["execution_backend"] == "cloud_run"
+    assert observed["run_type"] == "quick"
     assert any("emflow" in package for package in observed["image_spec"]["uv_pip_packages"])
 
 
@@ -1988,7 +2325,7 @@ def test_predictor_ephemeral_run_sends_model_payload(monkeypatch) -> None:
     assert observed["entrypoint"] == "predict"
     assert observed["parameters"] == {"zone": "SE4"}
     assert observed["default_parameters"] == {"zone": "SE3"}
-    assert observed["execution_backend"] == "cloud_run"
+    assert observed["run_type"] == "quick"
 
 
 def test_predictor_handle_runs_model(monkeypatch) -> None:
@@ -2128,8 +2465,366 @@ def test_workflow_ephemeral_run_embeds_step_sources_without_deploy(monkeypatch) 
     assert observed["project"] == "hello"
     assert observed["name"] == "hello-workflow"
     assert observed["parameters"] == {"name": "Rebase"}
-    assert observed["execution_backend"] == "prefect_cloud_run_service"
+    assert observed["run_type"] == "quick"
     nodes = observed["step_graph"]["nodes"]
     assert [node["name"] for node in nodes] == ["load-name", "package"]
     assert all(node["function_version_id"] is None for node in nodes)
     assert all("source_code" in node and node["source_code"] for node in nodes)
+
+
+def test_get_workflow_schedule(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        return FakeResponse(
+            {
+                "workflow_id": "workflow-id",
+                "version_id": "version-id",
+                "schedule": {"type": "cron", "cron": "0 * * * *"},
+                "active": True,
+                "next_run_at": "2026-07-11T11:00:00Z",
+            }
+        )
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    schedule = client.get_workflow_schedule("workflow-id")
+
+    assert observed["method"] == "GET"
+    assert observed["url"] == "https://workflows.example.com/workflows/workflow-id/schedule"
+    assert schedule["schedule"]["cron"] == "0 * * * *"
+    assert schedule["next_run_at"] == "2026-07-11T11:00:00Z"
+
+
+def test_cancel_run_posts_to_cancel_endpoint(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        return FakeResponse({"id": "run-id", "status": "cancelled"})
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    cancelled = client.cancel_run("run-id")
+
+    assert observed["method"] == "POST"
+    assert observed["url"] == "https://workflows.example.com/runs/run-id/cancel"
+    assert cancelled["status"] == "cancelled"
+
+
+def test_run_cancel_helper_updates_data(monkeypatch) -> None:
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        return FakeResponse({"id": "run-id", "status": "cancelled"})
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    run = rb.Run("run-id", client=client, data={"id": "run-id", "status": "running"})
+    run.cancel()
+    assert run.status == "cancelled"
+
+
+def test_get_run_logs_passes_cursor_params(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["params"] = kwargs.get("params")
+        return FakeResponse(
+            {
+                "run_id": "run-id",
+                "source": "cloud_logging",
+                "entries": [{"timestamp": "2026-07-11T10:00:01Z", "severity": "INFO", "message": "line"}],
+                "next_since": "2026-07-11T10:00:01Z",
+            }
+        )
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    logs = client.get_run_logs("run-id", since="2026-07-11T10:00:00Z", limit=100)
+
+    assert observed["method"] == "GET"
+    assert observed["url"] == "https://workflows.example.com/runs/run-id/logs"
+    assert observed["params"] == {"since": "2026-07-11T10:00:00Z", "limit": 100}
+    assert logs["entries"][0]["message"] == "line"
+
+
+def test_workspace_notifications_roundtrip(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["json"] = kwargs.get("json")
+        return FakeResponse(
+            {
+                "workspace_id": "default",
+                "notify_on_failure": True,
+                "webhook_url": "https://hooks.example.com/rebase",
+                "has_webhook_secret": True,
+            }
+        )
+
+    monkeypatch.setattr("requests.request", fake_request)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.get_workspace_notifications()
+    assert observed["method"] == "GET"
+    assert observed["url"] == "https://workflows.example.com/workspace/notifications"
+
+    client.update_workspace_notifications(
+        notify_on_failure=True,
+        webhook_url="https://hooks.example.com/rebase",
+        webhook_secret="s3cret",
+    )
+    assert observed["method"] == "PATCH"
+    assert observed["json"] == {
+        "notify_on_failure": True,
+        "webhook_url": "https://hooks.example.com/rebase",
+        "webhook_secret": "s3cret",
+    }
+
+    client.update_workspace_notifications(webhook_url=None, webhook_secret=None)
+    assert observed["json"] == {"webhook_url": "", "webhook_secret": ""}
+
+
+def test_volume_rpcs_and_file_ops(monkeypatch, tmp_path) -> None:
+    observed: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed.append({"method": method, "url": url, "json": kwargs.get("json"), "params": kwargs.get("params")})
+        if url.endswith("/upload-url") or url.endswith("/download-url"):
+            return FakeResponse({"url": "https://signed.example.com/x", "method": "PUT", "expires_seconds": 3600})
+        if url.endswith("/volumes"):
+            return FakeResponse({"name": "models", "provider": "gcs", "bucket": "b", "prefix": "models/"})
+        if url.endswith("/objects") and method == "GET":
+            return FakeResponse([{"path": "model.pkl", "size": 3, "updated": None}])
+        return FakeResponse({"deleted": "x"})
+
+    transferred: dict[str, Any] = {}
+
+    class FakeTransferResponse:
+        status_code = 200
+        text = ""
+        content = b"model-bytes"
+
+    def fake_put(url: str, data: Any = None, timeout: int | None = None) -> FakeTransferResponse:
+        transferred["put_url"] = url
+        transferred["body"] = data.read()
+        return FakeTransferResponse()
+
+    def fake_get(url: str, timeout: int | None = None) -> FakeTransferResponse:
+        transferred["get_url"] = url
+        return FakeTransferResponse()
+
+    monkeypatch.setattr("requests.request", fake_request)
+    monkeypatch.setattr("requests.put", fake_put)
+    monkeypatch.setattr("requests.get", fake_get)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    volume = rb.Volume.from_name("models", create_if_missing=True)
+    volume._client = client
+
+    local = tmp_path / "model.pkl"
+    local.write_bytes(b"weights")
+    remote = volume.put_file(local, "nested/model.pkl")
+    assert remote == "nested/model.pkl"
+    assert transferred["body"] == b"weights"
+    # create_if_missing triggered POST /volumes before the upload URL request
+    assert observed[0]["url"].endswith("/volumes")
+    assert observed[1]["json"] == {"path": "nested/model.pkl"}
+
+    assert volume.read_file("nested/model.pkl") == b"model-bytes"
+    assert volume.listdir() == [{"path": "model.pkl", "size": 3, "updated": None}]
+    volume.remove_file("/nested/model.pkl")
+    assert observed[-1]["method"] == "DELETE"
+    assert observed[-1]["params"] == {"path": "nested/model.pkl"}
+    volume.commit()  # no-ops must exist for Modal compatibility
+    volume.reload()
+
+
+def test_resolve_volumes_payload_from_mapping(monkeypatch) -> None:
+    from rebase.client import _resolve_volumes_payload
+
+    created: list[str] = []
+
+    class FakeClient:
+        def create_volume(self, name: str) -> dict[str, Any]:
+            created.append(name)
+            return {"name": name}
+
+    from typing import cast
+
+    from rebase.client import Client as _Client
+
+    payload = _resolve_volumes_payload(
+        {
+            "/models": rb.Volume.from_name("model-cache", create_if_missing=True),
+            "/features": "feature-store",
+        },
+        cast(_Client, FakeClient()),
+    )
+    assert payload == [
+        {"volume": "feature-store", "mount_path": "/features", "read_only": False},
+        {"volume": "model-cache", "mount_path": "/models", "read_only": False},
+    ]
+    assert created == ["model-cache"]
+
+
+def test_function_deploy_sends_volume_attachments(monkeypatch, tmp_path) -> None:
+    from rebase.client import Client
+
+    observed: dict[str, Any] = {}
+
+    def fake_find_function(self: Client, name: str, project: str | None = None) -> None:
+        return None
+
+    def fake_register_function(self: Client, **kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        return {"id": "function-id"}
+
+    monkeypatch.setattr(Client, "find_function", fake_find_function)
+    monkeypatch.setattr(Client, "register_function", fake_register_function)
+    monkeypatch.setattr(Client, "ensure_project", lambda self, name: {"id": "project-id"})
+
+    import rebase as rb_module
+
+    @rb_module.function(project="ml", name="train", volumes={"/models": "model-cache"})
+    def train() -> dict:
+        return {}
+
+    train.client = Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    train.deploy()
+
+    assert observed["volumes"] == [{"volume": "model-cache", "mount_path": "/models", "read_only": False}]
+
+
+def test_update_dataset_sends_only_provided_keys(monkeypatch) -> None:
+    observed: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed.append({"method": method, "url": url, "json": kwargs["json"]})
+        return FakeResponse({"id": "dataset-id", "name": "nordpool/prices"})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    contract = {"$schema": "rebase/contract-v1", "properties": {}, "required": [], "x-rebase": {}}
+    client.update_dataset("nordpool/prices", contract=contract)
+    client.update_dataset("nordpool/prices", freshness={"max_age": "45m"}, description="prices")
+    client.update_dataset("nordpool/prices", contract=None, freshness=None)  # explicit null clears
+
+    assert all(item["method"] == "PATCH" for item in observed)
+    assert all(item["url"] == "https://workflows.example.com/datasets/nordpool/prices" for item in observed)
+    assert observed[0]["json"] == {"contract": contract}
+    assert observed[1]["json"] == {"freshness": {"max_age": "45m"}, "description": "prices"}
+    assert observed[2]["json"] == {"contract": None, "freshness": None}
+
+
+def test_signal_dataset_includes_validation_when_given(monkeypatch) -> None:
+    observed: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed.append(kwargs["json"])
+        return FakeResponse({"dataset": "nordpool/prices", "fired": []})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.signal_dataset("nordpool/prices", watermark="w-1")
+    report = {"passed": True, "checks": 4, "row_count": 10, "failures": []}
+    client.signal_dataset("nordpool/prices", watermark="w-1", validation=report, source="source_write")
+
+    assert "validation" not in observed[0]
+    assert observed[1] == {"watermark": "w-1", "source": "source_write", "run_id": None, "validation": report}
+
+
+def test_dataset_sync_config_publishes_absent_and_warns_on_drift(monkeypatch) -> None:
+    contract = {"$schema": "rebase/contract-v1", "properties": {}, "required": [], "x-rebase": {}}
+    stored: dict[str, Any] = {
+        "name": "nordpool/prices",
+        "contract": {"$schema": "rebase/contract-v1", "properties": {"old": {"type": "number"}}},
+        "freshness": None,
+    }
+    calls: dict[str, int] = {"get": 0, "patch": 0}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        if method == "GET":
+            calls["get"] += 1
+            return FakeResponse(stored)
+        if method == "PATCH":
+            calls["patch"] += 1
+            return FakeResponse({**stored, **kwargs["json"]})
+        return FakeResponse({"dataset": "nordpool/prices", "fired": []})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    dataset = rb.Dataset(
+        "nordpool/prices",
+        client=client,
+        contract=contract,
+        freshness={"max_age": "45m"},
+    )
+    # Drifted contract: warned, never overwritten. Absent freshness: first
+    # publication, PATCHed once. Both evaluated once per instance.
+    with pytest.warns(UserWarning, match="rebase dataset sync"):
+        dataset.mark_updated(watermark="w-1")
+    dataset.mark_updated(watermark="w-2")
+
+    assert calls["patch"] == 1
+    assert calls["get"] == 1
+
+
+def test_dataset_sync_config_skips_patch_when_stored_matches(monkeypatch) -> None:
+    contract = {"$schema": "rebase/contract-v1", "properties": {}, "required": [], "x-rebase": {}}
+    observed_methods: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed_methods.append(method)
+        if method == "GET":
+            return FakeResponse({"name": "nordpool/prices", "contract": contract, "freshness": None})
+        return FakeResponse({"dataset": "nordpool/prices", "fired": []})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    dataset = rb.Dataset("nordpool/prices", client=client, contract=contract)
+    dataset.mark_updated()
+
+    assert "PATCH" not in observed_methods
+
+
+def test_dataset_sync_config_survives_get_failure(monkeypatch) -> None:
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        if method == "GET":
+            raise requests.ConnectionError("api down")
+        return FakeResponse({"dataset": "nordpool/prices", "fired": []})
+
+    monkeypatch.setattr("requests.request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    dataset = rb.Dataset("nordpool/prices", client=client, freshness={"max_age": "45m"})
+    with pytest.warns(UserWarning, match="skipping sync"):
+        result = dataset.mark_updated()
+
+    assert result == {"dataset": "nordpool/prices", "fired": []}
+
+
+def test_on_update_only_valid_serialization() -> None:
+    default = rb.OnUpdate(["nordpool/prices"])
+    assert "only_valid" not in default.to_dict()
+
+    strict = rb.OnUpdate(["nordpool/prices"], only_valid=True)
+    assert strict.to_dict()["only_valid"] is True
+
+    with pytest.raises(TypeError, match="only_valid"):
+        rb.OnUpdate(["nordpool/prices"], only_valid="yes")

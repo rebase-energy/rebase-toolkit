@@ -70,7 +70,7 @@ class DatabricksSource(DataSource):
         finally:
             cur.close()
 
-    def write(self, df: Frame, table: str, *, mode: str = "append") -> WriteResult:
+    def _write(self, df: Frame, table: str, mode: str) -> WriteResult:
         columns = list(df.columns)
         cur = self._get_conn().cursor()
         try:

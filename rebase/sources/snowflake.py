@@ -68,7 +68,7 @@ class SnowflakeSource(DataSource):
         finally:
             cur.close()
 
-    def write(self, df: Frame, table: str, *, mode: str = "append") -> WriteResult:
+    def _write(self, df: Frame, table: str, mode: str) -> WriteResult:
         pandas_tools = optional_module("snowflake.connector.pandas_tools", "snowflake")
         conn = self._get_conn()
         overwrite = mode == "replace"

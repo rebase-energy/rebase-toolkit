@@ -4,6 +4,7 @@ import ast
 import hashlib
 import inspect
 import json
+import logging
 import os
 import re
 import subprocess
@@ -12,6 +13,8 @@ import textwrap
 import time
 import warnings
 from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import FunctionType
 from typing import Any, Self
@@ -214,60 +217,139 @@ class Cron:
         }
 
 
+def _duration_payload(value: str | int | float | timedelta | None, *, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, timedelta):
+        return f"{int(value.total_seconds())}s"
+    if isinstance(value, bool):
+        raise TypeError(f"{field_name} must be a duration string, seconds, or timedelta")
+    if isinstance(value, (int, float)):
+        return f"{int(value)}s"
+    if isinstance(value, str):
+        if not value.strip():
+            raise ValueError(f"{field_name} must be a duration string like '15m'")
+        return value.strip()
+    raise TypeError(f"{field_name} must be a duration string, seconds, or timedelta")
+
+
+class OnWorkflow:
+    def __init__(
+        self,
+        source: str,
+        *,
+        on: str = "success",
+        active: bool = True,
+    ) -> None:
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("OnWorkflow requires a non-empty 'project/workflow' source")
+        if on not in {"success", "failure", "completion"}:
+            raise ValueError("on must be 'success', 'failure', or 'completion'")
+        self.source = source.strip()
+        self.on = on
+        self.active = active
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in {
+                "type": "on_workflow",
+                "source": self.source,
+                "on": self.on,
+                "active": self.active,
+            }.items()
+            if value is not None
+        }
+
+
+class OnUpdate:
+    def __init__(
+        self,
+        datasets: list[Any],
+        *,
+        require: str = "all",
+        at_most_every: str | int | float | timedelta | None = None,
+        deadline: Cron | dict[str, Any] | None = None,
+        only_valid: bool = False,
+        active: bool = True,
+    ) -> None:
+        names: list[str] = []
+        for item in datasets or []:
+            name = item.name if isinstance(item, Dataset) else item
+            if not isinstance(name, str) or not name.strip():
+                raise TypeError("OnUpdate datasets must be dataset names or rebase.Dataset instances")
+            names.append(name.strip())
+        if not names:
+            raise ValueError("OnUpdate requires at least one dataset")
+        if len(set(names)) != len(names):
+            raise ValueError("OnUpdate datasets must be unique")
+        if require not in {"all", "any"}:
+            raise ValueError("require must be 'all' or 'any'")
+        if isinstance(deadline, Cron):
+            deadline = deadline.to_dict()
+        elif deadline is not None and not isinstance(deadline, dict):
+            raise TypeError("deadline must be rb.Cron(...) or a schedule dictionary")
+        if not isinstance(only_valid, bool):
+            raise TypeError("only_valid must be a boolean")
+        self.datasets = names
+        self.require = require
+        self.at_most_every = _duration_payload(at_most_every, field_name="at_most_every")
+        self.deadline = deadline
+        self.only_valid = only_valid
+        self.active = active
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {
+            key: value
+            for key, value in {
+                "type": "on_update",
+                "datasets": list(self.datasets),
+                "require": self.require,
+                "at_most_every": self.at_most_every,
+                "deadline": self.deadline,
+                "active": self.active,
+            }.items()
+            if value is not None
+        }
+        if self.only_valid:
+            # Updates whose validation failed (or was skipped) don't satisfy
+            # the trigger; the next clean signal does.
+            payload["only_valid"] = True
+        return payload
+
+
 Schedule = Cron | dict[str, Any]
-FunctionBackend = str
-DEFAULT_FUNCTION_BACKEND: FunctionBackend = "interactive"
-WorkflowBackend = str
-DEFAULT_WORKFLOW_BACKEND: WorkflowBackend = "interactive"
+Trigger = OnWorkflow | OnUpdate | dict[str, Any]
+_RESERVED_WORKFLOW_PARAMETERS = frozenset({"ctx"})
+RunType = str
+RUN_TYPES = ("quick", "quick_shared", "long")
+DEFAULT_RUN_TYPE: RunType = "quick"
+WORKFLOW_RUN_TYPES = ("quick", "long")
 DeploySource = str
 DEFAULT_DEPLOY_SOURCE: DeploySource = "rebase"
 DEFAULT_PYTHON_VERSION = "3.13"
 DEFAULT_MODEL_DEPENDENCY = (
     "emflow @ git+https://github.com/rebase-energy/emflow.git@2d0205e1b479d439df72e50c6865735d0b26de8d"
 )
-FUNCTION_BACKEND_ALIASES = {
-    "interactive": "cloud_run",
-    "batch": "cloud_run_jobs",
-}
-WORKFLOW_BACKEND_ALIASES = {
-    "interactive": "prefect_cloud_run_service",
-    "batch": "prefect_cloud_run_jobs",
-    "prefect_cloud_run": "prefect_cloud_run_service",
-}
+LEGACY_BACKEND_REMOVED_ERROR = (
+    "the 'backend' parameter was removed; use run_type='quick' | 'quick_shared' | 'long' "
+    "('interactive' → 'quick', 'batch' → 'long')"
+)
 
 
-def _normalize_function_backend(backend: FunctionBackend) -> FunctionBackend:
-    return FUNCTION_BACKEND_ALIASES.get(backend, backend)
-
-
-def _normalize_workflow_backend(backend: WorkflowBackend) -> WorkflowBackend:
-    return WORKFLOW_BACKEND_ALIASES.get(backend, backend)
-
-
-def _validate_function_backend(backend: FunctionBackend) -> FunctionBackend:
-    backend = _normalize_function_backend(backend)
-    if backend not in {"modal", "prefect", "prefect_cloud", "cloud_run", "cloud_run_shared", "cloud_run_jobs"}:
+def _validate_run_type(run_type: RunType, target_type: str = "function") -> RunType:
+    if run_type not in RUN_TYPES or (target_type == "workflow" and run_type not in WORKFLOW_RUN_TYPES):
         raise ValueError(
-            "function backend must be 'interactive', 'batch', 'modal', 'prefect', 'prefect_cloud', 'cloud_run', "
-            "'cloud_run_shared', or 'cloud_run_jobs'"
+            "run_type must be 'quick', 'quick_shared', or 'long' (workflows: 'quick' or 'long'). "
+            "Legacy backends were removed: 'interactive' is now 'quick', 'batch' is now 'long'; "
+            "'modal', 'prefect', 'prefect_cloud', 'cloud_run*' are no longer selectable."
         )
-    return backend
+    return run_type
 
 
-def _validate_workflow_backend(backend: WorkflowBackend) -> WorkflowBackend:
-    backend = _normalize_workflow_backend(backend)
-    if backend not in {"prefect", "prefect_cloud_run_jobs", "prefect_cloud_run_service"}:
-        raise ValueError(
-            "workflow backend must be 'interactive', 'batch', 'prefect', 'prefect_cloud_run_jobs', "
-            "or 'prefect_cloud_run_service'"
-        )
-    return backend
-
-
-def _validate_target_backend(target_type: str, backend: str) -> str:
-    if target_type == "workflow":
-        return _validate_workflow_backend(backend)
-    return _validate_function_backend(backend)
+def _reject_legacy_backend(backend: Any) -> None:
+    if backend is not None:
+        raise ValueError(LEGACY_BACKEND_REMOVED_ERROR)
 
 
 def _cloud_run_cpu_value(value: float | int | str | None) -> str | None:
@@ -467,6 +549,486 @@ def _resolve_secrets_payload(
             raise RebaseWorkflowError("resolving secrets requires an authenticated client")
         resolved.update(secret.resolve(client))
     return resolved
+
+
+class Volume:
+    """A named, persistent file store shared between deployed code and your machine.
+
+    Mirrors Modal's volumes: create one lazily and mount it into functions or apps::
+
+        vol = rb.Volume.from_name("model-cache", create_if_missing=True)
+
+        @rb.function(volumes={"/models": vol})
+        def train():
+            open("/models/model.pkl", "wb").write(...)
+
+    Inside the container the volume is a directory (GCS-backed via gcsfuse in v1).
+    From your machine, use :meth:`put_file`, :meth:`read_file`, :meth:`listdir`, and
+    the ``rebase volume`` CLI; bytes move over presigned URLs, never through the API.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        create_if_missing: bool = False,
+        read_only: bool = False,
+        client: Client | None = None,
+    ) -> None:
+        if not name or not name.strip():
+            raise ValueError("Volume requires a non-empty name")
+        self.name = name.strip()
+        self.create_if_missing = create_if_missing
+        self.read_only = read_only
+        self._client = client
+        self._ensured = False
+
+    @classmethod
+    def from_name(cls, name: str, *, create_if_missing: bool = False, read_only: bool = False) -> Volume:
+        """Reference a workspace volume by name, optionally creating it lazily."""
+        return cls(name, create_if_missing=create_if_missing, read_only=read_only)
+
+    def _resolved_client(self) -> Client:
+        if self._client is None:
+            self._client = default_client()
+        return self._client
+
+    def ensure(self, client: Client | None = None) -> dict[str, Any]:
+        """Make sure the volume exists (creates it when ``create_if_missing``)."""
+        resolved = client or self._resolved_client()
+        data = resolved.create_volume(self.name) if self.create_if_missing else resolved.get_volume(self.name)
+        self._ensured = True
+        return data
+
+    def listdir(self, path: str = "") -> list[dict[str, Any]]:
+        """List objects in the volume, optionally under a path prefix."""
+        return self._resolved_client().list_volume_objects(self.name, prefix=path)
+
+    def put_file(self, local_path: str | Path, remote_path: str | None = None) -> str:
+        """Upload one local file into the volume. Returns the remote path."""
+        local = Path(local_path)
+        remote = (remote_path or local.name).lstrip("/")
+        client = self._resolved_client()
+        if self.create_if_missing and not self._ensured:
+            self.ensure(client)
+        signed = client.create_volume_upload_url(self.name, remote)
+        with local.open("rb") as handle:
+            response = requests.put(signed["url"], data=handle, timeout=600)
+        if response.status_code >= 400:
+            raise RebaseWorkflowError(f"volume upload failed: {response.status_code} {response.text[:200]}")
+        return remote
+
+    def put_directory(self, local_dir: str | Path, remote_prefix: str = "") -> list[str]:
+        """Recursively upload a local directory. Returns the remote paths written."""
+        base = Path(local_dir)
+        if not base.is_dir():
+            raise RebaseWorkflowError(f"not a directory: {local_dir}")
+        written: list[str] = []
+        prefix = remote_prefix.strip("/")
+        for path in sorted(base.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(base).as_posix()
+            remote = f"{prefix}/{relative}" if prefix else relative
+            written.append(self.put_file(path, remote))
+        return written
+
+    def read_file(self, remote_path: str) -> bytes:
+        """Download one file from the volume into memory."""
+        client = self._resolved_client()
+        signed = client.create_volume_download_url(self.name, remote_path.lstrip("/"))
+        response = requests.get(signed["url"], timeout=600)
+        if response.status_code >= 400:
+            raise RebaseWorkflowError(f"volume download failed: {response.status_code} {response.text[:200]}")
+        return response.content
+
+    def get_file(self, remote_path: str, local_path: str | Path) -> Path:
+        """Download one file from the volume to disk."""
+        local = Path(local_path)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(self.read_file(remote_path))
+        return local
+
+    def remove_file(self, remote_path: str) -> None:
+        """Delete one object from the volume."""
+        self._resolved_client().delete_volume_object(self.name, remote_path.lstrip("/"))
+
+    def commit(self) -> None:
+        """No-op for Modal compatibility: GCS-backed mounts persist writes directly."""
+
+    def reload(self) -> None:
+        """No-op for Modal compatibility: GCS-backed mounts read the live bucket state."""
+
+
+def _resolve_volumes_payload(
+    volumes: dict[str, Any] | list[Any] | None,
+    client: Client | None,
+) -> list[dict[str, Any]]:
+    """Normalize ``volumes=`` into the attachment list the API stores.
+
+    Accepts the Modal-style ``{"/mount/path": Volume}`` map (strings are treated as
+    volume names) or a pre-built attachment list.
+    """
+    if volumes is None:
+        return []
+    if isinstance(volumes, list):
+        return list(volumes)
+    attachments: list[dict[str, Any]] = []
+    for mount_path, item in sorted(volumes.items()):
+        volume = Volume.from_name(item) if isinstance(item, str) else item
+        if not isinstance(volume, Volume):
+            raise RebaseWorkflowError(f"volumes values must be rebase.Volume or volume names, got {type(item)!r}")
+        if volume.create_if_missing:
+            if client is None:
+                raise RebaseWorkflowError("resolving volumes requires an authenticated client")
+            volume.ensure(client)
+        attachments.append({"volume": volume.name, "mount_path": mount_path, "read_only": volume.read_only})
+    return attachments
+
+
+def _coerce_config_dict(value: Any, *, field_name: str) -> dict[str, Any] | None:
+    """Normalize a Contract/Freshness instance (anything with ``to_dict``) or dict to a dict."""
+    if value is None:
+        return None
+    if hasattr(value, "to_dict"):
+        value = value.to_dict()
+    if not isinstance(value, dict):
+        raise TypeError(f"{field_name} must be a dict or expose to_dict() (e.g. rb.Contract / rb.Freshness)")
+    return value
+
+
+# Process-level registry of datasets declared with a contract/freshness config.
+# Deploy preflight and `rebase dataset check` reconcile these against the
+# platform before any code runs. Keyed by name, last-wins: notebook re-runs
+# legitimately redefine a dataset, so re-registration warns on a changed
+# config instead of raising.
+_dataset_registry: dict[str, Dataset] = {}
+
+
+def registered_datasets() -> list[Dataset]:
+    """Datasets declared with a contract or freshness config in this process."""
+    return list(_dataset_registry.values())
+
+
+def _register_dataset(dataset: Dataset) -> None:
+    previous = _dataset_registry.get(dataset.name)
+    if previous is not None and previous is not dataset:
+        changed = [
+            key
+            for key in ("contract", "freshness")
+            if json.dumps(getattr(previous, key), sort_keys=True) != json.dumps(getattr(dataset, key), sort_keys=True)
+        ]
+        if changed:
+            warnings.warn(
+                f"dataset {dataset.name}: redefined with a different {' and '.join(changed)}; "
+                "the newest definition wins",
+                stacklevel=3,
+            )
+    _dataset_registry[dataset.name] = dataset
+
+
+class Dataset:
+    """A named signal channel that fans dataset updates into on-update workflow triggers.
+
+    Reference one lazily and watch it from a workflow, then signal it whenever fresh
+    data lands::
+
+        prices = rb.Dataset.from_name("nordpool/prices", create_if_missing=True)
+
+        @project.workflow(trigger=rb.OnUpdate([prices]))
+        def forecast(ctx=None): ...
+
+        prices.mark_updated(watermark="2026-07-11T09:00:00Z")
+
+    Inside deployed code, ``mark_updated`` authenticates via the platform-injected
+    ``REBASE_API_KEY``/``REBASE_WORKFLOWS_API_URL`` environment variables.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        create_if_missing: bool = False,
+        client: Client | None = None,
+        contract: Any = None,
+        freshness: Any = None,
+    ) -> None:
+        if not name or not name.strip():
+            raise ValueError("Dataset requires a non-empty name")
+        self.name = name.strip()
+        self.create_if_missing = create_if_missing
+        self.contract = _coerce_config_dict(contract, field_name="contract")
+        self.freshness = _coerce_config_dict(freshness, field_name="freshness")
+        self._client = client
+        self._ensured = False
+        self._config_synced = False
+        self._fetched_contract: Any = _UNSET  # _UNSET = never fetched; None = fetched but absent
+        if self.contract is not None or self.freshness is not None:
+            _register_dataset(self)
+
+    @classmethod
+    def from_name(
+        cls,
+        name: str,
+        *,
+        create_if_missing: bool = False,
+        contract: Any = None,
+        freshness: Any = None,
+    ) -> Dataset:
+        """Reference a workspace dataset by name, optionally creating it lazily."""
+        return cls(name, create_if_missing=create_if_missing, contract=contract, freshness=freshness)
+
+    def _resolved_client(self) -> Client:
+        if self._client is None:
+            self._client = default_client()
+        return self._client
+
+    def ensure(self, client: Client | None = None) -> dict[str, Any]:
+        """Make sure the dataset exists (creates it when ``create_if_missing``)."""
+        resolved = client or self._resolved_client()
+        data = resolved.create_dataset(self.name) if self.create_if_missing else resolved.get_dataset(self.name)
+        self._ensured = True
+        return data
+
+    def get(self) -> dict[str, Any]:
+        """Fetch the dataset's metadata, including its current watermark."""
+        return self._resolved_client().get_dataset(self.name)
+
+    def _stored_contract(self, *, swallow_errors: bool = True) -> dict[str, Any] | None:
+        """Fetch (once per instance) and cache the contract stored on the platform."""
+        if self._fetched_contract is _UNSET:
+            try:
+                self._fetched_contract = self._resolved_client().get_dataset(self.name).get("contract")
+            except Exception:
+                if not swallow_errors:
+                    self._fetched_contract = _UNSET
+                    raise
+                self._fetched_contract = None
+        return self._fetched_contract
+
+    def config_diff(self, client: Client | None = None) -> dict[str, tuple[Any, Any]]:
+        """Compare the in-code contract/freshness against the stored config.
+
+        Returns ``{key: (stored, local)}`` for each differing key. Raises on
+        fetch failure — callers decide policy. An unknown dataset counts as
+        ``stored = {}`` when ``create_if_missing``, else the 404 propagates.
+        """
+        resolved = client or self._resolved_client()
+        try:
+            stored = resolved.get_dataset(self.name)
+        except RebaseWorkflowError:
+            if not self.create_if_missing:
+                raise
+            stored = {}
+        if self._fetched_contract is _UNSET:
+            self._fetched_contract = stored.get("contract")
+        diff: dict[str, tuple[Any, Any]] = {}
+        for key, local in (("contract", self.contract), ("freshness", self.freshness)):
+            remote = stored.get(key)
+            if local is None or json.dumps(local, sort_keys=True) == json.dumps(remote, sort_keys=True):
+                continue
+            diff[key] = (remote, local)
+        return diff
+
+    def push_config(self, client: Client | None = None, *, diff: dict[str, tuple[Any, Any]] | None = None) -> None:
+        """Publish the in-code contract/freshness to the platform."""
+        resolved = client or self._resolved_client()
+        if diff is None:
+            diff = self.config_diff(resolved)
+        if not diff:
+            return
+        if self.create_if_missing and not self._ensured:
+            self.ensure(resolved)
+        updates = {key: local for key, (_, local) in diff.items()}
+        resolved.update_dataset(self.name, **updates)
+        if "contract" in updates:
+            self._fetched_contract = updates["contract"]
+        self._config_synced = True
+
+    def _sync_config(self, client: Client | None = None) -> None:
+        """First-use config publication (once per instance).
+
+        Publishes the in-code contract/freshness only when the platform has
+        none stored yet. Drift against an existing stored config is warned
+        about but never overwritten at runtime — changing a published config
+        is deliberate: ``rebase dataset sync`` or a deploy after syncing.
+        """
+        if self._config_synced or (self.contract is None and self.freshness is None):
+            return
+        self._config_synced = True
+        resolved = client or self._resolved_client()
+        try:
+            diff = self.config_diff(resolved)
+        except Exception as exc:  # noqa: BLE001 - runtime config sync is best-effort
+            warnings.warn(
+                f"dataset {self.name}: could not fetch stored config, skipping sync: {exc}",
+                stacklevel=2,
+            )
+            return
+        publishable = {key: pair for key, pair in diff.items() if pair[0] is None}
+        drifted = [key for key, pair in diff.items() if pair[0] is not None]
+        if drifted:
+            warnings.warn(
+                f"dataset {self.name}: in-code {' and '.join(drifted)} differs from the stored config; "
+                "run `rebase dataset sync` to update it (the in-code version is still used locally)",
+                stacklevel=2,
+            )
+        if publishable:
+            self.push_config(resolved, diff=publishable)
+
+    def validate(self, df: Any, *, raise_on_failure: bool = False) -> Any:
+        """Validate a DataFrame against this dataset's contract (in-code, else stored).
+
+        Returns a :class:`rebase.ValidationReport`; with ``raise_on_failure=True`` a failed
+        report raises :class:`rebase.ContractViolation` instead.
+        """
+        from rebase.contract import ContractViolation, validate_frame, violation_message
+
+        contract = self.contract or self._stored_contract(swallow_errors=False)
+        if not contract:
+            raise ValueError(f"dataset {self.name!r} has no contract")
+        report = validate_frame(df, contract, dataset_name=self.name)
+        if raise_on_failure and not report.passed:
+            raise ContractViolation(violation_message(self.name, report), report=report)
+        return report
+
+    def mark_updated(
+        self,
+        watermark: Any = None,
+        *,
+        validation: dict[str, Any] | None = None,
+        source: str = "sdk",
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Signal that fresh data landed, firing any listening on-update triggers.
+
+        Suppressed during replay runs: replays are shadow executions and never fire
+        downstream triggers or move dataset watermarks.
+        """
+        from rebase.sources.base import _replay_knowledge_time
+
+        if _replay_knowledge_time() is not None:
+            logging.getLogger("rebase.client").warning(
+                "replay run: suppressing dataset signal for %r — replays never fire downstream triggers",
+                self.name,
+            )
+            return {"suppressed": "replay", "dataset": self.name}
+        client = self._resolved_client()
+        if self.create_if_missing and not self._ensured:
+            self.ensure(client)
+        self._sync_config(client)
+        return client.signal_dataset(
+            self.name, watermark=watermark, validation=validation, source=source, run_id=run_id
+        )
+
+    def listeners(self) -> list[str]:
+        """List the workflows whose triggers watch this dataset."""
+        return self._resolved_client().list_dataset_listeners(self.name)
+
+
+def _flatten_config(value: Any, prefix: str = "") -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {prefix or "<value>": value}
+    flat: dict[str, Any] = {}
+    for key, item in value.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(item, dict):
+            flat.update(_flatten_config(item, path))
+        else:
+            flat[path] = item
+    return flat
+
+
+def _config_diff_lines(key: str, stored: Any, local: Any) -> list[str]:
+    """Compact key-level description of a config change, e.g.
+    ``contract: properties.price_eur_mwh.maximum: 4000 -> 5000``."""
+    if stored is None:
+        return [f"{key}: not stored -> declared in code"]
+    stored_flat = _flatten_config(stored)
+    local_flat = _flatten_config(local)
+    lines = []
+    for path in sorted(set(stored_flat) | set(local_flat)):
+        before = stored_flat.get(path, "<absent>")
+        after = local_flat.get(path, "<absent>")
+        if before != after:
+            lines.append(f"{key}: {path}: {before!r} -> {after!r}")
+    return lines or [f"{key}: changed"]
+
+
+def preflight_datasets(client: Client | None = None, *, datasets: list[Dataset] | None = None) -> None:
+    """Reconcile declared dataset configs with the platform before a deploy.
+
+    First publications (nothing stored yet) are pushed; drift against an
+    existing stored config fails the deploy — contract evolution is deliberate
+    (``rebase dataset sync``). Fetch failures also fail: a deploy must not
+    proceed on unknown dataset state.
+    """
+    resolved = client or default_client()
+    drift_reports: list[str] = []
+    for dataset in datasets if datasets is not None else registered_datasets():
+        try:
+            diff = dataset.config_diff(resolved)
+        except Exception as exc:
+            raise RebaseWorkflowError(
+                f"dataset {dataset.name}: could not verify stored config before deploy: {exc}"
+            ) from exc
+        publishable = {key: pair for key, pair in diff.items() if pair[0] is None}
+        drifted = {key: pair for key, pair in diff.items() if pair[0] is not None}
+        if drifted:
+            lines = [
+                line
+                for key, (stored, local) in sorted(drifted.items())
+                for line in _config_diff_lines(key, stored, local)
+            ]
+            drift_reports.append(f"  {dataset.name}:\n    " + "\n    ".join(lines))
+            continue
+        if publishable:
+            dataset.push_config(resolved, diff=publishable)
+    if drift_reports:
+        raise RebaseWorkflowError(
+            "dataset config drift — the in-code definition differs from the stored one:\n\n"
+            + "\n".join(drift_reports)
+            + "\n\nRun `rebase dataset check <file>` to review and `rebase dataset sync <file>` to apply, "
+            "then deploy again."
+        )
+
+
+@dataclass
+class TriggerContext:
+    """Why a triggered workflow run fired, injected into the reserved ``ctx`` parameter.
+
+    Declare ``ctx=None`` on a workflow entrypoint (``def forecast(ctx=None): ...``) and the
+    platform passes a payload describing the firing; rebuild it with :meth:`from_payload`.
+    """
+
+    reason: str = "api"
+    fired_at: str | None = None
+    source_run_id: str | None = None
+    source_workflow: str | None = None
+    since: dict[str, Any] = field(default_factory=dict)
+    latest: dict[str, Any] = field(default_factory=dict)
+    missing: list[str] = field(default_factory=list)
+    deadline: str | None = None
+    is_replay: bool = False
+    replay: dict[str, Any] = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any] | None) -> TriggerContext:
+        data = payload if isinstance(payload, dict) else {}
+        return cls(
+            reason=str(data.get("reason", "api")),
+            fired_at=data.get("fired_at"),
+            source_run_id=data.get("source_run_id"),
+            source_workflow=data.get("source_workflow"),
+            since=dict(data.get("since") or {}),
+            latest=dict(data.get("latest") or {}),
+            missing=list(data.get("missing") or []),
+            deadline=data.get("deadline"),
+            is_replay=bool(data.get("is_replay", False)),
+            replay=dict(data.get("replay") or {}),
+            raw=data,
+        )
 
 
 class HuggingFacePublishConfig:
@@ -770,7 +1332,7 @@ def _source_for_model(model: Model, *, operation_name: str) -> str:
     return "\n\n".join(section for section in sections if section) + "\n"
 
 
-def _defaults_for(fn: Callable[..., Any], *, target: str) -> dict[str, Any]:
+def _defaults_for(fn: Callable[..., Any], *, target: str, reserved: frozenset[str] = frozenset()) -> dict[str, Any]:
     signature = inspect.signature(fn)
     defaults: dict[str, Any] = {}
     for name, parameter in signature.parameters.items():
@@ -780,13 +1342,24 @@ def _defaults_for(fn: Callable[..., Any], *, target: str) -> dict[str, Any]:
             inspect.Parameter.POSITIONAL_ONLY,
         }:
             raise TypeError(f"{target} can only use positional-or-keyword and keyword-only parameters")
+        if name in reserved:
+            continue
         if parameter.default is inspect.Parameter.empty:
             continue
-        defaults[name] = parameter.default
+        default = parameter.default
+        # ForecastWindow defaults are stored in their JSON form so remote runs can
+        # round-trip them with ForecastWindow.coerce().
+        from rebase.timing import ForecastWindow
+
+        if isinstance(default, ForecastWindow):
+            default = default.to_dict()
+        defaults[name] = default
     return defaults
 
 
-def _required_parameters_for(fn: Callable[..., Any], *, target: str) -> list[str]:
+def _required_parameters_for(
+    fn: Callable[..., Any], *, target: str, reserved: frozenset[str] = frozenset()
+) -> list[str]:
     signature = inspect.signature(fn)
     required: list[str] = []
     for name, parameter in signature.parameters.items():
@@ -796,6 +1369,8 @@ def _required_parameters_for(fn: Callable[..., Any], *, target: str) -> list[str
             inspect.Parameter.POSITIONAL_ONLY,
         }:
             raise TypeError(f"{target} can only use positional-or-keyword and keyword-only parameters")
+        if name in reserved:
+            continue
         if parameter.default is inspect.Parameter.empty:
             required.append(name)
     return required
@@ -945,7 +1520,7 @@ class _WorkflowTrace:
                 {
                     "source_code": step.source_code,
                     "default_parameters": step.default_parameters,
-                    "execution_backend": step.execution_backend,
+                    "run_type": step.run_type,
                     "image_spec": step.image_spec,
                 }
             )
@@ -967,6 +1542,18 @@ def _schedule_payload(schedule: Schedule | None) -> dict[str, Any] | None:
             raise TypeError("Cron schedules do not accept parameters; define defaults on the workflow function")
         return schedule
     raise TypeError("schedule must be rb.Cron(...) or a schedule dictionary")
+
+
+def _trigger_payload(trigger: Trigger | None) -> dict[str, Any] | None:
+    if trigger is None:
+        return None
+    if isinstance(trigger, (OnWorkflow, OnUpdate)):
+        return trigger.to_dict()
+    if isinstance(trigger, dict):
+        if "parameters" in trigger:
+            raise TypeError("Triggers do not accept parameters; define defaults on the workflow function")
+        return trigger
+    raise TypeError("trigger must be rb.OnWorkflow(...), rb.OnUpdate(...), or a trigger dictionary")
 
 
 def _git(args: list[str], *, cwd: Path) -> str | None:
@@ -1349,6 +1936,125 @@ class Client:
         if not isinstance(response, list):
             raise RebaseWorkflowError("expected secret list response")
         return response
+
+    def create_volume(self, name: str) -> dict[str, Any]:
+        response = self.request("POST", "/volumes", json={"name": name})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected volume response")
+        return response
+
+    def list_volumes(self) -> list[dict[str, Any]]:
+        response = self.request("GET", "/volumes")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected volume list response")
+        return response
+
+    def get_volume(self, name: str) -> dict[str, Any]:
+        response = self.request("GET", f"/volumes/{name}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected volume response")
+        return response
+
+    def delete_volume(self, name: str) -> None:
+        self.request("DELETE", f"/volumes/{name}")
+
+    def list_volume_objects(self, name: str, *, prefix: str = "", limit: int | None = None) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {}
+        if prefix:
+            params["prefix"] = prefix
+        if limit is not None:
+            params["limit"] = limit
+        response = self.request("GET", f"/volumes/{name}/objects", params=params or None)
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected volume object list response")
+        return response
+
+    def create_volume_upload_url(self, name: str, path: str) -> dict[str, Any]:
+        response = self.request("POST", f"/volumes/{name}/upload-url", json={"path": path})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected signed URL response")
+        return response
+
+    def create_volume_download_url(self, name: str, path: str) -> dict[str, Any]:
+        response = self.request("POST", f"/volumes/{name}/download-url", json={"path": path})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected signed URL response")
+        return response
+
+    def delete_volume_object(self, name: str, path: str) -> None:
+        self.request("DELETE", f"/volumes/{name}/objects", params={"path": path})
+
+    def create_dataset(self, name: str, description: str | None = None) -> dict[str, Any]:
+        response = self.request("POST", "/datasets", json={"name": name, "description": description})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected dataset response")
+        return response
+
+    def list_datasets(self) -> list[dict[str, Any]]:
+        response = self.request("GET", "/datasets")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected dataset list response")
+        return response
+
+    def get_dataset(self, name: str) -> dict[str, Any]:
+        response = self.request("GET", f"/datasets/{name}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected dataset response")
+        return response
+
+    def update_dataset(
+        self,
+        name: str,
+        *,
+        contract: dict[str, Any] | None | object = _UNSET,
+        freshness: dict[str, Any] | None | object = _UNSET,
+        description: str | None | object = _UNSET,
+    ) -> dict[str, Any]:
+        """Update a dataset's contract/freshness/description; omitted keys stay unchanged."""
+        payload: dict[str, Any] = {}
+        if contract is not _UNSET:
+            payload["contract"] = contract
+        if freshness is not _UNSET:
+            payload["freshness"] = freshness
+        if description is not _UNSET:
+            payload["description"] = description
+        response = self.request("PATCH", f"/datasets/{name}", json=payload)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected dataset response")
+        return response
+
+    def delete_dataset(self, name: str) -> dict[str, Any]:
+        response = self.request("DELETE", f"/datasets/{name}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected dataset response")
+        return response
+
+    def signal_dataset(
+        self,
+        name: str,
+        *,
+        watermark: Any = None,
+        source: str = "sdk",
+        run_id: str | None = None,
+        validation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"watermark": watermark, "source": source, "run_id": run_id}
+        if validation is not None:
+            body["validation"] = validation
+        response = self.request(
+            "POST",
+            f"/datasets/{name}/signal",
+            json=body,
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected dataset signal response")
+        return response
+
+    def list_dataset_listeners(self, name: str) -> list[str]:
+        response = self.request("GET", f"/datasets/{name}/listeners")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected dataset listener list response")
+        return [str(listener) for listener in response]
 
     def _with_endpoint_url(self, endpoint: dict[str, Any]) -> dict[str, Any]:
         url_path = endpoint.get("url_path")
@@ -1860,6 +2566,7 @@ class Client:
         image_spec: dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
+        volumes: list[dict[str, Any]] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_max_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
@@ -1893,6 +2600,7 @@ class Client:
                 "image_spec": image_spec,
                 "env": env or {},
                 "secrets": secrets or {},
+                "volumes": volumes or [],
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_max_instances": cloud_run_max_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
@@ -1928,6 +2636,7 @@ class Client:
         image_spec: dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
+        volumes: list[dict[str, Any]] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_max_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
@@ -1958,6 +2667,7 @@ class Client:
                 "image_spec": image_spec,
                 "env": env,
                 "secrets": secrets,
+                "volumes": volumes,
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_max_instances": cloud_run_max_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
@@ -1996,10 +2706,11 @@ class Client:
         entrypoint: str,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        execution_backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
+        run_type: RunType = DEFAULT_RUN_TYPE,
         image_spec: dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
+        volumes: list[dict[str, Any]] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
         cloud_run_cpu: str | None = None,
@@ -2027,10 +2738,11 @@ class Client:
                 "source_code": source_code,
                 "entrypoint": entrypoint,
                 "default_parameters": default_parameters or {},
-                "execution_backend": _validate_function_backend(execution_backend),
+                "run_type": _validate_run_type(run_type),
                 "image_spec": image_spec,
                 "env": env or {},
                 "secrets": secrets or {},
+                "volumes": volumes or [],
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
                 "cloud_run_cpu": cloud_run_cpu,
@@ -2062,10 +2774,11 @@ class Client:
         entrypoint: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        execution_backend: FunctionBackend | None = None,
+        run_type: RunType | None = None,
         image_spec: dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
+        volumes: list[dict[str, Any]] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
         cloud_run_cpu: str | None = None,
@@ -2091,10 +2804,11 @@ class Client:
                 "source_code": source_code,
                 "entrypoint": entrypoint,
                 "default_parameters": default_parameters,
-                "execution_backend": _validate_function_backend(execution_backend) if execution_backend else None,
+                "run_type": _validate_run_type(run_type) if run_type else None,
                 "image_spec": image_spec,
                 "env": env,
                 "secrets": secrets,
+                "volumes": volumes,
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
                 "cloud_run_cpu": cloud_run_cpu,
@@ -2185,7 +2899,7 @@ class Client:
         source_code: str,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        execution_backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
+        run_type: RunType = DEFAULT_RUN_TYPE,
         image_spec: dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
@@ -2217,7 +2931,7 @@ class Client:
                 "description": description,
                 "source_code": source_code,
                 "default_parameters": default_parameters or {},
-                "execution_backend": _validate_function_backend(execution_backend),
+                "run_type": _validate_run_type(run_type),
                 "image_spec": image_spec,
                 "env": env or {},
                 "secrets": secrets or {},
@@ -2253,7 +2967,7 @@ class Client:
         source_code: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        execution_backend: FunctionBackend | None = None,
+        run_type: RunType | None = None,
         image_spec: dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
@@ -2283,7 +2997,7 @@ class Client:
                 "description": description,
                 "source_code": source_code,
                 "default_parameters": default_parameters,
-                "execution_backend": _validate_function_backend(execution_backend) if execution_backend else None,
+                "run_type": _validate_run_type(run_type) if run_type else None,
                 "image_spec": image_spec,
                 "env": env,
                 "secrets": secrets,
@@ -2529,10 +3243,11 @@ class Client:
         entrypoint: str | None = None,
         step_graph: dict[str, Any] | None = None,
         schedule: dict[str, Any] | None = None,
+        trigger: dict[str, Any] | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
         required_parameters: list[str] | None = None,
-        execution_backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
+        run_type: RunType = DEFAULT_RUN_TYPE,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         project: str | None = None,
@@ -2562,9 +3277,10 @@ class Client:
                 "entrypoint": entrypoint,
                 "step_graph": step_graph,
                 "schedule": schedule,
+                "trigger": trigger,
                 "default_parameters": default_parameters or {},
                 "required_parameters": required_parameters or [],
-                "execution_backend": _validate_workflow_backend(execution_backend),
+                "run_type": _validate_run_type(run_type, target_type="workflow"),
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "environment": environment,
@@ -2593,10 +3309,11 @@ class Client:
         entrypoint: str | None = None,
         step_graph: dict[str, Any] | None | object = _UNSET,
         schedule: dict[str, Any] | None | object = _UNSET,
+        trigger: dict[str, Any] | None | object = _UNSET,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
         required_parameters: list[str] | None = None,
-        execution_backend: WorkflowBackend | None = None,
+        run_type: RunType | None = None,
         enabled: bool | None = None,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         environment: str | None = None,
@@ -2620,7 +3337,7 @@ class Client:
                 "entrypoint": entrypoint,
                 "default_parameters": default_parameters,
                 "required_parameters": required_parameters,
-                "execution_backend": _validate_workflow_backend(execution_backend) if execution_backend else None,
+                "run_type": _validate_run_type(run_type, target_type="workflow") if run_type else None,
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "environment": environment,
@@ -2640,6 +3357,8 @@ class Client:
             payload["step_graph"] = step_graph
         if schedule is not _UNSET:
             payload["schedule"] = schedule
+        if trigger is not _UNSET:
+            payload["trigger"] = trigger
         response = self.request("PATCH", f"/workflows/{workflow_id}", json=payload)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected workflow response")
@@ -2647,6 +3366,31 @@ class Client:
 
     def run_workflow(self, workflow_id: str, parameters: dict[str, Any] | None = None) -> Run:
         response = self.request("POST", f"/workflows/{workflow_id}/runs", json={"parameters": parameters or {}})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected run response")
+        return Run(response["id"], client=self, data=response)
+
+    def replay_run(
+        self,
+        run_id: str,
+        *,
+        version: str | None = None,
+        parameters: dict[str, Any] | None = None,
+    ) -> Run:
+        """Replay a workflow run: re-execute it bounded to what was knowable at the time.
+
+        ``version`` selects the code: ``None`` replays the original pinned version,
+        ``"latest"`` (or ``"current"``) uses the workflow's current version, and any other
+        string is a specific version id. ``parameters`` are merged over the original run's
+        parameters. Returns the new run, which carries ``replay_of`` and
+        ``trigger_source: "replay"``.
+        """
+        payload: dict[str, Any] = {"parameters": parameters or {}}
+        if version in {"latest", "current"}:
+            payload["use_current_version"] = True
+        elif version is not None:
+            payload["target_version_id"] = version
+        response = self.request("POST", f"/runs/{run_id}/replay", json=payload)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected run response")
         return Run(response["id"], client=self, data=response)
@@ -2661,7 +3405,7 @@ class Client:
         entrypoint: str,
         default_parameters: dict[str, Any] | None = None,
         parameters: dict[str, Any] | None = None,
-        execution_backend: str,
+        run_type: RunType,
         image_spec: dict[str, Any] | None = None,
         step_graph: dict[str, Any] | None = None,
         required_parameters: list[str] | None = None,
@@ -2679,7 +3423,7 @@ class Client:
                 "entrypoint": entrypoint,
                 "default_parameters": default_parameters or {},
                 "parameters": parameters or {},
-                "execution_backend": _validate_target_backend(target_type, execution_backend),
+                "run_type": _validate_run_type(run_type, target_type=target_type),
                 "image_spec": image_spec,
                 "step_graph": step_graph,
                 "required_parameters": required_parameters or [],
@@ -2703,10 +3447,69 @@ class Client:
             raise RebaseWorkflowError("expected workflow version response")
         return response
 
+    def get_workflow_schedule(self, workflow_id: str) -> dict[str, Any]:
+        response = self.request("GET", f"/workflows/{workflow_id}/schedule")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected workflow schedule response")
+        return response
+
+    def get_workflow_trigger(self, workflow_id: str) -> dict[str, Any]:
+        response = self.request("GET", f"/workflows/{workflow_id}/trigger")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected workflow trigger response")
+        return response
+
     def get_run(self, run_id: str) -> dict[str, Any]:
         response = self.request("GET", f"/runs/{run_id}")
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected run response")
+        return response
+
+    def cancel_run(self, run_id: str) -> dict[str, Any]:
+        response = self.request("POST", f"/runs/{run_id}/cancel")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected run response")
+        return response
+
+    def get_run_logs(
+        self,
+        run_id: str,
+        *,
+        since: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        params = {key: value for key, value in {"since": since, "limit": limit}.items() if value is not None}
+        response = self.request("GET", f"/runs/{run_id}/logs", params=params or None)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected run logs response")
+        return response
+
+    def get_workspace_notifications(self) -> dict[str, Any]:
+        response = self.request("GET", "/workspace/notifications")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected workspace notification response")
+        return response
+
+    def update_workspace_notifications(
+        self,
+        *,
+        notify_on_failure: bool | None = None,
+        notify_on_stale: bool | None = None,
+        webhook_url: str | None | object = _UNSET,
+        webhook_secret: str | None | object = _UNSET,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if notify_on_failure is not None:
+            payload["notify_on_failure"] = notify_on_failure
+        if notify_on_stale is not None:
+            payload["notify_on_stale"] = notify_on_stale
+        if webhook_url is not _UNSET:
+            payload["webhook_url"] = "" if webhook_url is None else webhook_url
+        if webhook_secret is not _UNSET:
+            payload["webhook_secret"] = "" if webhook_secret is None else webhook_secret
+        response = self.request("PATCH", "/workspace/notifications", json=payload)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected workspace notification response")
         return response
 
     def list_runs(
@@ -2717,6 +3520,10 @@ class Client:
         function_id: str | None = None,
         model_id: str | None = None,
         target_type: str | None = None,
+        since: datetime | str | None = None,
+        until: datetime | str | None = None,
+        status: str | None = None,
+        trigger_source: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         params = {
@@ -2727,6 +3534,10 @@ class Client:
                 "function_id": function_id,
                 "model_id": model_id,
                 "target_type": target_type,
+                "since": since.isoformat() if isinstance(since, datetime) else since,
+                "until": until.isoformat() if isinstance(until, datetime) else until,
+                "status": status,
+                "trigger_source": trigger_source,
                 "limit": limit,
             }.items()
             if value is not None
@@ -2784,6 +3595,7 @@ class Project:
         for workflow in self._workflows:
             workflow._validate_schedule_defaults()
         resolved_deploy_source = _validate_deploy_source(deploy_source)
+        preflight_datasets(self._client)
         project = self._client.ensure_project(
             self.name,
             description=self.description,
@@ -2798,7 +3610,12 @@ class Project:
                 continue  # Steps are deployed automatically via their workflow
             function.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
         for workflow in self._workflows:
-            workflow.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
+            workflow.deploy(
+                replace=replace,
+                deploy_source=resolved_deploy_source,
+                environment=environment,
+                _skip_dataset_preflight=True,
+            )
         for asgi_app in self._asgi_apps:
             asgi_app.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
         return self
@@ -2809,7 +3626,7 @@ class Project:
         name: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
+        run_type: RunType = DEFAULT_RUN_TYPE,
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         min_instances: int | None = None,
@@ -2819,7 +3636,10 @@ class Project:
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
+        backend: str | None = None,
     ) -> Callable[[Callable[..., Any]], Function]:
+        _reject_legacy_backend(backend)
+
         def decorator(fn: Callable[..., Any]) -> Function:
             function = Function(
                 fn,
@@ -2827,7 +3647,7 @@ class Project:
                 project=self.name,
                 description=description,
                 default_parameters=default_parameters,
-                backend=backend,
+                run_type=run_type,
                 dependencies=dependencies,
                 image=image,
                 min_instances=min_instances,
@@ -2856,6 +3676,7 @@ class Project:
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | list[Secret | str] | None = None,
+        volumes: dict[str, Volume | str] | list[dict[str, Any]] | None = None,
         min_instances: int | None = None,
         max_instances: int | None = None,
         concurrency: int | None = None,
@@ -2877,6 +3698,7 @@ class Project:
                 image=image,
                 env=env,
                 secrets=secrets,
+                volumes=volumes,
                 min_instances=min_instances,
                 max_instances=max_instances,
                 concurrency=concurrency,
@@ -2932,8 +3754,9 @@ class Project:
         name: str | None = None,
         description: str | None = None,
         schedule: Schedule | None = None,
+        trigger: Trigger | None = None,
         default_parameters: dict[str, Any] | None = None,
-        backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
+        run_type: RunType = DEFAULT_RUN_TYPE,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
@@ -2942,7 +3765,10 @@ class Project:
         min_instances: int | None = None,
         concurrency: int | None = None,
         resources: dict[str, Any] | None = None,
+        backend: str | None = None,
     ) -> Callable[[Callable[..., Any]], Workflow]:
+        _reject_legacy_backend(backend)
+
         def decorator(fn: Callable[..., Any]) -> Workflow:
             workflow = Workflow(
                 fn,
@@ -2950,8 +3776,9 @@ class Project:
                 project=self.name,
                 description=description,
                 schedule=schedule,
+                trigger=trigger,
                 default_parameters=default_parameters,
-                backend=backend,
+                run_type=run_type,
                 enabled=enabled,
                 endpoint=endpoint,
                 deploy_source=deploy_source if deploy_source is not None else self.deploy_source,
@@ -2983,6 +3810,7 @@ class ASGIApp:
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | list[Secret | str] | None = None,
+        volumes: dict[str, Volume | str] | list[dict[str, Any]] | None = None,
         min_instances: int | None = None,
         max_instances: int | None = None,
         concurrency: int | None = None,
@@ -3006,6 +3834,8 @@ class ASGIApp:
         self.env = dict(env or {})
         # Kept unresolved (Secret handles or an {ENV: ref} map) until deploy needs a client.
         self.secrets = secrets if secrets is not None else {}
+        # Kept unresolved (Volume handles or an attachment list) until deploy needs a client.
+        self.volumes = volumes if volumes is not None else list((data.get("volumes") if data else None) or [])
         self.enabled = enabled
         self.deploy_source = _validate_deploy_source(deploy_source)
         self.project_source_mode = project_source_mode
@@ -3086,6 +3916,7 @@ class ASGIApp:
             raise RebaseWorkflowError("ASGI app name is required")
         source_metadata = self._source_metadata_for_deploy(deploy_source)
         secrets_payload = _resolve_secrets_payload(self.secrets, self._client)
+        volumes_payload = _resolve_volumes_payload(self.volumes, self._client)
         existing = self._client.find_asgi_app(self.name, project=self.project)
         if existing is not None:
             asgi_app = self._client.update_asgi_app(
@@ -3098,6 +3929,7 @@ class ASGIApp:
                 image_spec=self.image_spec,
                 env=self.env,
                 secrets=secrets_payload,
+                volumes=volumes_payload,
                 cloud_run_min_instances=self.cloud_run_min_instances,
                 cloud_run_max_instances=self.cloud_run_max_instances,
                 cloud_run_concurrency=self.cloud_run_concurrency,
@@ -3123,6 +3955,7 @@ class ASGIApp:
             image_spec=self.image_spec,
             env=self.env,
             secrets=secrets_payload,
+            volumes=volumes_payload,
             cloud_run_min_instances=self.cloud_run_min_instances,
             cloud_run_max_instances=self.cloud_run_max_instances,
             cloud_run_concurrency=self.cloud_run_concurrency,
@@ -3147,11 +3980,12 @@ class Function:
         project: str,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND,
+        run_type: RunType = DEFAULT_RUN_TYPE,
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | list[Secret | str] | None = None,
+        volumes: dict[str, Volume | str] | list[dict[str, Any]] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
         cpu: float | int | str | None = None,
@@ -3163,7 +3997,9 @@ class Function:
         client: Client | None = None,
         function_id: str | None = None,
         data: dict[str, Any] | None = None,
+        backend: str | None = None,
     ) -> None:
+        _reject_legacy_backend(backend)
         self.fn = fn
         self.project = project
         self.description = description
@@ -3171,6 +4007,8 @@ class Function:
         self.env = dict(env or (data.get("env") if data else None) or {})
         # Kept unresolved (Secret handles or an {ENV: ref} map) until deploy needs a client.
         self.secrets = secrets if secrets is not None else dict((data.get("secrets") if data else None) or {})
+        # Kept unresolved (Volume handles or an attachment list) until deploy needs a client.
+        self.volumes = volumes if volumes is not None else list((data.get("volumes") if data else None) or [])
         self.endpoint = _coerce_endpoint(endpoint) or _endpoint_for_callable(fn)
         self.client = client
         self.id: str | None = function_id
@@ -3181,9 +4019,7 @@ class Function:
         self.source_code: str | None = None
         self.entrypoint: str | None = None
         self.default_parameters = default_parameters or {}
-        self.execution_backend: FunctionBackend = (
-            data.get("execution_backend", DEFAULT_FUNCTION_BACKEND) if data else DEFAULT_FUNCTION_BACKEND
-        )
+        self.run_type: RunType = (data.get("run_type") or DEFAULT_RUN_TYPE) if data else DEFAULT_RUN_TYPE
         self.image_spec: dict[str, Any] | None = data.get("image_spec") if data else None
         self.image_fingerprint: str | None = data.get("image_fingerprint") if data else None
         self.cloud_run_min_instances: int | None = data.get("cloud_run_min_instances") if data else None
@@ -3200,7 +4036,7 @@ class Function:
             self.name = _target_name(fn, name)
             inferred_defaults = _defaults_for(fn, target="Function")
             self.default_parameters = {**inferred_defaults, **(default_parameters or {})}
-            self.execution_backend = _validate_function_backend(backend)
+            self.run_type = _validate_run_type(run_type)
             self.image_spec = _image_spec_for(image=image, dependencies=dependencies)
             if min_instances is not None and min_instances < 0:
                 raise ValueError("min_instances must be greater than or equal to 0")
@@ -3251,6 +4087,7 @@ class Function:
         name = self.name
         source_metadata = self._source_metadata_for_deploy(deploy_source)
         secrets_payload = _resolve_secrets_payload(self.secrets, self._client)
+        volumes_payload = _resolve_volumes_payload(self.volumes, self._client)
         existing = self._client.find_function(name, project=self.project)
         if existing is not None:
             function = self._client.update_function(
@@ -3259,10 +4096,11 @@ class Function:
                 source_code=self.source_code,
                 entrypoint=self.entrypoint,
                 default_parameters=self.default_parameters,
-                execution_backend=self.execution_backend,
+                run_type=self.run_type,
                 image_spec=self.image_spec,
                 env=self.env,
                 secrets=secrets_payload,
+                volumes=volumes_payload,
                 cloud_run_min_instances=self.cloud_run_min_instances,
                 cloud_run_concurrency=self.cloud_run_concurrency,
                 cloud_run_cpu=self.cloud_run_cpu,
@@ -3283,10 +4121,11 @@ class Function:
             source_code=self.source_code,
             entrypoint=self.entrypoint,
             default_parameters=self.default_parameters,
-            execution_backend=self.execution_backend,
+            run_type=self.run_type,
             image_spec=self.image_spec,
             env=self.env,
             secrets=secrets_payload,
+            volumes=volumes_payload,
             cloud_run_min_instances=self.cloud_run_min_instances,
             cloud_run_concurrency=self.cloud_run_concurrency,
             cloud_run_cpu=self.cloud_run_cpu,
@@ -3396,7 +4235,7 @@ class Function:
             entrypoint=self.entrypoint,
             default_parameters=self.default_parameters,
             parameters=parameters,
-            execution_backend=self.execution_backend,
+            run_type=self.run_type,
             image_spec=self.image_spec,
             cloud_run_min_instances=self.cloud_run_min_instances,
             cloud_run_concurrency=self.cloud_run_concurrency,
@@ -3649,7 +4488,7 @@ class Model(_EmflowModel):
     project: str | None = "default"
     description: str | None = None
     default_parameters: dict[str, Any] | None = None
-    backend: FunctionBackend = DEFAULT_FUNCTION_BACKEND
+    run_type: RunType = DEFAULT_RUN_TYPE
     dependencies: list[str] | tuple[str, ...] | None = None
     image: Image | dict[str, Any] | None = None
     env: dict[str, str] | None = None
@@ -3669,7 +4508,7 @@ class Model(_EmflowModel):
         project: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        backend: FunctionBackend | None = None,
+        run_type: RunType | None = None,
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
@@ -3682,7 +4521,9 @@ class Model(_EmflowModel):
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
         client: Client | None = None,
+        backend: str | None = None,
     ) -> None:
+        _reject_legacy_backend(backend)
         cls = type(self)
         resolved_name = name or getattr(cls, "name", None) or _model_target_name(cls)
         self._init_emflow_base(resolved_name)
@@ -3693,9 +4534,7 @@ class Model(_EmflowModel):
         self.default_parameters: dict[str, Any] = (
             dict(default_parameters) if default_parameters is not None else dict(class_default_parameters or {})
         )
-        self.execution_backend = _validate_function_backend(
-            backend or getattr(cls, "backend", DEFAULT_FUNCTION_BACKEND)
-        )
+        self.run_type = _validate_run_type(run_type or getattr(cls, "run_type", DEFAULT_RUN_TYPE))
         self.dependencies = dependencies if dependencies is not None else getattr(cls, "dependencies", None)
         self.image = image if image is not None else getattr(cls, "image", None)
         self.env = dict(env if env is not None else (getattr(cls, "env", None) or {}))
@@ -3770,7 +4609,7 @@ class Model(_EmflowModel):
             )
             function.source_code = _source_for_model(self, operation_name=operation_name)
             function.entrypoint = operation_name
-            function.execution_backend = self.execution_backend
+            function.run_type = self.run_type
             function.image_spec = _model_image_spec_for(image=self.image, dependencies=self.dependencies)
             function.cloud_run_min_instances = self.cloud_run_min_instances
             function.cloud_run_concurrency = self.cloud_run_concurrency
@@ -3929,7 +4768,7 @@ class Model(_EmflowModel):
                 description=self.description,
                 source_code=function.source_code,
                 default_parameters=function.default_parameters,
-                execution_backend=function.execution_backend,
+                run_type=function.run_type,
                 image_spec=function.image_spec,
                 env=self.env,
                 secrets=secrets_payload,
@@ -3951,7 +4790,7 @@ class Model(_EmflowModel):
                 description=self.description,
                 source_code=function.source_code,
                 default_parameters=function.default_parameters,
-                execution_backend=function.execution_backend,
+                run_type=function.run_type,
                 image_spec=function.image_spec,
                 env=self.env,
                 secrets=secrets_payload,
@@ -4000,7 +4839,7 @@ class Model(_EmflowModel):
             entrypoint=function.entrypoint,
             default_parameters=function.default_parameters,
             parameters=parameters,
-            execution_backend=function.execution_backend,
+            run_type=function.run_type,
             image_spec=function.image_spec,
             cloud_run_min_instances=function.cloud_run_min_instances,
             cloud_run_concurrency=function.cloud_run_concurrency,
@@ -4076,7 +4915,9 @@ class Step(Function):
             project=project,
             description=description,
             default_parameters=default_parameters,
-            backend="prefect",
+            # Steps execute in-flow inside their workflow's Prefect run; the
+            # stored run type is never used for dispatch, so use the default.
+            run_type=DEFAULT_RUN_TYPE,
             dependencies=None,
             image=None,
             min_instances=None,
@@ -4152,8 +4993,9 @@ class Workflow:
         project: str | None = None,
         description: str | None = None,
         schedule: Schedule | None = None,
+        trigger: Trigger | None = None,
         default_parameters: dict[str, Any] | None = None,
-        backend: WorkflowBackend = DEFAULT_WORKFLOW_BACKEND,
+        run_type: RunType = DEFAULT_RUN_TYPE,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
@@ -4166,7 +5008,9 @@ class Workflow:
         min_instances: int | None = None,
         concurrency: int | None = None,
         resources: dict[str, Any] | None = None,
+        backend: str | None = None,
     ) -> None:
+        _reject_legacy_backend(backend)
         self.fn = fn
         self.project = project
         self.description = description
@@ -4185,10 +5029,9 @@ class Workflow:
         self.schedule = (
             _schedule_payload(schedule) if schedule is not None else (data.get("schedule") if data else None)
         )
+        self.trigger = _trigger_payload(trigger) if trigger is not None else (data.get("trigger") if data else None)
         self.default_parameters = default_parameters or {}
-        self.execution_backend: WorkflowBackend = (
-            data.get("execution_backend", DEFAULT_WORKFLOW_BACKEND) if data else DEFAULT_WORKFLOW_BACKEND
-        )
+        self.run_type: RunType = (data.get("run_type") or DEFAULT_RUN_TYPE) if data else DEFAULT_RUN_TYPE
         self.required_parameters: list[str] = list(data.get("required_parameters", [])) if data else []
         self.source_metadata: dict[str, Any] = {}
         self.image_spec: dict[str, Any] | None = None
@@ -4200,10 +5043,12 @@ class Workflow:
             if not isinstance(fn, FunctionType):
                 raise TypeError("Workflow requires a plain Python function")
             self.name = _target_name(fn, name)
-            inferred_defaults = _defaults_for(fn, target="Workflow")
-            self.required_parameters = _required_parameters_for(fn, target="Workflow")
+            inferred_defaults = _defaults_for(fn, target="Workflow", reserved=_RESERVED_WORKFLOW_PARAMETERS)
+            self.required_parameters = _required_parameters_for(
+                fn, target="Workflow", reserved=_RESERVED_WORKFLOW_PARAMETERS
+            )
             self.default_parameters = {**inferred_defaults, **(default_parameters or {})}
-            self.execution_backend = _validate_workflow_backend(backend)
+            self.run_type = _validate_run_type(run_type, target_type="workflow")
             self.source_code = _source_for(fn, target="workflow")
             self.entrypoint = fn.__name__
             self.source_metadata = _git_metadata_for(fn)
@@ -4311,13 +5156,28 @@ class Workflow:
             raise RebaseWorkflowError(
                 f"Scheduled workflows require defaults for every workflow parameter. Missing defaults: {missing}"
             )
+        if self.trigger is not None and self.required_parameters:
+            missing = ", ".join(self.required_parameters)
+            raise RebaseWorkflowError(
+                f"Triggered workflows require defaults for every workflow parameter. Missing defaults: {missing}"
+            )
 
-    def deploy(self, *, replace: bool = False, deploy_source: str | None = None, environment: str = "dev") -> Workflow:
+    def deploy(
+        self,
+        *,
+        replace: bool = False,
+        deploy_source: str | None = None,
+        environment: str = "dev",
+        _skip_dataset_preflight: bool = False,
+    ) -> Workflow:
         if self.source_code is None or self.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy a workflow handle without source_code and entrypoint")
         if self.name is None:
             raise RebaseWorkflowError("workflow name is required")
         self._validate_schedule_defaults()
+        if not _skip_dataset_preflight:
+            # Project.deploy runs the preflight once for all targets.
+            preflight_datasets(self.client)
         name = self.name
         for step in self._collect_steps():
             step._deploy_for_workflow(
@@ -4342,9 +5202,10 @@ class Workflow:
                 entrypoint=self.entrypoint,
                 step_graph=step_graph,
                 schedule=self.schedule,
+                trigger=self.trigger,
                 default_parameters=self.default_parameters,
                 required_parameters=self.required_parameters,
-                execution_backend=self.execution_backend,
+                run_type=self.run_type,
                 enabled=self.enabled,
                 endpoint=self.endpoint,
                 environment=environment,
@@ -4364,9 +5225,10 @@ class Workflow:
             entrypoint=self.entrypoint,
             step_graph=step_graph,
             schedule=self.schedule,
+            trigger=self.trigger,
             default_parameters=self.default_parameters,
             required_parameters=self.required_parameters,
-            execution_backend=self.execution_backend,
+            run_type=self.run_type,
             enabled=self.enabled,
             endpoint=self.endpoint,
             environment=environment,
@@ -4401,7 +5263,7 @@ class Workflow:
             entrypoint=self.entrypoint,
             default_parameters=self.default_parameters,
             parameters=parameters,
-            execution_backend=self.execution_backend,
+            run_type=self.run_type,
             step_graph=self._build_step_graph(ephemeral=True),
             required_parameters=self.required_parameters,
         )
@@ -4427,6 +5289,17 @@ class Run:
 
     def events(self) -> list[dict[str, Any]]:
         return self.client.list_run_events(self.id)
+
+    def logs(self, *, since: str | None = None, limit: int | None = None) -> dict[str, Any]:
+        return self.client.get_run_logs(self.id, since=since, limit=limit)
+
+    def cancel(self) -> dict[str, Any]:
+        self.data = self.client.cancel_run(self.id)
+        return self.data
+
+    def replay(self, *, version: str | None = None, parameters: dict[str, Any] | None = None) -> Run:
+        """Replay this run; see :meth:`Client.replay_run` for the ``version`` semantics."""
+        return self.client.replay_run(self.id, version=version, parameters=parameters)
 
     @property
     def status(self) -> str:

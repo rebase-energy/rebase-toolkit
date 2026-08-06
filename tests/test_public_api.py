@@ -19,6 +19,19 @@ from rebase.client import (
 )
 
 
+def test_timing_and_stitch_are_exported() -> None:
+    from rebase.stitch import Exclude, Layer, StitchError, stitch
+    from rebase.timing import Duration, ForecastWindow
+
+    assert rb.Duration is Duration
+    assert rb.ForecastWindow is ForecastWindow
+    assert rb.Layer is Layer
+    assert rb.Exclude is Exclude
+    assert rb.StitchError is StitchError
+    assert rb.stitch is stitch
+    assert issubclass(rb.StitchError, rb.RebaseWorkflowError)
+
+
 def test_version_is_exported() -> None:
     assert isinstance(rb.__version__, str)
     assert rb.__version__

@@ -130,6 +130,15 @@ def format_bool(value: Any) -> str:
     return "-"
 
 
+def format_schedule(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "-"
+    cron = str(value.get("cron") or "-")
+    if not value.get("active", True):
+        return f"{cron} ⏸"
+    return cron
+
+
 def format_json_summary(value: Any, *, max_length: int = 180) -> str:
     if value is None or value == "":
         return "-"
@@ -342,12 +351,12 @@ class RebaseTuiApp(App[None]):
         functions = self.query_one("#functions-table", DataTable)
         functions.cursor_type = "row"
         functions.zebra_stripes = True
-        functions.add_columns("Name", "Backend", "State", "Version", "Updated", "ID")
+        functions.add_columns("Name", "Run type", "State", "Version", "Updated", "ID")
 
         workflows = self.query_one("#workflows-table", DataTable)
         workflows.cursor_type = "row"
         workflows.zebra_stripes = True
-        workflows.add_columns("Name", "Backend", "State", "Version", "Updated", "ID")
+        workflows.add_columns("Name", "Run type", "State", "Schedule", "Next run", "Version", "Updated", "ID")
 
         runs = self.query_one("#runs-table", DataTable)
         runs.cursor_type = "row"
@@ -489,7 +498,7 @@ class RebaseTuiApp(App[None]):
         for function_id, function in self._function_rows.items():
             functions.add_row(
                 str(function.get("name", "-")),
-                str(function.get("execution_backend", "-")),
+                str(function.get("run_type") or "-"),
                 format_bool(function.get("enabled")),
                 compact_id(function.get("current_version_id")),
                 format_timestamp(function.get("updated_at")),
@@ -502,8 +511,10 @@ class RebaseTuiApp(App[None]):
         for workflow_id, workflow in self._workflow_rows.items():
             workflows.add_row(
                 str(workflow.get("name", "-")),
-                str(workflow.get("execution_backend", "-")),
+                str(workflow.get("run_type") or "-"),
                 format_bool(workflow.get("enabled")),
+                format_schedule(workflow.get("schedule")),
+                format_timestamp(workflow.get("next_run_at")),
                 compact_id(workflow.get("current_version_id")),
                 format_timestamp(workflow.get("updated_at")),
                 compact_id(workflow_id),
@@ -667,7 +678,7 @@ class RebaseTuiApp(App[None]):
     def _render_target_detail(self, target_type: TargetType, target: dict[str, Any]) -> None:
         lines = [
             f"{target_type.title()} {target.get('name', '-')}",
-            f"Project: {self._project_name(target)} | Backend: {target.get('execution_backend', '-')}",
+            f"Project: {self._project_name(target)} | Run type: {target.get('run_type') or '-'}",
             "State: "
             f"{format_bool(target.get('enabled'))} | Current version: {compact_id(target.get('current_version_id'))}",
             f"ID: {target.get('id', '-')}",

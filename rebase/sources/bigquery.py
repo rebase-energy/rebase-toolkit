@@ -118,7 +118,7 @@ class BigQuerySource(DataSource):
     def _read_frame(self, query: str, params: Any | None = None) -> Frame:
         return self._run_query(query, params).to_dataframe()
 
-    def write(self, df: Frame, table: str, *, mode: str = "append") -> WriteResult:
+    def _write(self, df: Frame, table: str, mode: str) -> WriteResult:
         bigquery = optional_module("google.cloud.bigquery", "bigquery")
         client = self._get_client()
         disposition = "WRITE_TRUNCATE" if mode == "replace" else "WRITE_APPEND"

@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from rebase.sources.base import DataSourceError, Frame
+from rebase.sources.base import DataSourceError, Frame, _replay_knowledge_time
 
 VALID_TIME_END_SENTINEL = datetime(2200, 1, 1, tzinfo=UTC)
 
@@ -214,9 +214,14 @@ def series_values_select(
 
     ``QUALIFY`` is supported by BigQuery, Snowflake, and Databricks, so this builder is
     shared across warehouse connectors. Timestamps are bound as named parameters.
+
+    During a replay run, an ``as_of`` the caller did not pass defaults to the replay's
+    knowledge-time bound, so point-in-time reads reproduce what the original run saw.
     """
     if not series_ids:
         raise DataSourceError("series_values_select needs at least one series id")
+    if as_of is None:
+        as_of = _replay_knowledge_time()
     id_list = ", ".join(str(int(series_id)) for series_id in series_ids)
     where = [f"series_id IN ({id_list})"]
     params: dict[str, Any] = {}
