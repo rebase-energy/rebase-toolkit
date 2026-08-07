@@ -829,6 +829,26 @@ def deploy_file(
 
     deployed: list[DeployRow] = []
     if projects:
+        # A file with a top-level Project deploys only what is attached to it.
+        # Anything declared standalone -- rb.function(project="..."), rb.workflow(...)
+        # -- is otherwise dropped in silence, which is how you end up with a
+        # deployed workflow calling a function that was never registered.
+        attached = {
+            id(item)
+            for _, candidate in projects
+            for item in (*candidate._functions, *candidate._workflows, *candidate._asgi_apps)
+        }
+        orphans = sorted(
+            item_name
+            for item_name, item in _unique_named_objects(module, (Workflow, Function, ASGIApp, Model))
+            if not isinstance(item, Step) and id(item) not in attached
+        )
+        if orphans:
+            raise RebaseWorkflowError(
+                f"{', '.join(orphans)} is not attached to a project in this file, so deploying the "
+                "project would skip it. Declare it with the project decorators "
+                "(@project.function(...), @project.workflow(...)) or move it to its own file."
+            )
         for name, project in projects:
             if deploy_source is None:
                 project.deploy(environment=environment)
