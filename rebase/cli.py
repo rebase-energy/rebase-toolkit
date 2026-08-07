@@ -5305,7 +5305,7 @@ def run_replay_command(
 hillclimb_app = typer.Typer(
     add_completion=False,
     cls=AlphabeticalTyperGroup,
-    help="Agentic model searches (rebase-hillclimb) — hosted on the platform or local.",
+    help="Agentic model searches (hillclimb) — hosted on the platform or local.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )

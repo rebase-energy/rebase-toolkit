@@ -68,6 +68,10 @@ uv pip install "rebase-toolkit[hillclimb]"
 uv pip install "rebase-toolkit[all]"
 ```
 
+`[all]` covers every extra except `[snowflake]`: hillclimb requires pandas 3
+and no stable `snowflake-connector-python` allows it yet, so the two cannot
+share an environment. Install `rebase-toolkit[snowflake]` on its own.
+
 ## Configure
 
 ```bash
@@ -216,7 +220,7 @@ result = model.predict.remote(zone="SE4")
 ## Hillclimb Searches
 
 `rebase hillclimb` runs agentic model searches with
-[rebase-hillclimb](https://github.com/rebase-energy/rebase-hillclimb): coding
+[hillclimb](https://github.com/rebase-energy/hillclimb): coding
 agents draft, debug, improve, and ensemble
 [emflow](https://github.com/rebase-energy/emflow) `Predictor` classes; every
 candidate is backtested leakage-safe on the problem's validation split and the

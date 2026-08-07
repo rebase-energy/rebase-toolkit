@@ -35,10 +35,10 @@ huggingface = [
     "huggingface-hub>=1.20.1",
 ]
 modeling = [
-    "emflow",
+    "emflow>=0.3.1,<0.4",
 ]
 hillclimb = [
-    "rebase-hillclimb[emflow]",
+    "hillclimb[emflow]>=0.2,<0.3",
     "google-cloud-storage>=2.14",
 ]
 snowflake = [
@@ -67,13 +67,18 @@ sources = [
     "rebase-toolkit[fabric]",
     "rebase-toolkit[snowflake]",
 ]
+# Every extra except [snowflake]: hillclimb needs pandas>=3 and no stable
+# snowflake-connector-python allows pandas 3 yet, so the two cannot coexist in
+# one environment. Install "rebase-toolkit[snowflake]" separately if you need it.
 all = [
-    "emflow",
+    "emflow>=0.3.1,<0.4",
     "energydatamodel",
     "huggingface-hub>=1.20.1",
-    "rebase-hillclimb[emflow]",
+    "hillclimb[emflow]>=0.2,<0.3",
     "google-cloud-storage>=2.14",
-    "rebase-toolkit[sources]",
+    "rebase-toolkit[bigquery]",
+    "rebase-toolkit[databricks]",
+    "rebase-toolkit[fabric]",
 ]
 
 [dependency-groups]
@@ -82,6 +87,16 @@ dev = [
     "pytest>=8.0.0",
     "ruff>=0.8.0",
     "ty>=0.0.1a19",
+]
+
+# pandas 3 (hillclimb) vs pandas <3 (snowflake-connector-python) cannot coexist,
+# so uv must fork the resolution instead of demanding one graph for every extra.
+[tool.uv]
+conflicts = [
+    [{ extra = "hillclimb" }, { extra = "snowflake" }],
+    [{ extra = "hillclimb" }, { extra = "sources" }],
+    [{ extra = "all" }, { extra = "snowflake" }],
+    [{ extra = "all" }, { extra = "sources" }],
 ]
 
 
