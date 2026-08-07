@@ -126,3 +126,58 @@ class TestDeployRejectsOrphans:
 
         assert deployed == ["acme"]
         assert rows and rows[0][0] == "project"
+
+
+class TestWorkflowSecrets:
+    """Workflows can carry secrets directly, without a function to hold them.
+
+    Schedules exist only on workflows, so before this a scheduled job needing
+    a credential had to be split into a workflow that dispatches to a
+    function purely to borrow its secret mounting.
+    """
+
+    def test_secrets_and_env_reach_the_workflow(self) -> None:
+        project = rb.project("acme")
+
+        @project.workflow(name="nightly", secrets=["acme-creds"], env={"REGION": "eu"})
+        def nightly() -> dict:
+            return {}
+
+        assert nightly.secrets == ["acme-creds"]
+        assert nightly.env == {"REGION": "eu"}
+
+    def test_defaults_stay_empty(self) -> None:
+        project = rb.project("acme")
+
+        @project.workflow(name="nightly")
+        def nightly() -> dict:
+            return {}
+
+        assert nightly.env == {}
+        assert not nightly.secrets
+
+    def test_deploy_sends_resolved_secrets(self, monkeypatch) -> None:
+        """The client resolves bundle names to per-key refs before registering."""
+        project = rb.project("acme")
+
+        @project.workflow(name="nightly", secrets={"TOKEN": "acme-creds:TOKEN"}, env={"REGION": "eu"})
+        def nightly() -> dict:
+            return {}
+
+        sent: dict = {}
+
+        def fake_find_workflow(name, project=None):
+            return None
+
+        def fake_register_workflow(**kwargs):
+            sent.update(kwargs)
+            return {"id": "workflow-id", "name": kwargs.get("name")}
+
+        monkeypatch.setattr(nightly._client, "find_workflow", fake_find_workflow)
+        monkeypatch.setattr(nightly._client, "register_workflow", fake_register_workflow)
+        monkeypatch.setattr(nightly._client, "ensure_project", lambda *a, **k: {"id": "project-id"})
+
+        nightly.deploy()
+
+        assert sent["env"] == {"REGION": "eu"}
+        assert sent["secrets"] == {"TOKEN": "acme-creds:TOKEN"}

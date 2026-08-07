@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`-h` is an alias for `--help`** on every command and subcommand.
+- **Short flags for CLI options**: each option now also answers to `-x`, where `x` is the first
+  letter of its long name — `rebase deploy -n api -e prod`, `rebase workflow list -j`. 235 of 269
+  options got one. The remaining 34 lost the letter to an option declared earlier in the same
+  command (`rebase deploy --sync` has no `-s`, because `--source` took it), and `-h` is reserved
+  for `--help` throughout. Hand-written short flags are unchanged.
+
+### Fixed
+
+- **Unknown options and commands print a usage error again** instead of a Rich traceback, and exit
+  2 rather than 1. typer >= 0.26 vendors its own copy of click, and the vendored exception classes
+  do not subclass the ones in the `click` package, so the CLI's `except click.ClickException`
+  handler never fired for anything typer's parser raised. `Abort` (Ctrl-C at a prompt) was affected
+  the same way.
+
 ## 0.6.0 — 2026-07-07
 
 ### Added

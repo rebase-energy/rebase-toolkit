@@ -137,11 +137,58 @@ console = Console(highlight=False, soft_wrap=True, theme=REBASE_THEME)
 error_console = Console(stderr=True, highlight=False, soft_wrap=True, theme=REBASE_THEME)
 
 
+# Long form first: click uses names[0] in its "Try 'rebase deploy --help' for help." hint.
+HELP_OPTION_NAMES = ["--help", "-h"]
+
+
+def _vendored_click_exception() -> type[BaseException]:
+    """The ``ClickException`` base that typer's own parser actually raises.
+
+    typer >= 0.26 vendors a private copy of click under ``typer._click``, and those exception
+    classes do not subclass the ones in the installed ``click`` package. So ``except
+    click.ClickException`` never fires for anything typer's parser raises: an unknown option
+    escaped ``main()`` entirely and reached typer's Rich excepthook, printing a traceback and
+    exiting 1 instead of showing "Error: No such option: --bogus" and exiting 2.
+
+    ``typer.BadParameter`` is a public re-export of whichever hierarchy is in play, so its MRO
+    is a supported way to reach that base without importing the private module.
+    """
+    for cls in typer.BadParameter.__mro__:
+        if cls.__name__ == "ClickException":
+            return cls
+    return click.ClickException  # pragma: no cover - typer always exposes a ClickException base
+
+
+def _distinct(*classes: type[BaseException]) -> tuple[type[BaseException], ...]:
+    """Exception classes with duplicates dropped, so ``except`` tuples stay valid if they merge."""
+    return tuple(dict.fromkeys(classes))
+
+
+# Both hierarchies, because typer may or may not be using its vendored click (see above).
+CLICK_EXCEPTIONS = _distinct(click.ClickException, _vendored_click_exception())
+ABORT_EXCEPTIONS = _distinct(click.Abort, typer.Abort)
+EXIT_EXCEPTIONS = _distinct(click.exceptions.Exit, typer.Exit)
+
+
 class AlphabeticalTyperGroup(TyperGroup):
-    def __init__(self, *args: Any, commands: dict[str, click.Command] | None = None, **kwargs: Any) -> None:
+    """Group that lists subcommands alphabetically and answers to ``-h`` as well as ``--help``.
+
+    Click only registers ``--help`` by default. Setting ``help_option_names`` here covers every
+    command in the tree, not just the groups: a click ``Context`` inherits ``help_option_names``
+    from its parent, so leaf commands under any of these groups pick ``-h`` up for free.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        commands: dict[str, click.Command] | None = None,
+        context_settings: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
         if commands is not None:
             commands = dict(sorted(commands.items(), key=lambda item: item[0]))
-        super().__init__(*args, commands=commands, **kwargs)
+        context_settings = {"help_option_names": HELP_OPTION_NAMES, **(context_settings or {})}
+        super().__init__(*args, commands=commands, context_settings=context_settings, **kwargs)
 
 
 app = typer.Typer(
@@ -283,14 +330,15 @@ def _print_run_help() -> None:
     options.add_row("--param, -p", "Target parameter as name=json_value. Can be passed more than once.")
     options.add_row("--parameters-json", "JSON object with target parameters.")
     options.add_row(
-        "--run-type",
+        "--run-type, -r",
         "Override the run type for this ephemeral run: quick, quick_shared (functions only), or long.",
     )
     options.add_row("--module, -m", "Interpret the target source as a Python module path instead of a file.")
-    options.add_row("--wait / --no-wait", "Wait for the function result before exiting. Defaults to --wait.")
-    options.add_row("--timeout", "Maximum seconds to wait for the result. Defaults to 600.")
+    options.add_row("--wait / --no-wait, -w", "Wait for the function result before exiting. Defaults to --wait.")
+    options.add_row("--timeout, -t", "Maximum seconds to wait for the result. Defaults to 600.")
     options.add_row("--poll-interval", "Seconds between run status polls. Defaults to 1.0.")
-    options.add_row("--help", "Show this message and exit.")
+    options.add_row("--local, -l", "Execute the target in this process instead of submitting a cloud run.")
+    options.add_row("--help, -h", "Show this message and exit.")
     console.print(options)
 
     commands = Table(title="Inspection Commands", box=box.SIMPLE)
@@ -1855,12 +1903,13 @@ def _project_name_map(projects: list[dict[str, Any]]) -> dict[str, str]:
 
 @app.command("setup")
 def setup_command(
-    profile: Annotated[str, typer.Option("--profile", help="Credential profile name.")] = DEFAULT_PROFILE,
+    profile: Annotated[str, typer.Option("--profile", "-p", help="Credential profile name.")] = DEFAULT_PROFILE,
     api_key: Annotated[str | None, typer.Option("--api-key", hidden=True)] = None,
     api_url: Annotated[
         str | None,
         typer.Option(
             "--api-url",
+            "-a",
             help="Rebase API URL to store for this profile. Useful for local development with port-forwarding.",
         ),
     ] = None,
@@ -1868,24 +1917,27 @@ def setup_command(
         bool,
         typer.Option(
             "--verify/--no-verify",
+            "-v",
             help="Verify an API key against the hosted Rebase API before saving it.",
         ),
     ] = True,
     provider: Annotated[str | None, typer.Option("--provider", help="Supabase social auth provider.")] = None,
     force_auth: Annotated[
         bool,
-        typer.Option("--force-auth", help="Ignore any stored Supabase session and authenticate again."),
+        typer.Option("--force-auth", "-f", help="Ignore any stored Supabase session and authenticate again."),
     ] = False,
-    callback_port: Annotated[int, typer.Option("--callback-port", help="Local Supabase OAuth callback port.")] = 17658,
+    callback_port: Annotated[
+        int, typer.Option("--callback-port", "-c", help="Local Supabase OAuth callback port.")
+    ] = 17658,
     auth_timeout: Annotated[
         float,
         typer.Option("--auth-timeout", help="Seconds to wait for Supabase auth callback."),
     ] = 300,
     no_browser: Annotated[
         bool,
-        typer.Option("--no-browser", help="Print auth URLs instead of opening the browser."),
+        typer.Option("--no-browser", "-n", help="Print auth URLs instead of opening the browser."),
     ] = False,
-    workspace: Annotated[str | None, typer.Option("--workspace", help="Workspace id to use or create.")] = None,
+    workspace: Annotated[str | None, typer.Option("--workspace", "-w", help="Workspace id to use or create.")] = None,
     workspace_name: Annotated[
         str | None,
         typer.Option("--workspace-name", help="Workspace display name when creating a workspace."),
@@ -1942,11 +1994,11 @@ def setup_command(
 def tui_command(
     project: Annotated[
         str | None,
-        typer.Option("--project", help="Filter functions and workflows by project name."),
+        typer.Option("--project", "-p", help="Filter functions and workflows by project name."),
     ] = None,
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, max=500, help="Maximum latest runs to load per selected target."),
+        typer.Option("--limit", "-l", min=1, max=500, help="Maximum latest runs to load per selected target."),
     ] = 25,
 ) -> None:
     """Open the Rebase terminal UI."""
@@ -2010,7 +2062,7 @@ def profile_command(ctx: typer.Context) -> None:
 
 @profile_app.command("list")
 def profile_list_command(
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List local Rebase CLI profiles."""
     data = _profile_list_data()
@@ -2030,7 +2082,7 @@ def profile_list_command(
 @profile_app.command("show")
 def profile_show_command(
     profile: Annotated[str | None, typer.Argument(help="Profile name. Defaults to the active profile.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show one local Rebase CLI profile."""
     _show_profile(profile, json_output=json_output)
@@ -2081,17 +2133,18 @@ def workspace_create_command(
         str | None,
         typer.Argument(help="Workspace handle to create."),
     ] = None,
-    profile: Annotated[str, typer.Option("--profile", help="Credential profile name.")] = DEFAULT_PROFILE,
+    profile: Annotated[str, typer.Option("--profile", "-p", help="Credential profile name.")] = DEFAULT_PROFILE,
     api_url: Annotated[
         str | None,
         typer.Option(
             "--api-url",
+            "-a",
             help="Rebase API URL to store for this profile. Useful for local development with port-forwarding.",
         ),
     ] = None,
     workspace_name: Annotated[
         str | None,
-        typer.Option("--workspace-name", help="Workspace display name."),
+        typer.Option("--workspace-name", "-w", help="Workspace display name."),
     ] = None,
     handle: Annotated[
         str | None,
@@ -2100,16 +2153,18 @@ def workspace_create_command(
     provider: Annotated[str | None, typer.Option("--provider", help="Supabase social auth provider.")] = None,
     force_auth: Annotated[
         bool,
-        typer.Option("--force-auth", help="Ignore any stored Supabase session and authenticate again."),
+        typer.Option("--force-auth", "-f", help="Ignore any stored Supabase session and authenticate again."),
     ] = False,
-    callback_port: Annotated[int, typer.Option("--callback-port", help="Local Supabase OAuth callback port.")] = 17658,
+    callback_port: Annotated[
+        int, typer.Option("--callback-port", "-c", help="Local Supabase OAuth callback port.")
+    ] = 17658,
     auth_timeout: Annotated[
         float,
         typer.Option("--auth-timeout", help="Seconds to wait for Supabase auth callback."),
     ] = 300,
     no_browser: Annotated[
         bool,
-        typer.Option("--no-browser", help="Print auth URLs instead of opening the browser."),
+        typer.Option("--no-browser", "-n", help="Print auth URLs instead of opening the browser."),
     ] = False,
 ) -> None:
     """Create a workspace and save it as a local profile."""
@@ -2204,11 +2259,11 @@ def workspace_invite_command(
         str | None,
         typer.Argument(help="Email address or GitHub username to invite."),
     ] = None,
-    email: Annotated[str | None, typer.Option("--email", help="Email address to invite.")] = None,
-    github_username: Annotated[str | None, typer.Option("--github", help="GitHub username to invite.")] = None,
+    email: Annotated[str | None, typer.Option("--email", "-e", help="Email address to invite.")] = None,
+    github_username: Annotated[str | None, typer.Option("--github", "-g", help="GitHub username to invite.")] = None,
     role: Annotated[
         str,
-        typer.Option("--role", help="Workspace role: Viewer, Developer, Admin, or Owner."),
+        typer.Option("--role", "-r", help="Workspace role: Viewer, Developer, Admin, or Owner."),
     ] = "Viewer",
 ) -> None:
     """Invite a person to the active workspace."""
@@ -2239,9 +2294,9 @@ def workspace_set_role_command(
     ],
     role: Annotated[
         str,
-        typer.Option("--role", help="Workspace role: Viewer, Developer, Admin, or Owner."),
+        typer.Option("--role", "-r", help="Workspace role: Viewer, Developer, Admin, or Owner."),
     ],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Change an existing workspace member's role.
 
@@ -2265,7 +2320,7 @@ def workspace_set_role_command(
 
 @workspace_app.command("members")
 def workspace_members_command(
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List active workspace members and pending invites."""
     client = Client()
@@ -2279,7 +2334,7 @@ def workspace_members_command(
 
 @workspace_app.command("usage")
 def workspace_usage_command(
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show monthly compute credits for the active workspace."""
     usage = Client().get_workspace_usage()
@@ -2309,7 +2364,7 @@ NOTIFICATION_DETAIL_KEYS = [
 
 @notifications_app.command("show")
 def workspace_notifications_show_command(
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show the workspace's failure notification settings."""
     policy = Client().get_workspace_notifications()
@@ -2322,7 +2377,7 @@ def workspace_notifications_show_command(
 @notifications_app.command("set")
 def workspace_notifications_set_command(
     webhook_url: Annotated[
-        str | None, typer.Option("--webhook-url", help="HTTPS URL that receives run.failed webhooks.")
+        str | None, typer.Option("--webhook-url", "-w", help="HTTPS URL that receives run.failed webhooks.")
     ] = None,
     webhook_secret: Annotated[
         str | None,
@@ -2330,16 +2385,16 @@ def workspace_notifications_set_command(
     ] = None,
     on_failure: Annotated[
         bool | None,
-        typer.Option("--on-failure/--no-on-failure", help="Enable or disable run failure notifications."),
+        typer.Option("--on-failure/--no-on-failure", "-o", help="Enable or disable run failure notifications."),
     ] = None,
     on_stale: Annotated[
         bool | None,
         typer.Option("--on-stale/--no-on-stale", help="Enable or disable stale dataset notifications."),
     ] = None,
     clear_webhook: Annotated[
-        bool, typer.Option("--clear-webhook", help="Remove the stored webhook URL and secret.")
+        bool, typer.Option("--clear-webhook", "-c", help="Remove the stored webhook URL and secret.")
     ] = False,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Update the workspace's failure notification settings."""
     if clear_webhook and (webhook_url is not None or webhook_secret is not None):
@@ -2373,7 +2428,7 @@ workspace_app.add_typer(notifications_app, name="notifications")
 
 @environment_app.command("list")
 def environment_list_command(
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List deployment environment policies for the active workspace."""
     policies = Client().list_environment_policies()
@@ -2390,10 +2445,11 @@ def environment_protect_command(
         list[str] | None,
         typer.Option(
             "--allowed-branch",
+            "-a",
             help="Branch allowed for GitOps reconciliation. Can be passed more than once.",
         ),
     ] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Require GitOps for an environment."""
     policy = Client().update_environment_policy(
@@ -2409,7 +2465,7 @@ def environment_protect_command(
 @environment_app.command("unprotect")
 def environment_unprotect_command(
     environment: Annotated[str, typer.Argument(help="Environment to allow direct deploys for.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Allow direct deploys for an environment."""
     policy = Client().update_environment_policy(
@@ -2431,22 +2487,23 @@ app.add_typer(environment_app, name="environment")
 def connect_github_command(
     profile: Annotated[
         str | None,
-        typer.Option("--profile", help="Credential profile name. Defaults to the active workspace profile."),
+        typer.Option("--profile", "-p", help="Credential profile name. Defaults to the active workspace profile."),
     ] = None,
     api_url: Annotated[
         str | None,
         typer.Option(
             "--api-url",
+            "-a",
             help="Rebase API URL to use for this connection. Useful for local development with port-forwarding.",
         ),
     ] = None,
     no_browser: Annotated[
         bool,
-        typer.Option("--no-browser", help="Print GitHub URLs instead of opening the browser."),
+        typer.Option("--no-browser", "-n", help="Print GitHub URLs instead of opening the browser."),
     ] = False,
     github_installation_id: Annotated[
         int | None,
-        typer.Option("--github-installation-id", help="Existing GitHub App installation id."),
+        typer.Option("--github-installation-id", "-g", help="Existing GitHub App installation id."),
     ] = None,
     github_timeout: Annotated[
         float,
@@ -2458,7 +2515,7 @@ def connect_github_command(
     ] = 1.0,
     repo: Annotated[
         str | None,
-        typer.Option("--repo", help="GitHub repository full name, for example owner/name."),
+        typer.Option("--repo", "-r", help="GitHub repository full name, for example owner/name."),
     ] = None,
     repo_path: Annotated[
         str | None,
@@ -2466,7 +2523,7 @@ def connect_github_command(
     ] = None,
     create_repo: Annotated[
         bool,
-        typer.Option("--create-repo", help="Open GitHub to create a repository before installing the app."),
+        typer.Option("--create-repo", "-c", help="Open GitHub to create a repository before installing the app."),
     ] = False,
 ) -> None:
     """Connect and verify workspace-level GitHub source backing."""
@@ -2502,13 +2559,13 @@ def connect_gitlab_command(
         typer.Option("--token", "-t", help="GitLab access token. Falls back to $GITLAB_ACCESS_TOKEN, then a prompt."),
     ] = None,
     host: Annotated[str, typer.Option("--host", help="GitLab host; self-managed instances supported.")] = "gitlab.com",
-    scope: Annotated[str, typer.Option("--scope", help="Connection scope: workspace or project.")] = "workspace",
-    project: Annotated[str | None, typer.Option("--project", help="Rebase project name (scope=project).")] = None,
+    scope: Annotated[str, typer.Option("--scope", "-s", help="Connection scope: workspace or project.")] = "workspace",
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Rebase project name (scope=project).")] = None,
     repo_path: Annotated[
-        str | None, typer.Option("--repo-path", help="Folder inside the repo, e.g. projects/x.")
+        str | None, typer.Option("--repo-path", "-r", help="Folder inside the repo, e.g. projects/x.")
     ] = None,
-    branch: Annotated[str | None, typer.Option("--branch", help="Default branch override.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    branch: Annotated[str | None, typer.Option("--branch", "-b", help="Default branch override.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Connect a GitLab repository with an access token.
 
@@ -2567,11 +2624,12 @@ def connect_gitlab_command(
 
 @connect_app.command("huggingface")
 def connect_huggingface_command(
-    profile: Annotated[str, typer.Option("--profile", help="Credential profile name.")] = DEFAULT_PROFILE,
+    profile: Annotated[str, typer.Option("--profile", "-p", help="Credential profile name.")] = DEFAULT_PROFILE,
     api_url: Annotated[
         str | None,
         typer.Option(
             "--api-url",
+            "-a",
             help="Rebase API URL to read setup configuration from. Useful for local development.",
         ),
     ] = None,
@@ -2579,20 +2637,23 @@ def connect_huggingface_command(
         str | None,
         typer.Option(
             "--client-id",
+            "-c",
             help="Hugging Face public OAuth app client id. Defaults to REBASE_HUGGINGFACE_OAUTH_CLIENT_ID.",
         ),
     ] = None,
     scope: Annotated[
         list[str] | None,
-        typer.Option("--scope", help="Hugging Face OAuth scope. Repeat to override the default publish scopes."),
+        typer.Option("--scope", "-s", help="Hugging Face OAuth scope. Repeat to override the default publish scopes."),
     ] = None,
     no_browser: Annotated[
         bool,
-        typer.Option("--no-browser", help="Print the Hugging Face authorization URL instead of opening a browser."),
+        typer.Option(
+            "--no-browser", "-n", help="Print the Hugging Face authorization URL instead of opening a browser."
+        ),
     ] = False,
     timeout: Annotated[
         float,
-        typer.Option("--timeout", help="Seconds to wait for Hugging Face authorization."),
+        typer.Option("--timeout", "-t", help="Seconds to wait for Hugging Face authorization."),
     ] = 900,
     poll_interval: Annotated[
         float | None,
@@ -2649,10 +2710,10 @@ def secret_create_command(
     ] = None,
     from_dotenv: Annotated[
         str | None,
-        typer.Option("--from-dotenv", help="Read KEY=value pairs from a dotenv file."),
+        typer.Option("--from-dotenv", "-f", help="Read KEY=value pairs from a dotenv file."),
     ] = None,
     force: Annotated[bool, typer.Option("--force", help="Overwrite the bundle if it already exists.")] = False,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Create a workspace secret bundle: a named set of environment variables.
 
@@ -2687,7 +2748,7 @@ def secret_create_command(
 
 @secret_app.command("list")
 def secret_list_command(
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List workspace secret bundles and their env keys (never values)."""
     secrets = Client().list_secrets()
@@ -2705,7 +2766,7 @@ def secret_list_command(
 @secret_app.command("delete")
 def secret_delete_command(
     name: Annotated[str, typer.Argument(help="Bundle name to delete.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Delete a workspace secret bundle and all of its keys."""
     deleted = Client().delete_secret(name)
@@ -2729,7 +2790,7 @@ VOLUME_DETAIL_KEYS = ["name", "provider", "bucket", "prefix", "workspace_id", "c
 @volume_app.command("create")
 def volume_create_command(
     name: Annotated[str, typer.Argument(help="Volume name (lowercase letters, digits, '.', '_', '-').")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Create a volume (idempotent: returns the existing one if present)."""
     volume = Client().create_volume(name)
@@ -2741,7 +2802,7 @@ def volume_create_command(
 
 @volume_app.command("list")
 def volume_list_command(
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List volumes in the active workspace."""
     volumes = Client().list_volumes()
@@ -2773,7 +2834,7 @@ def volume_list_command(
 @volume_app.command("get")
 def volume_get_command(
     name: Annotated[str, typer.Argument(help="Volume name.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show volume metadata."""
     volume = Client().get_volume(name)
@@ -2787,7 +2848,7 @@ def volume_get_command(
 def volume_ls_command(
     name: Annotated[str, typer.Argument(help="Volume name.")],
     path: Annotated[str, typer.Argument(help="Path prefix inside the volume.")] = "",
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List files in a volume."""
     objects = Client().list_volume_objects(name, prefix=path)
@@ -2876,7 +2937,7 @@ def volume_rm_command(
 @volume_app.command("delete")
 def volume_delete_command(
     name: Annotated[str, typer.Argument(help="Volume name.")],
-    force: Annotated[bool, typer.Option("--force", help="Skip the confirmation prompt.")] = False,
+    force: Annotated[bool, typer.Option("--force", "-f", help="Skip the confirmation prompt.")] = False,
 ) -> None:
     """Delete a volume and every file stored in it."""
     if not force and not typer.confirm(f"Delete volume {name} and ALL of its files?"):
@@ -2931,8 +2992,8 @@ def _last_validation_label(dataset: dict[str, Any]) -> str:
 @dataset_app.command("create")
 def dataset_create_command(
     name: Annotated[str, typer.Argument(help="Dataset name, e.g. 'nordpool/prices'.")],
-    description: Annotated[str | None, typer.Option("--description", help="Human-readable description.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    description: Annotated[str | None, typer.Option("--description", "-d", help="Human-readable description.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Create a dataset (idempotent: returns the existing one if present)."""
     dataset = Client().create_dataset(name, description=description)
@@ -2944,7 +3005,7 @@ def dataset_create_command(
 
 @dataset_app.command("list")
 def dataset_list_command(
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List datasets in the active workspace."""
     datasets = Client().list_datasets()
@@ -2978,7 +3039,7 @@ def dataset_list_command(
 @dataset_app.command("get")
 def dataset_get_command(
     name: Annotated[str, typer.Argument(help="Dataset name.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show dataset metadata, including its current watermark."""
     dataset = Client().get_dataset(name)
@@ -2991,7 +3052,7 @@ def dataset_get_command(
 @dataset_app.command("delete")
 def dataset_delete_command(
     name: Annotated[str, typer.Argument(help="Dataset name.")],
-    yes: Annotated[bool, typer.Option("--yes", help="Skip the confirmation prompt.")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
 ) -> None:
     """Delete a dataset (fails while workflow triggers still watch it)."""
     if not yes and not typer.confirm(f"Delete dataset {name}?"):
@@ -3005,9 +3066,9 @@ def dataset_signal_command(
     name: Annotated[str, typer.Argument(help="Dataset name.")],
     watermark: Annotated[
         str | None,
-        typer.Option("--watermark", help="New watermark as JSON (falls back to a raw string)."),
+        typer.Option("--watermark", "-w", help="New watermark as JSON (falls back to a raw string)."),
     ] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Signal that fresh data landed, firing any listening on-update triggers."""
     parsed: Any = None
@@ -3031,7 +3092,7 @@ def dataset_signal_command(
 @dataset_app.command("listeners")
 def dataset_listeners_command(
     name: Annotated[str, typer.Argument(help="Dataset name.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List workflows whose triggers watch this dataset."""
     listeners = Client().list_dataset_listeners(name)
@@ -3049,7 +3110,7 @@ def dataset_listeners_command(
 def dataset_validate_command(
     name: Annotated[str, typer.Argument(help="Dataset name.")],
     file: Annotated[str, typer.Argument(help="Local .parquet or .csv file to validate.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Validate a local file against the dataset's stored contract (exit code 1 on failure)."""
     try:
@@ -3174,7 +3235,7 @@ def _render_dataset_config_rows(rows: list[tuple[str, str, str, str]], *, title:
 @dataset_app.command("check")
 def dataset_check_command(
     file: Annotated[str, typer.Argument(help="Python file declaring rb.Dataset configs (imported, not run).")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Diff in-code dataset contracts/freshness against the platform (CI gate; exit 1 on drift)."""
     datasets = _collect_declared_datasets(file)
@@ -3193,7 +3254,7 @@ def dataset_check_command(
 def dataset_sync_command(
     file: Annotated[str, typer.Argument(help="Python file declaring rb.Dataset configs (imported, not run).")],
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Apply without confirmation.")] = False,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Publish in-code dataset contracts/freshness to the platform (diff, confirm, apply)."""
     client = Client()
@@ -3238,15 +3299,19 @@ FRESHNESS_DETAIL_KEYS = ["name", "freshness", "freshness_status", "stale_since",
 @freshness_app.command("set")
 def dataset_freshness_set_command(
     name: Annotated[str, typer.Argument(help="Dataset name.")],
-    max_age: Annotated[str, typer.Option("--max-age", help="Maximum age before the dataset is stale, e.g. '45m'.")],
+    max_age: Annotated[
+        str, typer.Option("--max-age", "-m", help="Maximum age before the dataset is stale, e.g. '45m'.")
+    ],
     check_at: Annotated[
         str | None,
-        typer.Option("--check-at", help="Optional five-field cron expression for when to check, e.g. '15 9 * * *'."),
+        typer.Option(
+            "--check-at", "-c", help="Optional five-field cron expression for when to check, e.g. '15 9 * * *'."
+        ),
     ] = None,
     timezone: Annotated[
-        str | None, typer.Option("--timezone", help="IANA timezone for --check-at, e.g. 'Europe/Stockholm'.")
+        str | None, typer.Option("--timezone", "-t", help="IANA timezone for --check-at, e.g. 'Europe/Stockholm'.")
     ] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Set the dataset's freshness policy."""
     cron = Cron(check_at, timezone=timezone) if check_at is not None else None
@@ -3261,7 +3326,7 @@ def dataset_freshness_set_command(
 @freshness_app.command("show")
 def dataset_freshness_show_command(
     name: Annotated[str, typer.Argument(help="Dataset name.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show the dataset's freshness policy and current status."""
     dataset = Client().get_dataset(name)
@@ -3314,7 +3379,7 @@ def _contract_constraints_label(prop: dict[str, Any]) -> str:
 @contract_app.command("show")
 def dataset_contract_show_command(
     name: Annotated[str, typer.Argument(help="Dataset name.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show the dataset's stored contract: columns and table-level policies."""
     from rebase.contract import _property_dtype_label
@@ -3357,7 +3422,7 @@ def dataset_contract_show_command(
 @contract_app.command("clear")
 def dataset_contract_clear_command(
     name: Annotated[str, typer.Argument(help="Dataset name.")],
-    yes: Annotated[bool, typer.Option("--yes", help="Skip the confirmation prompt.")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
 ) -> None:
     """Remove the dataset's contract."""
     if not yes and not typer.confirm(f"Clear the contract on dataset {name}?"):
@@ -3377,7 +3442,7 @@ app.add_typer(dataset_app, name="dataset")
 
 @api_key_app.command("list")
 def api_key_list_command(
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List workspace API keys."""
     api_keys = Client().list_api_keys()
@@ -3390,7 +3455,7 @@ def api_key_list_command(
 @api_key_app.command("create")
 def api_key_create_command(
     name: Annotated[str, typer.Argument(help="Operator-facing API key name.")],
-    project: Annotated[str | None, typer.Option("--project", help="Scope the key to a project name.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Scope the key to a project name.")] = None,
     project_id: Annotated[
         str | None,
         typer.Option("--project-id", help="Scope the key to an exact project ID."),
@@ -3399,8 +3464,10 @@ def api_key_create_command(
         list[str] | None,
         typer.Option("--permission", help="Permission to grant. Repeat to override the read-only agent preset."),
     ] = None,
-    expires_at: Annotated[str | None, typer.Option("--expires-at", help="ISO datetime when the key expires.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    expires_at: Annotated[
+        str | None, typer.Option("--expires-at", "-e", help="ISO datetime when the key expires.")
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Create a workspace API key."""
     if project is not None and project_id is not None:
@@ -3445,7 +3512,7 @@ def api_key_create_command(
 @api_key_app.command("revoke")
 def api_key_revoke_command(
     selector: Annotated[str, typer.Argument(help="API key id, key prefix, or unique name.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Revoke a workspace API key."""
     client = Client()
@@ -3475,9 +3542,9 @@ app.add_typer(api_key_app, name="api-key")
 
 @endpoint_app.command("list")
 def endpoint_list_command(
-    project: Annotated[str | None, typer.Option("--project", help="Filter by project name.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Filter by project name.")] = None,
     project_id: Annotated[str | None, typer.Option("--project-id", help="Filter by exact project ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List workspace endpoints."""
     if project is not None and project_id is not None:
@@ -3497,7 +3564,7 @@ def endpoint_list_command(
 @endpoint_app.command("get")
 def endpoint_get_command(
     selector: Annotated[str, typer.Argument(help="Endpoint id, name, path, or project/name.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Inspect an endpoint."""
     client = Client()
@@ -3531,7 +3598,7 @@ def endpoint_get_command(
 @endpoint_app.command("invoke")
 def endpoint_invoke_command(
     selector: Annotated[str, typer.Argument(help="Endpoint id, name, path, or project/name.")],
-    json_body: Annotated[str | None, typer.Option("--json", help="JSON object to send to the endpoint.")] = None,
+    json_body: Annotated[str | None, typer.Option("--json", "-j", help="JSON object to send to the endpoint.")] = None,
     parameter: Annotated[
         list[str] | None,
         typer.Option("--param", "-p", help="Endpoint parameter as name=json_value. Can be repeated."),
@@ -3548,7 +3615,7 @@ def endpoint_invoke_command(
 @endpoint_app.command("disable")
 def endpoint_disable_command(
     selector: Annotated[str, typer.Argument(help="Endpoint id, name, path, or project/name.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Disable an endpoint."""
     client = Client()
@@ -3569,7 +3636,7 @@ def endpoint_disable_command(
 @endpoint_app.command("versions")
 def endpoint_versions_command(
     selector: Annotated[str, typer.Argument(help="Endpoint id, name, path, or project/name.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List endpoint versions."""
     client = Client()
@@ -3586,7 +3653,7 @@ app.add_typer(endpoint_app, name="endpoint")
 
 @project_app.command("list")
 def project_list_command(
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List projects in the active workspace."""
     client = Client()
@@ -3603,8 +3670,8 @@ def project_get_command(
         str | None,
         typer.Argument(help="Project name. Omit when using --id."),
     ] = None,
-    project_id: Annotated[str | None, typer.Option("--id", help="Exact project ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact project ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show project metadata."""
     client = Client()
@@ -3638,10 +3705,10 @@ def project_delete_command(
         str | None,
         typer.Argument(help="Project name. Omit when using --id."),
     ] = None,
-    project_id: Annotated[str | None, typer.Option("--id", help="Exact project ID.")] = None,
+    project_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact project ID.")] = None,
     force: Annotated[
         bool,
-        typer.Option("--force", help="Also delete the project's contents and run history."),
+        typer.Option("--force", "-f", help="Also delete the project's contents and run history."),
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
 ) -> None:
@@ -3665,8 +3732,8 @@ app.add_typer(project_app, name="project")
 
 @function_app.command("list")
 def function_list_command(
-    project: Annotated[str | None, typer.Option("--project", help="Filter by project name.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Filter by project name.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List functions in the active workspace."""
     client = Client()
@@ -3689,9 +3756,9 @@ def function_get_command(
         str | None,
         typer.Argument(help="Function name. Omit when using --id."),
     ] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    function_id: Annotated[str | None, typer.Option("--id", help="Exact function ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    function_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact function ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show function metadata."""
     client = Client()
@@ -3735,9 +3802,9 @@ def function_versions_command(
         str | None,
         typer.Argument(help="Function name. Omit when using --id."),
     ] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    function_id: Annotated[str | None, typer.Option("--id", help="Exact function ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    function_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact function ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List versions for a function."""
     client = Client()
@@ -3755,11 +3822,11 @@ def function_delete_command(
         str | None,
         typer.Argument(help="Function name. Omit when using --id."),
     ] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    function_id: Annotated[str | None, typer.Option("--id", help="Exact function ID.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    function_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact function ID.")] = None,
     force: Annotated[
         bool,
-        typer.Option("--force", help="Also delete its endpoints and run history."),
+        typer.Option("--force", "-f", help="Also delete its endpoints and run history."),
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
 ) -> None:
@@ -3782,8 +3849,8 @@ app.add_typer(function_app, name="function")
 
 @workflow_app.command("list")
 def workflow_list_command(
-    project: Annotated[str | None, typer.Option("--project", help="Filter by project name.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Filter by project name.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List workflows in the active workspace."""
     client = Client()
@@ -3806,9 +3873,9 @@ def workflow_get_command(
         str | None,
         typer.Argument(help="Workflow name. Omit when using --id."),
     ] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show workflow metadata."""
     client = Client()
@@ -3846,9 +3913,9 @@ def workflow_versions_command(
         str | None,
         typer.Argument(help="Workflow name. Omit when using --id."),
     ] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List versions for a workflow."""
     client = Client()
@@ -3919,9 +3986,9 @@ def _set_schedule_active(
 @schedule_app.command("show")
 def workflow_schedule_show_command(
     name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show a workflow's schedule and next run time."""
     client = Client()
@@ -3943,15 +4010,17 @@ def workflow_schedule_show_command(
 @schedule_app.command("set")
 def workflow_schedule_set_command(
     name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
-    cron: Annotated[str, typer.Option("--cron", help='Five-field cron expression, e.g. "0 * * * *".')] = "",
-    timezone: Annotated[str | None, typer.Option("--timezone", help="IANA timezone, e.g. Europe/Stockholm.")] = None,
+    cron: Annotated[str, typer.Option("--cron", "-c", help='Five-field cron expression, e.g. "0 * * * *".')] = "",
+    timezone: Annotated[
+        str | None, typer.Option("--timezone", "-t", help="IANA timezone, e.g. Europe/Stockholm.")
+    ] = None,
     day_and: Annotated[
-        bool, typer.Option("--day-and", help="Require day-of-month AND day-of-week to match (default OR).")
+        bool, typer.Option("--day-and", "-d", help="Require day-of-month AND day-of-week to match (default OR).")
     ] = False,
-    inactive: Annotated[bool, typer.Option("--inactive", help="Register the schedule paused.")] = False,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    inactive: Annotated[bool, typer.Option("--inactive", "-i", help="Register the schedule paused.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
     workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Set or replace a workflow's cron schedule."""
     if not cron.strip():
@@ -3975,8 +4044,8 @@ def workflow_schedule_set_command(
 @schedule_app.command("clear")
 def workflow_schedule_clear_command(
     name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
 ) -> None:
     """Remove a workflow's schedule."""
     client = Client()
@@ -3989,9 +4058,9 @@ def workflow_schedule_clear_command(
 @schedule_app.command("pause")
 def workflow_schedule_pause_command(
     name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Pause a schedule (keeps it registered; no runs fire)."""
     _set_schedule_active(name, project, workflow_id, json_output, active=False)
@@ -4000,9 +4069,9 @@ def workflow_schedule_pause_command(
 @schedule_app.command("resume")
 def workflow_schedule_resume_command(
     name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Resume a paused schedule."""
     _set_schedule_active(name, project, workflow_id, json_output, active=True)
@@ -4018,11 +4087,11 @@ def workflow_schedule_trigger_command(
     parameters_json: Annotated[
         str | None, typer.Option("--parameters-json", help="JSON object with run parameters.")
     ] = None,
-    wait: Annotated[bool, typer.Option("--wait/--no-wait", help="Follow the run until it finishes.")] = False,
-    timeout: Annotated[int, typer.Option("--timeout", help="Maximum seconds to wait with --wait.")] = 600,
+    wait: Annotated[bool, typer.Option("--wait/--no-wait", "-w", help="Follow the run until it finishes.")] = False,
+    timeout: Annotated[int, typer.Option("--timeout", "-t", help="Maximum seconds to wait with --wait.")] = 600,
     project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Trigger a deployed workflow run now."""
     client = Client()
@@ -4055,8 +4124,8 @@ def workflow_schedule_trigger_command(
 
 @schedule_app.command("list")
 def workflow_schedule_list_command(
-    project: Annotated[str | None, typer.Option("--project", help="Filter by project name.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Filter by project name.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List workflows that have schedules."""
     client = Client()
@@ -4198,9 +4267,9 @@ def _set_trigger_active(
 @trigger_app.command("show")
 def workflow_trigger_show_command(
     name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show a workflow's trigger, per-source state, and next deadline."""
     client = Client()
@@ -4225,7 +4294,7 @@ def workflow_trigger_set_command(
     name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
     on_workflow: Annotated[
         str | None,
-        typer.Option("--on-workflow", help="Fire after another workflow, as 'project/workflow'."),
+        typer.Option("--on-workflow", "-o", help="Fire after another workflow, as 'project/workflow'."),
     ] = None,
     on: Annotated[
         str, typer.Option("--on", help="Upstream status to fire on: success, failure, or completion.")
@@ -4235,20 +4304,20 @@ def workflow_trigger_set_command(
         typer.Option("--on-update", help="Dataset name to watch. Repeat or comma-separate for several."),
     ] = None,
     require: Annotated[
-        str, typer.Option("--require", help="Fire when 'all' or 'any' watched datasets have updated.")
+        str, typer.Option("--require", "-r", help="Fire when 'all' or 'any' watched datasets have updated.")
     ] = "all",
     at_most_every: Annotated[
-        str | None, typer.Option("--at-most-every", help='Debounce window, e.g. "15m" or "1h".')
+        str | None, typer.Option("--at-most-every", "-a", help='Debounce window, e.g. "15m" or "1h".')
     ] = None,
     deadline_cron: Annotated[
-        str | None, typer.Option("--deadline-cron", help='Five-field cron deadline, e.g. "0 9 * * *".')
+        str | None, typer.Option("--deadline-cron", "-d", help='Five-field cron deadline, e.g. "0 9 * * *".')
     ] = None,
     deadline_timezone: Annotated[
         str | None, typer.Option("--deadline-timezone", help="IANA timezone for the deadline cron.")
     ] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Set or replace a workflow's event trigger."""
     if bool(on_workflow) == bool(on_update):
@@ -4282,8 +4351,8 @@ def workflow_trigger_set_command(
 @trigger_app.command("clear")
 def workflow_trigger_clear_command(
     name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
 ) -> None:
     """Remove a workflow's trigger."""
     client = Client()
@@ -4296,9 +4365,9 @@ def workflow_trigger_clear_command(
 @trigger_app.command("pause")
 def workflow_trigger_pause_command(
     name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Pause a trigger (keeps it registered; no runs fire)."""
     _set_trigger_active(name, project, workflow_id, json_output, active=False)
@@ -4307,9 +4376,9 @@ def workflow_trigger_pause_command(
 @trigger_app.command("resume")
 def workflow_trigger_resume_command(
     name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Resume a paused trigger."""
     _set_trigger_active(name, project, workflow_id, json_output, active=True)
@@ -4317,8 +4386,8 @@ def workflow_trigger_resume_command(
 
 @trigger_app.command("list")
 def workflow_trigger_list_command(
-    project: Annotated[str | None, typer.Option("--project", help="Filter by project name.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Filter by project name.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List workflows that have event triggers."""
     client = Client()
@@ -4362,11 +4431,11 @@ def workflow_delete_command(
         str | None,
         typer.Argument(help="Workflow name. Omit when using --id."),
     ] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
     force: Annotated[
         bool,
-        typer.Option("--force", help="Also delete its endpoints and run history."),
+        typer.Option("--force", "-f", help="Also delete its endpoints and run history."),
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
 ) -> None:
@@ -4391,8 +4460,8 @@ app.add_typer(workflow_app, name="workflow")
 
 @model_app.command("list")
 def model_list_command(
-    project: Annotated[str | None, typer.Option("--project", help="Filter by project name.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Filter by project name.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List models in the active workspace."""
     client = Client()
@@ -4412,9 +4481,9 @@ def model_list_command(
 @model_app.command("get")
 def model_get_command(
     name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact model ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show model metadata."""
     client = Client()
@@ -4456,7 +4525,9 @@ def model_deploy_command(
         list[str] | None,
         typer.Option("--name", "-n", help="Deploy only the top-level variable name or model name."),
     ] = None,
-    environment: Annotated[str, typer.Option("--env", help="Deployment environment: dev, staging, or prod.")] = "dev",
+    environment: Annotated[
+        str, typer.Option("--env", "-e", help="Deployment environment: dev, staging, or prod.")
+    ] = "dev",
 ) -> None:
     """Deploy model objects from a Python file."""
     module = _load_module(file)
@@ -4481,17 +4552,17 @@ def model_deploy_command(
 def model_run_command(
     name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
     project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
-    environment: Annotated[str, typer.Option("--env", help="Deployment environment to run.")] = "dev",
+    model_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact model ID.")] = None,
+    environment: Annotated[str, typer.Option("--env", "-e", help="Deployment environment to run.")] = "dev",
     parameter: Annotated[
         list[str] | None,
         typer.Option("--param", "-p", help="Model parameter as name=json_value. Can be passed more than once."),
     ] = None,
     parameters_json: Annotated[str | None, typer.Option("--parameters-json", help="JSON object of parameters.")] = None,
-    wait: Annotated[bool, typer.Option("--wait/--no-wait", help="Wait for the run to finish.")] = True,
-    timeout: Annotated[int, typer.Option("--timeout", help="Maximum seconds to wait.")] = 600,
+    wait: Annotated[bool, typer.Option("--wait/--no-wait", "-w", help="Wait for the run to finish.")] = True,
+    timeout: Annotated[int, typer.Option("--timeout", "-t", help="Maximum seconds to wait.")] = 600,
     poll_interval: Annotated[float, typer.Option("--poll-interval", help="Seconds between status polls.")] = 1.0,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Run a deployed model."""
     client = Client()
@@ -4520,9 +4591,9 @@ def model_run_command(
 @model_app.command("versions")
 def model_versions_command(
     name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact model ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List versions for a model."""
     client = Client()
@@ -4537,9 +4608,9 @@ def model_versions_command(
 @model_app.command("deployments")
 def model_deployments_command(
     name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact model ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List model environment deployments."""
     client = Client()
@@ -4554,16 +4625,18 @@ def model_deployments_command(
 @model_app.command("promote")
 def model_promote_command(
     name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
-    from_environment: Annotated[str, typer.Option("--from", help="Source environment.")] = "dev",
-    to_environment: Annotated[str, typer.Option("--to", help="Target environment.")] = "staging",
-    model_version_id: Annotated[str | None, typer.Option("--version-id", help="Specific model version ID.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact model ID.")] = None,
+    from_environment: Annotated[str, typer.Option("--from", "-f", help="Source environment.")] = "dev",
+    to_environment: Annotated[str, typer.Option("--to", "-t", help="Target environment.")] = "staging",
+    model_version_id: Annotated[
+        str | None, typer.Option("--version-id", "-v", help="Specific model version ID.")
+    ] = None,
     promotion_request_id: Annotated[
         str | None,
         typer.Option("--promotion-request-id", help="Approved request ID required for prod."),
     ] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Promote a model version between environments."""
     client = Client()
@@ -4581,13 +4654,13 @@ def model_promote_command(
 @model_app.command("request-promotion")
 def model_request_promotion_command(
     name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
-    model_version_id: Annotated[str | None, typer.Option("--version-id", help="Model version ID.")] = None,
-    from_environment: Annotated[str, typer.Option("--from", help="Source environment.")] = "staging",
-    to_environment: Annotated[str, typer.Option("--to", help="Target environment.")] = "prod",
-    reason: Annotated[str | None, typer.Option("--reason", help="Promotion reason.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact model ID.")] = None,
+    model_version_id: Annotated[str | None, typer.Option("--version-id", "-v", help="Model version ID.")] = None,
+    from_environment: Annotated[str, typer.Option("--from", "-f", help="Source environment.")] = "staging",
+    to_environment: Annotated[str, typer.Option("--to", "-t", help="Target environment.")] = "prod",
+    reason: Annotated[str | None, typer.Option("--reason", "-r", help="Promotion reason.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Request approval to promote a model to prod."""
     client = Client()
@@ -4608,9 +4681,9 @@ def model_request_promotion_command(
 @model_app.command("promotion-requests")
 def model_promotion_requests_command(
     name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact model ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List promotion requests for a model."""
     client = Client()
@@ -4627,8 +4700,8 @@ def model_promotion_requests_command(
 @model_app.command("approve-promotion")
 def model_approve_promotion_command(
     request_id: Annotated[str, typer.Argument(help="Promotion request ID.")],
-    reason: Annotated[str | None, typer.Option("--reason", help="Review reason.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    reason: Annotated[str | None, typer.Option("--reason", "-r", help="Review reason.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Approve a model promotion request."""
     request = Client().approve_model_promotion_request(request_id, reason=reason)
@@ -4638,8 +4711,8 @@ def model_approve_promotion_command(
 @model_app.command("reject-promotion")
 def model_reject_promotion_command(
     request_id: Annotated[str, typer.Argument(help="Promotion request ID.")],
-    reason: Annotated[str | None, typer.Option("--reason", help="Review reason.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    reason: Annotated[str | None, typer.Option("--reason", "-r", help="Review reason.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Reject a model promotion request."""
     request = Client().reject_model_promotion_request(request_id, reason=reason)
@@ -4649,11 +4722,13 @@ def model_reject_promotion_command(
 @model_app.command("rollback")
 def model_rollback_command(
     name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
-    environment: Annotated[str, typer.Option("--env", help="Environment to roll back.")] = "prod",
-    model_version_id: Annotated[str | None, typer.Option("--version-id", help="Specific prior version ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact model ID.")] = None,
+    environment: Annotated[str, typer.Option("--env", "-e", help="Environment to roll back.")] = "prod",
+    model_version_id: Annotated[
+        str | None, typer.Option("--version-id", "-v", help="Specific prior version ID.")
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Roll back a model environment."""
     client = Client()
@@ -4665,9 +4740,9 @@ def model_rollback_command(
 @model_app.command("events")
 def model_events_command(
     name: Annotated[str | None, typer.Argument(help="Model name. Omit when using --id.")] = None,
-    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
-    model_id: Annotated[str | None, typer.Option("--id", help="Exact model ID.")] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    model_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact model ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List model audit events."""
     client = Client()
@@ -4695,10 +4770,12 @@ def deploy_command(
     ] = None,
     source: Annotated[
         str | None,
-        typer.Option("--source", help="Override deploy source for this command: rebase or github."),
+        typer.Option("--source", "-s", help="Override deploy source for this command: rebase or github."),
     ] = None,
-    environment: Annotated[str, typer.Option("--env", help="Deployment environment: dev, staging, or prod.")] = "dev",
-    plan: Annotated[bool, typer.Option("--plan", help="Show the deployment path without applying it.")] = False,
+    environment: Annotated[
+        str, typer.Option("--env", "-e", help="Deployment environment: dev, staging, or prod.")
+    ] = "dev",
+    plan: Annotated[bool, typer.Option("--plan", "-p", help="Show the deployment path without applying it.")] = False,
     sync: Annotated[bool, typer.Option("--sync", help="Reserved for reconciler-based GitOps sync.")] = False,
 ) -> None:
     """Deploy Rebase objects from a Python file."""
@@ -4816,6 +4893,7 @@ def run_command(
         str | None,
         typer.Option(
             "--run-type",
+            "-r",
             help="Override the run type for this ephemeral run: quick, quick_shared (functions only), or long.",
         ),
     ] = None,
@@ -4825,16 +4903,16 @@ def run_command(
     ] = False,
     wait: Annotated[
         bool,
-        typer.Option("--wait/--no-wait", help="Wait for the function result before exiting."),
+        typer.Option("--wait/--no-wait", "-w", help="Wait for the function result before exiting."),
     ] = True,
-    timeout: Annotated[int, typer.Option("--timeout", help="Maximum seconds to wait for the result.")] = 600,
+    timeout: Annotated[int, typer.Option("--timeout", "-t", help="Maximum seconds to wait for the result.")] = 600,
     poll_interval: Annotated[
         float,
         typer.Option("--poll-interval", help="Seconds between run status polls."),
     ] = 1.0,
     local: Annotated[
         bool,
-        typer.Option("--local", help="Execute the target in this process instead of submitting a cloud run."),
+        typer.Option("--local", "-l", help="Execute the target in this process instead of submitting a cloud run."),
     ] = False,
 ) -> None:
     """Run local Rebase targets and inspect submitted runs."""
@@ -4899,13 +4977,13 @@ def run_command(
 
 @run_app.command("list")
 def run_list_command(
-    project: Annotated[str | None, typer.Option("--project", help="Filter by project name.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Filter by project name.")] = None,
     target_type: Annotated[
         str | None,
-        typer.Option("--target-type", help="Filter by target type: function, workflow, or model."),
+        typer.Option("--target-type", "-t", help="Filter by target type: function, workflow, or model."),
     ] = None,
-    limit: Annotated[int, typer.Option("--limit", min=1, max=500, help="Maximum number of runs to list.")] = 100,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    limit: Annotated[int, typer.Option("--limit", "-l", min=1, max=500, help="Maximum number of runs to list.")] = 100,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """List submitted runs in the active workspace."""
     if target_type is not None and target_type not in {"function", "workflow", "model"}:
@@ -4933,7 +5011,7 @@ def run_list_command(
 @run_app.command("get")
 def run_get_command(
     run_id: Annotated[str, typer.Argument(help="Run ID.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show run metadata."""
     client = Client()
@@ -4973,14 +5051,14 @@ def run_logs_command(
     run_id: Annotated[str, typer.Argument(help="Run ID.")],
     follow: Annotated[
         bool,
-        typer.Option("--follow/--no-follow", help="Follow until the run reaches a terminal state."),
+        typer.Option("--follow/--no-follow", "-f", help="Follow until the run reaches a terminal state."),
     ] = True,
     poll_interval: Annotated[
         float,
-        typer.Option("--poll-interval", help="Seconds between run status polls when following."),
+        typer.Option("--poll-interval", "-p", help="Seconds between run status polls when following."),
     ] = 1.0,
-    timeout: Annotated[int, typer.Option("--timeout", help="Maximum seconds to follow the run.")] = 600,
-    json_output: Annotated[bool, typer.Option("--json", help="Print raw event and step JSON output.")] = False,
+    timeout: Annotated[int, typer.Option("--timeout", "-t", help="Maximum seconds to follow the run.")] = 600,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print raw event and step JSON output.")] = False,
 ) -> None:
     """Show run events, workflow step state, and captured stdout/stderr logs."""
     client = Client()
@@ -5014,7 +5092,7 @@ def run_logs_command(
 @run_app.command("cancel")
 def run_cancel_command(
     run_id: Annotated[str, typer.Argument(help="Run ID.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Cancel a run."""
     client = Client()
@@ -5306,6 +5384,7 @@ def run_replay_command(
         str | None,
         typer.Option(
             "--workflow",
+            "-w",
             help="Batch mode: replay runs of this workflow ('project/name', or a bare name with --project).",
         ),
     ] = None,
@@ -5317,6 +5396,7 @@ def run_replay_command(
         str | None,
         typer.Option(
             "--code",
+            "-c",
             help="Code to run: omit for the original pinned version, 'latest' for the current one, or a version ID.",
         ),
     ] = None,
@@ -5327,12 +5407,12 @@ def run_replay_command(
     since: Annotated[
         str | None,
         typer.Option(
-            "--since", help="Batch mode: runs created after this ISO datetime or duration (e.g. 7d, 24h, 90m)."
+            "--since", "-s", help="Batch mode: runs created after this ISO datetime or duration (e.g. 7d, 24h, 90m)."
         ),
     ] = None,
     until: Annotated[
         str | None,
-        typer.Option("--until", help="Batch mode: runs created before this ISO datetime."),
+        typer.Option("--until", "-u", help="Batch mode: runs created before this ISO datetime."),
     ] = None,
     status: Annotated[
         str | None,
@@ -5341,12 +5421,14 @@ def run_replay_command(
     trigger_source: Annotated[
         str | None,
         typer.Option(
-            "--trigger-source", help="Batch mode: filter candidates by trigger source (api, schedule, trigger, replay)."
+            "--trigger-source",
+            "-t",
+            help="Batch mode: filter candidates by trigger source (api, schedule, trigger, replay).",
         ),
     ] = None,
     max_parallel: Annotated[
         int,
-        typer.Option("--max-parallel", min=1, help="Batch mode: maximum concurrent replays."),
+        typer.Option("--max-parallel", "-m", min=1, help="Batch mode: maximum concurrent replays."),
     ] = 4,
     compare: Annotated[
         bool,
@@ -5355,7 +5437,7 @@ def run_replay_command(
             help="Batch mode: wait for each replay and compare its result with the original run.",
         ),
     ] = True,
-    yes: Annotated[bool, typer.Option("--yes", help="Batch mode: skip the confirmation prompt.")] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Batch mode: skip the confirmation prompt.")] = False,
     wait: Annotated[
         bool,
         typer.Option("--wait/--no-wait", help="Wait for the replay result and compare it with the original run."),
@@ -5365,7 +5447,7 @@ def run_replay_command(
         float,
         typer.Option("--poll-interval", help="Seconds between run status polls."),
     ] = 5.0,
-    json_output: Annotated[bool, typer.Option("--json", help="Print machine-readable JSON output.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Replay a run — or a period of workflow runs — bounded to what was knowable at the time."""
     if run_id is not None and workflow is not None:
@@ -5441,15 +5523,15 @@ def _parse_budget_seconds(value: str) -> int:
 @hillclimb_app.command("start")
 def hillclimb_start_command(
     target: Annotated[str, typer.Argument(help="Problem target, e.g. emflow://gefcom2014:solar.")],
-    budget: Annotated[str, typer.Option("--budget", help="Wall-clock budget, e.g. 2h / 30m.")] = "2h",
-    name: Annotated[str | None, typer.Option("--name", help="Search name.")] = None,
-    model: Annotated[str | None, typer.Option("--model", help="Agent model, e.g. sonnet.")] = None,
+    budget: Annotated[str, typer.Option("--budget", "-b", help="Wall-clock budget, e.g. 2h / 30m.")] = "2h",
+    name: Annotated[str | None, typer.Option("--name", "-n", help="Search name.")] = None,
+    model: Annotated[str | None, typer.Option("--model", "-m", help="Agent model, e.g. sonnet.")] = None,
     backend: Annotated[
         str | None,
         typer.Option("--backend", help="Operator backend: claude-code (default) | dummy (smoke tests)."),
     ] = None,
-    project: Annotated[str, typer.Option("--project", help="Project for the platform run.")] = "hillclimb",
-    local: Annotated[bool, typer.Option("--local", help="Run on this machine instead of the platform.")] = False,
+    project: Annotated[str, typer.Option("--project", "-p", help="Project for the platform run.")] = "hillclimb",
+    local: Annotated[bool, typer.Option("--local", "-l", help="Run on this machine instead of the platform.")] = False,
 ) -> None:
     """Start a hillclimb search (hosted by default; --local runs it here)."""
     module = _hillclimb()
@@ -5478,8 +5560,8 @@ def hillclimb_start_command(
 
 @hillclimb_app.command("list")
 def hillclimb_list_command(
-    limit: Annotated[int, typer.Option("--limit", min=1, max=500)] = 50,
-    json_output: Annotated[bool, typer.Option("--json")] = False,
+    limit: Annotated[int, typer.Option("--limit", "-l", min=1, max=500)] = 50,
+    json_output: Annotated[bool, typer.Option("--json", "-j")] = False,
 ) -> None:
     """List hosted hillclimb search runs."""
     module = _hillclimb()
@@ -5501,7 +5583,7 @@ def hillclimb_list_command(
 @hillclimb_app.command("status")
 def hillclimb_status_command(
     run_id: Annotated[str, typer.Argument(help="Platform run ID from `hillclimb start`.")],
-    bucket: Annotated[str | None, typer.Option("--bucket", help="Artifacts bucket override.")] = None,
+    bucket: Annotated[str | None, typer.Option("--bucket", "-b", help="Artifacts bucket override.")] = None,
 ) -> None:
     """Live search state (candidates, best score, budget) from synced GCS state."""
     module = _hillclimb()
@@ -5516,7 +5598,7 @@ def hillclimb_status_command(
 @hillclimb_app.command("stop")
 def hillclimb_stop_command(
     run_id: Annotated[str, typer.Argument(help="Platform run ID.")],
-    bucket: Annotated[str | None, typer.Option("--bucket")] = None,
+    bucket: Annotated[str | None, typer.Option("--bucket", "-b")] = None,
 ) -> None:
     """Gracefully stop a hosted search (parks after the current operator)."""
     module = _hillclimb()
@@ -5531,10 +5613,14 @@ def hillclimb_promote_command(
         str,
         typer.Argument(help="Platform run ID, or with --local a runs/ id, unique substring, or 'latest'."),
     ],
-    dest: Annotated[str, typer.Option("--dest", help="Directory for the model files.")] = "models",
-    bucket: Annotated[str | None, typer.Option("--bucket")] = None,
-    local: Annotated[bool, typer.Option("--local", help="Promote from a local search (state in ./runs/).")] = False,
-    pr: Annotated[bool, typer.Option("--pr", help="Open a promotion PR on the connected workspace repo.")] = False,
+    dest: Annotated[str, typer.Option("--dest", "-d", help="Directory for the model files.")] = "models",
+    bucket: Annotated[str | None, typer.Option("--bucket", "-b")] = None,
+    local: Annotated[
+        bool, typer.Option("--local", "-l", help="Promote from a local search (state in ./runs/).")
+    ] = False,
+    pr: Annotated[
+        bool, typer.Option("--pr", "-p", help="Open a promotion PR on the connected workspace repo.")
+    ] = False,
 ) -> None:
     """Fetch the selected model(s) into the workspace repo (models/<id>.py).
 
@@ -5610,7 +5696,7 @@ def _parse_logo_variant(args: list[str]) -> tuple[int, list[str]]:
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     logo_variant, args = _parse_logo_variant(list(args))
-    if not args or args == ["--help"]:
+    if not args or args in (["--help"], ["-h"]):
         console.print(_banner(logo_variant))
         try:
             app(args=["--help"], prog_name="rebase", standalone_mode=True)
@@ -5631,12 +5717,12 @@ def main(argv: list[str] | None = None) -> int:
     except RebaseWorkflowError as exc:
         error_console.print(f"Error: {exc}", style="rebase.error")
         return 1
-    except click.ClickException as exc:
+    except CLICK_EXCEPTIONS as exc:
         exc.show(file=sys.stderr)
         return int(exc.exit_code)
-    except click.exceptions.Exit as exc:
+    except EXIT_EXCEPTIONS as exc:
         return int(exc.exit_code or 0)
-    except click.Abort:
+    except ABORT_EXCEPTIONS:
         error_console.print("Aborted.", style="rebase.error")
         return 1
     except KeyboardInterrupt:

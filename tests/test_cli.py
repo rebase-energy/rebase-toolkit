@@ -78,6 +78,84 @@ def test_run_help_shows_execution_and_inspection_commands(capsys) -> None:
     assert "replay" in output
 
 
+def test_short_help_flag_works_at_every_depth(capsys) -> None:
+    for args in (["-h"], ["workflow", "-h"], ["workflow", "schedule", "-h"], ["workflow", "schedule", "set", "-h"]):
+        assert main(args) == 0, args
+        assert "Usage:" in capsys.readouterr().out, args
+
+
+def test_unknown_option_reports_usage_error(capsys) -> None:
+    # typer vendors its own click, so its NoSuchOption used to escape main() and reach typer's
+    # Rich excepthook: a traceback and exit code 1 instead of a usage error and exit code 2.
+    assert main(["deploy", "--bogus"]) == 2
+
+    captured = capsys.readouterr()
+    assert "No such option: --bogus" in captured.err
+    assert "Traceback" not in captured.err
+    assert "Try 'rebase deploy --help' for help." in captured.err
+
+
+def test_unknown_command_reports_usage_error(capsys) -> None:
+    assert main(["definitely-not-a-command"]) == 2
+    assert "No such command" in capsys.readouterr().err
+
+
+def test_abort_from_vendored_click_is_reported(monkeypatch, capsys) -> None:
+    import typer
+
+    from rebase import cli
+
+    def raise_abort(**_kwargs: Any) -> None:
+        raise typer.Abort()
+
+    monkeypatch.setattr(cli, "app", raise_abort)
+    assert main(["deploy", "app.py"]) == 1
+    assert "Aborted." in capsys.readouterr().err
+
+
+def _iter_leaf_commands(command: Any, path: tuple[str, ...] = ()) -> Any:
+    commands = getattr(command, "commands", None)
+    if commands:
+        for name, subcommand in commands.items():
+            yield from _iter_leaf_commands(subcommand, (*path, name))
+    else:
+        yield " ".join(path), command
+
+
+def test_options_expose_first_letter_short_flags() -> None:
+    """Every option gets ``-x`` for its first letter unless something already holds that letter.
+
+    ``-h`` belongs to ``--help``, hand-written short flags win, and within a command the
+    first-declared option wins a contested letter. Anything else is a new option that forgot
+    its short flag.
+    """
+    import typer.main
+
+    from rebase.cli import app
+
+    for name, command in _iter_leaf_commands(typer.main.get_command(app)):
+        options = []
+        for param in command.params:
+            if getattr(param, "param_type_name", None) != "option" or param.hidden:
+                continue
+            longs = [opt for opt in param.opts if opt.startswith("--")]
+            shorts = [opt for opt in param.opts if len(opt) == 2 and opt.startswith("-")]
+            assert longs, f"rebase {name}: option {param.opts} has no long flag"
+            assert "-h" not in shorts, f"rebase {name}: {longs[0]} claims -h, which belongs to --help"
+            options.append((longs[0], shorts))
+
+        taken = {"-h"}
+        for _long_flag, shorts in options:
+            for short in shorts:
+                assert short not in taken, f"rebase {name}: {short} is claimed twice"
+                taken.add(short)
+
+        for long_flag, shorts in options:
+            if not shorts:
+                letter = f"-{long_flag[2]}"
+                assert letter in taken, f"rebase {name}: {long_flag} should take {letter}"
+
+
 def test_tui_command_invokes_textual_app(monkeypatch) -> None:
     observed: dict[str, Any] = {}
 

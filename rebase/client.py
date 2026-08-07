@@ -3292,6 +3292,8 @@ class Client:
         default_parameters: dict[str, Any] | None = None,
         required_parameters: list[str] | None = None,
         run_type: RunType = DEFAULT_RUN_TYPE,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         project: str | None = None,
@@ -3325,6 +3327,8 @@ class Client:
                 "default_parameters": default_parameters or {},
                 "required_parameters": required_parameters or [],
                 "run_type": _validate_run_type(run_type, target_type="workflow"),
+                "env": env or {},
+                "secrets": secrets or {},
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "environment": environment,
@@ -3358,6 +3362,8 @@ class Client:
         default_parameters: dict[str, Any] | None = None,
         required_parameters: list[str] | None = None,
         run_type: RunType | None = None,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
         enabled: bool | None = None,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         environment: str | None = None,
@@ -3382,6 +3388,8 @@ class Client:
                 "default_parameters": default_parameters,
                 "required_parameters": required_parameters,
                 "run_type": _validate_run_type(run_type, target_type="workflow") if run_type else None,
+                "env": env,
+                "secrets": secrets,
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "environment": environment,
@@ -3812,6 +3820,8 @@ class Project:
         deploy_source: str | None = None,
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | list[Secret | str] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
         resources: dict[str, Any] | None = None,
@@ -3836,6 +3846,8 @@ class Project:
                 client=self._client,
                 dependencies=dependencies,
                 image=image,
+                env=env,
+                secrets=secrets,
                 min_instances=min_instances,
                 concurrency=concurrency,
                 resources=resources,
@@ -5055,6 +5067,8 @@ class Workflow:
         data: dict[str, Any] | None = None,
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | list[Secret | str] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
         resources: dict[str, Any] | None = None,
@@ -5071,6 +5085,8 @@ class Workflow:
         self.data = data or {}
         self.deploy_source = _validate_deploy_source(deploy_source)
         self.project_source_mode = project_source_mode
+        self.env = dict(env or (data.get("env") if data else None) or {})
+        self.secrets = secrets if secrets is not None else dict((data.get("secrets") if data else None) or {})
         self.name = name or (data["name"] if data else None)
         self.flow_ref: str | None = None
         self.source_code: str | None = None
@@ -5242,6 +5258,7 @@ class Workflow:
             )
         step_graph = self._build_step_graph()
         source_metadata = self._source_metadata_for_deploy(deploy_source)
+        secrets_payload = _resolve_secrets_payload(self.secrets, self._client)
         existing = self._client.find_workflow(name, project=self.project)
         if existing is not None:
             workflow = self._client.update_workflow(
@@ -5256,6 +5273,8 @@ class Workflow:
                 default_parameters=self.default_parameters,
                 required_parameters=self.required_parameters,
                 run_type=self.run_type,
+                env=self.env,
+                secrets=secrets_payload,
                 enabled=self.enabled,
                 endpoint=self.endpoint,
                 environment=environment,
@@ -5279,6 +5298,8 @@ class Workflow:
             default_parameters=self.default_parameters,
             required_parameters=self.required_parameters,
             run_type=self.run_type,
+            env=self.env,
+            secrets=secrets_payload,
             enabled=self.enabled,
             endpoint=self.endpoint,
             environment=environment,
