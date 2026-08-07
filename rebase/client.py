@@ -182,6 +182,10 @@ def _response_error_message(response: requests.Response) -> str:
                     f"{message}. Remaining: {remaining / 100:.2f} EUR; required reservation: {required / 100:.2f} EUR."
                 )
             return str(message)
+        if isinstance(detail, dict) and isinstance(detail.get("contents"), dict):
+            contents = ", ".join(f"{count} {label}" for label, count in detail["contents"].items())
+            message = detail.get("message") or "target is not empty"
+            return f"{message} (contains {contents})"
         if detail is not None:
             return json.dumps(detail)
     return response.text
@@ -1751,6 +1755,19 @@ class Client:
             raise RebaseWorkflowError(_response_error_message(response)) from exc
         return response.json()
 
+    def request_no_content(self, method: str, path: str, *, auth: bool = True, **kwargs: Any) -> None:
+        """Like :meth:`request`, for endpoints that answer 204 with an empty body.
+
+        ``request`` always parses the response as JSON, which a 204 has none of.
+        """
+        headers = self._request_headers(auth=auth, headers=kwargs.pop("headers", {}))
+        timeout = kwargs.pop("timeout", 30)
+        response = requests.request(method, f"{self.api_url}{path}", headers=headers, timeout=timeout, **kwargs)
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RebaseWorkflowError(_response_error_message(response)) from exc
+
     def stream_request(self, method: str, path: str, *, auth: bool = True, **kwargs: Any) -> Iterator[dict[str, Any]]:
         headers = self._request_headers(auth=auth, headers=kwargs.pop("headers", {}))
         timeout = kwargs.pop("timeout", None)
@@ -2483,6 +2500,16 @@ class Client:
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected project response")
         return response
+
+    def delete_project(self, project_id: str, *, force: bool = False) -> None:
+        """Delete a project. Without *force* the API refuses a non-empty one."""
+        self.request_no_content("DELETE", f"/projects/{project_id}", params={"force": str(force).lower()})
+
+    def delete_function(self, function_id: str, *, force: bool = False) -> None:
+        self.request_no_content("DELETE", f"/functions/{function_id}", params={"force": str(force).lower()})
+
+    def delete_workflow(self, workflow_id: str, *, force: bool = False) -> None:
+        self.request_no_content("DELETE", f"/workflows/{workflow_id}", params={"force": str(force).lower()})
 
     def find_project(self, name: str) -> dict[str, Any] | None:
         for project in self.list_projects():

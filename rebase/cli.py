@@ -3612,6 +3612,34 @@ def project_get_command(
     )
 
 
+@project_app.command("delete")
+def project_delete_command(
+    name: Annotated[
+        str | None,
+        typer.Argument(help="Project name. Omit when using --id."),
+    ] = None,
+    project_id: Annotated[str | None, typer.Option("--id", help="Exact project ID.")] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Also delete the project's contents and run history."),
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Delete a project.
+
+    Refused while the project still holds functions, workflows, apps, models,
+    endpoints or runs; pass --force to delete those along with it.
+    """
+    client = Client()
+    project = _resolve_project_selector(client, name, project_id=project_id)
+    label = project.get("name") or project["id"]
+    prompt = f"Delete project {label} and ALL of its contents?" if force else f"Delete project {label}?"
+    if not yes and not typer.confirm(prompt):
+        raise typer.Abort()
+    client.delete_project(project["id"], force=force)
+    console.print(f"[rebase.success]Deleted project {label}.[/rebase.success]")
+
+
 app.add_typer(project_app, name="project")
 
 
@@ -3699,6 +3727,34 @@ def function_versions_command(
         _print_json(versions)
         return
     console.print(_version_table("Function Versions", versions))
+
+
+@function_app.command("delete")
+def function_delete_command(
+    name: Annotated[
+        str | None,
+        typer.Argument(help="Function name. Omit when using --id."),
+    ] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    function_id: Annotated[str | None, typer.Option("--id", help="Exact function ID.")] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Also delete its endpoints and run history."),
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Delete a function, its versions and its endpoints.
+
+    Refused while the function still has endpoints or runs; pass --force to
+    delete those along with it.
+    """
+    client = Client()
+    function = _resolve_function_selector(client, name, function_id=function_id, project_name=project)
+    label = function.get("name") or function["id"]
+    if not yes and not typer.confirm(f"Delete function {label}?"):
+        raise typer.Abort()
+    client.delete_function(function["id"], force=force)
+    console.print(f"[rebase.success]Deleted function {label}.[/rebase.success]")
 
 
 app.add_typer(function_app, name="function")
@@ -4278,6 +4334,34 @@ def workflow_trigger_list_command(
             str(workflow.get("id", "-")),
         )
     console.print(table)
+
+
+@workflow_app.command("delete")
+def workflow_delete_command(
+    name: Annotated[
+        str | None,
+        typer.Argument(help="Workflow name. Omit when using --id."),
+    ] = None,
+    project: Annotated[str | None, typer.Option("--project", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Also delete its endpoints and run history."),
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Delete a workflow, its versions, schedule and triggers.
+
+    Refused while the workflow still has endpoints or runs; pass --force to
+    delete those along with it.
+    """
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    label = workflow.get("name") or workflow["id"]
+    if not yes and not typer.confirm(f"Delete workflow {label}?"):
+        raise typer.Abort()
+    client.delete_workflow(workflow["id"], force=force)
+    console.print(f"[rebase.success]Deleted workflow {label}.[/rebase.success]")
 
 
 workflow_app.add_typer(schedule_app, name="schedule")
