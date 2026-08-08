@@ -13,6 +13,13 @@
 
 ### Fixed
 
+- **`rebase tui` starts in about a second instead of stalling on the project list.** The workspace
+  overview issued two requests per project — one for functions, one for workflows — end to end, so
+  startup was `2 × projects` round trips deep: ~13.5s on a 21-project workspace. Workflow counts now
+  come from a single workspace-wide `/workflows` call (every workflow carries its `project_id`), and
+  the function counts, which have no workspace-wide route, are fetched concurrently. Same numbers,
+  ~1.8s.
+
 - **Unknown options and commands print a usage error again** instead of a Rich traceback, and exit
   2 rather than 1. typer >= 0.26 vendors its own copy of click, and the vendored exception classes
   do not subclass the ones in the `click` package, so the CLI's `except click.ClickException`

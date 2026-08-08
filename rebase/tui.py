@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import Counter
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -27,6 +29,8 @@ from rebase.config import list_profiles, load_profile, selected_profile_name, se
 
 TargetType = Literal["function", "workflow"]
 ViewName = Literal["workspace", "project", "workspace-switcher"]
+#: Concurrent requests used to collect the workspace overview's per-project function counts.
+OVERVIEW_FANOUT_WORKERS = 16
 
 
 @dataclass(frozen=True)
@@ -74,24 +78,49 @@ class RebaseTuiData:
 
     def load_workspace_overview(self) -> WorkspaceOverviewData:
         projects = self.client.list_projects()
-        project_summaries: list[ProjectSummary] = []
-        selected_project_found = self.project is None
-        for project in projects:
-            project_id = str(project["id"])
-            functions = self.client.list_functions(project_id=project_id)
-            workflows = self.client.list_workflows(project_id=project_id)
-            project_summaries.append(
-                ProjectSummary(project=project, function_count=len(functions), workflow_count=len(workflows))
-            )
-            selected_project_found = selected_project_found or project.get("name") == self.project
-        if not selected_project_found:
+        if self.project is not None and not any(project.get("name") == self.project for project in projects):
             raise RebaseWorkflowError(f"project not found: {self.project}")
 
+        workflow_counts = self._workflow_counts()
+        function_counts = self._function_counts(projects)
         return WorkspaceOverviewData(
             projects=projects,
-            project_summaries=project_summaries,
+            project_summaries=[
+                ProjectSummary(
+                    project=project,
+                    function_count=function_counts.get(str(project["id"]), 0),
+                    workflow_count=workflow_counts.get(str(project["id"]), 0),
+                )
+                for project in projects
+            ],
             project_names={str(project.get("id", "")): str(project.get("name", "-")) for project in projects},
         )
+
+    def _workflow_counts(self) -> dict[str, int]:
+        """Workflow counts per project id, from a single workspace-wide call.
+
+        Every workflow carries its `project_id`, so one `/workflows` request stands in for
+        one request per project.
+        """
+        return Counter(
+            str(workflow["project_id"]) for workflow in self.client.list_workflows() if workflow.get("project_id")
+        )
+
+    def _function_counts(self, projects: list[dict[str, Any]]) -> dict[str, int]:
+        """Function counts per project id, fanned out concurrently.
+
+        There is no workspace-wide functions route, so this stays one request per project.
+        Run end to end those requests are pure round-trip latency, and they dominated the
+        startup wait on workspaces with many projects.
+        """
+        project_ids = [str(project["id"]) for project in projects]
+        if not project_ids:
+            return {}
+        with ThreadPoolExecutor(max_workers=min(OVERVIEW_FANOUT_WORKERS, len(project_ids))) as executor:
+            counts = executor.map(
+                lambda project_id: len(self.client.list_functions(project_id=project_id)), project_ids
+            )
+            return dict(zip(project_ids, counts, strict=True))
 
     def load_project_targets(self, project: dict[str, Any]) -> ProjectTargetsData:
         project_id = str(project["id"])

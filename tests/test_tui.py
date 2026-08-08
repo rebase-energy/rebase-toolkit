@@ -31,6 +31,8 @@ class FakeClient:
     def __init__(self) -> None:
         self.api_url = "https://api.example.com"
         self.run_calls: list[dict[str, Any]] = []
+        self.function_calls: list[str | None] = []
+        self.workflow_calls: list[str | None] = []
         self.projects = [
             {"id": "project-id", "name": "energy"},
             {"id": "other-project-id", "name": "trading"},
@@ -106,10 +108,12 @@ class FakeClient:
 
     def list_functions(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
         assert project is None
+        self.function_calls.append(project_id)
         return [item for item in self.functions if project_id is None or item["project_id"] == project_id]
 
     def list_workflows(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
         assert project is None
+        self.workflow_calls.append(project_id)
         return [item for item in self.workflows if project_id is None or item["project_id"] == project_id]
 
     def list_project_endpoints(self, project_id: str) -> list[dict[str, Any]]:
@@ -253,6 +257,26 @@ def test_tui_data_tolerates_missing_endpoint_and_asgi_routes() -> None:
     assert targets.endpoints == []
     assert targets.asgi_apps == []
     assert [item["name"] for item in targets.workflows] == ["forecast"]
+
+
+def test_tui_overview_reads_all_workflows_in_one_call() -> None:
+    """Per-project workflow requests were the bulk of the TUI's startup wait."""
+    client = FakeClient()
+    client.projects.append({"id": "third-project-id", "name": "storage"})
+
+    overview = fake_tui_data(client).load_workspace_overview()
+
+    assert client.workflow_calls == [None]
+    assert sorted(call or "" for call in client.function_calls) == [
+        "other-project-id",
+        "project-id",
+        "third-project-id",
+    ]
+    assert [(summary.function_count, summary.workflow_count) for summary in overview.project_summaries] == [
+        (1, 1),
+        (0, 0),
+        (0, 0),
+    ]
 
 
 def test_tui_data_reports_missing_project() -> None:
@@ -480,7 +504,7 @@ def local_rebase_api() -> Iterator[tuple[str, list[tuple[str, dict[str, list[str
                 payload = projects
             elif parsed.path == "/projects/project-id/functions":
                 payload = functions
-            elif parsed.path == "/projects/project-id/workflows":
+            elif parsed.path in {"/workflows", "/projects/project-id/workflows"}:
                 payload = workflows
             elif parsed.path == "/projects/project-id/endpoints":
                 payload = endpoints
@@ -573,7 +597,8 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
             assert any(path == "/projects/project-id/functions" for path, _, _ in seen_requests)
             assert any(path == "/projects/project-id/workflows" for path, _, _ in seen_requests)
             assert not any(path == "/functions" for path, _, _ in seen_requests)
-            assert not any(path == "/workflows" for path, _, _ in seen_requests)
+            # The overview counts workflows workspace-wide; only an opened project is fetched per project.
+            assert any(path == "/workflows" for path, _, _ in seen_requests)
             assert any(
                 path == "/runs"
                 and query.get("workflow_id") == ["workflow-id"]
