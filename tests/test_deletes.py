@@ -29,14 +29,31 @@ class FakeNoContentResponse:
         raise ValueError("204 responses have no body")
 
 
+class FakeJsonResponse:
+    """A 200 with a body, which the batch delete answers with."""
+
+    text = ""
+    status_code = 200
+
+    def __init__(self, payload: Any) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> Any:
+        return self._payload
+
+
 class FakeConflictResponse:
     text = "conflict"
 
-    def __init__(self, detail: Any) -> None:
+    def __init__(self, detail: Any, *, status_code: int = 409) -> None:
         self._detail = detail
+        self.status_code = status_code
 
     def raise_for_status(self) -> None:
-        raise requests.HTTPError("409")
+        raise requests.HTTPError(str(self.status_code))
 
     def json(self) -> Any:
         return {"detail": self._detail}
@@ -96,6 +113,79 @@ def test_conflict_reports_what_the_project_still_holds(monkeypatch) -> None:
     message = str(excinfo.value)
     assert "force=true" in message
     assert "contains 2 functions, 17 runs" in message
+
+
+class TestBatchDeleteProjects:
+    """`delete_projects` is one request that reports per project rather than raising."""
+
+    def _fake_batch(self, monkeypatch, payload: Any, observed: dict[str, Any]):
+        def fake_request(method: str, url: str, **kwargs: Any) -> FakeJsonResponse:
+            observed["method"] = method
+            observed["url"] = url
+            observed["json"] = kwargs.get("json")
+            return FakeJsonResponse(payload)
+
+        monkeypatch.setattr("requests.request", fake_request)
+
+    def test_one_request_carries_every_id(self, monkeypatch) -> None:
+        observed: dict[str, Any] = {}
+        self._fake_batch(monkeypatch, {"deleted": ["p1", "p2"], "failed": []}, observed)
+
+        assert _client().delete_projects(["p1", "p2"], force=True) == []
+        assert observed["method"] == "POST"
+        assert observed["url"] == "https://toolkit.example.com/projects/batch-delete"
+        assert observed["json"] == {"project_ids": ["p1", "p2"], "force": True}
+
+    def test_failures_come_back_readable_instead_of_raising(self, monkeypatch) -> None:
+        payload = {
+            "deleted": ["p1"],
+            "failed": [
+                {
+                    "project_id": "p2",
+                    "status": 409,
+                    "detail": {"message": "project is not empty", "contents": {"runs": 3}},
+                }
+            ],
+        }
+        self._fake_batch(monkeypatch, payload, {})
+
+        failures = _client().delete_projects(["p1", "p2"])
+
+        assert [project_id for project_id, _ in failures] == ["p2"]
+        assert "project is not empty" in failures[0][1]
+        assert "runs" in failures[0][1]
+
+    def test_an_empty_list_makes_no_request(self, monkeypatch) -> None:
+        def explode(*_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("no request should be made")
+
+        monkeypatch.setattr("requests.request", explode)
+        assert _client().delete_projects([]) == []
+
+    def test_an_api_without_the_route_falls_back_to_one_by_one(self, monkeypatch) -> None:
+        """A toolkit ahead of its platform must still delete."""
+        calls: list[tuple[str, str]] = []
+
+        def fake_request(method: str, url: str, **_kwargs: Any) -> Any:
+            calls.append((method, url))
+            if method == "POST":
+                return FakeConflictResponse("Not Found", status_code=404)
+            return FakeNoContentResponse()
+
+        monkeypatch.setattr("requests.request", fake_request)
+
+        assert _client().delete_projects(["p1", "p2"], force=True) == []
+        assert calls == [
+            ("POST", "https://toolkit.example.com/projects/batch-delete"),
+            ("DELETE", "https://toolkit.example.com/projects/p1"),
+            ("DELETE", "https://toolkit.example.com/projects/p2"),
+        ]
+
+    def test_other_errors_are_not_swallowed_by_the_fallback(self, monkeypatch) -> None:
+        monkeypatch.setattr("requests.request", lambda *a, **k: FakeConflictResponse("nope", status_code=403))
+
+        with pytest.raises(RebaseWorkflowError, match="nope"):
+            _client().delete_projects(["p1"])
 
 
 def test_plain_string_detail_still_surfaces(monkeypatch) -> None:

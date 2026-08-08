@@ -12,7 +12,7 @@ import tempfile
 import textwrap
 import time
 import warnings
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -74,7 +74,9 @@ DEPLOY_REQUEST_TIMEOUT_SECONDS = 300
 
 
 class RebaseWorkflowError(RuntimeError):
-    pass
+    #: HTTP status behind the failure, where there was one. Lets a caller tell a
+    #: route this API version simply does not have (404) from a real error.
+    status_code: int | None = None
 
 
 RebaseError = RebaseWorkflowError
@@ -162,6 +164,16 @@ def _coerce_endpoint(endpoint: EndpointConfig | dict[str, Any] | None) -> Endpoi
 
 def _endpoint_for_callable(fn: Callable[..., Any] | None) -> EndpointConfig | None:
     return _coerce_endpoint(getattr(fn, "_rebase_endpoint", None)) if fn is not None else None
+
+
+def _batch_failure_message(failure: dict[str, Any]) -> str:
+    """Flatten one batch-delete failure into a line worth showing a user."""
+    detail = failure.get("detail")
+    if isinstance(detail, dict):
+        message = str(detail.get("message", detail))
+        contents = detail.get("contents")
+        return f"{message} ({contents})" if contents else message
+    return str(detail if detail is not None else failure.get("status", "failed"))
 
 
 def _response_error_message(response: requests.Response) -> str:
@@ -1752,7 +1764,9 @@ class Client:
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
-            raise RebaseWorkflowError(_response_error_message(response)) from exc
+            error = RebaseWorkflowError(_response_error_message(response))
+            error.status_code = response.status_code
+            raise error from exc
         return response.json()
 
     def request_no_content(self, method: str, path: str, *, auth: bool = True, **kwargs: Any) -> None:
@@ -1766,7 +1780,9 @@ class Client:
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
-            raise RebaseWorkflowError(_response_error_message(response)) from exc
+            error = RebaseWorkflowError(_response_error_message(response))
+            error.status_code = response.status_code
+            raise error from exc
 
     def stream_request(self, method: str, path: str, *, auth: bool = True, **kwargs: Any) -> Iterator[dict[str, Any]]:
         headers = self._request_headers(auth=auth, headers=kwargs.pop("headers", {}))
@@ -2504,6 +2520,50 @@ class Client:
     def delete_project(self, project_id: str, *, force: bool = False) -> None:
         """Delete a project. Without *force* the API refuses a non-empty one."""
         self.request_no_content("DELETE", f"/projects/{project_id}", params={"force": str(force).lower()})
+
+    def delete_projects(self, project_ids: Sequence[str], *, force: bool = False) -> list[tuple[str, str]]:
+        """Delete several projects in one request; returns ``(project_id, error)`` per failure.
+
+        Deliberately not all-or-nothing -- a project delete tears down Cloud Run
+        services and Prefect deployments, which cannot be rolled back -- so the
+        API answers 200 with a per-project verdict and this returns the failures
+        rather than raising on them.
+
+        Falls back to one request per project against an API too old to have the
+        batch route, so a toolkit ahead of its platform still deletes.
+        """
+        if not project_ids:
+            return []
+        failures: list[tuple[str, str]] = []
+        # The API refuses an oversized batch outright, so send it in whole chunks
+        # rather than turning a long selection into one 422.
+        for start in range(0, len(project_ids), PROJECT_BATCH_DELETE_LIMIT):
+            chunk = list(project_ids[start : start + PROJECT_BATCH_DELETE_LIMIT])
+            try:
+                response = self.request(
+                    "POST", "/projects/batch-delete", json={"project_ids": chunk, "force": force}
+                )
+            except RebaseWorkflowError as exc:
+                if exc.status_code != 404:
+                    raise
+                failures.extend(self._delete_projects_one_by_one(chunk, force=force))
+                continue
+            if not isinstance(response, dict):
+                raise RebaseWorkflowError("expected batch delete response")
+            failures.extend(
+                (str(failure.get("project_id", "-")), _batch_failure_message(failure))
+                for failure in response.get("failed", [])
+            )
+        return failures
+
+    def _delete_projects_one_by_one(self, project_ids: Sequence[str], *, force: bool) -> list[tuple[str, str]]:
+        failures: list[tuple[str, str]] = []
+        for project_id in project_ids:
+            try:
+                self.delete_project(project_id, force=force)
+            except RebaseWorkflowError as exc:
+                failures.append((project_id, str(exc)))
+        return failures
 
     def delete_function(self, function_id: str, *, force: bool = False) -> None:
         self.request_no_content("DELETE", f"/functions/{function_id}", params={"force": str(force).lower()})

@@ -3481,6 +3481,175 @@ def test_project_get_command_supports_name_and_id(monkeypatch, capsys) -> None:
     assert '"id": "project-id"' in output
 
 
+def _project_open_setup(monkeypatch, tmp_path: Path, *, declaring_files: int = 1) -> list[list[str]]:
+    """Seed a workspace whose search path holds `declaring_files` copies of a project.
+
+    Returns the list that launched editor argv lands in.
+    """
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("REBASE_EDITOR", "fake-editor -g {path}:{line}")
+    config_path.write_text(
+        json.dumps(
+            {
+                "default_profile": "default",
+                "profiles": {"default": {"api_key": "rbw_test", "workspace_id": "ws"}},
+                "workspaces": {"ws": {"search_paths": [str(tmp_path / "code")]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    code = tmp_path / "code"
+    code.mkdir()
+    for index in range(declaring_files):
+        (code / f"deploy_{index}.py").write_text(
+            'import rebase as rb\n\nPROJECT_NAME = "energy"\n\nproject = rb.project(PROJECT_NAME)\n',
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(Client, "list_projects", lambda self: [{"id": "project-id", "name": "energy"}])
+
+    launched: list[list[str]] = []
+    monkeypatch.setattr("rebase.cli.spawn_detached", lambda argv: launched.append(list(argv)))
+    return launched
+
+
+def test_cli_project_open_prints_the_resolved_path_without_launching_an_editor(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    launched = _project_open_setup(monkeypatch, tmp_path)
+
+    assert main(["project", "open", "energy", "--path"]) == 0
+
+    assert "deploy_0.py:5" in capsys.readouterr().out
+    assert launched == []
+
+
+def test_cli_project_open_launches_the_resolved_editor(monkeypatch, tmp_path: Path, capsys) -> None:
+    launched = _project_open_setup(monkeypatch, tmp_path)
+
+    assert main(["project", "open", "energy"]) == 0
+
+    assert "Opened" in capsys.readouterr().out
+    assert launched == [["fake-editor", "-g", f"{tmp_path / 'code' / 'deploy_0.py'}:5"]]
+
+
+def test_cli_project_open_reports_json_status_and_matches_without_launching(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    launched = _project_open_setup(monkeypatch, tmp_path)
+
+    assert main(["project", "open", "energy", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "found"
+    assert payload["matches"][0]["line"] == 5
+    assert payload["files_parsed"] == 1
+    assert launched == []
+
+
+def test_cli_project_open_fails_when_two_files_declare_the_project(monkeypatch, tmp_path: Path, capsys) -> None:
+    launched = _project_open_setup(monkeypatch, tmp_path, declaring_files=2)
+
+    assert main(["project", "open", "energy"]) == 1
+
+    error = capsys.readouterr().err
+    assert "deploy_0.py:5" in error
+    assert "deploy_1.py:5" in error
+    assert launched == []
+
+
+def test_cli_project_open_path_prints_every_match_when_ambiguous(monkeypatch, tmp_path: Path, capsys) -> None:
+    """--path is the scriptable escape hatch, so ambiguity is information, not an error."""
+    _project_open_setup(monkeypatch, tmp_path, declaring_files=2)
+
+    assert main(["project", "open", "energy", "--path"]) == 0
+
+    output = capsys.readouterr().out
+    assert "deploy_0.py:5" in output
+    assert "deploy_1.py:5" in output
+
+
+def test_cli_project_open_fails_when_no_search_paths_are_configured(monkeypatch, tmp_path: Path, capsys) -> None:
+    _project_open_setup(monkeypatch, tmp_path)
+    config_path = tmp_path / "config.json"
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    data.pop("workspaces")
+    config_path.write_text(json.dumps(data), encoding="utf-8")
+
+    assert main(["project", "open", "energy"]) == 1
+
+    assert "rebase project search-path add" in capsys.readouterr().err
+
+
+def test_cli_project_open_fails_when_no_file_declares_the_project(monkeypatch, tmp_path: Path, capsys) -> None:
+    _project_open_setup(monkeypatch, tmp_path, declaring_files=0)
+
+    assert main(["project", "open", "energy"]) == 1
+
+    error = capsys.readouterr().err
+    assert str(tmp_path / "code") in error
+    assert "web app" in error
+
+
+def test_cli_project_open_mentions_computed_project_names_when_nothing_matched(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    _project_open_setup(monkeypatch, tmp_path, declaring_files=0)
+    (tmp_path / "code" / "computed.py").write_text(
+        'import os\n\nimport rebase as rb\n\nrb.project(os.environ["NAME"])\n', encoding="utf-8"
+    )
+
+    assert main(["project", "open", "energy"]) == 1
+
+    assert "built at runtime" in capsys.readouterr().err
+
+
+def test_cli_project_search_path_add_list_and_remove_round_trip(monkeypatch, tmp_path: Path, capsys) -> None:
+    config_path = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    config_path.write_text(
+        json.dumps({"default_profile": "default", "profiles": {"default": {"workspace_id": "ws"}}}),
+        encoding="utf-8",
+    )
+    code = tmp_path / "code"
+    code.mkdir()
+
+    assert main(["project", "search-path", "add", str(code)]) == 0
+    assert "Added search path" in capsys.readouterr().out
+
+    assert main(["project", "search-path", "add", str(code)]) == 0
+    assert "already a search path" in capsys.readouterr().out
+
+    assert main(["project", "search-path", "list", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == [{"path": str(code), "exists": True}]
+
+    assert main(["project", "search-path", "remove", str(code)]) == 0
+    assert "Removed search path" in capsys.readouterr().out
+
+    assert main(["project", "search-path", "remove", str(code)]) == 1
+    assert "not a search path" in capsys.readouterr().err
+
+
+def test_cli_project_search_path_add_refuses_the_home_directory_without_force(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(tmp_path / "config.json"))
+
+    assert main(["project", "search-path", "add", str(Path.home())]) == 1
+
+    assert "--force" in capsys.readouterr().err
+
+
+def test_cli_project_search_path_add_refuses_a_directory_that_does_not_exist(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(tmp_path / "config.json"))
+
+    assert main(["project", "search-path", "add", str(tmp_path / "gone")]) == 1
+
+    assert "not a directory" in capsys.readouterr().err
+
+
 def test_function_list_command_supports_project_filter(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         Client,

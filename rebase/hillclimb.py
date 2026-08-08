@@ -42,22 +42,17 @@ def _require_hillclimb():
         import hillclimb
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "hillclimb commands need the hillclimb extra: "
-            "pip install 'rebase-toolkit[hillclimb]'"
+            "hillclimb commands need the hillclimb extra: pip install 'rebase-toolkit[hillclimb]'"
         ) from exc
     return hillclimb
 
 
 def _bucket_name(explicit: str | None = None) -> str:
     bucket = (
-        explicit
-        or os.environ.get("REBASE_HILLCLIMB_ARTIFACTS_BUCKET")
-        or os.environ.get("REBASE_HILLCLIMB_BUCKET")
+        explicit or os.environ.get("REBASE_HILLCLIMB_ARTIFACTS_BUCKET") or os.environ.get("REBASE_HILLCLIMB_BUCKET")
     )
     if not bucket:
-        raise RuntimeError(
-            "no artifacts bucket configured (REBASE_HILLCLIMB_BUCKET)"
-        )
+        raise RuntimeError("no artifacts bucket configured (REBASE_HILLCLIMB_BUCKET)")
     return bucket
 
 
@@ -65,9 +60,7 @@ def _gcs_bucket(name: str):
     try:
         from google.cloud import storage
     except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "GCS sync needs google-cloud-storage: pip install 'rebase-toolkit[hillclimb]'"
-        ) from exc
+        raise RuntimeError("GCS sync needs google-cloud-storage: pip install 'rebase-toolkit[hillclimb]'") from exc
     return storage.Client().bucket(name)
 
 
@@ -164,9 +157,7 @@ def hosted_search(
 
     home = Path(os.environ.get("HILLCLIMB_HOME", "/hillclimb"))
     config = Config()
-    config.backend_auth = (
-        "subscription" if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") else "api-key"
-    )
+    config.backend_auth = "subscription" if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") else "api-key"
     # hosted containers run one search with several operator workers; the
     # machine-wide semaphore is meaningless inside a single-search container
     config.search.parallel_agents = int(os.environ.get("REBASE_HILLCLIMB_PARALLEL_AGENTS", "3"))
@@ -199,7 +190,11 @@ def hosted_search(
         seed_path.write_text(seed_solution_code)
     try:
         outcome = hillclimb.run_search(
-            target, budget_s=budget_s, name=name, config=config, log=print,
+            target,
+            budget_s=budget_s,
+            name=name,
+            config=config,
+            log=print,
             seed_from=seed_path,
             knowledge_context=knowledge_context or None,
         )
@@ -308,9 +303,7 @@ def run_local_search(
     """`--local` mode: same command surface, search runs on this machine with
     the user's own hillclimb config (subscription agent auth, local runs/)."""
     hillclimb = _require_hillclimb()
-    return hillclimb.run_search(
-        target, budget_s=budget_s, name=name, model=model, backend=backend, log=log
-    )
+    return hillclimb.run_search(target, budget_s=budget_s, name=name, model=model, backend=backend, log=log)
 
 
 def read_hosted_state(sync_id: str, bucket: str | None = None) -> dict[str, Any]:
@@ -320,7 +313,7 @@ def read_hosted_state(sync_id: str, bucket: str | None = None) -> dict[str, Any]
     statuses: dict[str, Any] = {}
     for blob in gcs.client.list_blobs(gcs, prefix=prefix):
         if blob.name.endswith("status.json"):
-            search_ref = "/".join(blob.name[len(prefix) + 1:].split("/")[:3])
+            search_ref = "/".join(blob.name[len(prefix) + 1 :].split("/")[:3])
             statuses[search_ref] = json.loads(blob.download_as_bytes())
     return statuses
 
@@ -356,8 +349,7 @@ def promote_local(run_ref: str, dest: Path, runs_dir: Path | None = None) -> lis
     if run_ref == "latest":
         matches = candidates[-1:]
     else:
-        matches = [d for d in candidates if d.name == run_ref] or \
-                  [d for d in candidates if run_ref in d.name]
+        matches = [d for d in candidates if d.name == run_ref] or [d for d in candidates if run_ref in d.name]
     if not matches:
         raise RuntimeError(f"no local run matching {run_ref!r} under {runs_dir.resolve()}")
     if len(matches) > 1:
@@ -374,8 +366,7 @@ def promote_local(run_ref: str, dest: Path, runs_dir: Path | None = None) -> lis
         written.append(out)
     if not written:
         raise RuntimeError(
-            f"run {run_dir.name} has no searches with a best/solution.py — "
-            "did the search select a candidate?"
+            f"run {run_dir.name} has no searches with a best/solution.py — did the search select a candidate?"
         )
     return written
 
@@ -387,7 +378,7 @@ def fetch_best_solution(sync_id: str, dest: Path, bucket: str | None = None) -> 
     prefix = gcs_prefix(sync_id)
     written: list[Path] = []
     for blob in gcs.client.list_blobs(gcs, prefix=prefix):
-        parts = blob.name[len(prefix) + 1:].split("/")
+        parts = blob.name[len(prefix) + 1 :].split("/")
         if len(parts) >= 4 and parts[-2] == "best" and parts[-1] == "solution.py":
             search_id = parts[2]
             out = dest / f"{search_id.replace(':', '_').replace('-', '_')}.py"
@@ -403,7 +394,7 @@ def read_best_solution_text(sync_id: str, bucket: str | None = None) -> str | No
     gcs = _gcs_bucket(_bucket_name(bucket))
     prefix = gcs_prefix(sync_id)
     for blob in gcs.client.list_blobs(gcs, prefix=prefix):
-        parts = blob.name[len(prefix) + 1:].split("/")
+        parts = blob.name[len(prefix) + 1 :].split("/")
         if len(parts) >= 4 and parts[-2] == "best" and parts[-1] == "solution.py":
             return blob.download_as_bytes().decode("utf-8")
     return None

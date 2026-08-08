@@ -24,6 +24,7 @@ class FakeResponse:
 
 class FakeErrorResponse(FakeResponse):
     text = '{"detail":"Rebase Workflows is invite-only."}'
+    status_code = 403
 
     def raise_for_status(self) -> None:
         raise requests.HTTPError("403")

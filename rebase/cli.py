@@ -61,13 +61,21 @@ from rebase.client import (
 from rebase.config import (
     DEFAULT_PROFILE,
     DEFAULT_SERVER_URL,
+    add_search_path,
     config_path,
+    editor_settings,
     list_profiles,
+    load_profile,
+    remove_search_path,
+    search_paths,
     selected_profile_name,
     set_default_profile,
+    workspace_key,
     write_profile,
 )
 from rebase.contract import Freshness, validate_frame
+from rebase.editor import NO_EDITOR_HINT, build_argv, resolve_editor, run_foreground, spawn_detached
+from rebase.locate import describe_failure, find_project_declarations, is_risky_root
 
 _BANNER_LINES = [
     "██████╗  ███████╗ ██████╗   █████╗  ███████╗ ███████╗",
@@ -253,6 +261,13 @@ project_app = typer.Typer(
     add_completion=False,
     cls=AlphabeticalTyperGroup,
     help="Inspect Rebase projects.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+search_path_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Local directories searched for the files declaring this workspace's projects.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -3727,6 +3742,152 @@ def project_delete_command(
     console.print(f"[rebase.success]Deleted project {label}.[/rebase.success]")
 
 
+def _active_workspace_key() -> str:
+    profile_name = selected_profile_name()
+    return workspace_key(load_profile(profile_name), profile_name)
+
+
+def _open_in_editor(path: Path, line: int) -> None:
+    settings = editor_settings()
+    configured = settings.get("command")
+    configured_terminal = settings.get("terminal")
+    command = resolve_editor(
+        configured=configured if isinstance(configured, str) else None,
+        configured_terminal=configured_terminal if isinstance(configured_terminal, bool) else None,
+    )
+    if command is None:
+        raise RebaseWorkflowError(NO_EDITOR_HINT)
+    argv = build_argv(command, path, line=line)
+    if command.terminal:
+        run_foreground(argv)
+    else:
+        spawn_detached(argv)
+
+
+@project_app.command("open")
+def project_open_command(
+    name: Annotated[
+        str | None,
+        typer.Argument(help="Project name. Omit when using --id."),
+    ] = None,
+    project_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact project ID.")] = None,
+    path_only: Annotated[
+        bool,
+        typer.Option("--path", "-p", help="Print the resolved path instead of opening an editor."),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Open the Python file that declares a project.
+
+    The file is found by searching this workspace's search paths for the
+    `rb.project(...)` call that names it, so a file that has moved since it was last
+    deployed still resolves. Projects created from the web app have no declaring
+    file and will not be found.
+    """
+    client = Client()
+    project = _resolve_project_selector(client, name, project_id=project_id)
+    project_name = str(project.get("name") or "")
+    roots = [Path(entry) for entry in search_paths(_active_workspace_key())]
+    result = find_project_declarations(project_name, roots)
+
+    if json_output:
+        _print_json(
+            {
+                "project": {"id": project.get("id"), "name": project_name},
+                "status": result.status,
+                "roots": [str(root) for root in result.roots],
+                "matches": [
+                    {"path": str(match.path), "line": match.line, "column": match.column} for match in result.matches
+                ],
+                "unresolved": [str(path) for path in result.unresolved],
+                "files_scanned": result.files_scanned,
+                "files_parsed": result.files_parsed,
+                "truncated": result.truncated,
+            }
+        )
+        return
+
+    if path_only:
+        # Ambiguity is not an error here: printing every candidate is what makes this
+        # usable from a script.
+        if not result.matches:
+            raise RebaseWorkflowError(describe_failure(result))
+        for match in result.matches:
+            console.print(f"{match.path}:{match.line}")
+        return
+
+    if result.status == "ambiguous":
+        listed = "\n".join(f"  {match.path}:{match.line}" for match in result.matches)
+        raise RebaseWorkflowError(
+            f'{len(result.matches)} files declare project "{project_name}":\n{listed}\n'
+            "Open one directly, or narrow the search paths."
+        )
+    if result.status != "found":
+        raise RebaseWorkflowError(describe_failure(result))
+
+    match = result.matches[0]
+    _open_in_editor(match.path, match.line)
+    console.print(f"[rebase.success]Opened {match.path}:{match.line}.[/rebase.success]")
+
+
+@search_path_app.command("list")
+def project_search_path_list_command(
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List the directories searched for this workspace's project files."""
+    paths = search_paths(_active_workspace_key())
+    if json_output:
+        _print_json([{"path": entry, "exists": Path(entry).is_dir()} for entry in paths])
+        return
+    if not paths:
+        console.print(
+            "No search paths configured. Start the TUI inside a repository, or add one with: "
+            "rebase project search-path add <dir>"
+        )
+        return
+    table = Table(box=box.SIMPLE_HEAD, header_style=f"bold {BRAND_BRIGHT_GREEN}")
+    table.add_column("Path")
+    table.add_column("Exists")
+    for entry in paths:
+        table.add_row(entry, "yes" if Path(entry).is_dir() else "no")
+    console.print(table)
+
+
+@search_path_app.command("add")
+def project_search_path_add_command(
+    directory: Annotated[Path, typer.Argument(help="Directory to search for project files.")],
+    force: Annotated[
+        bool,
+        typer.Option("--force", "-f", help="Allow a very broad directory such as your home folder."),
+    ] = False,
+) -> None:
+    """Add a directory to this workspace's search paths."""
+    if not directory.is_dir():
+        raise RebaseWorkflowError(f"not a directory: {directory}")
+    if is_risky_root(directory) and not force:
+        raise RebaseWorkflowError(
+            f"{directory} is broad enough that every lookup would scan it in full. "
+            "Pass --force if that is really what you want."
+        )
+    resolved = directory.expanduser().resolve()
+    if add_search_path(_active_workspace_key(), resolved):
+        console.print(f"[rebase.success]Added search path {resolved}.[/rebase.success]")
+    else:
+        console.print(f"{resolved} is already a search path.")
+
+
+@search_path_app.command("remove")
+def project_search_path_remove_command(
+    directory: Annotated[Path, typer.Argument(help="Directory to stop searching.")],
+) -> None:
+    """Remove a directory from this workspace's search paths."""
+    resolved = directory.expanduser().resolve()
+    if not remove_search_path(_active_workspace_key(), resolved):
+        raise RebaseWorkflowError(f"not a search path: {resolved}")
+    console.print(f"[rebase.success]Removed search path {resolved}.[/rebase.success]")
+
+
+project_app.add_typer(search_path_app, name="search-path")
 app.add_typer(project_app, name="project")
 
 

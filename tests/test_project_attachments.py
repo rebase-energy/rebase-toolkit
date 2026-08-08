@@ -60,7 +60,7 @@ class TestProjectFunctionSecrets:
         assert load in project._functions
 
 
-PROJECT_WITH_ORPHAN = '''
+PROJECT_WITH_ORPHAN = """
 import rebase as rb
 
 project = rb.project("acme")
@@ -74,9 +74,9 @@ def fetch() -> dict:
 @project.workflow(name="nightly")
 def nightly() -> dict:
     return fetch()
-'''
+"""
 
-PROJECT_ALL_ATTACHED = '''
+PROJECT_ALL_ATTACHED = """
 import rebase as rb
 
 project = rb.project("acme")
@@ -85,7 +85,7 @@ project = rb.project("acme")
 @project.function(name="fetch")
 def fetch() -> dict:
     return {}
-'''
+"""
 
 
 class TestDeployRejectsOrphans:

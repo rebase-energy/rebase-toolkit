@@ -3,21 +3,39 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from datetime import datetime
+from contextlib import suppress
+from dataclasses import dataclass, replace
+from datetime import datetime, tzinfo
+from pathlib import Path
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, available_timezones
 
 from rich.text import Text
 from textual import events
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, RenderResult, SuspendNotSupported
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.coordinate import Coordinate
+from textual.geometry import Offset
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Input, Static, TabbedContent, TabPane
+from textual.selection import SELECT_ALL, Selection
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    OptionList,
+    Static,
+    TabbedContent,
+    TabPane,
+)
+
+# Recomposing the header means naming its pieces, and Textual only exports the container.
+# `test_tui_header_parts_still_exist` fails loudly if these move.
+from textual.widgets._header import HeaderClock, HeaderIcon, HeaderTitle
 
 from rebase.brand import (
     BRAND_AMBER,
@@ -28,7 +46,24 @@ from rebase.brand import (
     BRAND_SLATE_BLUE,
 )
 from rebase.client import Client, RebaseWorkflowError
-from rebase.config import list_profiles, load_profile, selected_profile_name, set_default_profile
+from rebase.config import (
+    add_search_path,
+    editor_settings,
+    list_profiles,
+    load_profile,
+    search_paths,
+    selected_profile_name,
+    set_default_profile,
+    workspace_key,
+)
+from rebase.editor import NO_EDITOR_HINT, build_argv, resolve_editor, run_foreground, spawn_detached
+from rebase.locate import (
+    ProjectDeclaration,
+    describe_failure,
+    find_project_declarations,
+    git_toplevel,
+    is_risky_root,
+)
 
 TargetType = Literal["function", "workflow"]
 ViewName = Literal["workspace", "project", "workspace-switcher"]
@@ -45,6 +80,17 @@ CONFIRM_WORD = "delete"
 MARK_STYLE = f"bold {BRAND_AMBER}"
 #: Concurrent requests used to collect the workspace overview's per-project function counts.
 OVERVIEW_FANOUT_WORKERS = 16
+#: Header text per table, added when the rows are and never before. See `_setup_tables`.
+TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "projects-table": ("Project", "Workflows", "Functions", "Endpoints"),
+    "workspace-profiles-table": ("Active", "Profile", "Workspace", "Workspace ID", "API URL"),
+    "functions-table": ("Name", "Run type", "State", "Endpoint", "Version", "Updated"),
+    "workflows-table": ("Name", "Run type", "State", "Endpoint", "Schedule", "Next run", "Version", "Updated"),
+    "asgi-apps-table": ("Name", "Base path", "Auth", "State", "URL path", "Updated"),
+    "runs-table": ("Run", "Status", "Backend", "Created", "Finished"),
+    "events-table": ("Time", "Stage", "Status", "Message"),
+    "steps-table": ("Step", "Status", "Attempt", "Started", "Finished", "Error"),
+}
 
 
 @dataclass(frozen=True)
@@ -52,6 +98,14 @@ class ProjectSummary:
     project: dict[str, Any]
     function_count: int
     workflow_count: int
+    endpoint_count: int = 0
+
+
+@dataclass(frozen=True)
+class OverviewCounts:
+    functions: dict[str, int]
+    workflows: dict[str, int]
+    endpoints: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -95,46 +149,47 @@ class RebaseTuiData:
         if self.project is not None and not any(project.get("name") == self.project for project in projects):
             raise RebaseWorkflowError(f"project not found: {self.project}")
 
-        workflow_counts = self._workflow_counts()
-        function_counts = self._function_counts(projects)
+        counts = self._overview_counts(projects)
         return WorkspaceOverviewData(
             projects=projects,
             project_summaries=[
                 ProjectSummary(
                     project=project,
-                    function_count=function_counts.get(str(project["id"]), 0),
-                    workflow_count=workflow_counts.get(str(project["id"]), 0),
+                    function_count=counts.functions.get(str(project["id"]), 0),
+                    workflow_count=counts.workflows.get(str(project["id"]), 0),
+                    endpoint_count=counts.endpoints.get(str(project["id"]), 0),
                 )
                 for project in projects
             ],
             project_names={str(project.get("id", "")): str(project.get("name", "-")) for project in projects},
         )
 
-    def _workflow_counts(self) -> dict[str, int]:
-        """Workflow counts per project id, from a single workspace-wide call.
+    def _overview_counts(self, projects: list[dict[str, Any]]) -> OverviewCounts:
+        """Every count the project table shows, gathered concurrently.
 
-        Every workflow carries its `project_id`, so one `/workflows` request stands in for
-        one request per project.
-        """
-        return Counter(
-            str(workflow["project_id"]) for workflow in self.client.list_workflows() if workflow.get("project_id")
-        )
-
-    def _function_counts(self, projects: list[dict[str, Any]]) -> dict[str, int]:
-        """Function counts per project id, fanned out concurrently.
-
-        There is no workspace-wide functions route, so this stays one request per project.
-        Run end to end those requests are pure round-trip latency, and they dominated the
-        startup wait on workspaces with many projects.
+        Workflows and endpoints each come from one workspace-wide call, because those
+        objects carry their `project_id`. Functions have no such route and stay one
+        request per project. All of it shares a single pool, so the overview costs
+        roughly one round trip's wait instead of one per project.
         """
         project_ids = [str(project["id"]) for project in projects]
-        if not project_ids:
-            return {}
-        with ThreadPoolExecutor(max_workers=min(OVERVIEW_FANOUT_WORKERS, len(project_ids))) as executor:
-            counts = executor.map(
-                lambda project_id: len(self.client.list_functions(project_id=project_id)), project_ids
+        with ThreadPoolExecutor(max_workers=min(OVERVIEW_FANOUT_WORKERS, len(project_ids) + 2)) as executor:
+            workflows = executor.submit(self._counts_by_project, self.client.list_workflows)
+            # Endpoints are supplementary here, as they are in load_project_targets: an API
+            # without the route should cost the column, not the whole overview.
+            endpoints = executor.submit(self._counts_by_project, lambda: _optional_list(self.client.list_endpoints))
+            functions = list(
+                executor.map(lambda project_id: len(self.client.list_functions(project_id=project_id)), project_ids)
             )
-            return dict(zip(project_ids, counts, strict=True))
+        return OverviewCounts(
+            functions=dict(zip(project_ids, functions, strict=True)),
+            workflows=workflows.result(),
+            endpoints=endpoints.result(),
+        )
+
+    @staticmethod
+    def _counts_by_project(load: Callable[[], list[dict[str, Any]]]) -> dict[str, int]:
+        return Counter(str(item["project_id"]) for item in load() if item.get("project_id"))
 
     def load_project_targets(self, project: dict[str, Any]) -> ProjectTargetsData:
         project_id = str(project["id"])
@@ -168,7 +223,8 @@ def compact_id(value: Any, *, length: int = 8) -> str:
     return f"{text[:length]}..."
 
 
-def format_timestamp(value: Any) -> str:
+def format_timestamp(value: Any, tz: tzinfo | None = None) -> str:
+    """Render an API timestamp, converted to *tz* when it carries an offset to convert from."""
     if value in {None, ""}:
         return "-"
     raw = str(value)
@@ -176,6 +232,8 @@ def format_timestamp(value: Any) -> str:
         parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return raw
+    if tz is not None and parsed.tzinfo is not None:
+        parsed = parsed.astimezone(tz)
     return parsed.strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -282,7 +340,37 @@ def status_text(status: Any) -> Text:
     return Text(value, style=status_style(value))
 
 
+class RebaseClock(HeaderClock):
+    """The header clock, named with the zone it is showing and clickable to change it.
+
+    Textual's clock renders bare local time, which says nothing about which zone the
+    rest of the screen is in — the times in the tables come from the API in UTC. This
+    one names its zone and hands the choice to the user.
+    """
+
+    DEFAULT_CSS = """
+    RebaseClock {
+        width: auto;
+        padding: 0;
+        content-align: right middle;
+    }
+    """
+
+    def render(self) -> RenderResult:
+        now = datetime.now(getattr(self.app, "display_tzinfo", None))
+        return Text(f"{now:%H:%M:%S} {now.tzname() or ''}".rstrip())
+
+    async def on_click(self, event: events.Click) -> None:
+        event.stop()
+        await self.run_action("app.choose_timezone")
+
+
 class RebaseHeader(Header):
+    def compose(self) -> ComposeResult:
+        yield HeaderIcon().data_bind(Header.icon)
+        yield HeaderTitle()
+        yield RebaseClock()
+
     def _on_click(self, event: events.Click) -> None:
         return None
 
@@ -515,6 +603,179 @@ class DeleteConfirmScreen(ModalScreen[bool]):
         return f'Type "{CONFIRM_WORD}" to confirm, then enter. Escape cancels.'
 
 
+class OpenSourceChoiceScreen(ModalScreen[ProjectDeclaration | None]):
+    """Asks which file to open when several declare the same project.
+
+    Two repositories can each declare a project of the same name, and the search has
+    no way to rank them, so the choice belongs to the user. It is deliberately not
+    remembered: a stored answer would go stale exactly the way the deploy-time path
+    this feature replaced does.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    CSS = f"""
+    OpenSourceChoiceScreen {{
+        align: center middle;
+        background: #101412 70%;
+    }}
+
+    #open-source-dialog {{
+        width: 88;
+        height: auto;
+        padding: 1 2;
+        background: #101412;
+        border: solid {BRAND_BRIGHT_GREEN};
+    }}
+
+    #open-source-title {{
+        color: {BRAND_BRIGHT_GREEN};
+        text-style: bold;
+        margin-bottom: 1;
+    }}
+
+    #open-source-options {{
+        height: auto;
+        max-height: 12;
+        background: #101412;
+        border: none;
+    }}
+
+    #open-source-hint {{
+        color: {BRAND_MEDIUM_GRAY};
+        margin-top: 1;
+    }}
+    """
+
+    def __init__(self, *, project_name: str, matches: Sequence[ProjectDeclaration], roots: Sequence[Path]) -> None:
+        super().__init__()
+        self.project_name = project_name
+        self.matches = list(matches)
+        self.roots = list(roots)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="open-source-dialog"):
+            yield Static(
+                f'{len(self.matches)} files declare project "{self.project_name}"',
+                id="open-source-title",
+            )
+            yield OptionList(*[self._label(match) for match in self.matches], id="open-source-options")
+            yield Static("Enter opens the highlighted file. Escape cancels.", id="open-source-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#open-source-options", OptionList).focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(self.matches[event.option_index])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _label(self, match: ProjectDeclaration) -> str:
+        for root in self.roots:
+            with suppress(ValueError):
+                return f"{match.path.relative_to(root)}:{match.line}"
+        return f"{match.path}:{match.line}"
+
+
+class TimezoneChoiceScreen(ModalScreen[str | None]):
+    """Pick the zone the TUI shows times in.
+
+    The zone list is every name `zoneinfo` knows, which is far too many to scroll, so
+    the filter box takes the focus and the arrow keys drive the list from inside it.
+    """
+
+    SYSTEM = "System default"
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("down", "highlight(1)", "Next", show=False),
+        Binding("up", "highlight(-1)", "Previous", show=False),
+    ]
+    CSS = f"""
+    TimezoneChoiceScreen {{
+        align: center middle;
+        background: #101412 70%;
+    }}
+
+    #timezone-dialog {{
+        width: 62;
+        height: auto;
+        padding: 1 2;
+        background: #101412;
+        border: solid {BRAND_BRIGHT_GREEN};
+    }}
+
+    #timezone-title {{
+        color: {BRAND_BRIGHT_GREEN};
+        text-style: bold;
+        margin-bottom: 1;
+    }}
+
+    #timezone-filter {{
+        background: #101412;
+        border: solid {BRAND_MEDIUM_GRAY};
+    }}
+
+    #timezone-options {{
+        height: auto;
+        max-height: 12;
+        background: #101412;
+        border: none;
+    }}
+
+    #timezone-hint {{
+        color: {BRAND_MEDIUM_GRAY};
+        margin-top: 1;
+    }}
+    """
+
+    def __init__(self, *, current: str) -> None:
+        super().__init__()
+        self.current = current
+        # UTC first because the API speaks it; the rest of the database follows.
+        self.zones = [self.SYSTEM, "UTC", *sorted(available_timezones() - {"UTC"})]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="timezone-dialog"):
+            yield Static(f"Show times in — currently {self.current}", id="timezone-title")
+            yield Input(placeholder="filter, e.g. stockholm", id="timezone-filter")
+            yield OptionList(*self.zones, id="timezone-options")
+            yield Static("Enter picks the highlighted zone. Escape cancels.", id="timezone-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#timezone-filter", Input).focus()
+
+    def matches(self, query: str) -> list[str]:
+        needle = query.strip().casefold().replace(" ", "_")
+        if not needle:
+            return self.zones
+        return [zone for zone in self.zones if needle in zone.casefold()]
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        options = self.query_one("#timezone-options", OptionList)
+        options.clear_options()
+        options.add_options(self.matches(event.value))
+        if options.option_count:
+            options.highlighted = 0
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        options = self.query_one("#timezone-options", OptionList)
+        if options.option_count and options.highlighted is not None:
+            self.dismiss(str(options.get_option_at_index(options.highlighted).prompt))
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(str(event.option.prompt))
+
+    def action_highlight(self, delta: int) -> None:
+        options = self.query_one("#timezone-options", OptionList)
+        if not options.option_count:
+            return
+        current = options.highlighted if options.highlighted is not None else -1
+        options.highlighted = max(0, min(options.option_count - 1, current + delta))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class RebaseTuiApp(App[None]):
     TITLE = "Rebase TUI"
     SUB_TITLE = ""
@@ -523,8 +784,13 @@ class RebaseTuiApp(App[None]):
         ("r", "refresh", "Refresh"),
         ("b", "back", "Back"),
         ("d", "delete_selection", "Delete"),
+        ("o", "open_source", "Open source"),
+        ("s", "toggle_terminal_select", "Select text"),
         # priority: the screen's default `tab` -> focus_next otherwise shadows this.
         Binding("tab", "toggle_target_tab", "Switch target", priority=True),
+        # Textual's own `ctrl+c,super+c` copies the selection; these adjust it first.
+        Binding("shift+right", "adjust_text_selection(1)", "Grow selection", show=False),
+        Binding("shift+left", "adjust_text_selection(-1)", "Shrink selection", show=False),
     ]
     CSS = f"""
     Screen {{
@@ -547,7 +813,7 @@ class RebaseTuiApp(App[None]):
         content-align: center middle;
     }}
 
-    HeaderClock, HeaderClockSpace {{
+    HeaderClockSpace {{
         width: 13;
     }}
 
@@ -586,12 +852,6 @@ class RebaseTuiApp(App[None]):
     #projects-table > .datatable--odd-row,
     #projects-table > .datatable--even-row {{
         background: #101412;
-    }}
-
-    #summary {{
-        height: 3;
-        padding: 0 1;
-        border-bottom: solid {BRAND_MEDIUM_GRAY};
     }}
 
     #target-tabs {{
@@ -658,6 +918,8 @@ class RebaseTuiApp(App[None]):
         self._endpoints_by_target: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._run_rows: dict[str, dict[str, Any]] = {}
         self._marked_count = 0
+        self._terminal_select = False
+        self._display_timezone: ZoneInfo | None = None
 
     def compose(self) -> ComposeResult:
         yield RebaseHeader(show_clock=True, icon="• Commands")
@@ -666,7 +928,6 @@ class RebaseTuiApp(App[None]):
         with Vertical(id="workspace-switcher-view"):
             yield DataTable(id="workspace-profiles-table")
         with Vertical(id="project-view"):
-            yield Static("", id="summary")
             yield Static("Select a project.", id="project-detail", classes="panel")
             with TabbedContent(initial="workflows-tab", id="target-tabs"):
                 with TabPane("Workflows", id="workflows-tab"):
@@ -687,45 +948,80 @@ class RebaseTuiApp(App[None]):
         self._update_workspace_title()
         self._show_workspace_view()
         self.action_refresh()
+        # Own group: this must never cancel, or be cancelled by, the overview load.
+        self.run_worker(self._bootstrap_search_path(), name="bootstrap", group="tui-bootstrap")
+
+    def _workspace_key(self) -> str:
+        # A method rather than a cached attribute so switching workspace picks up the
+        # new one's search paths without extra bookkeeping.
+        return workspace_key(self.profile_data, self.profile_name)
+
+    async def _bootstrap_search_path(self) -> None:
+        """Remember the repository the TUI was started in, so `o` works with no setup.
+
+        Runs in a thread because `git rev-parse` can stall on a network filesystem,
+        and first paint should not wait for it.
+        """
+
+        def bootstrap() -> None:
+            root = git_toplevel(Path.cwd())
+            # Only a git root, never a bare cwd: that is how a home directory would
+            # end up registered and turn every lookup into a full-disk scan.
+            if root is None or is_risky_root(root):
+                return
+            with suppress(OSError):
+                add_search_path(self._workspace_key(), root)
+
+        await asyncio.to_thread(bootstrap)
+
+    def _fill_table(self, table_id: str) -> DataTable:
+        """Empty a table and give it its header back, ready for rows.
+
+        Headers and rows land in the same paint this way, so the columns are sized once
+        against real data instead of snapping from header width to content width.
+        """
+        table = self.query_one(f"#{table_id}", DataTable)
+        table.clear(columns=True)
+        table.add_columns(*TABLE_COLUMNS[table_id])
+        return table
 
     def _setup_tables(self) -> None:
+        """Set the tables up, but leave them without columns.
+
+        Column widths are computed from the header text until the first row lands, so a
+        table that shows its headers early shows them at the wrong widths and then jerks
+        them into place when the data arrives. Headers are added in `_fill_table` instead,
+        in the same paint as the rows.
+        """
         projects = self.query_one("#projects-table", DataTable)
         projects.cursor_type = "row"
         projects.zebra_stripes = False
-        projects.add_columns("Project", "Workflows", "Functions")
 
         profiles = self.query_one("#workspace-profiles-table", DataTable)
         profiles.cursor_type = "row"
         profiles.zebra_stripes = True
-        profiles.add_columns("Active", "Profile", "Workspace", "Workspace ID", "API URL")
 
         functions = self.query_one("#functions-table", DataTable)
         functions.cursor_type = "row"
         functions.zebra_stripes = True
-        functions.add_columns("Name", "Run type", "State", "Endpoint", "Version", "Updated")
 
         workflows = self.query_one("#workflows-table", DataTable)
         workflows.cursor_type = "row"
         workflows.zebra_stripes = True
-        workflows.add_columns("Name", "Run type", "State", "Endpoint", "Schedule", "Next run", "Version", "Updated")
 
         asgi_apps = self.query_one("#asgi-apps-table", DataTable)
         asgi_apps.cursor_type = "row"
         asgi_apps.zebra_stripes = True
-        asgi_apps.add_columns("Name", "Base path", "Auth", "State", "URL path", "Updated")
 
         runs = self.query_one("#runs-table", DataTable)
         runs.cursor_type = "row"
         runs.zebra_stripes = True
-        runs.add_columns("Run", "Status", "Backend", "Created", "Finished")
 
         events = self.query_one("#events-table", DataTable)
         events.zebra_stripes = True
-        events.add_columns("Time", "Stage", "Status", "Message")
 
         steps = self.query_one("#steps-table", DataTable)
         steps.zebra_stripes = True
-        steps.add_columns("Step", "Status", "Attempt", "Started", "Finished", "Error")
 
     def action_refresh(self) -> None:
         if self.current_view == "workspace-switcher":
@@ -767,6 +1063,101 @@ class RebaseTuiApp(App[None]):
         current = order.index(tabs.active) if tabs.active in order else 0
         tabs.active = order[(current + 1) % len(order)]
 
+    @property
+    def display_tzinfo(self) -> tzinfo | None:
+        """The zone every time in the TUI is rendered in, system local until changed."""
+        return self._display_timezone or datetime.now().astimezone().tzinfo
+
+    def _time(self, value: Any) -> str:
+        return format_timestamp(value, self.display_tzinfo)
+
+    def _timezone_label(self) -> str:
+        if self._display_timezone is not None:
+            return str(self._display_timezone)
+        now = datetime.now().astimezone()
+        return f"{TimezoneChoiceScreen.SYSTEM} ({now.tzname()})"
+
+    def action_choose_timezone(self) -> None:
+        """Change the zone times are shown in. Bound to a click on the header clock."""
+        self.push_screen(TimezoneChoiceScreen(current=self._timezone_label()), self._on_timezone_chosen)
+
+    def _on_timezone_chosen(self, choice: str | None) -> None:
+        if choice is None:
+            return
+        if choice == TimezoneChoiceScreen.SYSTEM:
+            self._display_timezone = None
+        else:
+            try:
+                self._display_timezone = ZoneInfo(choice)
+            except Exception as exc:
+                self.notify(f"Unknown timezone {choice}: {exc}", severity="error")
+                return
+        self.query_one(RebaseClock).refresh()
+        # Every rendered timestamp is now in the wrong zone; the reload repaints the
+        # tables, and the project panel is redrawn here because nothing else will.
+        if self.selected_project is not None:
+            summary = self._project_rows.get(str(self.selected_project.get("id", "")))
+            if summary is not None:
+                self._render_project_detail(summary)
+        self.action_refresh()
+        self.notify(f"Times now shown in {self._timezone_label()}.")
+
+    def action_toggle_terminal_select(self) -> None:
+        """Hand the mouse back to the terminal, and take it again.
+
+        Mouse reporting is all-or-nothing: while it is on, the terminal forwards drags to
+        the app instead of making a selection of its own, which is why the terminal's copy
+        shortcut has nothing to copy. Turning it off restores native selection — drag, then
+        cmd+c, exactly as in a program that never took the mouse — and turning it back on
+        restores hover, clicking and wheel scrolling. Keys keep working either way, so `s`
+        always gets you back.
+        """
+        method = "_enable_mouse_support" if self._terminal_select else "_disable_mouse_support"
+        toggle = getattr(self._driver, method, None)
+        if toggle is None:
+            self.notify("This terminal has no mouse support to hand over.", severity="warning")
+            return
+        toggle()
+        self._terminal_select = not self._terminal_select
+        if self._terminal_select:
+            # Nothing will report the pointer leaving now, so drop the app's own highlights by hand.
+            self._set_mouse_over(None, None)
+            self.screen.clear_selection()
+            self.notify("Mouse handed to the terminal: drag to select, then copy as you would anywhere. s resumes.")
+        else:
+            self.notify("Mouse back in the TUI: hover, click and scroll again.")
+        self._update_workspace_title()
+
+    def action_adjust_text_selection(self, delta: int) -> None:
+        """Move the trailing edge of the mouse-made text selection by one cell.
+
+        Textual only builds selections by dragging, and `Selection.from_offsets` sorts
+        the two ends, so there is no record of which end the pointer was on: `shift+right`
+        always grows the selection at its end and `shift+left` always pulls that end back.
+        A selection spanning several widgets has no single edge to move, so it is left
+        alone rather than moved arbitrarily.
+        """
+        screen = self.screen
+        if len(screen.selections) != 1:
+            return
+        widget, selection = next(iter(screen.selections.items()))
+        start, end = selection
+        if start is None or end is None:
+            # A whole-widget selection: no concrete offsets to walk.
+            return
+        selected = widget.get_selection(SELECT_ALL)
+        if selected is None:
+            return
+        lines = selected[0].splitlines()
+        if not 0 <= end.y < len(lines):
+            return
+        # `end` is exclusive, so it may sit one past the last character of its line.
+        lowest = start.x if end.y == start.y else 0
+        new_x = min(max(end.x + delta, lowest), len(lines[end.y]))
+        if new_x == end.x:
+            return
+        screen.selections = {widget: Selection(start, Offset(new_x, end.y))}
+
     def action_delete_selection(self) -> None:
         """Delete the marked rows, or the row under the cursor when nothing is marked."""
         table = self._delete_table()
@@ -784,8 +1175,80 @@ class RebaseTuiApp(App[None]):
             return
         self.push_screen(
             DeleteConfirmScreen(kind=kind, names=[name for _, name in items]),
-            lambda confirmed: self._on_delete_confirmed(bool(confirmed), kind, items),
+            lambda confirmed: self._on_delete_confirmed(bool(confirmed), kind, items, table),
         )
+
+    def _open_source_target(self) -> dict[str, Any] | None:
+        """The project `o` acts on: the highlighted row, or the one already open."""
+        if self.current_view == "project":
+            return self.selected_project
+        if self.current_view == "workspace":
+            key = self.query_one("#projects-table", SelectableDataTable).cursor_key
+            summary = None if key is None else self._project_rows.get(key)
+            return None if summary is None else summary.project
+        return None
+
+    def action_open_source(self) -> None:
+        """Open the file that declares the selected project."""
+        project = self._open_source_target()
+        name = str(project.get("name") or "") if project is not None else ""
+        if not name:
+            self.notify("Select a project first.", severity="warning")
+            return
+        self.run_worker(
+            self._open_project_source(name),
+            name="open-source",
+            group="tui-open",
+            exclusive=True,
+        )
+
+    async def _open_project_source(self, project_name: str) -> None:
+        roots = [Path(entry) for entry in search_paths(self._workspace_key())]
+        # Off the event loop: walking a large repository must not freeze the UI.
+        result = await asyncio.to_thread(find_project_declarations, project_name, roots)
+        if result.status == "found":
+            self._launch_editor(result.matches[0])
+            return
+        if result.status == "ambiguous":
+            self.push_screen(
+                OpenSourceChoiceScreen(project_name=project_name, matches=result.matches, roots=result.roots),
+                self._on_source_chosen,
+            )
+            return
+        self.notify(describe_failure(result), severity="warning")
+
+    def _on_source_chosen(self, chosen: ProjectDeclaration | None) -> None:
+        if chosen is not None:
+            self._launch_editor(chosen)
+
+    def _launch_editor(self, declaration: ProjectDeclaration) -> None:
+        settings = editor_settings()
+        configured = settings.get("command")
+        configured_terminal = settings.get("terminal")
+        try:
+            command = resolve_editor(
+                configured=configured if isinstance(configured, str) else None,
+                configured_terminal=configured_terminal if isinstance(configured_terminal, bool) else None,
+            )
+            if command is None:
+                self.notify(NO_EDITOR_HINT, severity="error")
+                return
+            argv = build_argv(command, declaration.path, line=declaration.line)
+            if command.terminal:
+                try:
+                    # A terminal editor needs this terminal, so hand it over and take
+                    # it back when the editor exits.
+                    with self.suspend():
+                        run_foreground(argv)
+                except SuspendNotSupported:
+                    # Headless and web drivers cannot yield the terminal.
+                    spawn_detached(argv)
+            else:
+                spawn_detached(argv)
+        except RebaseWorkflowError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.notify(f"Opened {declaration.path.name}:{declaration.line}.")
 
     def _delete_table(self) -> SelectableDataTable | None:
         """The table `d` acts on, resolved from the current view.
@@ -813,33 +1276,106 @@ class RebaseTuiApp(App[None]):
         item = rows.get(key)
         return None if item is None else str(item.get("name", key))
 
-    def _on_delete_confirmed(self, confirmed: bool, kind: DeletableKind, items: list[tuple[str, str]]) -> None:
+    def _on_delete_confirmed(
+        self,
+        confirmed: bool,
+        kind: DeletableKind,
+        items: list[tuple[str, str]],
+        table: SelectableDataTable,
+    ) -> None:
         if not confirmed:
             return
+        # Drop the rows before the API is even asked. The requests take a round trip
+        # each and there is no bulk delete route, so waiting for them -- and then for
+        # the reload that used to follow -- left confirmed-gone rows on screen for
+        # seconds. A delete that fails puts its row back, via the refresh below.
+        self._forget_deleted(kind, [object_id for object_id, _ in items], table)
         self.run_worker(self._delete_items(kind, items), name="delete", group="tui-delete", exclusive=True)
 
+    def _forget_deleted(self, kind: DeletableKind, object_ids: list[str], table: SelectableDataTable) -> None:
+        """Take the rows off screen and out of the view's backing data."""
+        table.action_clear_marks()
+        for object_id in object_ids:
+            with suppress(KeyError):  # already gone -- a refresh landed first
+                table.remove_row(object_id)
+        gone = set(object_ids)
+        if kind == "project":
+            self._project_rows = {key: value for key, value in self._project_rows.items() if key not in gone}
+            if self.workspace_overview is not None:
+                self.workspace_overview = replace(
+                    self.workspace_overview,
+                    projects=[p for p in self.workspace_overview.projects if str(p.get("id")) not in gone],
+                    project_summaries=[
+                        s for s in self.workspace_overview.project_summaries if str(s.project.get("id")) not in gone
+                    ],
+                    project_names={
+                        key: value for key, value in self.workspace_overview.project_names.items() if key not in gone
+                    },
+                )
+        elif kind == "function":
+            self._function_rows = {key: value for key, value in self._function_rows.items() if key not in gone}
+            if self.project_targets is not None:
+                self.project_targets = replace(
+                    self.project_targets,
+                    functions=[f for f in self.project_targets.functions if str(f.get("id")) not in gone],
+                )
+        else:
+            self._workflow_rows = {key: value for key, value in self._workflow_rows.items() if key not in gone}
+            if self.project_targets is not None:
+                self.project_targets = replace(
+                    self.project_targets,
+                    workflows=[w for w in self.project_targets.workflows if str(w.get("id")) not in gone],
+                )
+        self._clear_target_detail(clear_project=kind == "project")
+
     async def _delete_items(self, kind: DeletableKind, items: list[tuple[str, str]]) -> None:
-        # Forced: the confirmation dialog is explicit that contents go too, and an
-        # unforced delete is refused for anything that still holds runs.
+        # Forced throughout: the confirmation dialog is explicit that contents go
+        # too, and an unforced delete is refused for anything that still holds runs.
+        if kind == "project":
+            deleted, failures = await self._delete_projects(items)
+        else:
+            deleted, failures = await self._delete_targets(kind, items)
+        self._report_deletes(kind, deleted, failures)
+        if failures:
+            # The rows are already gone from the screen, so reload to put back whatever survived.
+            self.action_refresh()
+
+    async def _delete_projects(self, items: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
+        """One request for the whole marked run, via the API's batch route."""
+        names = dict(items)
+        try:
+            reported = await asyncio.to_thread(
+                self.data.client.delete_projects, [object_id for object_id, _ in items], force=True
+            )
+        except Exception as exc:
+            # The batch was refused whole: auth, a bad payload, an unreachable API.
+            return [], [f"{name}: {exc}" for _, name in items]
+        failed = {project_id for project_id, _ in reported}
+        return (
+            [name for object_id, name in items if object_id not in failed],
+            [f"{names.get(project_id, project_id)}: {message}" for project_id, message in reported],
+        )
+
+    async def _delete_targets(self, kind: DeletableKind, items: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
+        """Functions and workflows have no batch route, so fan out concurrently instead."""
+
         def delete(object_id: str) -> None:
-            if kind == "project":
-                self.data.client.delete_project(object_id, force=True)
-            elif kind == "function":
+            if kind == "function":
                 self.data.client.delete_function(object_id, force=True)
             else:
                 self.data.client.delete_workflow(object_id, force=True)
 
-        deleted: list[str] = []
-        failures: list[str] = []
-        for object_id, name in items:
-            try:
-                await asyncio.to_thread(delete, object_id)
-            except Exception as exc:
-                failures.append(f"{name}: {exc}")
-            else:
-                deleted.append(name)
-        self._report_deletes(kind, deleted, failures)
-        self.action_refresh()
+        results = await asyncio.gather(
+            *(asyncio.to_thread(delete, object_id) for object_id, _ in items), return_exceptions=True
+        )
+        return (
+            [name for (_, name), result in zip(items, results, strict=True) if not isinstance(result, BaseException)],
+            [
+                f"{name}: {result}"
+                for (_, name), result in zip(items, results, strict=True)
+                if isinstance(result, BaseException)
+            ],
+        )
 
     def _report_deletes(self, kind: DeletableKind, deleted: list[str], failures: list[str]) -> None:
         if deleted:
@@ -868,7 +1404,6 @@ class RebaseTuiApp(App[None]):
         self._show_workspace_view()
 
     async def _load_project_targets(self, project: dict[str, Any]) -> None:
-        self._set_summary(f"Loading project {project.get('name', project.get('id', '-'))}...")
         try:
             targets = await asyncio.to_thread(self.data.load_project_targets, project)
         except Exception as exc:
@@ -876,17 +1411,15 @@ class RebaseTuiApp(App[None]):
             return
         self.project_targets = targets
         self._render_project_targets(targets)
-        self._set_summary(self._summary_text())
 
     async def _load_runs(self, target_type: TargetType, target_id: str) -> None:
-        self._set_summary(f"Loading latest {target_type} runs...")
+        self.query_one("#run-detail", Static).update(f"Loading latest {target_type} runs...")
         try:
             runs = await asyncio.to_thread(self.data.load_target_runs, target_type, target_id)
         except Exception as exc:
             self._set_error(exc)
             return
         self._render_runs(runs)
-        self._set_summary(self._summary_text())
 
     async def _load_run_detail(self, run_id: str) -> None:
         self.query_one("#run-detail", Static).update(f"Loading run {compact_id(run_id)}...")
@@ -904,24 +1437,21 @@ class RebaseTuiApp(App[None]):
             if summary.project.get("id") is not None
         }
 
-        projects = self.query_one("#projects-table", DataTable)
-        projects.clear()
+        projects = self._fill_table("projects-table")
         for project_id, summary in self._project_rows.items():
             project = summary.project
             projects.add_row(
                 str(project.get("name", "-")),
                 str(summary.workflow_count),
                 str(summary.function_count),
+                str(summary.endpoint_count),
                 key=project_id,
             )
-
-        self._set_summary(self._summary_text())
 
     def _render_workspace_profiles(self) -> None:
         profiles = list_profiles()
         self._profile_rows = profiles
-        table = self.query_one("#workspace-profiles-table", DataTable)
-        table.clear()
+        table = self._fill_table("workspace-profiles-table")
         for profile_name, profile_data in sorted(profiles.items()):
             table.add_row(
                 "*" if profile_name == self.profile_name else "",
@@ -938,8 +1468,7 @@ class RebaseTuiApp(App[None]):
         self._asgi_app_rows = {str(item["id"]): item for item in targets.asgi_apps if item.get("id") is not None}
         self._endpoints_by_target = endpoints_by_target(targets.endpoints)
 
-        functions = self.query_one("#functions-table", DataTable)
-        functions.clear()
+        functions = self._fill_table("functions-table")
         for function_id, function in self._function_rows.items():
             functions.add_row(
                 str(function.get("name", "-")),
@@ -947,12 +1476,11 @@ class RebaseTuiApp(App[None]):
                 format_bool(function.get("enabled")),
                 format_endpoint(self._target_endpoints("function", function_id)),
                 compact_id(function.get("current_version_id")),
-                format_timestamp(function.get("updated_at")),
+                self._time(function.get("updated_at")),
                 key=function_id,
             )
 
-        workflows = self.query_one("#workflows-table", DataTable)
-        workflows.clear()
+        workflows = self._fill_table("workflows-table")
         for workflow_id, workflow in self._workflow_rows.items():
             workflows.add_row(
                 str(workflow.get("name", "-")),
@@ -960,14 +1488,13 @@ class RebaseTuiApp(App[None]):
                 format_bool(workflow.get("enabled")),
                 format_endpoint(self._target_endpoints("workflow", workflow_id)),
                 format_schedule(workflow.get("schedule")),
-                format_timestamp(workflow.get("next_run_at")),
+                self._time(workflow.get("next_run_at")),
                 compact_id(workflow.get("current_version_id")),
-                format_timestamp(workflow.get("updated_at")),
+                self._time(workflow.get("updated_at")),
                 key=workflow_id,
             )
 
-        asgi_apps = self.query_one("#asgi-apps-table", DataTable)
-        asgi_apps.clear()
+        asgi_apps = self._fill_table("asgi-apps-table")
         for asgi_app_id, asgi_app in self._asgi_app_rows.items():
             asgi_apps.add_row(
                 str(asgi_app.get("name", "-")),
@@ -975,7 +1502,7 @@ class RebaseTuiApp(App[None]):
                 str(asgi_app.get("auth") or "-"),
                 format_bool(asgi_app.get("enabled")),
                 str(asgi_app.get("url_path") or "-"),
-                format_timestamp(asgi_app.get("updated_at")),
+                self._time(asgi_app.get("updated_at")),
                 key=asgi_app_id,
             )
 
@@ -987,23 +1514,22 @@ class RebaseTuiApp(App[None]):
 
     def _render_runs(self, runs: list[dict[str, Any]]) -> None:
         self._run_rows = {str(item["id"]): item for item in runs if item.get("id") is not None}
-        table = self.query_one("#runs-table", DataTable)
-        table.clear()
+        table = self._fill_table("runs-table")
         for run_id, run in self._run_rows.items():
             table.add_row(
                 compact_id(run_id),
                 status_text(run.get("status")),
                 str(run.get("execution_backend", "-")),
-                format_timestamp(run.get("created_at")),
-                format_timestamp(run.get("finished_at")),
+                self._time(run.get("created_at")),
+                self._time(run.get("finished_at")),
                 key=run_id,
             )
         if not runs:
             self.query_one("#run-detail", Static).update("No runs found for the selected target.")
         else:
             self.query_one("#run-detail", Static).update("Select a run.")
-        self.query_one("#events-table", DataTable).clear()
-        self.query_one("#steps-table", DataTable).clear()
+        self.query_one("#events-table", DataTable).clear(columns=True)
+        self.query_one("#steps-table", DataTable).clear(columns=True)
 
     def _render_run_detail(self, detail: RunDetailData) -> None:
         run = detail.run
@@ -1017,43 +1543,41 @@ class RebaseTuiApp(App[None]):
             lines[-1] = f"Error: {format_json_summary(run.get('error'), max_length=130)}"
         self.query_one("#run-detail", Static).update("\n".join(lines))
 
-        events = self.query_one("#events-table", DataTable)
-        events.clear()
+        events = self._fill_table("events-table")
         for event in detail.events:
             events.add_row(
-                format_timestamp(event.get("created_at")),
+                self._time(event.get("created_at")),
                 str(event.get("stage", "-")),
                 status_text(event.get("status")),
                 format_json_summary(event.get("message"), max_length=120),
             )
 
-        steps = self.query_one("#steps-table", DataTable)
-        steps.clear()
+        steps = self._fill_table("steps-table")
         for step in detail.steps:
             steps.add_row(
                 str(step.get("name") or step.get("node_key") or "-"),
                 status_text(step.get("status")),
                 str(step.get("attempt", "-")),
-                format_timestamp(step.get("started_at")),
-                format_timestamp(step.get("finished_at")),
+                self._time(step.get("started_at")),
+                self._time(step.get("finished_at")),
                 format_json_summary(step.get("error"), max_length=80),
             )
 
     def _clear_target_detail(self, *, clear_project: bool = True) -> None:
         if clear_project:
             self.query_one("#project-detail", Static).update("Select a project.")
-            self.query_one("#functions-table", DataTable).clear()
-            self.query_one("#workflows-table", DataTable).clear()
-            self.query_one("#asgi-apps-table", DataTable).clear()
+            self.query_one("#functions-table", DataTable).clear(columns=True)
+            self.query_one("#workflows-table", DataTable).clear(columns=True)
+            self.query_one("#asgi-apps-table", DataTable).clear(columns=True)
             self._function_rows = {}
             self._workflow_rows = {}
             self._asgi_app_rows = {}
             self._endpoints_by_target = {}
         self.query_one("#target-detail", Static).update("Select a workflow, function, or ASGI app.")
-        self.query_one("#runs-table", DataTable).clear()
+        self.query_one("#runs-table", DataTable).clear(columns=True)
         self.query_one("#run-detail", Static).update("Select a run.")
-        self.query_one("#events-table", DataTable).clear()
-        self.query_one("#steps-table", DataTable).clear()
+        self.query_one("#events-table", DataTable).clear(columns=True)
+        self.query_one("#steps-table", DataTable).clear(columns=True)
         self._run_rows = {}
 
     def _render_project_detail(self, summary: ProjectSummary) -> None:
@@ -1061,8 +1585,9 @@ class RebaseTuiApp(App[None]):
         description = format_json_summary(project.get("description"), max_length=110)
         lines = [
             f"Project {project.get('name', '-')}",
-            f"Functions: {summary.function_count} | Workflows: {summary.workflow_count}",
-            f"Updated: {format_timestamp(project.get('updated_at'))} | ID: {project.get('id', '-')}",
+            f"Functions: {summary.function_count} | Workflows: {summary.workflow_count} | "
+            f"Endpoints: {summary.endpoint_count}",
+            f"Updated: {self._time(project.get('updated_at'))} | ID: {project.get('id', '-')}",
             f"Description: {description}",
         ]
         self.query_one("#project-detail", Static).update("\n".join(lines))
@@ -1215,19 +1740,6 @@ class RebaseTuiApp(App[None]):
         project_id = str(item.get("project_id", ""))
         return self.workspace_overview.project_names.get(project_id, project_id or "-")
 
-    def _summary_text(self) -> str:
-        if self.workspace_overview is None:
-            return "No Rebase data loaded."
-        selected = self.selected_project.get("name", "-") if self.selected_project is not None else "none"
-        total_functions = sum(summary.function_count for summary in self.workspace_overview.project_summaries)
-        total_workflows = sum(summary.workflow_count for summary in self.workspace_overview.project_summaries)
-        api_url = str(getattr(self.data.client, "api_url", "-"))
-        return (
-            f"Profile: {self.profile_name} | API: {api_url} | Projects: {len(self.workspace_overview.projects)} | "
-            f"Functions: {total_functions} | Workflows: {total_workflows} | Selected project: {selected} | "
-            f"Latest runs per target: {self.limit}"
-        )
-
     def _workspace_label(self) -> str:
         return self._profile_workspace_label(self.profile_data, fallback=self.profile_name)
 
@@ -1250,15 +1762,18 @@ class RebaseTuiApp(App[None]):
         title = f"Rebase TUI - Workspace: {self._workspace_label()}"
         if self._marked_count:
             title = f"{title} - {self._marked_count} marked"
+        if self._terminal_select:
+            title = f"{title} - select text (mouse off, s to resume)"
         self.title = title
 
-    def _set_summary(self, message: str) -> None:
-        self.query_one("#summary", Static).update(message)
-
     def _set_error(self, error: Exception) -> None:
+        # The summary bar used to carry the error text; the detail panel is now the only
+        # place a failed load can say what went wrong, so it gets the message itself.
         self._show_project_view()
-        self._set_summary(f"Error: {error}")
-        self.query_one("#project-detail", Static).update("The Rebase API request failed. Press r to retry.")
+        self.query_one("#project-detail", Static).update(
+            f"The Rebase API request failed. Press r to retry.\nError: {error}"
+        )
+        self.notify(f"Rebase API request failed: {error}", severity="error")
 
 
 def run_tui(*, project: str | None = None, limit: int = 25, client: Client | None = None) -> None:
