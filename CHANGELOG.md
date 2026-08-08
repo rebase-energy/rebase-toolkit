@@ -32,6 +32,20 @@
   handler never fired for anything typer's parser raised. `Abort` (Ctrl-C at a prompt) was affected
   the same way.
 
+## 0.6.1 — 2026-08-07
+
+### Fixed
+
+- `rebase-toolkit[hillclimb]` now installs the published `hillclimb` 0.2 release
+  with its compatible `emflow` 0.3.1 integration and packaged benchmark data.
+- The `rebase` compatibility package now forwards its `hillclimb` extra.
+
+### Changed
+
+- `rebase-toolkit[all]` excludes Snowflake because its current pandas constraint
+  conflicts with hillclimb's pandas 3 requirement; install the `snowflake` extra
+  separately.
+
 ## 0.6.0 — 2026-07-07
 
 ### Added

@@ -27,6 +27,7 @@ def test_rebase_alias_extras_forward_to_toolkit_extras() -> None:
             "data",
             "huggingface",
             "modeling",
+            "hillclimb",
             "snowflake",
             "databricks",
             "bigquery",
