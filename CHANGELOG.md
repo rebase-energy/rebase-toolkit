@@ -4,6 +4,12 @@
 
 ### Added
 
+- **`d` deletes from the TUI**, with `shift+up` / `shift+down` to mark a range of rows first.
+  It acts on the projects table in the workspace view and on the workflows/functions table of
+  the active tab inside a project; marked rows turn amber and are counted in the title. Every
+  delete goes through a type-to-confirm dialog — one row asks for its own name typed back, a
+  batch asks for the word `delete` — and then deletes with `force`, so contents and run history
+  go with it. ASGI apps and runs have no delete endpoint, so `d` declines there.
 - **`-h` is an alias for `--help`** on every command and subcommand.
 - **Short flags for CLI options**: each option now also answers to `-x`, where `x` is the first
   letter of its long name — `rebase deploy -n api -e prod`, `rebase workflow list -j`. 235 of 269

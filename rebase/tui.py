@@ -14,7 +14,10 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
+from textual.coordinate import Coordinate
+from textual.message import Message
+from textual.screen import ModalScreen
+from textual.widgets import DataTable, Footer, Header, Input, Static, TabbedContent, TabPane
 
 from rebase.brand import (
     BRAND_AMBER,
@@ -29,6 +32,17 @@ from rebase.config import list_profiles, load_profile, selected_profile_name, se
 
 TargetType = Literal["function", "workflow"]
 ViewName = Literal["workspace", "project", "workspace-switcher"]
+DeletableKind = Literal["project", "function", "workflow"]
+
+#: Tables whose rows `d` can delete, and the kind of object each row is.
+DELETABLE_TABLES: dict[str, DeletableKind] = {
+    "projects-table": "project",
+    "functions-table": "function",
+    "workflows-table": "workflow",
+}
+#: What a multi-item delete asks the user to type. Compared case-insensitively.
+CONFIRM_WORD = "delete"
+MARK_STYLE = f"bold {BRAND_AMBER}"
 #: Concurrent requests used to collect the workspace overview's per-project function counts.
 OVERVIEW_FANOUT_WORKERS = 16
 
@@ -273,6 +287,234 @@ class RebaseHeader(Header):
         return None
 
 
+class SelectableDataTable(DataTable):
+    """A DataTable whose rows can be *marked* in bulk, on top of the single-row cursor.
+
+    Textual's DataTable has a cursor but no notion of a selection, so the marks live
+    here: `shift+up` / `shift+down` grow an inclusive range anchored where the shifted
+    run started, any unshifted cursor move drops the range again, and `escape` clears
+    it outright. Marked rows are restyled in place rather than tracked invisibly, and
+    the cursor's foreground is demoted to `renderable` priority so the mark still
+    shows on the one row the cursor is sitting on.
+    """
+
+    BINDINGS = [
+        Binding("shift+up", "extend_mark(-1)", "Mark up", show=False),
+        Binding("shift+down", "extend_mark(1)", "Mark down", show=False),
+        Binding("escape", "clear_marks", "Clear marks", show=False),
+    ]
+
+    class MarksChanged(Message):
+        """Posted whenever the set of marked rows changes."""
+
+        def __init__(self, table: SelectableDataTable, marked: list[str]) -> None:
+            super().__init__()
+            self.table = table
+            self.marked = marked
+
+        @property
+        def control(self) -> SelectableDataTable:
+            return self.table
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("cursor_foreground_priority", "renderable")
+        super().__init__(*args, **kwargs)
+        self._marked: set[str] = set()
+        self._anchor: int | None = None
+        self._extending = False
+        # Cells are restyled in place, so the unmarked renderables have to be kept.
+        self._unmarked_cells: dict[str, dict[Any, Any]] = {}
+
+    @property
+    def marked_keys(self) -> list[str]:
+        """Row keys of the marked rows, in table order."""
+        return [
+            str(row.key.value)
+            for row in self.ordered_rows
+            if row.key.value is not None and row.key.value in self._marked
+        ]
+
+    @property
+    def cursor_key(self) -> str | None:
+        """Row key under the cursor, or None on an empty table."""
+        if not 0 <= self.cursor_row < len(self.ordered_rows):
+            return None
+        value = self.ordered_rows[self.cursor_row].key.value
+        return None if value is None else str(value)
+
+    def clear(self, columns: bool = False) -> SelectableDataTable:
+        self._reset_marks()
+        return super().clear(columns)
+
+    def watch_cursor_coordinate(self, old_coordinate: Coordinate, new_coordinate: Coordinate) -> None:
+        super().watch_cursor_coordinate(old_coordinate, new_coordinate)
+        # Moving off a range without shift held is how you abandon it.
+        if getattr(self, "_extending", True) or old_coordinate.row == new_coordinate.row:
+            return
+        if getattr(self, "_marked", None):
+            self.action_clear_marks()
+
+    def action_extend_mark(self, delta: int) -> None:
+        if not self.ordered_rows:
+            return
+        if self._anchor is None:
+            self._anchor = self.cursor_row
+        target = max(0, min(len(self.ordered_rows) - 1, self.cursor_row + delta))
+        self._extending = True
+        try:
+            self.move_cursor(row=target)
+        finally:
+            self._extending = False
+        anchor = self._anchor
+        rows = self.ordered_rows[min(anchor, target) : max(anchor, target) + 1]
+        self._apply_marks({str(row.key.value) for row in rows if row.key.value is not None})
+
+    def action_clear_marks(self) -> None:
+        self._anchor = None
+        self._apply_marks(set())
+
+    def _apply_marks(self, marked: set[str]) -> None:
+        if marked == self._marked:
+            return
+        for row_key in self._marked - marked:
+            self._restyle_row(row_key, marked=False)
+        for row_key in marked - self._marked:
+            self._restyle_row(row_key, marked=True)
+        self._marked = marked
+        self.post_message(self.MarksChanged(self, self.marked_keys))
+
+    def _restyle_row(self, row_key: str, *, marked: bool) -> None:
+        if marked:
+            unmarked: dict[Any, Any] = {}
+            for column_key in list(self.columns):
+                value = self.get_cell(row_key, column_key)
+                unmarked[column_key] = value
+                self.update_cell(row_key, column_key, self._mark_text(value))
+            self._unmarked_cells[row_key] = unmarked
+            return
+        for column_key, value in self._unmarked_cells.pop(row_key, {}).items():
+            self.update_cell(row_key, column_key, value)
+
+    @staticmethod
+    def _mark_text(value: Any) -> Text:
+        text = value.copy() if isinstance(value, Text) else Text(str(value))
+        # Appended last, so it wins over whatever styling the cell already carried.
+        text.stylize(MARK_STYLE)
+        return text
+
+    def _reset_marks(self) -> None:
+        had_marks = bool(self._marked)
+        self._marked = set()
+        self._anchor = None
+        self._unmarked_cells = {}
+        if had_marks:
+            self.post_message(self.MarksChanged(self, []))
+
+
+class DeleteConfirmScreen(ModalScreen[bool]):
+    """Type-to-confirm gate in front of every delete.
+
+    Deletes here are forced and irreversible, so a keypress is not enough: one item
+    asks for its own name back, and a batch asks for the literal word `delete` —
+    the only phrase that can be typed once for rows with different names.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    CSS = f"""
+    DeleteConfirmScreen {{
+        align: center middle;
+        background: #101412 70%;
+    }}
+
+    #delete-dialog {{
+        width: 78;
+        height: auto;
+        padding: 1 2;
+        background: #101412;
+        border: solid {BRAND_CORAL_RED};
+    }}
+
+    #delete-title {{
+        color: {BRAND_CORAL_RED};
+        text-style: bold;
+        padding-bottom: 1;
+    }}
+
+    #delete-names {{
+        color: {BRAND_AMBER};
+        padding: 1 0;
+    }}
+
+    #delete-hint {{
+        color: {BRAND_MEDIUM_GRAY};
+        padding-top: 1;
+    }}
+
+    #delete-input {{
+        background: #101412;
+        border: solid {BRAND_MEDIUM_GRAY};
+    }}
+    """
+    #: How many names the dialog spells out before it starts counting.
+    NAME_PREVIEW = 8
+
+    def __init__(self, *, kind: DeletableKind, names: list[str]) -> None:
+        super().__init__()
+        self.kind = kind
+        self.names = names
+
+    @property
+    def required_phrase(self) -> str:
+        return self.names[0] if len(self.names) == 1 else CONFIRM_WORD
+
+    def matches(self, typed: str) -> bool:
+        value = typed.strip()
+        if len(self.names) == 1:
+            return value == self.names[0]
+        return value.casefold() == CONFIRM_WORD
+
+    def compose(self) -> ComposeResult:
+        plural = self.kind if len(self.names) == 1 else f"{self.kind}s"
+        with Vertical(id="delete-dialog"):
+            yield Static(f"Delete {len(self.names)} {plural}?", id="delete-title")
+            yield Static(
+                "This also deletes their contents and run history — endpoints, runs, and (for a "
+                "project) every function and workflow inside it. It cannot be undone.",
+                id="delete-body",
+            )
+            yield Static(self._names_preview(), id="delete-names")
+            yield Input(placeholder=f"type {self.required_phrase}", id="delete-input")
+            yield Static(self._hint_text(), id="delete-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#delete-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if self.matches(event.value):
+            self.dismiss(True)
+            return
+        event.input.value = ""
+        self.query_one("#delete-hint", Static).update(
+            Text(f"That did not match. Type {self.required_phrase} exactly, or press escape.", style=BRAND_CORAL_RED)
+        )
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+    def _names_preview(self) -> str:
+        shown = self.names[: self.NAME_PREVIEW]
+        lines = [f"  {name}" for name in shown]
+        remaining = len(self.names) - len(shown)
+        if remaining > 0:
+            lines.append(f"  ... and {remaining} more")
+        return "\n".join(lines)
+
+    def _hint_text(self) -> str:
+        if len(self.names) == 1:
+            return f"Type the {self.kind} name to confirm, then enter. Escape cancels."
+        return f'Type "{CONFIRM_WORD}" to confirm, then enter. Escape cancels.'
+
+
 class RebaseTuiApp(App[None]):
     TITLE = "Rebase TUI"
     SUB_TITLE = ""
@@ -280,6 +522,7 @@ class RebaseTuiApp(App[None]):
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
         ("b", "back", "Back"),
+        ("d", "delete_selection", "Delete"),
         # priority: the screen's default `tab` -> focus_next otherwise shadows this.
         Binding("tab", "toggle_target_tab", "Switch target", priority=True),
     ]
@@ -414,11 +657,12 @@ class RebaseTuiApp(App[None]):
         self._asgi_app_rows: dict[str, dict[str, Any]] = {}
         self._endpoints_by_target: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._run_rows: dict[str, dict[str, Any]] = {}
+        self._marked_count = 0
 
     def compose(self) -> ComposeResult:
         yield RebaseHeader(show_clock=True, icon="• Commands")
         with Vertical(id="workspace-view"):
-            yield DataTable(id="projects-table")
+            yield SelectableDataTable(id="projects-table")
         with Vertical(id="workspace-switcher-view"):
             yield DataTable(id="workspace-profiles-table")
         with Vertical(id="project-view"):
@@ -426,9 +670,9 @@ class RebaseTuiApp(App[None]):
             yield Static("Select a project.", id="project-detail", classes="panel")
             with TabbedContent(initial="workflows-tab", id="target-tabs"):
                 with TabPane("Workflows", id="workflows-tab"):
-                    yield DataTable(id="workflows-table")
+                    yield SelectableDataTable(id="workflows-table")
                 with TabPane("Functions", id="functions-tab"):
-                    yield DataTable(id="functions-table")
+                    yield SelectableDataTable(id="functions-table")
                 with TabPane("ASGI apps", id="asgi-apps-tab"):
                     yield DataTable(id="asgi-apps-table")
             yield Static("Select a workflow or function.", id="target-detail", classes="panel")
@@ -522,6 +766,91 @@ class RebaseTuiApp(App[None]):
         order = ["workflows-tab", "functions-tab", "asgi-apps-tab"]
         current = order.index(tabs.active) if tabs.active in order else 0
         tabs.active = order[(current + 1) % len(order)]
+
+    def action_delete_selection(self) -> None:
+        """Delete the marked rows, or the row under the cursor when nothing is marked."""
+        table = self._delete_table()
+        if table is None:
+            self.notify(
+                "Nothing here can be deleted. ASGI apps, runs and workspaces have no delete endpoint.",
+                severity="warning",
+            )
+            return
+        kind = DELETABLE_TABLES[str(table.id)]
+        keys = table.marked_keys or [key for key in (table.cursor_key,) if key is not None]
+        items = [(key, name) for key in keys if (name := self._delete_label(kind, key)) is not None]
+        if not items:
+            self.notify(f"No {kind} selected.", severity="warning")
+            return
+        self.push_screen(
+            DeleteConfirmScreen(kind=kind, names=[name for _, name in items]),
+            lambda confirmed: self._on_delete_confirmed(bool(confirmed), kind, items),
+        )
+
+    def _delete_table(self) -> SelectableDataTable | None:
+        """The table `d` acts on, resolved from the current view.
+
+        Focus alone is not enough to go on: it stays on the projects table after you
+        drill into a project, and deleting a project from inside the project view is
+        not what `d` looks like it would do there.
+        """
+        if self.current_view == "workspace":
+            return self.query_one("#projects-table", SelectableDataTable)
+        if self.current_view != "project":
+            return None
+        focused = self.focused
+        if isinstance(focused, SelectableDataTable) and str(focused.id) in {"workflows-table", "functions-table"}:
+            return focused
+        active_tab = self.query_one("#target-tabs", TabbedContent).active
+        table_id = {"workflows-tab": "#workflows-table", "functions-tab": "#functions-table"}.get(active_tab)
+        return None if table_id is None else self.query_one(table_id, SelectableDataTable)
+
+    def _delete_label(self, kind: DeletableKind, key: str) -> str | None:
+        if kind == "project":
+            summary = self._project_rows.get(key)
+            return None if summary is None else str(summary.project.get("name", key))
+        rows = self._function_rows if kind == "function" else self._workflow_rows
+        item = rows.get(key)
+        return None if item is None else str(item.get("name", key))
+
+    def _on_delete_confirmed(self, confirmed: bool, kind: DeletableKind, items: list[tuple[str, str]]) -> None:
+        if not confirmed:
+            return
+        self.run_worker(self._delete_items(kind, items), name="delete", group="tui-delete", exclusive=True)
+
+    async def _delete_items(self, kind: DeletableKind, items: list[tuple[str, str]]) -> None:
+        # Forced: the confirmation dialog is explicit that contents go too, and an
+        # unforced delete is refused for anything that still holds runs.
+        def delete(object_id: str) -> None:
+            if kind == "project":
+                self.data.client.delete_project(object_id, force=True)
+            elif kind == "function":
+                self.data.client.delete_function(object_id, force=True)
+            else:
+                self.data.client.delete_workflow(object_id, force=True)
+
+        deleted: list[str] = []
+        failures: list[str] = []
+        for object_id, name in items:
+            try:
+                await asyncio.to_thread(delete, object_id)
+            except Exception as exc:
+                failures.append(f"{name}: {exc}")
+            else:
+                deleted.append(name)
+        self._report_deletes(kind, deleted, failures)
+        self.action_refresh()
+
+    def _report_deletes(self, kind: DeletableKind, deleted: list[str], failures: list[str]) -> None:
+        if deleted:
+            label = deleted[0] if len(deleted) == 1 else f"{len(deleted)} {kind}s"
+            self.notify(f"Deleted {label}.")
+        for failure in failures:
+            self.notify(f"Delete failed — {failure}", severity="error")
+
+    def on_selectable_data_table_marks_changed(self, event: SelectableDataTable.MarksChanged) -> None:
+        self._marked_count = len(event.marked)
+        self._update_workspace_title()
 
     async def _load_workspace_overview(self) -> None:
         try:
@@ -918,7 +1247,10 @@ class RebaseTuiApp(App[None]):
         return workspace_id if isinstance(workspace_id, str) and workspace_id else "-"
 
     def _update_workspace_title(self) -> None:
-        self.title = f"Rebase TUI - Workspace: {self._workspace_label()}"
+        title = f"Rebase TUI - Workspace: {self._workspace_label()}"
+        if self._marked_count:
+            title = f"{title} - {self._marked_count} marked"
+        self.title = title
 
     def _set_summary(self, message: str) -> None:
         self.query_one("#summary", Static).update(message)

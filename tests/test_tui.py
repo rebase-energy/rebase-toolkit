@@ -11,13 +11,16 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 from textual.coordinate import Coordinate
-from textual.widgets import DataTable, Header, Static, TabbedContent
+from textual.widgets import DataTable, Header, Input, Static, TabbedContent
 
 from rebase.brand import BRAND_MEDIUM_GRAY
 from rebase.client import Client, RebaseWorkflowError
 from rebase.tui import (
+    MARK_STYLE,
+    DeleteConfirmScreen,
     RebaseTuiApp,
     RebaseTuiData,
+    SelectableDataTable,
     compact_id,
     endpoints_by_target,
     format_endpoint,
@@ -31,6 +34,7 @@ class FakeClient:
     def __init__(self) -> None:
         self.api_url = "https://api.example.com"
         self.run_calls: list[dict[str, Any]] = []
+        self.deleted: list[tuple[str, str, bool]] = []
         self.function_calls: list[str | None] = []
         self.workflow_calls: list[str | None] = []
         self.projects = [
@@ -105,6 +109,18 @@ class FakeClient:
 
     def list_projects(self) -> list[dict[str, Any]]:
         return self.projects
+
+    def delete_project(self, project_id: str, *, force: bool = False) -> None:
+        self.deleted.append(("project", project_id, force))
+        self.projects = [item for item in self.projects if item["id"] != project_id]
+
+    def delete_function(self, function_id: str, *, force: bool = False) -> None:
+        self.deleted.append(("function", function_id, force))
+        self.functions = [item for item in self.functions if item["id"] != function_id]
+
+    def delete_workflow(self, workflow_id: str, *, force: bool = False) -> None:
+        self.deleted.append(("workflow", workflow_id, force))
+        self.workflows = [item for item in self.workflows if item["id"] != workflow_id]
 
     def list_functions(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
         assert project is None
@@ -669,5 +685,161 @@ def test_tui_workspace_title_opens_switcher_and_changes_profile(monkeypatch, tmp
                 assert app.title == "Rebase TUI - Workspace: Development"
                 assert app.query_one("#workspace-view").styles.display == "block"
                 assert app.query_one("#projects-table", DataTable).row_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_tui_shift_arrows_mark_a_range_and_plain_movement_drops_it() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.pause(0.1)
+            first_column = list(projects.columns)[0]
+
+            await pilot.press("shift+down")
+            await pilot.pause(0.1)
+            assert projects.marked_keys == ["project-id", "other-project-id"]
+            assert app.title.endswith("2 marked")
+            marked_cell = projects.get_cell("project-id", first_column)
+            assert MARK_STYLE in [span.style for span in marked_cell.spans]
+
+            # Shrinking back onto the anchor leaves just the anchor row marked.
+            await pilot.press("shift+up")
+            await pilot.pause(0.1)
+            assert projects.marked_keys == ["project-id"]
+
+            await pilot.press("down")
+            await pilot.pause(0.1)
+            assert projects.marked_keys == []
+            assert "marked" not in app.title
+            assert projects.get_cell("project-id", first_column) == "energy"
+
+    asyncio.run(scenario())
+
+
+def test_tui_delete_of_one_project_requires_its_name_typed_back() -> None:
+    async def scenario() -> None:
+        client = FakeClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=1)
+            await pilot.pause(0.1)
+
+            await pilot.press("d")
+            await pilot.pause(0.1)
+            screen = app.screen
+            assert isinstance(screen, DeleteConfirmScreen)
+            assert screen.required_phrase == "trading"
+
+            # The other project's name is still the wrong answer.
+            screen.query_one("#delete-input", Input).value = "energy"
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, DeleteConfirmScreen)
+            assert client.deleted == []
+
+            screen.query_one("#delete-input", Input).value = "trading"
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            assert not isinstance(app.screen, DeleteConfirmScreen)
+            assert client.deleted == [("project", "other-project-id", True)]
+            assert projects.row_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_tui_delete_of_marked_projects_requires_the_word_delete() -> None:
+    async def scenario() -> None:
+        client = FakeClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.pause(0.1)
+
+            await pilot.press("shift+down")
+            await pilot.press("d")
+            await pilot.pause(0.1)
+            screen = app.screen
+            assert isinstance(screen, DeleteConfirmScreen)
+            assert screen.required_phrase == "delete"
+
+            screen.query_one("#delete-input", Input).value = "energy"
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, DeleteConfirmScreen)
+            assert client.deleted == []
+
+            screen.query_one("#delete-input", Input).value = "DELETE"
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            assert [(kind, object_id) for kind, object_id, _ in client.deleted] == [
+                ("project", "project-id"),
+                ("project", "other-project-id"),
+            ]
+            assert all(force for *_, force in client.deleted)
+            assert projects.row_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_tui_delete_follows_the_active_target_tab_and_skips_asgi_apps() -> None:
+    async def scenario() -> None:
+        client = FakeClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            # Focus is still on the (now hidden) projects table: the active tab decides.
+            await pilot.press("d")
+            await pilot.pause(0.1)
+            screen = app.screen
+            assert isinstance(screen, DeleteConfirmScreen)
+            assert screen.kind == "workflow"
+            assert screen.required_phrase == "forecast"
+
+            await pilot.press("escape")
+            await pilot.pause(0.1)
+            assert not isinstance(app.screen, DeleteConfirmScreen)
+            assert client.deleted == []
+
+            # ASGI apps have no delete endpoint, so `d` must not offer one.
+            app.query_one("#target-tabs", TabbedContent).active = "asgi-apps-tab"
+            await pilot.pause(0.1)
+            await pilot.press("d")
+            await pilot.pause(0.1)
+            assert not isinstance(app.screen, DeleteConfirmScreen)
+            assert client.deleted == []
+
+            app.query_one("#target-tabs", TabbedContent).active = "workflows-tab"
+            await pilot.pause(0.1)
+            await pilot.press("d")
+            await pilot.pause(0.1)
+            screen = app.screen
+            assert isinstance(screen, DeleteConfirmScreen)
+            screen.query_one("#delete-input", Input).value = "forecast"
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            assert client.deleted == [("workflow", "workflow-id", True)]
+            assert app.query_one("#workflows-table", SelectableDataTable).row_count == 0
 
     asyncio.run(scenario())
