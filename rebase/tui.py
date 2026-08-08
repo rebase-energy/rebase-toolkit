@@ -63,6 +63,7 @@ from rebase.locate import (
     find_project_declarations,
     git_toplevel,
     is_risky_root,
+    project_folder,
 )
 
 TargetType = Literal["function", "workflow"]
@@ -82,7 +83,7 @@ MARK_STYLE = f"bold {BRAND_AMBER}"
 OVERVIEW_FANOUT_WORKERS = 16
 #: Header text per table, added when the rows are and never before. See `_setup_tables`.
 TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
-    "projects-table": ("Project", "Workflows", "Functions", "Endpoints"),
+    "projects-table": ("Project", "Functions", "Workflows", "Cron jobs", "Endpoints"),
     "workspace-profiles-table": ("Active", "Profile", "Workspace", "Workspace ID", "API URL"),
     "functions-table": ("Name", "Run type", "State", "Endpoint", "Version", "Updated"),
     "workflows-table": ("Name", "Run type", "State", "Endpoint", "Schedule", "Next run", "Version", "Updated"),
@@ -99,6 +100,7 @@ class ProjectSummary:
     function_count: int
     workflow_count: int
     endpoint_count: int = 0
+    cron_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -106,6 +108,7 @@ class OverviewCounts:
     functions: dict[str, int]
     workflows: dict[str, int]
     endpoints: dict[str, int]
+    crons: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -158,6 +161,7 @@ class RebaseTuiData:
                     function_count=counts.functions.get(str(project["id"]), 0),
                     workflow_count=counts.workflows.get(str(project["id"]), 0),
                     endpoint_count=counts.endpoints.get(str(project["id"]), 0),
+                    cron_count=counts.crons.get(str(project["id"]), 0),
                 )
                 for project in projects
             ],
@@ -174,17 +178,37 @@ class RebaseTuiData:
         """
         project_ids = [str(project["id"]) for project in projects]
         with ThreadPoolExecutor(max_workers=min(OVERVIEW_FANOUT_WORKERS, len(project_ids) + 2)) as executor:
-            workflows = executor.submit(self._counts_by_project, self.client.list_workflows)
+            workflows = executor.submit(self._workflow_and_cron_counts)
             # Endpoints are supplementary here, as they are in load_project_targets: an API
             # without the route should cost the column, not the whole overview.
             endpoints = executor.submit(self._counts_by_project, lambda: _optional_list(self.client.list_endpoints))
             functions = list(
                 executor.map(lambda project_id: len(self.client.list_functions(project_id=project_id)), project_ids)
             )
+        workflow_counts, cron_counts = workflows.result()
         return OverviewCounts(
             functions=dict(zip(project_ids, functions, strict=True)),
-            workflows=workflows.result(),
+            workflows=workflow_counts,
             endpoints=endpoints.result(),
+            crons=cron_counts,
+        )
+
+    def _workflow_and_cron_counts(self) -> tuple[dict[str, int], dict[str, int]]:
+        """Workflows per project, and how many of them are on a live cron.
+
+        Both come out of the one workspace-wide call, so the cron column costs no
+        request of its own. A workflow counts as a cron job when the API gives it a
+        `next_run_at`: that is the platform's own verdict, computed per read, and it
+        already accounts for a missing or paused schedule, a disabled workflow or
+        version, and an unusable cron expression. Re-deriving those rules here would
+        only give them somewhere to drift apart.
+        """
+        workflows = self.client.list_workflows()
+        return (
+            Counter(str(item["project_id"]) for item in workflows if item.get("project_id")),
+            Counter(
+                str(item["project_id"]) for item in workflows if item.get("project_id") and item.get("next_run_at")
+            ),
         )
 
     @staticmethod
@@ -1233,7 +1257,13 @@ class RebaseTuiApp(App[None]):
             if command is None:
                 self.notify(NO_EDITOR_HINT, severity="error")
                 return
-            argv = build_argv(command, declaration.path, line=declaration.line)
+            roots = [Path(entry) for entry in search_paths(self._workspace_key())]
+            argv = build_argv(
+                command,
+                declaration.path,
+                line=declaration.line,
+                folder=project_folder(declaration.path, roots),
+            )
             if command.terminal:
                 try:
                     # A terminal editor needs this terminal, so hand it over and take
@@ -1443,6 +1473,7 @@ class RebaseTuiApp(App[None]):
             projects.add_row(
                 str(project.get("name", "-")),
                 str(summary.workflow_count),
+                str(summary.cron_count),
                 str(summary.function_count),
                 str(summary.endpoint_count),
                 key=project_id,
@@ -1586,7 +1617,7 @@ class RebaseTuiApp(App[None]):
         lines = [
             f"Project {project.get('name', '-')}",
             f"Functions: {summary.function_count} | Workflows: {summary.workflow_count} | "
-            f"Endpoints: {summary.endpoint_count}",
+            f"Cron jobs: {summary.cron_count} | Endpoints: {summary.endpoint_count}",
             f"Updated: {self._time(project.get('updated_at'))} | ID: {project.get('id', '-')}",
             f"Description: {description}",
         ]

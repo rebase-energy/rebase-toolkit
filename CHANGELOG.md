@@ -14,19 +14,27 @@
   picker asks which; the answer is deliberately not remembered, since a stored path is exactly
   what goes stale. Editor resolution is `REBASE_EDITOR` → the `editor` config key → `$VISUAL` →
   `$EDITOR` → the first of `code`/`cursor`/`zed`/`subl`/`idea` on `PATH` → a macOS application
-  bundle. Terminal editors get the terminal, via suspend, and get it back on exit.
+  bundle. Terminal editors get the terminal, via suspend, and get it back on exit. The file's
+  git repository opens with it as the editor's workspace, so the sidebar shows the project
+  tree rather than a lone file — the repository rather than the file's own directory, which
+  for a deployment file is usually a `deploy/` folder several levels down.
 - **`rebase project open`** does the same from the command line, with `--path` to print the
   resolved `file:line` instead of launching anything and `--json` for the full search result.
 - **`rebase project search-path {list,add,remove}`** manages where that search looks. The TUI
   records the git repository it was started in automatically, so the common case needs no
   setup; `add` refuses your home directory without `--force`, since registering it would turn
   every lookup into a scan of everything you own.
-- **An Endpoints column in the TUI's project table**, alongside Workflows and Functions, so the
-  workspace view shows at a glance how much of a project is exposed over HTTP. Endpoints belong
-  to a function or workflow rather than sitting beside them, so the columns overlap by design —
-  a project with 1 function and 1 endpoint has one deployed thing, reachable two ways. The count
-  costs no extra startup time: it comes from one workspace-wide `/endpoints` call issued
-  alongside the others. Project detail and the summary line carry the same total.
+- **Cron jobs and Endpoints columns in the TUI's project table**, so the workspace view shows at
+  a glance what a project holds and how much of it runs on its own. Both overlap the existing
+  columns by design: an endpoint belongs to a function or workflow rather than sitting beside
+  one, and a cron job *is* a workflow, so a project with 1 workflow, 1 cron and 1 endpoint has
+  one deployed thing that both fires on a schedule and answers over HTTP. A workflow counts as a
+  cron job when the API gives it a `next_run_at` — the platform's own verdict, which already
+  accounts for a missing or paused schedule, a disabled workflow or version, and an unusable
+  cron expression, rather than a second copy of those rules here that could drift. Neither
+  column costs startup time: crons fall out of the workspace-wide `/workflows` call already
+  being made, and endpoints come from one `/endpoints` call issued alongside it. The project
+  detail panel carries both counts.
 - **`d` deletes from the TUI**, with `shift+up` / `shift+down` to mark a range of rows first.
   It acts on the projects table in the workspace view and on the workflows/functions table of
   the active tab inside a project; marked rows turn amber and are counted in the title. Every
@@ -53,6 +61,12 @@
   no batch route and stay a concurrent fan-out.
 - **`RebaseWorkflowError.status_code`** carries the HTTP status behind a failure, so callers can
   tell a route this API version does not have from a genuine error.
+- **The TUI's clock names its zone** (`10:56:03 CEST`) and sits flush against the right edge
+  instead of a couple of cells short of it. **Clicking it picks the zone** every time in the TUI
+  is shown in — the clock and every table timestamp, which arrive from the API in UTC and were
+  previously displayed that way whatever the clock said. The picker filters the full `zoneinfo`
+  list from a box that keeps the focus, so the arrow keys drive the list while you type. The
+  choice lasts for the session; it is not written to the profile.
 - **`-h` is an alias for `--help`** on every command and subcommand.
 - **Short flags for CLI options**: each option now also answers to `-x`, where `x` is the first
   letter of its long name — `rebase deploy -n api -e prod`, `rebase workflow list -j`. 235 of 269
@@ -71,12 +85,20 @@
 
 ### Fixed
 
+- **The TUI's column headers no longer appear before their data and then jerk into place.** A
+  DataTable sizes its columns from the header text until the first row lands, so headers added at
+  mount were laid out against `Project | Workflows | Functions | Endpoints` and snapped to new
+  widths the moment the projects arrived. Headers are now added in the same paint as the rows, so
+  a loading table is simply empty, and clearing a table takes its header with it rather than
+  leaving one sized for data that is gone.
+
 - **Deleted rows leave the TUI immediately instead of after every request has returned.** A marked
   run of projects was deleted one round trip at a time and then followed by a full workspace
   reload, so rows the user had already confirmed gone sat on screen for seconds. The rows now come
   off as soon as the dialog is confirmed, the deletes are issued concurrently, and the reload only
-  happens if one of them fails — in which case the surviving rows come back. The API has no bulk
-  delete route, so this is still one request per object, just no longer one wait per object.
+  happens if one of them fails — in which case the surviving rows come back. Projects go in a single
+  batch request; functions and workflows have no batch route and stay a concurrent fan-out, so they
+  are still one request each, just no longer one wait each.
 
 - **`rebase tui` starts in about a second instead of stalling on the project list.** The workspace
   overview issued two requests per project — one for functions, one for workflows — end to end, so

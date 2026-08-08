@@ -7,7 +7,7 @@ import importlib.util
 import json
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -75,7 +75,7 @@ from rebase.config import (
 )
 from rebase.contract import Freshness, validate_frame
 from rebase.editor import NO_EDITOR_HINT, build_argv, resolve_editor, run_foreground, spawn_detached
-from rebase.locate import describe_failure, find_project_declarations, is_risky_root
+from rebase.locate import describe_failure, find_project_declarations, is_risky_root, project_folder
 
 _BANNER_LINES = [
     "██████╗  ███████╗ ██████╗   █████╗  ███████╗ ███████╗",
@@ -3747,7 +3747,7 @@ def _active_workspace_key() -> str:
     return workspace_key(load_profile(profile_name), profile_name)
 
 
-def _open_in_editor(path: Path, line: int) -> None:
+def _open_in_editor(path: Path, line: int, roots: Sequence[Path] = ()) -> None:
     settings = editor_settings()
     configured = settings.get("command")
     configured_terminal = settings.get("terminal")
@@ -3757,7 +3757,7 @@ def _open_in_editor(path: Path, line: int) -> None:
     )
     if command is None:
         raise RebaseWorkflowError(NO_EDITOR_HINT)
-    argv = build_argv(command, path, line=line)
+    argv = build_argv(command, path, line=line, folder=project_folder(path, roots))
     if command.terminal:
         run_foreground(argv)
     else:
@@ -3826,7 +3826,7 @@ def project_open_command(
         raise RebaseWorkflowError(describe_failure(result))
 
     match = result.matches[0]
-    _open_in_editor(match.path, match.line)
+    _open_in_editor(match.path, match.line, result.roots)
     console.print(f"[rebase.success]Opened {match.path}:{match.line}.[/rebase.success]")
 
 

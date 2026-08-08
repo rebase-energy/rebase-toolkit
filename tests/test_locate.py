@@ -9,6 +9,7 @@ from rebase.locate import (
     find_project_declarations,
     git_toplevel,
     is_risky_root,
+    project_folder,
 )
 
 
@@ -268,3 +269,30 @@ def test_is_risky_root_rejects_the_home_directory_and_the_filesystem_root(tmp_pa
 def test_locate_result_status_is_derived_from_roots_and_matches() -> None:
     assert LocateResult(project_name="a").status == "no-roots"
     assert LocateResult(project_name="a", roots=(Path("/x"),)).status == "not-found"
+
+
+def test_project_folder_is_the_git_repository_containing_the_file(tmp_path: Path) -> None:
+    """An editor should open the project, not the deploy/ subfolder the file sits in."""
+    repo = tmp_path / "repo"
+    target = write(repo / "deploy" / "rebase" / "epex.py", "VALUE = 1\n")
+
+    folder = project_folder(target, [tmp_path], run_git=lambda args, directory: str(repo))
+
+    assert folder == repo.resolve()
+
+
+def test_project_folder_falls_back_to_the_search_root_outside_a_git_repository(tmp_path: Path) -> None:
+    root = tmp_path / "code"
+    target = write(root / "nested" / "deploy.py", "VALUE = 1\n")
+
+    folder = project_folder(target, [root], run_git=lambda args, directory: None)
+
+    assert folder == root.resolve()
+
+
+def test_project_folder_falls_back_to_the_parent_directory_with_no_matching_root(tmp_path: Path) -> None:
+    target = write(tmp_path / "nested" / "deploy.py", "VALUE = 1\n")
+
+    folder = project_folder(target, [tmp_path / "elsewhere"], run_git=lambda args, directory: None)
+
+    assert folder == (tmp_path / "nested").resolve()

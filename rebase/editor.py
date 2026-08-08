@@ -22,14 +22,19 @@ from rebase.client import RebaseWorkflowError
 #: GUI editors worth auto-detecting, best-known first. The line-number flag is
 #: hard-coded per editor because we picked this list and know their arguments; an
 #: editor arriving via $EDITOR gets no such assumption.
+#: The `{folder}` placeholder opens the file's project as the editor's workspace, so
+#: the sidebar shows the tree rather than a lone file. VS Code-family editors reuse
+#: an existing window when that folder is already open, so this does not spawn one
+#: window per keypress. JetBrains editors are left without it: they resolve the
+#: enclosing project from the file themselves, and their CLI is order-sensitive.
 DETECTED_EDITORS: tuple[tuple[str, str], ...] = (
-    ("code", "code -g {path}:{line}"),
-    ("cursor", "cursor -g {path}:{line}"),
-    ("windsurf", "windsurf -g {path}:{line}"),
-    ("code-insiders", "code-insiders -g {path}:{line}"),
-    ("codium", "codium -g {path}:{line}"),
-    ("zed", "zed {path}:{line}"),
-    ("subl", "subl {path}:{line}"),
+    ("code", "code {folder} -g {path}:{line}"),
+    ("cursor", "cursor {folder} -g {path}:{line}"),
+    ("windsurf", "windsurf {folder} -g {path}:{line}"),
+    ("code-insiders", "code-insiders {folder} -g {path}:{line}"),
+    ("codium", "codium {folder} -g {path}:{line}"),
+    ("zed", "zed {folder} {path}:{line}"),
+    ("subl", "subl {folder} {path}:{line}"),
     ("idea", "idea --line {line} {path}"),
     ("pycharm", "pycharm --line {line} {path}"),
 )
@@ -128,12 +133,23 @@ def resolve_editor(
     return None
 
 
-def build_argv(command: EditorCommand, path: Path | str, *, line: int | None = None) -> tuple[str, ...]:
+def build_argv(
+    command: EditorCommand,
+    path: Path | str,
+    *,
+    line: int | None = None,
+    folder: Path | str | None = None,
+) -> tuple[str, ...]:
     """Expand a command template into an argv list.
 
     Placeholders are substituted with `str.replace` rather than `str.format` so a
     brace occurring in a real path cannot raise. A template that never mentions
     `{path}` gets the path appended, which is what makes a bare `EDITOR=nvim` work.
+
+    A token mentioning `{folder}` is dropped entirely when no folder is known,
+    rather than expanded to an empty string that the editor would read as an
+    argument. `{folder}` is never injected into a template the user wrote: an
+    editor we did not choose may not accept a directory argument.
     """
     argv = shlex.split(command.template, posix=os.name != "nt")
     if not argv:
@@ -145,10 +161,14 @@ def build_argv(command: EditorCommand, path: Path | str, *, line: int | None = N
         "{line}": str(line if line is not None else 1),
         "{column}": "1",
     }
+    if folder is not None:
+        substitutions["{folder}"] = str(folder)
 
     expanded: list[str] = []
     mentions_path = False
     for token in argv:
+        if folder is None and "{folder}" in token:
+            continue
         for placeholder, value in substitutions.items():
             if placeholder in token:
                 if placeholder == "{path}":

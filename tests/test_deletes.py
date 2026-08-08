@@ -181,6 +181,21 @@ class TestBatchDeleteProjects:
             ("DELETE", "https://toolkit.example.com/projects/p2"),
         ]
 
+    def test_more_than_the_api_ceiling_is_sent_in_chunks(self, monkeypatch) -> None:
+        """The API rejects an oversized list, so a long selection must not become one 422."""
+        sent: list[list[str]] = []
+
+        def fake_request(method: str, url: str, **kwargs: Any) -> FakeJsonResponse:
+            sent.append(kwargs["json"]["project_ids"])
+            return FakeJsonResponse({"deleted": kwargs["json"]["project_ids"], "failed": []})
+
+        monkeypatch.setattr("requests.request", fake_request)
+        ids = [f"p{index}" for index in range(250)]
+
+        assert _client().delete_projects(ids) == []
+        assert [len(chunk) for chunk in sent] == [100, 100, 50]
+        assert [project_id for chunk in sent for project_id in chunk] == ids
+
     def test_other_errors_are_not_swallowed_by_the_fallback(self, monkeypatch) -> None:
         monkeypatch.setattr("requests.request", lambda *a, **k: FakeConflictResponse("nope", status_code=403))
 

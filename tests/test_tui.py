@@ -26,8 +26,8 @@ from rebase.editor import EditorCommand
 from rebase.tui import (
     MARK_STYLE,
     DeleteConfirmScreen,
-    RebaseClock,
     OpenSourceChoiceScreen,
+    RebaseClock,
     RebaseTuiApp,
     RebaseTuiData,
     SelectableDataTable,
@@ -82,6 +82,10 @@ class FakeClient:
                 "execution_backend": "prefect_cloud_run_service",
                 "enabled": True,
                 "current_version_id": "workflow-version-id-123456",
+                "schedule": {"type": "cron", "cron": "0 6 * * *", "active": True},
+                # Set by the API only for a schedule that will actually fire, which is
+                # what makes this workflow count as a cron job.
+                "next_run_at": "2026-06-17T06:00:00Z",
                 "updated_at": "2026-06-16T13:00:00Z",
             }
         ]
@@ -331,9 +335,33 @@ def test_tui_overview_reads_all_workflows_and_endpoints_in_one_call_each() -> No
         "third-project-id",
     ]
     assert [
-        (summary.function_count, summary.workflow_count, summary.endpoint_count)
+        (summary.function_count, summary.workflow_count, summary.endpoint_count, summary.cron_count)
         for summary in overview.project_summaries
-    ] == [(1, 1, 1), (0, 0, 0), (0, 0, 0)]
+    ] == [(1, 1, 1, 1), (0, 0, 0, 0), (0, 0, 0, 0)]
+
+
+def test_tui_counts_only_workflows_the_api_says_will_fire_as_cron_jobs() -> None:
+    """A schedule that cannot fire is not a cron job, and the API is the judge of that."""
+    client = FakeClient()
+    client.workflows.append(
+        {
+            "id": "paused-workflow-id",
+            "project_id": "project-id",
+            "name": "paused",
+            "enabled": True,
+            # A schedule the API refused to give a next_run_at: paused, disabled,
+            # or an unusable cron expression. Either way it is not a cron job.
+            "schedule": {"type": "cron", "cron": "0 6 * * *", "active": False},
+            "next_run_at": None,
+        }
+    )
+    client.workflows.append({"id": "ad-hoc-workflow-id", "project_id": "project-id", "name": "ad-hoc", "enabled": True})
+
+    overview = fake_tui_data(client).load_workspace_overview()
+
+    energy = overview.project_summaries[0]
+    assert energy.workflow_count == 3
+    assert energy.cron_count == 1
 
 
 def test_tui_overview_survives_an_api_without_the_endpoints_route() -> None:
@@ -502,6 +530,8 @@ def local_rebase_api() -> Iterator[tuple[str, list[tuple[str, dict[str, list[str
             "execution_backend": "prefect_cloud_run_service",
             "enabled": True,
             "current_version_id": "workflow-version-id",
+            "schedule": {"type": "cron", "cron": "0 6 * * *", "active": True},
+            "next_run_at": "2026-06-17T06:00:00Z",
             "updated_at": "2026-06-16T13:00:00Z",
         }
     ]
@@ -628,7 +658,8 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
 
                 projects = app.query_one("#projects-table", DataTable)
                 assert projects.row_count == 1
-                assert [str(cell) for cell in projects.get_row_at(0)] == ["energy", "1", "1", "1"]
+                # Project, Workflows, Cron jobs, Functions, Endpoints.
+                assert [str(cell) for cell in projects.get_row_at(0)] == ["energy", "1", "1", "1", "1"]
                 assert app.query_one("#workspace-view").styles.display == "block"
                 assert app.query_one("#project-view").styles.display == "none"
                 projects.focus()
@@ -638,7 +669,7 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
 
                 detail = app.query_one("#project-detail", Static)
                 assert "Project energy" in str(detail.content)
-                assert "Functions: 1 | Workflows: 1 | Endpoints: 1" in str(detail.content)
+                assert "Functions: 1 | Workflows: 1 | Cron jobs: 1 | Endpoints: 1" in str(detail.content)
                 assert app.query_one("#workspace-view").styles.display == "none"
                 assert app.query_one("#project-view").styles.display == "block"
 
@@ -1506,6 +1537,7 @@ def test_tui_tables_have_no_header_until_their_rows_arrive() -> None:
             assert [str(column.label) for column in projects.columns.values()] == [
                 "Project",
                 "Workflows",
+                "Cron jobs",
                 "Functions",
                 "Endpoints",
             ]

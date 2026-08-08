@@ -371,6 +371,33 @@ def git_toplevel(
     return Path(root).resolve()
 
 
+def project_folder(
+    path: Path,
+    roots: Iterable[Path] = (),
+    *,
+    run_git: Callable[[list[str], Path], str | None] | None = None,
+) -> Path | None:
+    """The folder an editor should open alongside `path`, as its workspace.
+
+    The git repository containing the file, because that is what a developer means
+    by "the project" — not the directory the file happens to sit in, which for a
+    deployment file is usually a `deploy/` subfolder several levels down.
+
+    Falls back to the search root the file was found under, then to its parent, so
+    a checkout that is not a git repository still opens something sensible.
+    """
+    resolved = Path(path).resolve()
+    root = git_toplevel(resolved.parent, run_git=run_git)
+    if root is not None:
+        return root
+    for candidate in roots:
+        candidate = Path(candidate).resolve()
+        if resolved.is_relative_to(candidate):
+            return candidate
+    parent = resolved.parent
+    return parent if parent.is_dir() else None
+
+
 def is_risky_root(path: Path) -> bool:
     """Whether `path` is too broad to search: the home directory or a filesystem root.
 

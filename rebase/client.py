@@ -166,6 +166,11 @@ def _endpoint_for_callable(fn: Callable[..., Any] | None) -> EndpointConfig | No
     return _coerce_endpoint(getattr(fn, "_rebase_endpoint", None)) if fn is not None else None
 
 
+#: Projects per batch-delete request. Must not exceed the API's own ceiling,
+#: which rejects a longer list rather than truncating it.
+PROJECT_BATCH_DELETE_LIMIT = 100
+
+
 def _batch_failure_message(failure: dict[str, Any]) -> str:
     """Flatten one batch-delete failure into a line worth showing a user."""
     detail = failure.get("detail")
@@ -2540,9 +2545,7 @@ class Client:
         for start in range(0, len(project_ids), PROJECT_BATCH_DELETE_LIMIT):
             chunk = list(project_ids[start : start + PROJECT_BATCH_DELETE_LIMIT])
             try:
-                response = self.request(
-                    "POST", "/projects/batch-delete", json={"project_ids": chunk, "force": force}
-                )
+                response = self.request("POST", "/projects/batch-delete", json={"project_ids": chunk, "force": force})
             except RebaseWorkflowError as exc:
                 if exc.status_code != 404:
                     raise

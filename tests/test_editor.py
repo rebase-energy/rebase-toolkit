@@ -168,3 +168,41 @@ def test_editor_detach_kwargs_differ_on_windows() -> None:
 def test_editor_reports_a_missing_binary_as_a_rebase_workflow_error(tmp_path: Path) -> None:
     with pytest.raises(RebaseWorkflowError, match="definitely-not-an-editor-xyz"):
         spawn_detached(["definitely-not-an-editor-xyz", str(tmp_path / "f.py")])
+
+
+def test_editor_template_substitutes_the_folder_placeholder() -> None:
+    """VS Code takes the workspace folder as a plain path argument alongside -g."""
+    command = EditorCommand(template="code {folder} -g {path}:{line}", terminal=False, source="test")
+
+    assert build_argv(command, "/repo/deploy/x.py", line=7, folder="/repo") == (
+        "code",
+        "/repo",
+        "-g",
+        "/repo/deploy/x.py:7",
+    )
+
+
+def test_editor_drops_the_folder_token_when_no_folder_is_known() -> None:
+    """An empty argv element would be read by the editor as an argument."""
+    command = EditorCommand(template="code {folder} -g {path}:{line}", terminal=False, source="test")
+
+    assert build_argv(command, "/x/y.py", line=7) == ("code", "-g", "/x/y.py:7")
+
+
+def test_editor_detected_vscode_family_opens_the_workspace_folder() -> None:
+    command = resolve_editor(
+        env={},
+        which=lambda name: "/usr/local/bin/code" if name == "code" else None,
+        app_exists=no_apps,
+    )
+
+    assert command is not None
+    assert "{folder}" in command.template
+
+
+def test_editor_does_not_inject_a_folder_into_a_user_supplied_template() -> None:
+    """An editor we did not choose may not accept a directory argument at all."""
+    command = resolve_editor(env={"REBASE_EDITOR": "myeditor {path}"}, which=nothing_installed, app_exists=no_apps)
+
+    assert command is not None
+    assert build_argv(command, "/repo/x.py", line=7, folder="/repo") == ("myeditor", "/repo/x.py")
