@@ -4,6 +4,46 @@
 
 ### Added
 
+- **`rebase hillclimb init` and `rebase hillclimb problems` make local search
+  setup and problem discovery Rebase-native.** A fresh repository can now create
+  its versionable Hillclimb workspace and browse installed emflow targets without
+  dropping down to the standalone engine CLI. `rebase hillclimb start` also gains
+  `--holdout/--no-holdout`, threaded through local and hosted runs, so public-data
+  smoke checks do not require private holdout credentials; holdout remains on by
+  default for real model selection.
+- **Steps in a workflow are now a chain.** The compiler adds an ordering edge from each step to
+  the one recorded before it, on top of whatever the data bindings already imply, so two steps
+  that pass nothing between them no longer compile to independent roots. Steps are the sequence
+  a workflow runs in — a straight line to draw, and one unambiguous answer to which step failed
+  and what never ran because of it; work that wants to run side by side belongs to tasks inside
+  a step. `input_bindings` is untouched, so the graph still distinguishes a dependency that
+  carries a value from one that is only order. Existing deployments keep the graph they were
+  compiled with; the change applies from the next deploy.
+- **`rb.current_run()`, and `Function.map` attributes its batch to the step that issued it.**
+  A map from inside a workflow step *is* that step's tasks, but the platform could not know it:
+  the batch is created by the map request, and the request said nothing about where it came
+  from. The runner now puts `REBASE_RUN_ID` and `REBASE_STEP_RUN_ID` in the environment,
+  `current_run()` reads them, and `run_function_map` attaches them — so `/runs/{id}/tasks` can
+  answer "which task failed, and in which step". Read per call rather than cached, because the
+  steps of one run share a process and a value captured at import would name the wrong step.
+  A map from a laptop still belongs to no run, which the platform accepts.
+- **`Client.list_run_tasks(run_id, step_run_id=...)`**, and **the TUI's timeline shows a step's
+  tasks** indented under it, one row per unit of work with its own status, its parameters and
+  either its result or its error. A step reports one outcome for everything inside it; the task
+  rows are where "which one of them failed" survives. Against an API without the route the
+  method returns no tasks rather than raising, so an older platform costs the rows and not the
+  run view.
+- **`rebase init [WORKSPACE]`** connects the repository you are in to a workspace you already
+  belong to, by writing the committed `.rebase/config.json` marker — and nothing else. No
+  sign-in, no workspace creation, and the machine's active workspace is left where it was.
+  `rebase setup` could only reach an existing workspace through its "Create a new workspace"
+  prompt, which happened to work because creating one you already own returns it, and it
+  re-pointed the global profile on the way past. Omit the argument to pick from your workspaces,
+  defaulted to the one whose handle matches the folder name. The marker is anchored at the git
+  root, so running it from `deploy/rebase/` marks the repo once; running it again is a no-op that
+  does not even call the API; changing an existing marker needs `--force`; and a workspace you are
+  not a member of is refused with a pointer to `rebase setup`, never created.
+
 - **`o` opens a project's source file from the TUI**, from the project list or from inside a
   project. A project is a platform record with no path on this machine, so the file is found by
   searching this workspace's search paths for the `rb.project(...)` call that names it — which

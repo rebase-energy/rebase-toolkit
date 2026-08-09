@@ -71,6 +71,10 @@ class FakeClient:
         ]
         self.version_calls: list[tuple[str, str]] = []
         self.log_calls: list[str] = []
+        self.task_calls: list[str] = []
+        # Empty by default: a workflow whose steps fan out into nothing has no tasks,
+        # which is most of them. `SteppedClient` is the other kind.
+        self.tasks: list[dict[str, Any]] = []
         # One line between the run's only event and its only step, so the timeline has to
         # interleave the three routes rather than concatenate them.
         self.log_entries: list[dict[str, Any]] = [
@@ -123,19 +127,6 @@ class FakeClient:
                 "updated_at": "2026-06-16T13:30:00Z",
             }
         ]
-        self.asgi_apps = [
-            {
-                "id": "asgi-app-id",
-                "project_id": "project-id",
-                "name": "grid-api",
-                "base_path": "/api",
-                "auth": "api_key",
-                "enabled": True,
-                "current_version_id": "asgi-version-id-123456",
-                "url_path": "/e/energy-workspace/energy/api",
-                "updated_at": "2026-06-16T13:45:00Z",
-            }
-        ]
         self.runs = [
             {
                 "id": "run-id",
@@ -154,6 +145,10 @@ class FakeClient:
     def get_workflow_version(self, workflow_id: str, version_id: str) -> dict[str, Any]:
         self.version_calls.append((workflow_id, version_id))
         return {"id": version_id, "workflow_id": workflow_id, "step_graph": self.step_graph}
+
+    def list_run_tasks(self, run_id: str, *, step_run_id: str | None = None) -> list[dict[str, Any]]:
+        self.task_calls.append(run_id)
+        return self.tasks
 
     def get_run_logs(self, run_id: str, *, since: str | None = None, limit: int | None = None) -> dict[str, Any]:
         self.log_calls.append(run_id)
@@ -205,10 +200,6 @@ class FakeClient:
 
     def list_project_endpoints(self, project_id: str) -> list[dict[str, Any]]:
         return [item for item in self.endpoints if item["project_id"] == project_id]
-
-    def list_asgi_apps(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
-        assert project is None
-        return [item for item in self.asgi_apps if project_id is None or item["project_id"] == project_id]
 
     def list_runs(
         self,
@@ -291,6 +282,34 @@ class SteppedClient(FakeClient):
                 "updated_at": "2026-06-16T10:00:00Z",
             },
         ]
+        # One task per unit of work inside `load_weather`, which is what a step's
+        # fan-out looks like on the run.
+        self.tasks = [
+            {
+                "id": "task-0",
+                "batch_id": "batch-id",
+                "item_index": 0,
+                "parameters": {"area": "NO1"},
+                "status": "succeeded",
+                "result": {"objects": 1},
+                "error": None,
+                "created_at": "2026-06-16T14:00:05Z",
+                "started_at": "2026-06-16T14:00:06Z",
+                "finished_at": "2026-06-16T14:00:12Z",
+            },
+            {
+                "id": "task-1",
+                "batch_id": "batch-id",
+                "item_index": 1,
+                "parameters": {"area": "SE3"},
+                "status": "failed",
+                "result": None,
+                "error": "401 Unauthorized",
+                "created_at": "2026-06-16T14:00:05Z",
+                "started_at": "2026-06-16T14:00:07Z",
+                "finished_at": "2026-06-16T14:00:09Z",
+            },
+        ]
         self.step_graph = {
             "schema_version": 1,
             "engine": "prefect",
@@ -318,7 +337,6 @@ class EmptyWorkspaceClient(FakeClient):
         self.functions = []
         self.workflows = []
         self.endpoints = []
-        self.asgi_apps = []
 
 
 def fake_tui_data(client: Any, **kwargs: Any) -> RebaseTuiData:
@@ -361,13 +379,12 @@ def test_tui_data_loads_project_filtered_overview_and_runs() -> None:
     }
 
 
-def test_tui_data_loads_endpoints_and_asgi_apps() -> None:
+def test_tui_data_loads_endpoints() -> None:
     data = fake_tui_data(FakeClient(), project="energy")
     overview = data.load_workspace_overview()
 
     targets = data.load_project_targets(overview.project_summaries[0].project)
     assert [item["name"] for item in targets.endpoints] == ["forecast"]
-    assert [item["name"] for item in targets.asgi_apps] == ["grid-api"]
 
     grouped = endpoints_by_target(targets.endpoints)
     assert list(grouped) == [("workflow", "workflow-id")]
@@ -471,12 +488,9 @@ def test_tui_format_duration() -> None:
     assert format_duration("nonsense", "2026-06-16T14:01:00Z") == "-"
 
 
-def test_tui_data_tolerates_missing_endpoint_and_asgi_routes() -> None:
+def test_tui_data_tolerates_a_missing_endpoint_route() -> None:
     class Unsupported(FakeClient):
         def list_project_endpoints(self, project_id: str) -> list[dict[str, Any]]:
-            raise RebaseWorkflowError("404 Not Found")
-
-        def list_asgi_apps(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
             raise RebaseWorkflowError("404 Not Found")
 
     data = fake_tui_data(Unsupported(), project="energy")
@@ -484,7 +498,6 @@ def test_tui_data_tolerates_missing_endpoint_and_asgi_routes() -> None:
 
     targets = data.load_project_targets(overview.project_summaries[0].project)
     assert targets.endpoints == []
-    assert targets.asgi_apps == []
     assert [item["name"] for item in targets.workflows] == ["forecast"]
 
 
@@ -670,7 +683,7 @@ def test_tui_app_mounts_and_renders_selected_workflow_run() -> None:
     asyncio.run(scenario())
 
 
-def test_tui_app_shows_endpoint_column_and_asgi_apps_tab() -> None:
+def test_tui_app_shows_the_endpoint_column_and_the_two_target_chips() -> None:
     async def scenario() -> None:
         app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
 
@@ -701,41 +714,29 @@ def test_tui_app_shows_endpoint_column_and_asgi_apps_tab() -> None:
             await pilot.press("escape")
             await pilot.pause(0.2)
 
-            # left/right cycles workflows -> functions -> asgi apps and back.
+            # Two chips, and left/right toggles between them either way round. The
+            # brackets are in the label, so a chip reads as pressable without colour.
             tabs = app.query_one("#target-tabs", TabbedContent)
+            assert [str(tab.label) for tab in app.query("#target-tabs Tab")] == [
+                "[ Workflows ]",
+                "[ Functions ]",
+            ]
             assert tabs.active == "workflows-tab"
             await pilot.press("right")
             await pilot.pause(0.1)
             assert tabs.active == "functions-tab"
             await pilot.press("right")
             await pilot.pause(0.1)
-            assert tabs.active == "asgi-apps-tab"
+            assert tabs.active == "workflows-tab"
             await pilot.press("left")
             await pilot.pause(0.1)
             assert tabs.active == "functions-tab"
-            await pilot.press("right")
-            await pilot.pause(0.1)
 
-            asgi_apps = app.query_one("#asgi-apps-table", DataTable)
-            assert asgi_apps.row_count == 1
-            asgi_apps.focus()
-            asgi_apps.move_cursor(row=0)
-            await pilot.press("p")
-            await pilot.pause(0.2)
-
-            drawer = app.screen
-            assert isinstance(drawer, DetailDrawer)
-            assert drawer.drawer_title == "ASGI app grid-api"
-            # ASGI apps only carry url_path, so the TUI joins it onto the client's api_url.
-            assert drawer.payload["url"] == "https://api.example.com/e/energy-workspace/energy/api"
-            await pilot.press("escape")
-            await pilot.pause(0.2)
-
-            # Selecting one opens nothing below: an ASGI app answers HTTP and has no runs.
-            await pilot.press("enter")
-            await pilot.pause(0.2)
-            assert app.query_one("#runs-table").styles.display == "none"
-            assert app.query_one("#timeline-table").styles.display == "none"
+            # The selected chip is a filled rectangle rather than an underlined label,
+            # and the strip costs one row rather than two.
+            assert app.query_one("#target-tabs Tabs").size.height == 1
+            active = next(tab for tab in app.query("#target-tabs Tab") if tab.has_class("-active"))
+            assert active.styles.background.hex == "#03C497"
 
     asyncio.run(scenario())
 
@@ -801,19 +802,6 @@ def local_rebase_api() -> Iterator[tuple[str, list[tuple[str, dict[str, list[str
             "updated_at": "2026-06-16T13:30:00Z",
         }
     ]
-    asgi_apps = [
-        {
-            "id": "asgi-app-id",
-            "project_id": "project-id",
-            "name": "grid-api",
-            "base_path": "/api",
-            "auth": "api_key",
-            "enabled": True,
-            "current_version_id": "asgi-version-id",
-            "url_path": "/e/energy-workspace/energy/api",
-            "updated_at": "2026-06-16T13:45:00Z",
-        }
-    ]
     run = {
         "id": "run-id",
         "target_type": "workflow",
@@ -866,8 +854,6 @@ def local_rebase_api() -> Iterator[tuple[str, list[tuple[str, dict[str, list[str
                 payload = workflows
             elif parsed.path in {"/endpoints", "/projects/project-id/endpoints"}:
                 payload = endpoints
-            elif parsed.path == "/projects/project-id/asgi-apps":
-                payload = asgi_apps
             elif parsed.path == "/workflows/workflow-id/versions/workflow-version-id":
                 payload = workflow_version
             elif parsed.path == "/runs":
@@ -954,7 +940,7 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
                 # `l` folds the log lines in, each under the step or stage it followed.
                 await pilot.press("l")
                 await pilot.pause(0.3)
-                assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(4)] == [
+                assert [str(timeline.get_cell_at(Coordinate(row, 1))).strip() for row in range(4)] == [
                     "dispatch",
                     "",
                     "load_weather",
@@ -1269,7 +1255,7 @@ def test_tui_failed_delete_puts_the_row_back() -> None:
     asyncio.run(scenario())
 
 
-def test_tui_delete_follows_the_active_target_tab_and_skips_asgi_apps() -> None:
+def test_tui_delete_follows_the_active_target_tab() -> None:
     async def scenario() -> None:
         client = FakeClient()
         app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
@@ -1291,14 +1277,6 @@ def test_tui_delete_follows_the_active_target_tab_and_skips_asgi_apps() -> None:
             assert screen.required_phrase == "forecast"
 
             await pilot.press("escape")
-            await pilot.pause(0.1)
-            assert not isinstance(app.screen, DeleteConfirmScreen)
-            assert client.deleted == []
-
-            # ASGI apps have no delete endpoint, so `d` must not offer one.
-            app.query_one("#target-tabs", TabbedContent).active = "asgi-apps-tab"
-            await pilot.pause(0.1)
-            await pilot.press("d")
             await pilot.pause(0.1)
             assert not isinstance(app.screen, DeleteConfirmScreen)
             assert client.deleted == []
@@ -1923,35 +1901,6 @@ def test_tui_project_view_opens_a_box_at_a_time() -> None:
     asyncio.run(scenario())
 
 
-def test_tui_hides_the_asgi_tab_for_a_project_without_one() -> None:
-    class NoAsgiClient(FakeClient):
-        def list_asgi_apps(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
-            return []
-
-    async def scenario() -> None:
-        app = RebaseTuiApp(data=fake_tui_data(NoAsgiClient(), project="energy", limit=5))
-
-        async with app.run_test(size=(140, 42)) as pilot:
-            await pilot.pause(0.2)
-            projects = app.query_one("#projects-table", SelectableDataTable)
-            projects.focus()
-            projects.move_cursor(row=0)
-            await pilot.press("enter")
-            await pilot.pause(0.3)
-
-            tabs = app.query_one("#target-tabs", TabbedContent)
-            assert tabs.active == "workflows-tab"
-            # right now cycles between the two that have something behind them.
-            await pilot.press("right")
-            await pilot.pause(0.1)
-            assert tabs.active == "functions-tab"
-            await pilot.press("right")
-            await pilot.pause(0.1)
-            assert tabs.active == "workflows-tab"
-
-    asyncio.run(scenario())
-
-
 def test_tui_tab_walks_every_box_on_screen() -> None:
     """`tab` used to switch the top box's two tabs and leave the rest unreachable."""
 
@@ -2186,28 +2135,45 @@ def test_tui_m_maximises_the_focused_box_and_b_gives_it_back() -> None:
             await pilot.pause(0.3)
             tabs, runs, timeline = (app.query_one(box) for box in tui_module.BOX_SELECTORS)
 
-            # Maximise the middle box, not just the bottom one.
+            # Maximise the middle box, not just the bottom one. The others go off screen
+            # rather than shrinking to their headers, and the header bar goes with them:
+            # what is left is the box and the footer.
+            header = app.query_one(tui_module.RebaseHeader)
             app.query_one("#runs-table", DataTable).focus()
             await pilot.pause(0.1)
             await pilot.press("m")
             await pilot.pause(0.2)
-            assert tabs.size.height == tui_module.MIN_TARGET_BOX_HEIGHT
-            assert timeline.size.height == tui_module.MIN_TABLE_HEIGHT
-            assert runs.size.height == 42 - 2 - tui_module.MIN_TARGET_BOX_HEIGHT - 1
+            assert (tabs.display, timeline.display, header.display) == (False, False, False)
+            assert runs.size.height == 42 - 1  # everything but the footer
+
+            # Nothing else is on screen, so tab stays put.
+            await pilot.press("tab")
+            await pilot.pause(0.1)
+            assert str(app.focused.id) == "runs-table"
 
             # b gives the screen back without also closing the box.
             await pilot.press("b")
             await pilot.pause(0.2)
             assert app._reveal_level == 2
-            assert timeline.size.height > tui_module.MIN_TABLE_HEIGHT
+            assert (tabs.display, timeline.display, header.display) == (True, True, True)
 
             # And m toggles it off again itself.
             await pilot.press("m")
             await pilot.pause(0.2)
-            assert timeline.size.height == tui_module.MIN_TABLE_HEIGHT
+            assert timeline.display is False
             await pilot.press("m")
             await pilot.pause(0.2)
-            assert timeline.size.height > tui_module.MIN_TABLE_HEIGHT
+            assert (timeline.display, header.display) == (True, True)
+
+            # Leaving the project restores the chrome even from inside `m`.
+            await pilot.press("m")
+            await pilot.pause(0.2)
+            assert header.display is False
+            app.query_one("#projects-table", SelectableDataTable).focus()
+            app._show_workspace_view()
+            await pilot.pause(0.2)
+            assert header.display is True
+            assert app._maximised is None
 
     asyncio.run(scenario())
 
@@ -2290,7 +2256,7 @@ def test_tui_l_folds_the_run_logs_into_the_timeline() -> None:
             await pilot.press("l")
             await pilot.pause(0.4)
             # The log line at 14:00:02 sits between the 14:00:01 event and the 14:00:05 step.
-            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(3)] == [
+            assert [str(timeline.get_cell_at(Coordinate(row, 1))).strip() for row in range(3)] == [
                 "dispatch",
                 "",
                 "load_weather",
@@ -2457,6 +2423,79 @@ def test_tui_build_timeline_keeps_rows_with_no_usable_timestamp() -> None:
     assert [row.stage for row in rows] == ["undated", "late"]
 
 
+def test_tui_build_timeline_nests_a_steps_tasks_under_it() -> None:
+    """A step reports one outcome; its tasks are where "which one failed" survives."""
+    steps = [{"name": "fetch", "status": "succeeded", "started_at": "2026-06-16T14:00:05Z"}]
+    tasks = [
+        {
+            "item_index": 0,
+            "parameters": {"area": "NO1"},
+            "status": "succeeded",
+            "result": {"objects": 1},
+            "started_at": "2026-06-16T14:00:06Z",
+        },
+        {
+            "item_index": 1,
+            "parameters": {"area": "SE3"},
+            "status": "failed",
+            "error": "401 Unauthorized",
+            "started_at": "2026-06-16T14:00:07Z",
+        },
+    ]
+
+    rows = tui_module.build_timeline([], steps, None, tasks)
+    assert [(row.kind, row.stage, row.status) for row in rows] == [
+        ("step", "fetch", "succeeded"),
+        ("task", "task 0", "succeeded"),
+        ("task", "task 1", "failed"),
+    ]
+    # The parameters say which unit of work it was; the error says what became of it.
+    assert rows[1].message == '{"area": "NO1"} -> {"objects": 1}'
+    assert rows[2].message == '{"area": "SE3"} -> 401 Unauthorized'
+
+    # A task that has not started yet sorts with its batch, not to the top of the run.
+    queued = tui_module.build_timeline(
+        [], steps, None, [{"item_index": 0, "status": "queued", "created_at": "2026-06-16T14:00:06Z"}]
+    )
+    assert [row.kind for row in queued] == ["step", "task"]
+
+
+def test_tui_shows_a_steps_tasks_in_the_timeline() -> None:
+    async def scenario() -> None:
+        client = SteppedClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
+
+        async with app.run_test(size=(160, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+
+            assert client.task_calls == ["run-id"]
+            timeline = app.query_one("#timeline-table", DataTable)
+            # dispatch, the step, and one row per task, indented under it.
+            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(4)] == [
+                "dispatch",
+                "load_weather",
+                "  task 0",
+                "  task 1",
+            ]
+            assert [str(timeline.get_cell_at(Coordinate(row, 2))) for row in range(4)] == [
+                "completed",
+                "succeeded",
+                "succeeded",
+                "failed",
+            ]
+
+    asyncio.run(scenario())
+
+
 def test_tui_functions_table_names_the_workflow_each_step_belongs_to() -> None:
     """A step is registered as a function, with nothing on the row to say whose step it is."""
 
@@ -2600,28 +2639,6 @@ def test_tui_runs_table_reports_when_each_run_started_and_how_long_it_took() -> 
                 shown("2026-06-16T14:01:00Z"),
                 "50.0s",
             ]
-
-    asyncio.run(scenario())
-
-
-def test_tui_keeps_the_asgi_tab_hidden_until_a_project_is_known_to_have_one() -> None:
-    """It used to appear on every project and vanish again once the data landed."""
-
-    async def scenario() -> None:
-        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
-
-        async with app.run_test(size=(140, 42)) as pilot:
-            await pilot.pause(0.2)
-            assert app.query_one("#target-tabs", TabbedContent).get_tab("asgi-apps-tab").display is False
-
-            projects = app.query_one("#projects-table", SelectableDataTable)
-            projects.focus()
-            projects.move_cursor(row=0)
-            await pilot.press("enter")
-            await pilot.pause(0.3)
-
-            # This project does have one, so now it is there.
-            assert app.query_one("#target-tabs", TabbedContent).get_tab("asgi-apps-tab").display is True
 
     asyncio.run(scenario())
 

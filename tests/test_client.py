@@ -169,6 +169,86 @@ def test_client_run_function_map_posts_payload(monkeypatch) -> None:
     }
 
 
+def test_client_run_function_map_attributes_the_batch_to_the_running_step(monkeypatch) -> None:
+    """A map issued inside a step is that step's tasks, and only this call can say so."""
+    observed: dict[str, Any] = {}
+
+    def fake_stream_request(method: str, path: str, **kwargs: Any):
+        observed.clear()
+        observed.update(kwargs["json"])
+        yield {"type": "summary", "status": "succeeded"}
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "stream_request", fake_stream_request)
+    monkeypatch.setenv("REBASE_RUN_ID", "run-1")
+    monkeypatch.setenv("REBASE_STEP_RUN_ID", "step-1")
+
+    list(client.run_function_map("function-id", items=[1], parameter="x"))
+    assert observed["workflow_run_id"] == "run-1"
+    assert observed["step_run_id"] == "step-1"
+
+    # Outside any step but inside a run, the batch still belongs to the run.
+    monkeypatch.delenv("REBASE_STEP_RUN_ID")
+    list(client.run_function_map("function-id", items=[1], parameter="x"))
+    assert observed["workflow_run_id"] == "run-1"
+    assert "step_run_id" not in observed
+
+    # And a map from a laptop belongs to nothing, which the platform accepts.
+    monkeypatch.delenv("REBASE_RUN_ID")
+    list(client.run_function_map("function-id", items=[1], parameter="x"))
+    assert "workflow_run_id" not in observed
+
+
+def _http_error(message: str, status_code: int) -> rb.RebaseWorkflowError:
+    """`status_code` is set on the instance by `request`, not passed to the constructor."""
+    error = rb.RebaseWorkflowError(message)
+    error.status_code = status_code
+    return error
+
+
+def test_client_list_run_tasks_tolerates_an_api_without_the_route(monkeypatch) -> None:
+    calls: list[tuple[str, str, Any]] = []
+
+    def fake_request(method: str, path: str, params: Any = None) -> Any:
+        calls.append((method, path, params))
+        return [{"item_index": 0, "status": "succeeded"}]
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "request", fake_request)
+    assert client.list_run_tasks("run-1", step_run_id="step-1") == [{"item_index": 0, "status": "succeeded"}]
+    assert calls == [("GET", "/runs/run-1/tasks", {"step_run_id": "step-1"})]
+
+    # 404/405 mean the platform is older than this toolkit: no tasks, not a failure.
+    def absent(method: str, path: str, params: Any = None) -> Any:
+        raise _http_error("Method Not Allowed", 405)
+
+    monkeypatch.setattr(client, "request", absent)
+    assert client.list_run_tasks("run-1") == []
+
+    def broken(method: str, path: str, params: Any = None) -> Any:
+        raise _http_error("boom", 500)
+
+    monkeypatch.setattr(client, "request", broken)
+    with pytest.raises(rb.RebaseWorkflowError, match="boom"):
+        client.list_run_tasks("run-1")
+
+
+def test_current_run_reads_the_runner_s_environment(monkeypatch) -> None:
+    """Read per call, not cached: the steps of one run share a process."""
+    monkeypatch.delenv("REBASE_RUN_ID", raising=False)
+    monkeypatch.delenv("REBASE_STEP_RUN_ID", raising=False)
+    assert rb.current_run() is None
+
+    monkeypatch.setenv("REBASE_RUN_ID", "run-1")
+    assert rb.current_run() == rb.RunContext(run_id="run-1", step_run_id=None)
+
+    monkeypatch.setenv("REBASE_STEP_RUN_ID", "step-1")
+    assert rb.current_run() == rb.RunContext(run_id="run-1", step_run_id="step-1")
+
+    monkeypatch.setenv("REBASE_STEP_RUN_ID", "step-2")
+    assert rb.current_run().step_run_id == "step-2"
+
+
 def test_function_map_buffers_ordered_results(monkeypatch) -> None:
     def fake_run_function_map(*args: Any, **kwargs: Any):
         yield {"type": "item", "index": 1, "status": "succeeded", "result": {"value": 4}}

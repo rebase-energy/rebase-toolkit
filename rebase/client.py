@@ -23,6 +23,7 @@ import requests
 
 from rebase.auth import AuthError, load_access_token
 from rebase.config import DEFAULT_SERVER_URL, load_profile, local_workspace_id
+from rebase.runtime import current_run
 
 try:
     from emflow.models import Agent as _ImportedEmflowAgent
@@ -2977,7 +2978,7 @@ class Client:
         return_exceptions: bool = False,
         timeout: float | None = None,
     ) -> Iterator[dict[str, Any]]:
-        payload = {
+        payload: dict[str, Any] = {
             "items": items,
             "parameter": parameter,
             "kwargs": kwargs or {},
@@ -2988,6 +2989,14 @@ class Client:
             payload["max_concurrency"] = max_concurrency
         if timeout is not None:
             payload["timeout_seconds"] = timeout
+        # A map issued from inside a run is that run's tasks, and the platform can only
+        # know it from here — the batch is created by this request. Absent on a laptop,
+        # where the batch legitimately belongs to no run.
+        context = current_run()
+        if context is not None:
+            payload["workflow_run_id"] = context.run_id
+            if context.step_run_id is not None:
+                payload["step_run_id"] = context.step_run_id
         yield from self.stream_request("POST", f"/functions/{function_id}/map", json=payload, timeout=None)
 
     def list_models(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
@@ -3685,6 +3694,25 @@ class Client:
         response = self.request("GET", f"/runs/{run_id}/steps")
         if not isinstance(response, list):
             raise RebaseWorkflowError("expected step run list response")
+        return response
+
+    def list_run_tasks(self, run_id: str, *, step_run_id: str | None = None) -> list[dict[str, Any]]:
+        """The individual pieces of work fanned out inside a run's steps.
+
+        A step reports one outcome for everything inside it; its tasks are where
+        "which one failed" survives. Empty for a run whose steps fan out into nothing,
+        and against an API without the route — the caller gets a run with no tasks
+        rather than a broken run view.
+        """
+        params = {"step_run_id": step_run_id} if step_run_id is not None else None
+        try:
+            response = self.request("GET", f"/runs/{run_id}/tasks", params=params)
+        except RebaseWorkflowError as exc:
+            if exc.status_code in ROUTE_ABSENT_STATUSES:
+                return []
+            raise
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected run task list response")
         return response
 
     def list_run_events(self, run_id: str) -> list[dict[str, Any]]:

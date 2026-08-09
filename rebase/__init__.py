@@ -61,6 +61,7 @@ from rebase.public import (
     workflow,
     workspace,
 )
+from rebase.runtime import RunContext, current_run
 from rebase.stitch import Exclude, Layer, StitchError, stitch
 from rebase.timing import Duration, ForecastWindow
 from rebase.version import __version__
@@ -103,6 +104,7 @@ __all__ = [
     "RebaseError",
     "RebaseWorkflowError",
     "Run",
+    "RunContext",
     "RunType",
     "Secret",
     "Volume",
@@ -113,6 +115,7 @@ __all__ = [
     "__version__",
     "asgi_app",
     "configure",
+    "current_run",
     "data",
     "deploy",
     "endpoint",
