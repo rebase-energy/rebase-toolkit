@@ -2834,3 +2834,28 @@ def test_tui_footer_shows_only_the_keys_you_move_around_with() -> None:
             assert tab.description == "Next pane"
 
     asyncio.run(scenario())
+
+
+def test_tui_background_is_the_same_in_every_view() -> None:
+    """Textual tints the focused table, which changed the whole background per view."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(120, 24)) as pilot:
+            await pilot.pause(0.3)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            assert projects.has_focus
+            # The one table filling the workspace view is focused, so its tint used to
+            # repaint the entire screen a shade lighter than the project view's.
+            assert projects.styles.background_tint.a == 0
+
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            assert workflows.has_focus
+            assert workflows.styles.background.hex == projects.styles.background.hex
+            assert workflows.styles.background_tint.a == 0
+
+    asyncio.run(scenario())

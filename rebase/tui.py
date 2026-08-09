@@ -1365,6 +1365,14 @@ class RebaseTuiApp(App[None]):
         scrollbar-size-vertical: 1;
     }}
 
+    /* Textual tints the focused table 5% lighter, which turned the pane you were in a
+       visibly different shade from the rest of the app — most obvious in the workspace
+       view, where one table fills the screen and the whole background changed with it.
+       The cursor row already says where the focus is, in colour rather than in wash. */
+    DataTable:focus {{
+        background-tint: transparent;
+    }}
+
     /* Textual's toast is a grey `$panel` slab 60 cells wide whatever it has to say.
        This one is the app's own: a bordered card in the brand green, sized to its text,
        standing clear of the footer rather than sharing a row with the key hints. The

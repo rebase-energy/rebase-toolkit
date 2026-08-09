@@ -205,6 +205,12 @@
 
 ### Fixed
 
+- **The background no longer changes shade between views.** Textual tints a focused DataTable
+  five percent lighter, and in the workspace view one table fills the screen — so walking into a
+  project visibly darkened the whole app and walking back out lightened it again. The tint is
+  off; the focused pane is still the one with the bright cursor row, which says it in colour
+  rather than by washing the background.
+
 - **Notifications no longer look like they belong to another program.** Textual's toast is a
   grey `$panel` slab 60 cells wide whatever it has to say — the one widget on screen still
   wearing the default theme. It is a bordered card in the brand green now, sized to its text and
