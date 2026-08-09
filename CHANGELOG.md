@@ -45,6 +45,18 @@
   rows are where "which one of them failed" survives. Against an API without the route the
   method returns no tasks rather than raising, so an older platform costs the rows and not the
   run view.
+- **`[ All ] [ Steps ] [ Logs ] [ Tasks ]` over the timeline.** A run's lifecycle events, its
+  steps, the tasks fanned out inside them and its log output were one undifferentiated list, and
+  the question was usually about one of them. The chips filter it; `left`/`right` step between
+  them, the same gesture the target pane already uses, and `l` jumps straight to Logs. `All`
+  keeps everything interleaved by time and adds a Type column saying which each row is — dropped
+  under the other three, where every row would repeat one word. `Logs` carries the platform's
+  own stage events alongside the runtime's output: both are the run talking, one in stages and
+  one in prose. An empty filter says why it is empty rather than showing a blank table, which is
+  how a workflow with no step graph now tells you so. One `Tabs` over one table, not four panes
+  holding four slices of the same run.
+- **Log output arrives with the run** rather than on request. It joins the four reads already
+  issued together, so the Logs chip is instant and costs no extra wait.
 - **`rebase init [WORKSPACE]`** connects the repository you are in to a workspace you already
   belong to, by writing the committed `.rebase/config.json` marker — and nothing else. No
   sign-in, no workspace creation, and the machine's active workspace is left where it was.

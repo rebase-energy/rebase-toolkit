@@ -17,7 +17,7 @@ from textual.coordinate import Coordinate
 from textual.events import MouseMove
 from textual.geometry import Offset
 from textual.selection import Selection
-from textual.widgets import DataTable, Footer, Header, Input, OptionList, Static, TabbedContent
+from textual.widgets import DataTable, Footer, Header, Input, OptionList, Static, TabbedContent, Tabs
 from textual.widgets._toast import Toast
 
 from rebase import config as config_module
@@ -655,18 +655,25 @@ def test_tui_app_mounts_and_renders_selected_workflow_run() -> None:
             await pilot.press("enter")
             await pilot.pause(0.2)
 
-            # The event and the step land in one timeline, in the order they happened.
+            # Event, log and step land in one timeline, in the order they happened, and
+            # under All each says which it is. Columns: Time, Type, Stage, Status, Message.
             timeline = app.query_one("#timeline-table", DataTable)
-            assert timeline.row_count == 2
-            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(2)] == [
+            assert timeline.row_count == 3
+            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(3)] == [
+                "event",
+                "log",
+                "step",
+            ]
+            assert [str(timeline.get_cell_at(Coordinate(row, 2))).strip() for row in range(3)] == [
                 "dispatch",
+                "",
                 "load_weather",
             ]
 
             # Back closes the timeline, then the runs box, and only then leaves the project.
             await pilot.press("b")
             await pilot.pause(0.2)
-            assert app.query_one("#timeline-table").styles.display == "none"
+            assert app.query_one("#timeline-pane").styles.display == "none"
             assert app.query_one("#runs-table").styles.display == "block"
             assert app.query_one("#project-view").styles.display == "block"
 
@@ -940,22 +947,23 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
                 await pilot.press("enter")
                 await pilot.pause(0.2)
 
+                # All: the event, both log lines and the step, interleaved by time.
                 timeline = app.query_one("#timeline-table", DataTable)
-                assert timeline.row_count == 2
-
-                # `l` folds the log lines in, each under the step or stage it followed.
-                await pilot.press("l")
-                await pilot.pause(0.3)
-                assert [str(timeline.get_cell_at(Coordinate(row, 1))).strip() for row in range(4)] == [
-                    "dispatch",
-                    "",
-                    "load_weather",
-                    "",
+                assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(4)] == [
+                    "event",
+                    "log",
+                    "step",
+                    "log",
                 ]
-                assert str(timeline.get_cell_at(Coordinate(1, 3))).strip() == "Fetching curves."
+                assert str(timeline.get_cell_at(Coordinate(1, 4))).strip() == "Fetching curves."
+
+                # `l` narrows to the log output and its events; `l` again goes back.
                 await pilot.press("l")
                 await pilot.pause(0.3)
-                assert timeline.row_count == 2
+                assert timeline.row_count == 3  # the event and the two log lines
+                await pilot.press("l")
+                await pilot.pause(0.3)
+                assert timeline.row_count == 4
 
                 await pilot.press("b", "b", "b")
                 await pilot.pause(0.2)
@@ -1878,7 +1886,7 @@ def test_tui_project_view_opens_a_box_at_a_time() -> None:
 
             # Level 0: the switcher and its table, and nothing else.
             assert app._reveal_level == 0
-            for selector in ("#runs-table", "#timeline-table"):
+            for selector in ("#runs-table", "#timeline-pane"):
                 assert app.query_one(selector).styles.display == "none", selector
             assert app.query_one("#target-tabs").styles.height.value == 1  # 1fr
             assert app.title.endswith("/ energy")
@@ -1892,7 +1900,7 @@ def test_tui_project_view_opens_a_box_at_a_time() -> None:
             # Level 1: the runs, still no timeline.
             assert app._reveal_level == 1
             assert app.query_one("#runs-table").styles.display == "block"
-            assert app.query_one("#timeline-table").styles.display == "none"
+            assert app.query_one("#timeline-pane").styles.display == "none"
 
             runs = app.query_one("#runs-table", DataTable)
             runs.focus()
@@ -1902,7 +1910,7 @@ def test_tui_project_view_opens_a_box_at_a_time() -> None:
 
             # Level 2: the run's timeline.
             assert app._reveal_level == 2
-            assert app.query_one("#timeline-table").styles.display == "block"
+            assert app.query_one("#timeline-pane").styles.display == "block"
 
     asyncio.run(scenario())
 
@@ -2040,7 +2048,7 @@ def test_tui_a_squeezed_box_keeps_only_its_header() -> None:
             await pilot.pause(0.2)
             # And the tables below it are down to a column header each.
             assert app.query_one("#runs-table").size.height == tui_module.MIN_TABLE_HEIGHT
-            assert app.query_one("#timeline-table").size.height == tui_module.MIN_TABLE_HEIGHT
+            assert app.query_one("#timeline-pane").size.height == tui_module.MIN_TARGET_BOX_HEIGHT
 
     asyncio.run(scenario())
 
@@ -2108,9 +2116,9 @@ def test_tui_shrinking_a_box_cannot_push_the_one_below_off_screen() -> None:
 
             await pilot.press(*["-"] * 40)
             await pilot.pause(0.3)
-            timeline = app.query_one("#timeline-table")
+            timeline = app.query_one("#timeline-pane")
             assert timeline.styles.display == "block"
-            assert timeline.size.height == tui_module.MIN_TABLE_HEIGHT
+            assert timeline.size.height == tui_module.MIN_TARGET_BOX_HEIGHT
             # Everything still fits between the header and the footer.
             boxes = [app.query_one(box).size.height for box in tui_module.BOX_SELECTORS]
             assert sum(boxes) == app.query_one("#project-view").size.height
@@ -2229,110 +2237,6 @@ def test_tui_dragging_a_column_header_resizes_the_box_above_it() -> None:
             app.end_box_drag()
             await pilot.pause(0.2)
             assert app.query_one("#target-tabs").size.height == start + 4
-
-    asyncio.run(scenario())
-
-
-def test_tui_l_folds_the_run_logs_into_the_timeline() -> None:
-    async def scenario() -> None:
-        client = FakeClient()
-        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
-
-        async with app.run_test(size=(140, 42)) as pilot:
-            await pilot.pause(0.2)
-            # Nothing selected yet: `l` says so rather than doing nothing.
-            await pilot.press("l")
-            await pilot.pause(0.1)
-            assert any("Select a run first" in n.message for n in app._notifications)
-
-            projects = app.query_one("#projects-table", SelectableDataTable)
-            projects.focus()
-            projects.move_cursor(row=0)
-            await pilot.press("enter")
-            await pilot.pause(0.3)
-            await pilot.press("enter")
-            await pilot.pause(0.3)
-            app.query_one("#runs-table", DataTable).focus()
-            await pilot.press("enter")
-            await pilot.pause(0.3)
-
-            timeline = app.query_one("#timeline-table", DataTable)
-            assert timeline.row_count == 2
-
-            await pilot.press("l")
-            await pilot.pause(0.4)
-            # The log line at 14:00:02 sits between the 14:00:01 event and the 14:00:05 step.
-            assert [str(timeline.get_cell_at(Coordinate(row, 1))).strip() for row in range(3)] == [
-                "dispatch",
-                "",
-                "load_weather",
-            ]
-            assert str(timeline.get_cell_at(Coordinate(1, 3))).strip() == "Fetching curves."
-            assert client.log_calls == ["run-id"]
-
-            # Folding them away and back costs no second request.
-            await pilot.press("l")
-            await pilot.pause(0.2)
-            assert timeline.row_count == 2
-            await pilot.press("l")
-            await pilot.pause(0.2)
-            assert timeline.row_count == 3
-            assert client.log_calls == ["run-id"]
-
-    asyncio.run(scenario())
-
-
-def test_tui_expanded_logs_take_the_room_from_the_boxes_above() -> None:
-    async def scenario() -> None:
-        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
-
-        async with app.run_test(size=(140, 42)) as pilot:
-            await pilot.pause(0.2)
-            projects = app.query_one("#projects-table", SelectableDataTable)
-            projects.focus()
-            projects.move_cursor(row=0)
-            await pilot.press("enter")
-            await pilot.pause(0.3)
-            await pilot.press("enter")
-            await pilot.pause(0.3)
-            app.query_one("#runs-table", DataTable).focus()
-            await pilot.press("enter")
-            await pilot.pause(0.3)
-
-            packed = app.query_one("#timeline-table").size.height
-            await pilot.press("l")
-            await pilot.pause(0.4)
-            assert app.query_one("#timeline-table").size.height > packed
-
-    asyncio.run(scenario())
-
-
-def test_tui_reports_a_failed_log_request_and_folds_back_up() -> None:
-    class NoLogs(FakeClient):
-        def get_run_logs(self, run_id: str, *, since: str | None = None, limit: int | None = None) -> dict[str, Any]:
-            raise RebaseWorkflowError("404 Not Found")
-
-    async def scenario() -> None:
-        app = RebaseTuiApp(data=fake_tui_data(NoLogs(), project="energy", limit=5))
-
-        async with app.run_test(size=(140, 42)) as pilot:
-            await pilot.pause(0.2)
-            projects = app.query_one("#projects-table", SelectableDataTable)
-            projects.focus()
-            projects.move_cursor(row=0)
-            await pilot.press("enter")
-            await pilot.pause(0.3)
-            await pilot.press("enter")
-            await pilot.pause(0.3)
-            app.query_one("#runs-table", DataTable).focus()
-            await pilot.press("enter")
-            await pilot.pause(0.3)
-
-            await pilot.press("l")
-            await pilot.pause(0.4)
-            assert any("Could not load logs" in n.message for n in app._notifications)
-            assert app._logs_expanded is False
-            assert app.query_one("#timeline-table", DataTable).row_count == 2
 
     asyncio.run(scenario())
 
@@ -2474,42 +2378,6 @@ def test_tui_build_timeline_nests_a_steps_tasks_under_it() -> None:
         [], steps, None, [{"item_index": 0, "status": "queued", "created_at": "2026-06-16T14:00:06Z"}]
     )
     assert [row.kind for row in queued] == ["step", "task"]
-
-
-def test_tui_shows_a_steps_tasks_in_the_timeline() -> None:
-    async def scenario() -> None:
-        client = SteppedClient()
-        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
-
-        async with app.run_test(size=(160, 42)) as pilot:
-            await pilot.pause(0.2)
-            projects = app.query_one("#projects-table", SelectableDataTable)
-            projects.focus()
-            projects.move_cursor(row=0)
-            await pilot.press("enter")
-            await pilot.pause(0.3)
-            await pilot.press("enter")
-            await pilot.pause(0.3)
-            await pilot.press("enter")
-            await pilot.pause(0.4)
-
-            assert client.task_calls == ["run-id"]
-            timeline = app.query_one("#timeline-table", DataTable)
-            # dispatch, the step, and one row per task, indented under it.
-            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(4)] == [
-                "dispatch",
-                "load_weather",
-                "  task 0",
-                "  task 1",
-            ]
-            assert [str(timeline.get_cell_at(Coordinate(row, 2))) for row in range(4)] == [
-                "completed",
-                "succeeded",
-                "succeeded",
-                "failed",
-            ]
-
-    asyncio.run(scenario())
 
 
 def test_tui_functions_table_names_the_workflow_each_step_belongs_to() -> None:
@@ -2892,3 +2760,115 @@ def test_tui_run_detail_issues_its_reads_together() -> None:
     assert sorted(order) == ["events", "run", "steps", "tasks"]
     assert detail.run["id"] == "run-id"
     assert [step["name"] for step in detail.steps] == ["load_weather"]
+
+
+def _open_run(app, pilot):
+    """Drill workspace -> project -> workflow -> run, leaving the timeline focused."""
+
+    async def go():
+        await pilot.pause(0.2)
+        projects = app.query_one("#projects-table", SelectableDataTable)
+        projects.focus()
+        projects.move_cursor(row=0)
+        await pilot.press("enter")
+        await pilot.pause(0.3)
+        await pilot.press("enter")
+        await pilot.pause(0.3)
+        await pilot.press("enter")
+        await pilot.pause(0.4)
+
+    return go()
+
+
+def test_tui_timeline_chips_filter_the_run_by_kind() -> None:
+    """One table, four chips: the same run seen four ways rather than four tables."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(SteppedClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(160, 40)) as pilot:
+            await _open_run(app, pilot)
+            timeline = app.query_one("#timeline-table", DataTable)
+            assert [str(tab.label) for tab in app.query("#timeline-tabs Tab")] == [
+                "[ All ]",
+                "[ Steps ]",
+                "[ Logs ]",
+                "[ Tasks ]",
+            ]
+
+            def kinds() -> list[str]:
+                return [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(timeline.row_count)]
+
+            # All: the Type column says which each row is, and everything is present.
+            assert set(kinds()) == {"event", "log", "step", "task"}
+
+            # left/right steps the chips, the same gesture as the target pane's.
+            await pilot.press("right")
+            await pilot.pause(0.2)
+            assert app._timeline_filter == "timeline-steps"
+            # A filtered view drops the Type column: every row would say the same word.
+            assert [str(column.label) for column in timeline.columns.values()] == [
+                "Time",
+                "Stage",
+                "Status",
+                "Message",
+            ]
+            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(timeline.row_count)] == [
+                "load_weather"
+            ]
+
+            await pilot.press("right")
+            await pilot.pause(0.2)
+            assert app._timeline_filter == "timeline-logs"
+            # Logs carries the platform's own stages as well as the runtime's output.
+            assert timeline.row_count == 2
+
+            await pilot.press("right")
+            await pilot.pause(0.2)
+            assert app._timeline_filter == "timeline-tasks"
+            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(timeline.row_count)] == [
+                "task 0",
+                "task 1",
+            ]
+
+            await pilot.press("right")
+            await pilot.pause(0.2)
+            assert app._timeline_filter == "timeline-all"
+
+    asyncio.run(scenario())
+
+
+def test_tui_timeline_says_why_a_filter_is_empty() -> None:
+    """An empty table looks broken; this is the run saying it has no steps."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(160, 40)) as pilot:
+            await _open_run(app, pilot)
+            timeline = app.query_one("#timeline-table", DataTable)
+
+            app._select_timeline_filter("timeline-tasks")
+            await pilot.pause(0.2)
+            assert timeline.row_count == 1
+            assert "No tasks" in str(timeline.get_cell_at(Coordinate(0, 2)))
+
+    asyncio.run(scenario())
+
+
+def test_tui_l_jumps_to_the_logs_chip_and_back() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(160, 40)) as pilot:
+            await _open_run(app, pilot)
+            assert app._timeline_filter == "timeline-all"
+            await pilot.press("l")
+            await pilot.pause(0.2)
+            assert app._timeline_filter == "timeline-logs"
+            assert app.query_one("#timeline-tabs", Tabs).active == "timeline-logs"
+            await pilot.press("l")
+            await pilot.pause(0.2)
+            assert app._timeline_filter == "timeline-all"
+
+    asyncio.run(scenario())

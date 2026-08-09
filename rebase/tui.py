@@ -32,8 +32,10 @@ from textual.widgets import (
     Input,
     OptionList,
     Static,
+    Tab,
     TabbedContent,
     TabPane,
+    Tabs,
 )
 
 # Recomposing the header means naming its pieces, and restyling the toast means naming
@@ -91,12 +93,12 @@ OVERVIEW_FANOUT_WORKERS = 16
 STEP_GRAPH_FANOUT_WORKERS = 8
 #: The run, its events, its steps and its tasks: four independent reads behind one
 #: keypress, so they go together rather than one after another.
-RUN_DETAIL_FANOUT_WORKERS = 4
+RUN_DETAIL_FANOUT_WORKERS = 5
 #: What each level of the project view adds, outermost first. Level 0 is the target
 #: table alone; selecting a target reveals level 1, selecting a run reveals level 2.
 REVEAL_LEVELS: tuple[tuple[str, ...], ...] = (
     ("#runs-table",),
-    ("#timeline-table",),
+    ("#timeline-pane",),
 )
 #: Header text per table, added when the rows are and never before. See `_setup_tables`.
 TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -105,7 +107,10 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "functions-table": ("Name", "Workflow", "Step", "Run type", "State", "Endpoint", "Version", "Updated"),
     "workflows-table": ("Name", "Run type", "State", "Endpoint", "Schedule", "Next run", "Version", "Updated"),
     "runs-table": ("Run", "Status", "Trigger", "Created", "Started", "Finished", "Duration"),
+    # The Type column only earns its place under `All`; every other filter would
+    # repeat one word down the whole table. See `_timeline_columns`.
     "timeline-table": ("Time", "Stage", "Status", "Message"),
+    "timeline-table-all": ("Time", "Type", "Stage", "Status", "Message"),
 }
 #: The tab each target table belongs to, in the order `left`/`right` cycle them.
 TARGET_TABS: tuple[tuple[str, str], ...] = (
@@ -114,7 +119,22 @@ TARGET_TABS: tuple[tuple[str, str], ...] = (
 )
 #: The project view's stacked boxes, top to bottom. One per reveal level. Each box below
 #: the first resizes the one above it by its own column header — see `DragHeaderTable`.
-BOX_SELECTORS: tuple[str, ...] = ("#target-tabs", "#runs-table", "#timeline-table")
+BOX_SELECTORS: tuple[str, ...] = ("#target-tabs", "#runs-table", "#timeline-pane")
+#: What the timeline's chips filter down to. `logs` carries the platform's own
+#: lifecycle events as well: both are the run talking, one in stages and one in output.
+TIMELINE_FILTERS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("timeline-all", "[ All ]", ("event", "step", "task", "log")),
+    ("timeline-steps", "[ Steps ]", ("step",)),
+    ("timeline-logs", "[ Logs ]", ("event", "log")),
+    ("timeline-tasks", "[ Tasks ]", ("task",)),
+)
+#: What to say when a filter has nothing to show, rather than leaving a blank table.
+TIMELINE_EMPTY: dict[str, str] = {
+    "timeline-steps": "No steps — this workflow's body does the work itself.",
+    "timeline-tasks": "No tasks — no step of this run fanned work out.",
+    "timeline-logs": "No log output recorded for this run.",
+    "timeline-all": "Nothing recorded for this run yet.",
+}
 #: The rows a box keeps whatever you do to it: its column header. For the tabbed box that
 #: is two rows, not one — the chip strip above the table costs a row of its own.
 MIN_TABLE_HEIGHT = 1
@@ -203,6 +223,8 @@ class RunDetailData:
     steps: list[dict[str, Any]]
     #: The fan-out inside those steps, one row per unit of work.
     tasks: list[dict[str, Any]] = field(default_factory=list)
+    #: The runtime's own output, which the Logs chip shows alongside the events.
+    logs: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -214,6 +236,14 @@ class TimelineRow:
     status: str
     message: str
     kind: Literal["event", "step", "task", "log"]
+
+
+def _optional_entries(load: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Log output is supplementary: a run with unreadable logs is still a run."""
+    try:
+        return load()
+    except Exception:
+        return []
 
 
 def _optional_list(load: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -356,6 +386,10 @@ class RebaseTuiData:
         with ThreadPoolExecutor(max_workers=RUN_DETAIL_FANOUT_WORKERS) as executor:
             run = executor.submit(self.client.get_run, run_id)
             events = executor.submit(self.client.list_run_events, run_id)
+            # Logs used to be fetched only when asked for. They come with the run now, so
+            # the Logs chip is instant -- and it costs nothing, being one more request
+            # alongside four rather than one after them.
+            logs = executor.submit(_optional_entries, lambda: self.load_run_logs(run_id))
             # Supplementary, like the endpoint list: an API without the route costs the
             # rows and not the run view.
             wanted = target_type in (None, "workflow")
@@ -368,6 +402,7 @@ class RebaseTuiData:
                 events=events.result(),
                 steps=steps.result() if steps is not None and is_workflow else [],
                 tasks=tasks.result() if tasks is not None and is_workflow else [],
+                logs=logs.result(),
             )
 
     def load_run_logs(self, run_id: str) -> list[dict[str, Any]]:
@@ -726,6 +761,19 @@ class DragHeaderTable(DataTable):
     def _screen_y(self, event: events.MouseEvent) -> int:
         # screen_y is what survives the widget moving under the pointer mid-drag.
         return int(getattr(event, "screen_y", self.region.y + event.y))
+
+
+class TimelineTable(DragHeaderTable):
+    """The timeline: its header drags the boundary above, its arrows switch its chips.
+
+    Same rule as the target tables — `left`/`right` step between the chips of whichever
+    pane holds the focus — so the timeline inherits the gesture rather than inventing one.
+    """
+
+    BINDINGS = [
+        Binding("left", "app.switch_timeline_filter(-1)", "Previous filter", show=False),
+        Binding("right", "app.switch_timeline_filter(1)", "Next filter", show=False),
+    ]
 
 
 class SelectableDataTable(DataTable):
@@ -1327,28 +1375,34 @@ class RebaseTuiApp(App[None]):
     /* A pair of chips rather than Textual's underlined labels: the selected one is a
        filled rectangle, which reads as "this is the one" at a glance and, unlike a bar
        drawn under the text, costs no row of its own. */
-    #target-tabs Tabs {{
+    #target-tabs Tabs,
+    #timeline-tabs {{
         height: 1;
     }}
 
-    #target-tabs Underline {{
+    #target-tabs Underline,
+    #timeline-tabs Underline {{
         display: none;
     }}
 
-    #target-tabs Tab {{
+    #target-tabs Tab,
+    #timeline-tabs Tab {{
         padding: 0 1;
         margin: 0 1 0 0;
         color: {BRAND_MEDIUM_GRAY};
     }}
 
-    #target-tabs Tab:hover {{
+    #target-tabs Tab:hover,
+    #timeline-tabs Tab:hover {{
         color: {BRAND_BRIGHT_GREEN};
     }}
 
     /* The `:focus` rule repeats the unfocused one because Textual's own
        `Tabs:focus .-active` would otherwise repaint it in the block-cursor colours. */
     #target-tabs Tab.-active,
-    #target-tabs Tabs:focus Tab.-active {{
+    #target-tabs Tabs:focus Tab.-active,
+    #timeline-tabs Tab.-active,
+    #timeline-tabs:focus Tab.-active {{
         background: {BRAND_BRIGHT_GREEN};
         color: #101412;
         text-style: bold;
@@ -1373,6 +1427,10 @@ class RebaseTuiApp(App[None]):
 
     #runs-table {{
         height: 8;
+    }}
+
+    #timeline-pane {{
+        height: 1fr;
     }}
 
     #timeline-table {{
@@ -1471,9 +1529,10 @@ class RebaseTuiApp(App[None]):
         self._endpoints_by_target: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._run_rows: dict[str, dict[str, Any]] = {}
         self._run_detail: RunDetailData | None = None
+        #: Which of the timeline's chips is showing. `l` jumps to the logs one.
+        self._timeline_filter = TIMELINE_FILTERS[0][0]
         #: Log entries per run id, kept so toggling `l` back on costs no request.
         self._run_logs: dict[str, list[dict[str, Any]]] = {}
-        self._logs_expanded = False
         self._marked_count = 0
         self._terminal_select = False
         self._display_timezone: ZoneInfo | None = None
@@ -1504,7 +1563,19 @@ class RebaseTuiApp(App[None]):
                 with TabPane(Content("[ Functions ]"), id="functions-tab"):
                     yield SelectableDataTable(id="functions-table")
             yield DragHeaderTable(resizes="#target-tabs", id="runs-table")
-            yield DragHeaderTable(resizes="#runs-table", id="timeline-table")
+            # A bare `Tabs` rather than a `TabbedContent`: four panes would mean four
+            # tables holding slices of one run. One table, filtered by the chips.
+            with Vertical(id="timeline-pane"):
+                # Not focusable: `tab` walks panes, and a chip strip that could hold
+                # the focus would be a stop on that walk with nothing to navigate.
+                # The arrows on the table below drive it, and the mouse still clicks it.
+                chips = Tabs(
+                    *(Tab(Content(label), id=tab_id) for tab_id, label, _ in TIMELINE_FILTERS),
+                    id="timeline-tabs",
+                )
+                chips.can_focus = False
+                yield chips
+                yield TimelineTable(resizes="#runs-table", id="timeline-table")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1578,8 +1649,10 @@ class RebaseTuiApp(App[None]):
             return
         # Opening a box hands it the focus, so the arrow keys drive what you just asked
         # for; closing one hands the focus back up rather than stranding it off screen.
+        # Membership of the visible set, not the widget's own `display`: a table inside a
+        # hidden pane is still "displayed" and would keep a focus nothing can see.
         focused = self.focused
-        if opening or (isinstance(focused, DataTable) and not focused.display):
+        if opening or (isinstance(focused, DataTable) and focused not in boxes):
             boxes[-1].focus()
 
     def _default_box_height(self, selector: str) -> int:
@@ -1589,7 +1662,7 @@ class RebaseTuiApp(App[None]):
         one with room to show something. Expanded logs are the exception that genuinely
         wants the whole screen, so both boxes above shrink to a header and a row or two.
         """
-        if self._reveal_level == 2 and self._logs_expanded:
+        if self._reveal_level == 2 and self._reading_logs:
             return {"#target-tabs": 5, "#runs-table": 6}.get(selector, MIN_TABLE_HEIGHT)
         if selector == "#target-tabs":
             return 14 if self._reveal_level == 1 else 9
@@ -1603,7 +1676,8 @@ class RebaseTuiApp(App[None]):
         says what is still open, and what each column of it means, without spending rows
         on the contents.
         """
-        return MIN_TARGET_BOX_HEIGHT if selector == BOX_SELECTORS[0] else MIN_TABLE_HEIGHT
+        # Both chip-strip boxes spend a row on their chips before their table's header.
+        return MIN_TABLE_HEIGHT if selector == "#runs-table" else MIN_TARGET_BOX_HEIGHT
 
     def _box_height(self, selector: str) -> int:
         return max(self._min_box_height(selector), self._box_heights.get(selector, self._default_box_height(selector)))
@@ -1730,6 +1804,8 @@ class RebaseTuiApp(App[None]):
         focused_id = f"#{focused.id}" if focused is not None and focused.id else ""
         if focused_id in dict(TARGET_TABS).values():
             return BOX_SELECTORS[0]
+        if focused_id == "#timeline-table":
+            return "#timeline-pane"
         return focused_id if focused_id in selectors else selectors[-1]
 
     def action_reset_box_heights(self) -> None:
@@ -1760,13 +1836,13 @@ class RebaseTuiApp(App[None]):
         panel.styles.display = "none" if message is None else "block"
         panel.update(Text(message or ""))
 
-    def _fill_table(self, table_id: str) -> DataTable:
+    def _fill_table(self, table_id: str, *, widget: str | None = None) -> DataTable:
         """Empty a table and give it its header back, ready for rows.
 
         Headers and rows land in the same paint this way, so the columns are sized once
         against real data instead of snapping from header width to content width.
         """
-        table = self.query_one(f"#{table_id}", DataTable)
+        table = self.query_one(f"#{widget or table_id}", DataTable)
         table.clear(columns=True)
         table.add_columns(*TABLE_COLUMNS[table_id])
         return table
@@ -1858,7 +1934,12 @@ class RebaseTuiApp(App[None]):
         # The target box holds whichever of its two tables the chip strip has open; the
         # other two boxes *are* their table. Pair them so visibility is read off the box.
         tables = [dict(self._target_tab_order()).get(active, "#workflows-table")]
-        tables.extend(selector for level in REVEAL_LEVELS[: self._reveal_level] for selector in level)
+        # A box is not always its table: the two with chip strips wrap one.
+        tables.extend(
+            "#timeline-table" if selector == "#timeline-pane" else selector
+            for level in REVEAL_LEVELS[: self._reveal_level]
+            for selector in level
+        )
         # Under `m` the rest are off screen, and `tab` has nowhere else to go.
         return [
             self.query_one(table, DataTable)
@@ -2260,35 +2341,39 @@ class RebaseTuiApp(App[None]):
             self._set_error(exc)
             return
         self._run_detail = detail
+        self._run_logs[run_id] = detail.logs
         self._render_timeline()
-        if self._logs_expanded and run_id not in self._run_logs:
-            self.run_worker(self._load_run_logs(run_id), name="run-logs", group="tui-logs", exclusive=True)
 
-    async def _load_run_logs(self, run_id: str) -> None:
-        try:
-            entries = await asyncio.to_thread(self.data.load_run_logs, run_id)
-        except Exception as exc:
-            self.notify(f"Could not load logs for run {compact_id(run_id)}: {exc}", severity="error")
-            self._logs_expanded = False
-            self._render_timeline()
-            return
-        self._run_logs[run_id] = entries
-        self._render_timeline()
+    @property
+    def _reading_logs(self) -> bool:
+        """Whether the timeline is showing log output alone, which wants the screen."""
+        return self._timeline_filter == TIMELINE_FILTERS[2][0]
 
     def action_toggle_logs(self) -> None:
-        """Fold the run's log output into the timeline, all of it at once.
-
-        Expanded means expanded: there is no per-step fold, because the thing worth
-        having is one scrollable read of the whole run rather than a tree to click open.
-        """
+        """Jump the timeline to its Logs chip, or back to All."""
         if self._run_detail is None:
-            self.notify("Select a run first — l folds its logs into the timeline.", severity="warning")
+            self.notify("Select a run first — l shows its log output.", severity="warning")
             return
-        self._logs_expanded = not self._logs_expanded
-        run_id = str(self._run_detail.run.get("id", ""))
-        if self._logs_expanded and run_id not in self._run_logs:
-            self.run_worker(self._load_run_logs(run_id), name="run-logs", group="tui-logs", exclusive=True)
+        logs_tab = TIMELINE_FILTERS[2][0]
+        self._select_timeline_filter(TIMELINE_FILTERS[0][0] if self._timeline_filter == logs_tab else logs_tab)
+
+    def _select_timeline_filter(self, tab_id: str) -> None:
+        self._timeline_filter = tab_id
+        tabs = self.query_one("#timeline-tabs", Tabs)
+        if tabs.active != tab_id:
+            tabs.active = tab_id
         self._render_timeline()
+
+    def action_switch_timeline_filter(self, delta: int) -> None:
+        """Step between the timeline's chips. Bound to left/right on its table."""
+        order = [tab_id for tab_id, _, _ in TIMELINE_FILTERS]
+        current = order.index(self._timeline_filter) if self._timeline_filter in order else 0
+        self._select_timeline_filter(order[(current + delta) % len(order)])
+
+    def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+        if event.tabs.id == "timeline-tabs" and event.tab.id != self._timeline_filter:
+            self._timeline_filter = str(event.tab.id)
+            self._render_timeline()
 
     def _render_workspace_overview(self, overview: WorkspaceOverviewData) -> None:
         self._project_rows = {
@@ -2425,27 +2510,47 @@ class RebaseTuiApp(App[None]):
             return
         self._reveal(2)
         run_id = str(detail.run.get("id", ""))
-        logs = self._run_logs.get(run_id) if self._logs_expanded else None
-        table = self._fill_table("timeline-table")
+        logs = self._run_logs.get(run_id)
+        kinds = dict((tab_id, kinds) for tab_id, _, kinds in TIMELINE_FILTERS)[self._timeline_filter]
+        showing_all = self._timeline_filter == TIMELINE_FILTERS[0][0]
+        table = self._fill_table("timeline-table-all" if showing_all else "timeline-table", widget="timeline-table")
+        shown = 0
         for row in build_timeline(detail.events, detail.steps, logs, detail.tasks):
+            if row.kind not in kinds:
+                continue
+            shown += 1
             # Indented under the step above them: tasks by one level, log lines by two,
             # which is the order they nest in even though the timeline sorts by time.
-            indent = {"task": "  ", "log": "    "}.get(row.kind, "")
-            table.add_row(
-                self._time(row.at),
-                Text(f"{indent}{row.stage}", style=MARK_STYLE if row.kind == "step" else ""),
-                status_text(row.status),
-                Text(row.message, style=BRAND_MEDIUM_GRAY if row.kind == "log" else ""),
+            # Indent only under All, where the nesting is what tells the kinds apart;
+            # a filtered view is one kind throughout and reads better flush left.
+            indent = {"task": "  ", "log": "    "}.get(row.kind, "") if showing_all else ""
+            cells: list[Any] = [self._time(row.at)]
+            if showing_all:
+                cells.append(Text(row.kind, style=BRAND_MEDIUM_GRAY))
+            cells.extend(
+                (
+                    Text(f"{indent}{row.stage}", style=MARK_STYLE if row.kind == "step" else ""),
+                    status_text(row.status),
+                    Text(row.message, style=BRAND_MEDIUM_GRAY if row.kind == "log" else ""),
+                )
             )
-        if self._logs_expanded and logs is None:
-            table.add_row("", "", Text("loading", style=BRAND_AMBER), "Fetching logs...")
-        elif logs is not None and len(logs) >= RUN_LOG_LIMIT:
+            table.add_row(*cells)
+        # An empty table looks broken; saying why it is empty is the whole point of
+        # having asked for Steps on a workflow that has none.
+        if not shown:
+            note = TIMELINE_EMPTY.get(self._timeline_filter, "Nothing to show.")
+            table.add_row(*self._timeline_note(showing_all, "empty", note))
+        elif logs is not None and len(logs) >= RUN_LOG_LIMIT and "log" in kinds:
             table.add_row(
-                "",
-                "",
-                Text("truncated", style=BRAND_AMBER),
-                f"Showing the first {RUN_LOG_LIMIT} log lines of this run.",
+                *self._timeline_note(
+                    showing_all, "truncated", f"Showing the first {RUN_LOG_LIMIT} log lines of this run."
+                )
             )
+
+    @staticmethod
+    def _timeline_note(showing_all: bool, status: str, message: str) -> list[Any]:
+        cells: list[Any] = ["", Text(status, style=BRAND_AMBER), Text(message, style=BRAND_MEDIUM_GRAY)]
+        return [cells[0], "", *cells[1:]] if showing_all else cells
 
     def _clear_target_detail(self, *, clear_project: bool = True) -> None:
         if clear_project:
