@@ -2792,6 +2792,7 @@ def test_tui_timeline_chips_filter_the_run_by_kind() -> None:
             assert [str(tab.label) for tab in app.query("#timeline-tabs Tab")] == [
                 "[ All ]",
                 "[ Steps ]",
+                "[ Events ]",
                 "[ Logs ]",
                 "[ Tasks ]",
             ]
@@ -2819,8 +2820,14 @@ def test_tui_timeline_chips_filter_the_run_by_kind() -> None:
 
             await pilot.press("right")
             await pilot.pause(0.2)
+            assert app._timeline_filter == "timeline-events"
+            # Events is the platform's own account of the run: stages, no output.
+            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(timeline.row_count)] == ["dispatch"]
+
+            await pilot.press("right")
+            await pilot.pause(0.2)
             assert app._timeline_filter == "timeline-logs"
-            # Logs carries the platform's own stages as well as the runtime's output.
+            # Logs is everything the run said: the stages and the output together.
             assert timeline.row_count == 2
 
             await pilot.press("right")
@@ -2931,5 +2938,36 @@ def test_tui_timeline_scrolls_sideways_where_the_other_tables_clip() -> None:
             assert timeline.styles.scrollbar_size_horizontal == 1
             # The tables of fixed-width fields stay clipped; only prose scrolls.
             assert app.query_one("#runs-table").styles.overflow_x == "hidden"
+
+    asyncio.run(scenario())
+
+
+def test_tui_e_jumps_to_the_events_chip_and_back() -> None:
+    """The stages on their own, without the runtime's output around them."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(160, 40)) as pilot:
+            await _open_run(app, pilot)
+            timeline = app.query_one("#timeline-table", DataTable)
+
+            await pilot.press("e")
+            await pilot.pause(0.2)
+            assert app._timeline_filter == "timeline-events"
+            assert app.query_one("#timeline-tabs", Tabs).active == "timeline-events"
+            assert timeline.row_count == 1  # the event, not the log line beside it
+
+            await pilot.press("l")
+            await pilot.pause(0.2)
+            assert app._timeline_filter == "timeline-logs"
+            assert timeline.row_count == 2  # the stage and the output together
+
+            await pilot.press("e")
+            await pilot.pause(0.2)
+            assert app._timeline_filter == "timeline-events"
+            await pilot.press("e")
+            await pilot.pause(0.2)
+            assert app._timeline_filter == "timeline-all"
 
     asyncio.run(scenario())

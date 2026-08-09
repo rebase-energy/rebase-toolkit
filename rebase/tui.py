@@ -126,12 +126,16 @@ BOX_SELECTORS: tuple[str, ...] = ("#target-tabs", "#runs-table", "#timeline-pane
 TIMELINE_FILTERS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("timeline-all", "[ All ]", ("event", "step", "task", "log")),
     ("timeline-steps", "[ Steps ]", ("step",)),
+    # Events and Logs deliberately overlap: the stages are the run's own account of
+    # itself and belong in both "what happened" and "everything it said".
+    ("timeline-events", "[ Events ]", ("event",)),
     ("timeline-logs", "[ Logs ]", ("event", "log")),
     ("timeline-tasks", "[ Tasks ]", ("task",)),
 )
 #: What to say when a filter has nothing to show, rather than leaving a blank table.
 TIMELINE_EMPTY: dict[str, str] = {
     "timeline-steps": "No steps — this workflow's body does the work itself.",
+    "timeline-events": "No lifecycle events recorded for this run.",
     "timeline-tasks": "No tasks — no step of this run fanned work out.",
     "timeline-logs": "No log output recorded for this run.",
     "timeline-all": "Nothing recorded for this run yet.",
@@ -1297,6 +1301,7 @@ class RebaseTuiApp(App[None]):
         Binding("s", "toggle_terminal_select", "Select text", show=False),
         Binding("p", "show_details", "Details", show=False),
         Binding("l", "toggle_logs", "Logs", show=False),
+        Binding("e", "toggle_events", "Events", show=False),
         Binding("m", "maximise_box", "Maximise pane", show=False),
         Binding("plus,+,equals_sign,=", "resize_box(1)", "Grow pane", show=False),
         Binding("minus,-,underscore,_", "resize_box(-1)", "Shrink pane", show=False),
@@ -2364,16 +2369,22 @@ class RebaseTuiApp(App[None]):
 
     @property
     def _reading_logs(self) -> bool:
-        """Whether the timeline is showing log output alone, which wants the screen."""
-        return self._timeline_filter == TIMELINE_FILTERS[2][0]
+        """Whether the timeline is showing log output, which wants the screen."""
+        return self._timeline_filter == "timeline-logs"
 
     def action_toggle_logs(self) -> None:
         """Jump the timeline to its Logs chip, or back to All."""
+        self._jump_to_timeline_filter("timeline-logs", "l shows everything the run said")
+
+    def action_toggle_events(self) -> None:
+        """Jump the timeline to its Events chip, or back to All."""
+        self._jump_to_timeline_filter("timeline-events", "e shows the run's stages on their own")
+
+    def _jump_to_timeline_filter(self, tab_id: str, hint: str) -> None:
         if self._run_detail is None:
-            self.notify("Select a run first — l shows its log output.", severity="warning")
+            self.notify(f"Select a run first — {hint}.", severity="warning")
             return
-        logs_tab = TIMELINE_FILTERS[2][0]
-        self._select_timeline_filter(TIMELINE_FILTERS[0][0] if self._timeline_filter == logs_tab else logs_tab)
+        self._select_timeline_filter(TIMELINE_FILTERS[0][0] if self._timeline_filter == tab_id else tab_id)
 
     def _select_timeline_filter(self, tab_id: str) -> None:
         self._timeline_filter = tab_id
