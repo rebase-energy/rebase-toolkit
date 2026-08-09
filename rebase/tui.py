@@ -36,8 +36,10 @@ from textual.widgets import (
     TabPane,
 )
 
-# Recomposing the header means naming its pieces, and Textual only exports the container.
-# `test_tui_header_parts_still_exist` fails loudly if these move.
+# Recomposing the header means naming its pieces, and restyling the toast means naming
+# it at all — Textual exports neither. `test_tui_header_parts_still_exist` and
+# `test_tui_notifications_wear_the_app_s_colours_and_hug_their_text` fail loudly if
+# either moves.
 from textual.widgets._header import HeaderClock, HeaderIcon, HeaderTitle
 
 from rebase.brand import (
@@ -1358,6 +1360,50 @@ class RebaseTuiApp(App[None]):
     DataTable {{
         background: #101412;
         scrollbar-size-vertical: 1;
+    }}
+
+    /* Textual's toast is the one widget still wearing the default theme: a grey
+       `$panel` slab 60 cells wide with a message four words long in it, floating a row
+       above the footer. Hug the text, take the app's own background, and sit down on
+       the footer. Stacking and the severity colours are Textual's and are kept. */
+    ToastRack {{
+        margin-bottom: 0;
+    }}
+
+    Toast {{
+        width: auto;
+        max-width: 60%;
+        padding: 0 1;
+        margin-top: 0;
+        margin-right: 1;
+        background: #1a201d;
+        color: #E8F0ED;
+        border-left: outer {BRAND_BRIGHT_GREEN};
+    }}
+
+    Toast.-information {{
+        border-left: outer {BRAND_BRIGHT_GREEN};
+    }}
+
+    Toast.-warning {{
+        border-left: outer {BRAND_AMBER};
+    }}
+
+    Toast.-error {{
+        border-left: outer {BRAND_CORAL_RED};
+    }}
+
+    Toast .toast--title {{
+        text-style: bold;
+        color: {BRAND_BRIGHT_GREEN};
+    }}
+
+    Toast.-warning .toast--title {{
+        color: {BRAND_AMBER};
+    }}
+
+    Toast.-error .toast--title {{
+        color: {BRAND_CORAL_RED};
     }}
     """
 

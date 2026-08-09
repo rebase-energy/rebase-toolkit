@@ -200,6 +200,13 @@
 
 ### Fixed
 
+- **Notifications no longer look like they belong to another program.** Textual's toast is a
+  grey `$panel` slab 60 cells wide and four rows tall whatever it has to say, floating a row
+  above the footer — the one widget on screen still wearing the default theme. It now takes the
+  app's own background, hugs its text on a single row, and sits down on the footer. Stacking and
+  the severity colours are Textual's and are kept, re-pointed at the brand green, amber and
+  coral so a warning and an error still read apart at a glance.
+
 - **`p` did nothing in the timeline box.** The drawer resolved a record per row, and a log line
   or a lifecycle stage has none, so it said "select a row first" while sitting on a run's own
   timeline. The timeline *is* one run's story, so `p` there now opens that run.

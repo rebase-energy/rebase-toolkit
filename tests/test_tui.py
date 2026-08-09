@@ -18,6 +18,7 @@ from textual.events import MouseMove
 from textual.geometry import Offset
 from textual.selection import Selection
 from textual.widgets import DataTable, Header, Input, OptionList, Static, TabbedContent
+from textual.widgets._toast import Toast
 
 from rebase import config as config_module
 from rebase import tui as tui_module
@@ -2772,3 +2773,32 @@ def test_tui_run_drawer_puts_an_error_before_the_result() -> None:
     # Two sections, so two rules: what it was given, and what came back — the error
     # belonging with the result rather than to a section of its own.
     assert drawer.sections == [{"parameters": {"a": 1}}, {"error": "boom", "result": None}]
+
+
+def test_tui_notifications_wear_the_app_s_colours_and_hug_their_text() -> None:
+    """Textual's default toast is a grey slab 60 cells wide whatever the message."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
+
+        # run_test disables notifications by default, which is why every other test in
+        # this file reads app._notifications rather than the widget.
+        async with app.run_test(size=(150, 26), notifications=True) as pilot:
+            await pilot.pause(0.3)
+            app.notify("Times now shown in UTC.")
+            await pilot.pause(0.3)
+
+            toast = app.query_one(Toast)
+            assert toast.size.height == 1  # not Textual's four
+            assert toast.styles.background.hex == "#1A201D"
+            assert toast.styles.border_left[1].hex == "#03C497"
+
+            # Each hugs its own text rather than all being one fixed width.
+            app.notify("Could not load logs for run 8547eb63: 404 Not Found", severity="error")
+            await pilot.pause(0.3)
+            widths = {t.size.width for t in app.query(Toast)}
+            assert len(widths) == 2, widths
+            error = next(t for t in app.query(Toast) if t.has_class("-error"))
+            assert error.styles.border_left[1].hex == "#E46962"
+
+    asyncio.run(scenario())
