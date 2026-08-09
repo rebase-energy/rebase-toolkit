@@ -1037,7 +1037,18 @@ class DetailDrawer(ModalScreen[None]):
     #detail-title {{
         color: {BRAND_BRIGHT_GREEN};
         text-style: bold;
+    }}
+
+    #detail-subtitle {{
         margin-bottom: 1;
+    }}
+
+    /* A rule the eye stops at. The input a run was given and the output it produced
+       are two different things, and a single JSON blob made them look like one. */
+    .detail-heading {{
+        color: {BRAND_AMBER};
+        text-style: bold;
+        margin-top: 1;
     }}
 
     #detail-body {{
@@ -1053,16 +1064,36 @@ class DetailDrawer(ModalScreen[None]):
     }}
     """
 
-    def __init__(self, *, title: str, payload: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        *,
+        title: str,
+        sections: Sequence[tuple[str, Any]],
+        subtitle: str = "",
+        subtitle_style: str = "",
+    ) -> None:
         super().__init__()
         self.drawer_title = title
-        self.payload = payload
+        self.subtitle = subtitle
+        self.subtitle_style = subtitle_style
+        #: (heading, payload) pairs, rendered in order under their own rule. An empty
+        #: heading renders the payload alone, for records that are not split in two.
+        self.sections = list(sections)
+
+    @property
+    def payload(self) -> Any:
+        """The first section's body, which is the whole record for a single-section drawer."""
+        return self.sections[0][1] if self.sections else None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="detail-drawer"):
             yield Static(Text(self.drawer_title), id="detail-title")
+            yield Static(Text(self.subtitle, style=self.subtitle_style), id="detail-subtitle")
             with VerticalScroll(id="detail-body"):
-                yield Static(JSON(json.dumps(self.payload, indent=2, sort_keys=True, default=str)))
+                for heading, payload in self.sections:
+                    if heading:
+                        yield Static(Text(heading), classes="detail-heading")
+                    yield Static(JSON(json.dumps(payload, indent=2, sort_keys=True, default=str)))
             yield Static("Arrow keys scroll. p or escape closes.", id="detail-hint")
 
     def on_mount(self) -> None:
@@ -2441,57 +2472,83 @@ class RebaseTuiApp(App[None]):
         if details is None:
             self.notify("Select a row first — p shows its full record.", severity="warning")
             return
-        title, payload = details
-        self.push_screen(DetailDrawer(title=title, payload=payload))
+        self.push_screen(details)
 
-    def _selected_details(self) -> tuple[str, dict[str, Any]] | None:
-        """The title and JSON body the drawer should show for the focused table's row."""
+    def _run_drawer(self, run: dict[str, Any]) -> DetailDrawer:
+        """A run, split the way it actually divides: what it was asked, what came back.
+
+        The id is spelled out in full rather than shortened — the drawer is where you
+        come to copy it — and the status gets its own line instead of riding along
+        after a separator.
+        """
+        sections: list[tuple[str, Any]] = [("Input — parameters", run.get("parameters") or {})]
+        if run.get("error"):
+            sections.append(("Output — error", run["error"]))
+        sections.append(("Output — result", run.get("result")))
+        return DetailDrawer(
+            title=f"Run {run.get('id', '-')}",
+            subtitle=str(run.get("status", "unknown")),
+            subtitle_style=status_style(run.get("status")),
+            sections=sections,
+        )
+
+    def _selected_details(self) -> DetailDrawer | None:
+        """The drawer for the focused table's row, or None when there is nothing to show."""
         focused = self.focused
         table_id = str(focused.id) if isinstance(focused, DataTable) else ""
+        # The timeline is one run's own story, so `p` there means that run — there is no
+        # per-row record behind a log line or a stage to show instead.
+        if table_id == "timeline-table":
+            return None if self._run_detail is None else self._run_drawer(self._run_detail.run)
         key = focused.cursor_key if isinstance(focused, SelectableDataTable) else self._cursor_key(focused)
         if key is None:
             return None
         if table_id == "runs-table":
             run = self._run_rows.get(key)
-            if run is None:
-                return None
-            # A run's own record is mostly plumbing — backend ids, version ids, flags —
-            # and the table above already shows its status and timings. What is not
-            # anywhere else, and is the reason to open a run at all, is what it was asked
-            # to do and what came back.
-            payload: dict[str, Any] = {"parameters": run.get("parameters") or {}, "result": run.get("result")}
-            if run.get("error"):
-                payload["error"] = run["error"]
-            return f"Run {compact_id(key)} · {run.get('status', 'unknown')}", payload
+            return None if run is None else self._run_drawer(run)
         if table_id == "projects-table":
             summary = self._project_rows.get(key)
             if summary is None:
                 return None
-            return (
-                f"Project {summary.project.get('name', '-')}",
-                detail_payload(
-                    summary.project,
-                    functions=summary.function_count,
-                    workflows=summary.workflow_count,
-                    cron_jobs=summary.cron_count,
-                    endpoints=summary.endpoint_count,
-                ),
+            return DetailDrawer(
+                title=f"Project {summary.project.get('name', '-')}",
+                sections=[
+                    (
+                        "",
+                        detail_payload(
+                            summary.project,
+                            functions=summary.function_count,
+                            workflows=summary.workflow_count,
+                            cron_jobs=summary.cron_count,
+                            endpoints=summary.endpoint_count,
+                        ),
+                    )
+                ],
             )
         if table_id == "functions-table":
             item = self._function_rows.get(key)
             if item is None:
                 return None
             steps = self._steps_by_function.get(key, [])
-            return (
-                f"Function {item.get('name', '-')}",
-                detail_payload(
-                    item,
-                    endpoints=self._endpoint_details("function", key),
-                    step_of=[
-                        {"workflow": step.workflow_name, "node_key": step.node_key, "after": list(step.upstream)}
-                        for step in steps
-                    ],
-                ),
+            return DetailDrawer(
+                title=f"Function {item.get('name', '-')}",
+                sections=[
+                    (
+                        "",
+                        detail_payload(
+                            item,
+                            endpoints=self._endpoint_details("function", key),
+                            step_of=[
+                                {
+                                    "workflow": step.workflow_name,
+                                    "node_key": step.node_key,
+                                    "after": list(step.upstream),
+                                }
+                                for step in steps
+                            ],
+                        ),
+                    )
+                ],
             )
         if table_id == "workflows-table":
             item = self._workflow_rows.get(key)
@@ -2501,15 +2558,21 @@ class RebaseTuiApp(App[None]):
                 (step for steps in self._steps_by_function.values() for step in steps if step.workflow_id == key),
                 key=lambda step: step.order,
             )
-            return (
-                f"Workflow {item.get('name', '-')}",
-                detail_payload(
-                    item,
-                    endpoints=self._endpoint_details("workflow", key),
-                    steps=[
-                        {"node_key": step.node_key, "function": step.name, "after": list(step.upstream)} for step in own
-                    ],
-                ),
+            return DetailDrawer(
+                title=f"Workflow {item.get('name', '-')}",
+                sections=[
+                    (
+                        "",
+                        detail_payload(
+                            item,
+                            endpoints=self._endpoint_details("workflow", key),
+                            steps=[
+                                {"node_key": step.node_key, "function": step.name, "after": list(step.upstream)}
+                                for step in own
+                            ],
+                        ),
+                    )
+                ],
             )
         return None
 

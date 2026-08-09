@@ -27,6 +27,11 @@
   answer "which task failed, and in which step". Read per call rather than cached, because the
   steps of one run share a process and a value captured at import would name the wrong step.
   A map from a laptop still belongs to no run, which the platform accepts.
+- **The run drawer separates what a run was given from what it returned.** The id is spelled
+  out in full instead of truncated — the drawer is where you go to copy it — the status has a
+  line of its own rather than riding after a separator, and `Input — parameters` and
+  `Output — result` sit under their own rules instead of being two keys in one JSON blob. A
+  failed run shows its error under `Output — error`, above the result.
 - **`Client.list_run_tasks(run_id, step_run_id=...)`**, and **the TUI's timeline shows a step's
   tasks** indented under it, one row per unit of work with its own status, its parameters and
   either its result or its error. A step reports one outcome for everything inside it; the task
@@ -192,6 +197,10 @@
   three tables that show something different on every line.
 
 ### Fixed
+
+- **`p` did nothing in the timeline box.** The drawer resolved a record per row, and a log line
+  or a lifecycle stage has none, so it said "select a row first" while sitting on a run's own
+  timeline. The timeline *is* one run's story, so `p` there now opens that run.
 
 - **Every project's runs showed under every other project's workflow.** Opening a workflow in
   the TUI, or running `rebase workflow runs <name>`, listed every run in the workspace: the

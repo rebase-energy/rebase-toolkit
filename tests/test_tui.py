@@ -2364,8 +2364,14 @@ def test_tui_p_opens_the_selected_row_as_json() -> None:
             await pilot.pause(0.2)
             drawer = app.screen
             assert isinstance(drawer, DetailDrawer)
-            assert drawer.drawer_title == "Run run-id · succeeded"
-            assert drawer.payload == {"parameters": {"site_id": "site-001"}, "result": {"ok": True}}
+            # The id is spelled out in full, and the status has a line of its own.
+            assert drawer.drawer_title == "Run run-id"
+            assert drawer.subtitle == "succeeded"
+            # Input and output are separate sections, not one blob.
+            assert drawer.sections == [
+                ("Input — parameters", {"site_id": "site-001"}),
+                ("Output — result", {"ok": True}),
+            ]
 
             # p closes it again, the way it opened it.
             await pilot.press("p")
@@ -2717,3 +2723,46 @@ def test_tui_title_names_the_workspace_a_marker_pinned() -> None:
             assert "rebase-grid" in app.title
 
     asyncio.run(scenario())
+
+
+def test_tui_p_in_the_timeline_opens_the_run_it_belongs_to() -> None:
+    """The timeline is one run's story; there is no per-row record behind a log line."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(160, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+            assert str(app.focused.id) == "timeline-table"
+
+            await pilot.press("p")
+            await pilot.pause(0.2)
+            drawer = app.screen
+            assert isinstance(drawer, DetailDrawer)
+            assert drawer.drawer_title == "Run run-id"
+            assert drawer.subtitle == "succeeded"
+
+    asyncio.run(scenario())
+
+
+def test_tui_run_drawer_puts_an_error_before_the_result() -> None:
+    run = {"id": "run-9", "status": "failed", "parameters": {"a": 1}, "result": None, "error": "boom"}
+    app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
+    drawer = app._run_drawer(run)
+
+    assert drawer.drawer_title == "Run run-9"
+    assert drawer.subtitle == "failed"
+    assert [heading for heading, _ in drawer.sections] == [
+        "Input — parameters",
+        "Output — error",
+        "Output — result",
+    ]
