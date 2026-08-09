@@ -22,7 +22,7 @@ from typing import Any, Self
 import requests
 
 from rebase.auth import AuthError, load_access_token
-from rebase.config import DEFAULT_SERVER_URL, load_profile
+from rebase.config import DEFAULT_SERVER_URL, load_profile, local_workspace_id
 
 try:
     from emflow.models import Agent as _ImportedEmflowAgent
@@ -1726,6 +1726,7 @@ class Client:
         api_url: str | None = None,
         profile: str | None = None,
         access_token: str | None = None,
+        workspace_id: str | None = None,
     ) -> None:
         env_api_key = os.getenv("REBASE_API_KEY") or os.getenv("REBASE_WORKFLOWS_API_KEY")
         env_access_token = os.getenv("REBASE_ACCESS_TOKEN") or os.getenv("REBASE_WORKFLOWS_ACCESS_TOKEN")
@@ -1740,7 +1741,17 @@ class Client:
         self.api_key = api_key or env_api_key
         if self.api_key is None and self.access_token is None and isinstance(configured_api_key, str):
             self.api_key = configured_api_key
-        self.workspace_id = configured_workspace_id if isinstance(configured_workspace_id, str) else None
+        # A `.rebase/config.json` marker pins the workspace, not the credentials: the
+        # workspace travels as one header and an API key reaches every workspace you
+        # belong to, so a repo can override the globally active workspace without a
+        # second profile or another sign-in. Precedence: argument, marker, profile.
+        pinned_workspace_id = local_workspace_id()
+        resolved_workspace_id = (
+            workspace_id
+            or pinned_workspace_id
+            or (configured_workspace_id if isinstance(configured_workspace_id, str) else None)
+        )
+        self.workspace_id = resolved_workspace_id or None
         profile_api_url = configured_api_url if isinstance(configured_api_url, str) else None
         selected_api_url = api_url or os.getenv("REBASE_WORKFLOWS_API_URL") or profile_api_url or DEFAULT_SERVER_URL
         self.api_url = selected_api_url.rstrip("/")

@@ -2014,7 +2014,7 @@ def tui_command(
     limit: Annotated[
         int,
         typer.Option("--limit", "-l", min=1, max=500, help="Maximum latest runs to load per selected target."),
-    ] = 25,
+    ] = 100,
 ) -> None:
     """Open the Rebase terminal UI."""
     from rebase.tui import run_tui

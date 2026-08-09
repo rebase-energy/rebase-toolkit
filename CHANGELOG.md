@@ -67,6 +67,67 @@
   previously displayed that way whatever the clock said. The picker filters the full `zoneinfo`
   list from a box that keeps the focus, so the arrow keys drive the list while you type. The
   choice lasts for the session; it is not written to the profile.
+- **The TUI's project view reveals a box at a time.** Entering a project now shows the
+  Workflows/Functions switcher and its table filling the screen, and nothing else. Selecting a
+  target adds its runs; selecting a run adds its timeline. `b` closes the boxes in reverse before
+  it leaves the project. The view previously painted all seven boxes up front, most of them
+  holding a "Select a ..." placeholder. The ASGI apps tab appears only for a project that has
+  one, and the project's name moved into the header title, next to the workspace.
+- **One timeline per run**, in place of the separate events and steps tables. The two routes and
+  the run's log output describe the same couple of minutes, and reading them in three places
+  meant reconstructing the order by eye. **`l` folds the logs in**, all of them at once, so the
+  run reads as one scrollable sequence with each log line under the step or stage it followed —
+  chronologically, because a log entry carries a timestamp and a severity and nothing that names
+  a step. Expanding also shrinks the two boxes above it, since that is the one view that wants
+  the whole screen. Log lines are dimmed and indented, steps are picked out in amber, and the
+  first 200 lines are what the API will serve.
+- **`p` opens the selected row as JSON** in a drawer over the right of the screen — a workflow or
+  function with its endpoints and their absolute URLs and its place in the step graph, a project
+  with its counts. A **run** shows only what it was asked to do and what came back: its
+  parameters, its result, and its error when it has one. The rest of a run's record is backend
+  plumbing — provider ids, version ids, flags — and its status and timings are already the row
+  you opened it from. `p` or escape closes the drawer. A workflow's `source_code` is replaced by
+  its length, since printing the whole deployed body would bury every other field and `o` already
+  opens the file.
+- **Opening a box hands it the focus**, so the arrow keys drive whatever you just asked for
+  without a `tab` in between: enter on a workflow moves you into its runs, enter on a run moves
+  you into its timeline. Closing one with `b` hands the focus back up rather than stranding it
+  off screen. **`tab` moves between the boxes** — target table, runs, timeline — instead of
+  switching the top box's two tabs and leaving the rest reachable only with the mouse. Switching
+  Workflows / Functions / ASGI apps is `left` and `right` now, which also carry the focus with
+  them so `tab` keeps its place.
+- **The boxes are resizable.** `+` and `-` grow and shrink the focused one in two-row steps, `m`
+  gives the focused box the whole view and `b` or `m` again gives it back, and `0` puts everything
+  back to the per-level defaults. Rows come from the other boxes nearest-first and keep going:
+  pushing the timeline up eats the runs table and then carries on into the target box, rather than
+  stopping dead the moment its neighbour is empty. The floor is a box's column header — one row
+  for a table, three for the tabbed box, which spends two on its tab strip before the table inside
+  gets to draw anything — so a squeezed box still says what is open and what each of its columns
+  means. Explicit sizes outrank the defaults, including the ones `l` sets.
+- **A box's column header is also the handle that drags the boundary above it.** The usual answer
+  is a splitter row between the panes, and that is what this was, hint text and all — but a row
+  per boundary is a row the tables do not get, and the header is already sitting on the boundary,
+  pinned there while the rows scroll underneath. So it *is* the splitter: grab the runs table's
+  header and the target box above follows the pointer. It lights up under the pointer, which is
+  the only affordance a terminal has to offer; a press anywhere else in the table is still an
+  ordinary press.
+- **Workflow and Step columns in the TUI's functions table**, so a step stops looking like a
+  loose function. A step *is* a function — the deploy registers it as one — and the row had
+  nothing on it to say which workflow calls it, or in what order. Both columns are read off the
+  current workflow version's compiled step graph, which is also what puts the rows in graph
+  order: a workflow's steps now run down the table in sequence, under the workflow that calls
+  them, with functions no graph mentions last. The Step column carries the node key, which
+  differs from the function name only when one function is called twice; `p` spells the wiring
+  out per step and per workflow. A workflow whose body does the work itself has no graph at all —
+  the common case — and leaves the two columns empty. The graph lives on the version rather than
+  the workflow, so this costs a request per workflow, issued concurrently; like the endpoint list
+  it is supplementary, and a route that fails costs the column and nothing else.
+- **Trigger, Started and Duration columns in the TUI's runs table**, which showed only when a run
+  was created and when it finished — so a run that queued for 90 seconds before starting read as
+  a slow run rather than a delayed one, and nothing distinguished a scheduled firing from an
+  ad-hoc `api` dispatch. Backend moved out of the table to make room; it was the widest column
+  and `p` has it. The TUI also loads 100 runs per target now rather than 25, matching
+  `rebase runs list`.
 - **`-h` is an alias for `--help`** on every command and subcommand.
 - **Short flags for CLI options**: each option now also answers to `-x`, where `x` is the first
   letter of its long name — `rebase deploy -n api -e prod`, `rebase workflow list -j`. 235 of 269
@@ -76,14 +137,46 @@
 
 ### Removed
 
-- **The TUI's summary bar** — the `Profile | API | Projects | Functions | Workflows | Endpoints |
-  Selected project | Latest runs per target` line above the project detail. It restated the
-  workspace counts on every screen that already showed them, and cost three rows at the top of
-  the project view; those rows go to the target tables instead. The project detail panel below it
-  keeps the per-project counts, and a failed request now writes its error there and raises a
-  notification, since the bar used to be where errors landed.
+- **The TUI's summary bar and project detail panel** — the `Profile | API | Projects | ...` line
+  and the `Project epex / Functions: 0 | Workflows: 1 / Updated | ID` panel under it. Between them
+  they cost seven rows at the top of the project view to restate what the project table already
+  showed. The project's name is in the header title now, its counts stay in the workspace table,
+  and what is left is a one-line error panel that appears only when a request fails.
+
+- **The TUI's target and run detail panels** — the `Workflow epex-bid-curves / Project: epex |
+  Run type: long / State: enabled | ...` block and the `Run 8547eb63... / Status | Backend /
+  Parameters: {"batch_size": 8, "days_back": 1, ...` block below it. Twelve permanent rows in the
+  middle of the project view, almost all of it a second copy of the table row directly above, and
+  the one thing they had that the tables did not — a run's parameters and result — was truncated
+  at one line each. Both are `p` now, whole and scrollable, and the rows they cost went to the
+  three tables that show something different on every line.
 
 ### Fixed
+
+- **An empty workspace no longer looks like one that is still loading.** The TUI drew nothing
+  either way, so pointing a profile at an empty workspace read as a hang. It now says
+  `No projects in workspace <id>` and how to refresh or switch.
+
+- **The TUI's ASGI apps tab no longer flashes on the way into a project without one.** Hiding it
+  only ran once the project's data had landed, so every project opened with three tabs and then
+  dropped to two a moment later. It now starts hidden and appears only when there is something
+  behind it, which is what the tab was always meant to mean.
+
+- **A directory's `.rebase/config.json` marker now overrides the active workspace**, not just the
+  profile chosen to reach it. The marker previously only won when some profile already stored that
+  `workspace_id`, so a repo pinned to a workspace you had no dedicated profile for silently ran
+  against the globally active one instead — `rebase tui` inside the rebase-grid checkout opened
+  `agent-work`. Nothing about that needed a second profile: the workspace travels as one
+  `X-Rebase-Workspace` header and an API key reaches every workspace you belong to, so the marker
+  now sets the header on the active credentials. Precedence is `Client(workspace_id=...)`, then the
+  marker, then the profile — so switching workspace by hand still wins inside a marked repo, and
+  the TUI's own switcher passes the choice explicitly for that reason. The TUI's title names the
+  workspace the data actually came from, and says so if a pin was not honoured.
+
+- **Selecting a run could crash the TUI.** Textual reads a plain `str` passed to `Static.update`
+  as content markup, so a run whose parameters, result or error contained a `[` raised
+  `MarkupError` inside the worker and took the app down. The detail panels render `Text` now,
+  which is never parsed.
 
 - **The TUI's column headers no longer appear before their data and then jerk into place.** A
   DataTable sizes its columns from the header text until the first row lands, so headers added at

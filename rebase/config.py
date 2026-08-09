@@ -11,6 +11,8 @@ DEFAULT_SERVER_URL = "https://rebase-toolkit-api-1002868894268.europe-north1.run
 DEFAULT_API_URL = DEFAULT_SERVER_URL
 DEFAULT_PROFILE = "default"
 CONFIG_PATH_ENV = "REBASE_CONFIG_PATH"
+LOCAL_CONFIG_DIRNAME = ".rebase"
+LOCAL_CONFIG_FILENAME = "config.json"
 
 
 def config_path() -> Path:
@@ -18,6 +20,123 @@ def config_path() -> Path:
     if override:
         return Path(override).expanduser()
     return Path.home() / ".rebase" / "config.json"
+
+
+def find_local_config(start: str | Path | None = None) -> Path | None:
+    """Nearest `.rebase/config.json` marker, searching `start` then each parent.
+
+    Mirrors how git and uv find their config, so a command run from a subdirectory
+    of the repo still resolves to that repo's workspace.
+
+    The global config lives at `~/.rebase/config.json`, which sits directly on this
+    walk for any repo under the home directory. It is credentials, not a marker, so
+    it is skipped — otherwise every lookup outside a marked repo would "find" it.
+    """
+    try:
+        current = Path(start).expanduser().resolve() if start else Path.cwd().resolve()
+    except OSError:
+        return None
+
+    skip = set()
+    for candidate in (config_path(), Path.home() / LOCAL_CONFIG_DIRNAME / LOCAL_CONFIG_FILENAME):
+        with suppress(OSError, RuntimeError):
+            skip.add(candidate.expanduser().resolve())
+
+    for directory in (current, *current.parents):
+        candidate = directory / LOCAL_CONFIG_DIRNAME / LOCAL_CONFIG_FILENAME
+        if candidate.resolve() in skip:
+            continue
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def read_local_config(start: str | Path | None = None) -> dict[str, Any]:
+    """The nearest marker's contents, or {} when there is none or it is unreadable.
+
+    A malformed marker degrades to the global default rather than breaking every
+    command in the repo: it is checked in, so a bad merge must not brick the CLI.
+    """
+    local_path = find_local_config(start)
+    if local_path is None:
+        return {}
+    try:
+        with local_path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def local_workspace_id(start: str | Path | None = None) -> str | None:
+    """Workspace this directory is pinned to by a checked-in marker."""
+    workspace_id = read_local_config(start).get("workspace")
+    return workspace_id if isinstance(workspace_id, str) and workspace_id else None
+
+
+def profile_for_workspace(workspace_id: str, *, path: Path | None = None) -> str | None:
+    """A local profile holding credentials for `workspace_id`, if one exists.
+
+    The marker is committed and so names a workspace, not a profile: profile names
+    are personal to each checkout. Preference goes to the configured default when it
+    already points at the right workspace, so that having several matching profiles
+    does not make the choice depend on dict ordering.
+    """
+    profiles = list_profiles(path=path)
+    configured = read_config(path).get("default_profile")
+    if isinstance(configured, str) and profiles.get(configured, {}).get("workspace_id") == workspace_id:
+        return configured
+    for name, profile in profiles.items():
+        if profile.get("workspace_id") == workspace_id:
+            return name
+    return None
+
+
+def local_workspace_mismatch(*, path: Path | None = None, start: str | Path | None = None) -> str | None:
+    """Workspace pinned by a marker that no local profile can reach, else None.
+
+    Commands surface this as a hint: the directory says one thing and the available
+    credentials say another, so whatever runs is silently against the wrong
+    workspace unless the user is told.
+    """
+    workspace_id = local_workspace_id(start)
+    if workspace_id and profile_for_workspace(workspace_id, path=path) is None:
+        return workspace_id
+    return None
+
+
+def write_local_config(
+    directory: str | Path,
+    *,
+    workspace_id: str,
+    workspace_name: str | None = None,
+) -> Path:
+    """Pin `directory` to a workspace by writing `.rebase/config.json`.
+
+    Meant to be committed, so it carries only the workspace identity — never
+    credentials, which stay in the global config. Unknown keys already in the file
+    are preserved so this can share `.rebase/` with other repo-local content.
+    """
+    resolved_dir = Path(directory).expanduser().resolve()
+    target = resolved_dir / LOCAL_CONFIG_DIRNAME / LOCAL_CONFIG_FILENAME
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    data: dict[str, Any] = {}
+    if target.is_file():
+        with suppress(OSError, json.JSONDecodeError):
+            with target.open("r", encoding="utf-8") as file:
+                existing = json.load(file)
+            if isinstance(existing, dict):
+                data = existing
+
+    data["workspace"] = workspace_id
+    if workspace_name:
+        data["workspace_name"] = workspace_name
+
+    with target.open("w", encoding="utf-8") as file:
+        json.dump(data, file, indent=2)
+        file.write("\n")
+    return target
 
 
 def read_config(path: Path | None = None) -> dict[str, Any]:
@@ -31,9 +150,26 @@ def read_config(path: Path | None = None) -> dict[str, Any]:
     return data
 
 
-def selected_profile_name(profile: str | None = None, *, path: Path | None = None) -> str:
+def selected_profile_name(
+    profile: str | None = None,
+    *,
+    path: Path | None = None,
+    start: str | Path | None = None,
+) -> str:
+    """Resolve the profile to use: explicit argument, then marker, then global default.
+
+    A `.rebase/config.json` marker only wins when some local profile actually holds
+    credentials for the workspace it names; otherwise this falls back so that an
+    unreachable workspace does not break commands like `rebase profile list`, which
+    are how you would diagnose it. `local_workspace_mismatch` reports that case.
+    """
     if profile:
         return profile
+    workspace_id = local_workspace_id(start)
+    if workspace_id:
+        matched = profile_for_workspace(workspace_id, path=path)
+        if matched:
+            return matched
     data = read_config(path)
     configured = data.get("default_profile")
     if isinstance(configured, str) and configured:

@@ -7,16 +7,17 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import datetime, tzinfo
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, available_timezones
 
+from rich.json import JSON
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult, RenderResult, SuspendNotSupported
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.coordinate import Coordinate
 from textual.geometry import Offset
 from textual.message import Message
@@ -51,6 +52,7 @@ from rebase.config import (
     editor_settings,
     list_profiles,
     load_profile,
+    local_workspace_id,
     search_paths,
     selected_profile_name,
     set_default_profile,
@@ -81,17 +83,45 @@ CONFIRM_WORD = "delete"
 MARK_STYLE = f"bold {BRAND_AMBER}"
 #: Concurrent requests used to collect the workspace overview's per-project function counts.
 OVERVIEW_FANOUT_WORKERS = 16
+#: Concurrent requests used to collect a project's per-workflow step graphs.
+STEP_GRAPH_FANOUT_WORKERS = 8
+#: What each level of the project view adds, outermost first. Level 0 is the target
+#: table alone; selecting a target reveals level 1, selecting a run reveals level 2.
+REVEAL_LEVELS: tuple[tuple[str, ...], ...] = (
+    ("#runs-table",),
+    ("#timeline-table",),
+)
 #: Header text per table, added when the rows are and never before. See `_setup_tables`.
 TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "projects-table": ("Project", "Functions", "Workflows", "Cron jobs", "Endpoints"),
     "workspace-profiles-table": ("Active", "Profile", "Workspace", "Workspace ID", "API URL"),
-    "functions-table": ("Name", "Run type", "State", "Endpoint", "Version", "Updated"),
+    "functions-table": ("Name", "Workflow", "Step", "Run type", "State", "Endpoint", "Version", "Updated"),
     "workflows-table": ("Name", "Run type", "State", "Endpoint", "Schedule", "Next run", "Version", "Updated"),
     "asgi-apps-table": ("Name", "Base path", "Auth", "State", "URL path", "Updated"),
-    "runs-table": ("Run", "Status", "Backend", "Created", "Finished"),
-    "events-table": ("Time", "Stage", "Status", "Message"),
-    "steps-table": ("Step", "Status", "Attempt", "Started", "Finished", "Error"),
+    "runs-table": ("Run", "Status", "Trigger", "Created", "Started", "Finished", "Duration"),
+    "timeline-table": ("Time", "Stage", "Status", "Message"),
 }
+#: The tab each target table belongs to, in the order `left`/`right` cycle them.
+TARGET_TABS: tuple[tuple[str, str], ...] = (
+    ("workflows-tab", "#workflows-table"),
+    ("functions-tab", "#functions-table"),
+    ("asgi-apps-tab", "#asgi-apps-table"),
+)
+#: The project view's stacked boxes, top to bottom. One per reveal level. Each box below
+#: the first resizes the one above it by its own column header — see `DragHeaderTable`.
+BOX_SELECTORS: tuple[str, ...] = ("#target-tabs", "#runs-table", "#timeline-table")
+#: The rows a box keeps whatever you do to it: its column header. For the tabbed box that
+#: is three rows, not one — Textual spends two on the tab strip (the labels and the rule
+#: under them) before the table inside it gets to draw its header at all.
+MIN_TABLE_HEIGHT = 1
+MIN_TARGET_BOX_HEIGHT = 3
+#: How many rows `+`/`-` move a box.
+BOX_STEP = 2
+#: Log lines fetched per run. The API answers an empty list — not an error — somewhere
+#: above 200, so this is a ceiling to respect rather than one to raise on a hunch.
+RUN_LOG_LIMIT = 200
+#: Fields too long to belong in the details drawer, and what to say instead.
+ELIDED_DETAIL_KEYS = ("source_code",)
 
 
 @dataclass(frozen=True)
@@ -119,12 +149,39 @@ class WorkspaceOverviewData:
 
 
 @dataclass(frozen=True)
+class WorkflowStep:
+    """One node of a workflow's step graph, named by the function it runs.
+
+    A step *is* a function — the deploy registers it as one, so it shows up in the
+    project's function list with nothing to say which workflow calls it. This is that
+    missing link, read back off the workflow version that was compiled from it.
+    """
+
+    workflow_id: str
+    workflow_name: str
+    node_key: str
+    name: str
+    function_id: str
+    upstream: tuple[str, ...]
+    #: Position in the workflow's node list, which is the order the graph was traced in.
+    order: int
+
+
+@dataclass(frozen=True)
 class ProjectTargetsData:
     project: dict[str, Any]
     functions: list[dict[str, Any]]
     workflows: list[dict[str, Any]]
     endpoints: list[dict[str, Any]]
     asgi_apps: list[dict[str, Any]]
+    #: Every step of every workflow in the project, workflow by workflow.
+    steps: tuple[WorkflowStep, ...] = ()
+
+    def steps_by_function(self) -> dict[str, list[WorkflowStep]]:
+        grouped: dict[str, list[WorkflowStep]] = {}
+        for step in self.steps:
+            grouped.setdefault(step.function_id, []).append(step)
+        return grouped
 
 
 @dataclass(frozen=True)
@@ -132,6 +189,17 @@ class RunDetailData:
     run: dict[str, Any]
     events: list[dict[str, Any]]
     steps: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class TimelineRow:
+    """One line of a run's timeline: a lifecycle event, a step, or a log line."""
+
+    at: datetime | None
+    stage: str
+    status: str
+    message: str
+    kind: Literal["event", "step", "log"]
 
 
 def _optional_list(load: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -142,7 +210,7 @@ def _optional_list(load: Callable[[], list[dict[str, Any]]]) -> list[dict[str, A
 
 
 class RebaseTuiData:
-    def __init__(self, client: Client | None = None, *, project: str | None = None, limit: int = 25) -> None:
+    def __init__(self, client: Client | None = None, *, project: str | None = None, limit: int = 100) -> None:
         self.client = client or Client()
         self.project = project
         self.limit = limit
@@ -217,14 +285,43 @@ class RebaseTuiData:
 
     def load_project_targets(self, project: dict[str, Any]) -> ProjectTargetsData:
         project_id = str(project["id"])
+        workflows = self.client.list_workflows(project_id=project_id)
         return ProjectTargetsData(
             project=project,
             functions=self.client.list_functions(project_id=project_id),
-            workflows=self.client.list_workflows(project_id=project_id),
+            workflows=workflows,
             # Supplementary data: never let it take down the function/workflow view.
             endpoints=_optional_list(lambda: self.client.list_project_endpoints(project_id)),
             asgi_apps=_optional_list(lambda: self.client.list_asgi_apps(project_id=project_id)),
+            steps=self.load_workflow_steps(workflows),
         )
+
+    def load_workflow_steps(self, workflows: list[dict[str, Any]]) -> tuple[WorkflowStep, ...]:
+        """The step graph of every workflow in the project, read concurrently.
+
+        The graph lives on the workflow *version*, not on the workflow, so this costs a
+        request per workflow — hence the pool. Like the endpoint list it is supplementary:
+        an old API, a workflow with no current version, or a single failed read costs the
+        Workflow column for that workflow and nothing more.
+        """
+        versioned = [
+            (str(workflow["id"]), str(workflow.get("name", "-")), str(workflow["current_version_id"]))
+            for workflow in workflows
+            if workflow.get("id") is not None and workflow.get("current_version_id")
+        ]
+        if not versioned:
+            return ()
+
+        def load(entry: tuple[str, str, str]) -> tuple[WorkflowStep, ...]:
+            workflow_id, workflow_name, version_id = entry
+            try:
+                version = self.client.get_workflow_version(workflow_id, version_id)
+            except Exception:
+                return ()
+            return workflow_steps(workflow_id, workflow_name, version.get("step_graph"))
+
+        with ThreadPoolExecutor(max_workers=min(STEP_GRAPH_FANOUT_WORKERS, len(versioned))) as executor:
+            return tuple(step for steps in executor.map(load, versioned) for step in steps)
 
     def load_target_runs(self, target_type: TargetType, target_id: str) -> list[dict[str, Any]]:
         if target_type == "function":
@@ -236,6 +333,141 @@ class RebaseTuiData:
         events = self.client.list_run_events(run_id)
         steps = self.client.list_run_steps(run_id) if run.get("target_type") == "workflow" else []
         return RunDetailData(run=run, events=events, steps=steps)
+
+    def load_run_logs(self, run_id: str) -> list[dict[str, Any]]:
+        entries = self.client.get_run_logs(run_id, limit=RUN_LOG_LIMIT).get("entries")
+        return entries if isinstance(entries, list) else []
+
+
+def workflow_steps(workflow_id: str, workflow_name: str, step_graph: Any) -> tuple[WorkflowStep, ...]:
+    """Read a compiled step graph into steps, skipping nodes with no function behind them.
+
+    A workflow whose body does the work itself has no graph at all — `step_graph` is
+    null — and that is the common case, not a fault.
+    """
+    if not isinstance(step_graph, dict):
+        return ()
+    nodes = step_graph.get("nodes")
+    if not isinstance(nodes, list):
+        return ()
+    steps = []
+    for order, node in enumerate(nodes):
+        if not isinstance(node, dict) or not node.get("function_id"):
+            continue
+        upstream = node.get("upstream_node_keys")
+        steps.append(
+            WorkflowStep(
+                workflow_id=workflow_id,
+                workflow_name=workflow_name,
+                node_key=str(node.get("node_key") or node.get("name") or "-"),
+                name=str(node.get("name") or node.get("node_key") or "-"),
+                function_id=str(node["function_id"]),
+                upstream=tuple(str(key) for key in upstream) if isinstance(upstream, list) else (),
+                order=order,
+            )
+        )
+    return tuple(steps)
+
+
+def build_timeline(
+    events: Sequence[dict[str, Any]],
+    steps: Sequence[dict[str, Any]],
+    logs: Sequence[dict[str, Any]] | None,
+) -> list[TimelineRow]:
+    """Everything that happened during a run, in the order it happened.
+
+    Events, steps and log lines are three separate routes with nothing linking them:
+    a log entry carries a timestamp, a severity and a message, and no step or stage id.
+    So the grouping here is chronological rather than declared — a log line sits under
+    the last step or stage that began before it, which is what "belongs to" means when
+    the producer never said. Sorting them together is the whole mechanism; the indent on
+    log lines is what makes it readable as grouping.
+    """
+    rows = [
+        TimelineRow(
+            at=_parse_timestamp(event.get("created_at")),
+            stage=str(event.get("stage", "-")),
+            status=str(event.get("status", "-")),
+            message=format_json_summary(event.get("message"), max_length=200),
+            kind="event",
+        )
+        for event in events
+    ]
+    for step in steps:
+        detail = format_json_summary(step.get("error"), max_length=160)
+        if detail == "-":
+            attempt = step.get("attempt")
+            finished = step.get("finished_at")
+            detail = " · ".join(
+                part
+                for part in (
+                    f"attempt {attempt}" if attempt not in {None, ""} else "",
+                    f"finished {format_timestamp(finished)}" if finished else "",
+                )
+                if part
+            )
+        rows.append(
+            TimelineRow(
+                at=_parse_timestamp(step.get("started_at")),
+                stage=str(step.get("name") or step.get("node_key") or "-"),
+                status=str(step.get("status", "-")),
+                message=detail or "-",
+                kind="step",
+            )
+        )
+    for entry in logs or []:
+        rows.append(
+            TimelineRow(
+                at=_parse_timestamp(entry.get("timestamp")),
+                stage="",
+                status=str(entry.get("severity") or "-"),
+                message=str(entry.get("message") or ""),
+                kind="log",
+            )
+        )
+    # A row with no usable timestamp sorts to the top rather than being dropped: it is
+    # still something that happened, and hiding it would be worse than misplacing it.
+    epoch = datetime.min.replace(tzinfo=UTC)
+    return sorted(rows, key=lambda row: (row.at or epoch, row.kind == "log"))
+
+
+def format_step_workflows(steps: Sequence[WorkflowStep]) -> str:
+    """The workflow a function is a step of, and a count when it is a step of several."""
+    if not steps:
+        return "-"
+    names = list(dict.fromkeys(step.workflow_name for step in steps))
+    return names[0] if len(names) == 1 else f"{names[0]} (+{len(names) - 1})"
+
+
+def format_step_keys(steps: Sequence[WorkflowStep]) -> str:
+    """The node keys a function is called under, which differ from its name on reuse."""
+    if not steps:
+        return "-"
+    return ", ".join(dict.fromkeys(step.node_key for step in steps))
+
+
+def format_duration(started: Any, finished: Any) -> str:
+    """How long a run took, from the two timestamps the API reports."""
+    start, end = _parse_timestamp(started), _parse_timestamp(finished)
+    if start is None or end is None:
+        return "-"
+    seconds = (end - start).total_seconds()
+    if seconds < 0:
+        return "-"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, seconds = divmod(int(round(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m{seconds:02d}s"
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    if value in {None, ""}:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def compact_id(value: Any, *, length: int = 8) -> str:
@@ -251,11 +483,14 @@ def format_timestamp(value: Any, tz: tzinfo | None = None) -> str:
     """Render an API timestamp, converted to *tz* when it carries an offset to convert from."""
     if value in {None, ""}:
         return "-"
-    raw = str(value)
-    try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return raw
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value)
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return raw
     if tz is not None and parsed.tzinfo is not None:
         parsed = parsed.astimezone(tz)
     return parsed.strftime("%Y-%m-%d %H:%M:%S")
@@ -318,20 +553,20 @@ def format_endpoint(endpoints: list[dict[str, Any]]) -> Text:
     return Text(label, style="" if primary.get("enabled", True) else BRAND_MEDIUM_GRAY)
 
 
-def format_endpoint_detail(endpoints: list[dict[str, Any]], *, api_url: str) -> list[str]:
-    if not endpoints:
-        return ["Endpoint: none"]
-    primary = endpoints[0]
-    lines = [
-        f"Endpoint: {primary.get('method', '-')} {primary.get('path', '-')} | "
-        f"auth: {primary.get('auth', '-')} | mode: {primary.get('mode', '-')} | "
-        f"{format_bool(primary.get('enabled'))}",
-        f"URL: {format_url(primary, api_url=api_url)}",
-    ]
-    if len(endpoints) > 1:
-        others = ", ".join(f"{item.get('method', '-')} {item.get('path', '-')}" for item in endpoints[1:])
-        lines.append(f"Also: {others}")
-    return lines
+def detail_payload(record: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    """A record as the drawer should show it: whole, minus the fields nothing can read.
+
+    A workflow's `source_code` is the entire deployed function body. Printing it into a
+    JSON drawer buries every other field under it, and `o` already opens the real file.
+    """
+    payload = {}
+    for key, value in record.items():
+        if key in ELIDED_DETAIL_KEYS and isinstance(value, str) and value:
+            payload[key] = f"<{len(value)} characters — press o to open the source>"
+        else:
+            payload[key] = value
+    payload.update({key: value for key, value in extra.items() if value not in (None, [], {})})
+    return payload
 
 
 def format_url(item: dict[str, Any], *, api_url: str) -> str:
@@ -399,7 +634,63 @@ class RebaseHeader(Header):
         return None
 
 
-class SelectableDataTable(DataTable):
+class DragHeaderTable(DataTable):
+    """A table whose column header doubles as the splitter for the box above it.
+
+    Textual has no splitter widget, so the usual answer — the one the hillclimb TUI uses —
+    is a one-row handle between the panes. A row per boundary is a row the tables do not
+    get, and this header is already sitting on the boundary, pinned there while the rows
+    scroll underneath. So it is the handle: grab it and the box above follows the pointer.
+    Header clicks otherwise only post `HeaderSelected`, which nothing here listens for.
+    """
+
+    def __init__(self, *, resizes: str, id: str) -> None:
+        #: The box this header resizes — the one directly above it.
+        super().__init__(id=id)
+        self.resizes = resizes
+
+    def _on_header(self, event: events.MouseEvent) -> bool:
+        return self.show_header and (event.style.meta.get("row") == -1 or event.y == 0)
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        if not self._on_header(event):
+            return
+        self.app.begin_box_drag(self.resizes, self._screen_y(event))  # type: ignore[attr-defined]
+        self.capture_mouse()
+        event.stop()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if self.app.mouse_captured is self:
+            self.app.drag_box_to(self._screen_y(event))  # type: ignore[attr-defined]
+            event.stop()
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if self.app.mouse_captured is self:
+            self.app.end_box_drag()  # type: ignore[attr-defined]
+            self.release_mouse()
+            event.stop()
+
+    def _screen_y(self, event: events.MouseEvent) -> int:
+        # screen_y is what survives the widget moving under the pointer mid-drag.
+        return int(getattr(event, "screen_y", self.region.y + event.y))
+
+
+class TargetTable(DataTable):
+    """A table that sits behind one of the project view's target tabs.
+
+    All it adds is the pair of keys that step between those tabs. They are bound here
+    rather than on the app because an app-level binding would have to be `priority` to
+    beat DataTable's own inert cursor_left/cursor_right — and a priority binding on an
+    arrow key takes it away from every Input in every dialog too.
+    """
+
+    BINDINGS = [
+        Binding("left", "app.switch_target_tab(-1)", "Previous target", show=False),
+        Binding("right", "app.switch_target_tab(1)", "Next target", show=False),
+    ]
+
+
+class SelectableDataTable(TargetTable):
     """A DataTable whose rows can be *marked* in bulk, on top of the single-row cursor.
 
     Textual's DataTable has a cursor but no notion of a selection, so the marks live
@@ -701,6 +992,72 @@ class OpenSourceChoiceScreen(ModalScreen[ProjectDeclaration | None]):
         return f"{match.path}:{match.line}"
 
 
+class DetailDrawer(ModalScreen[None]):
+    """The selected row's own record, as JSON, in a panel over the right of the screen.
+
+    This is where the project view's two static detail panels went. They sat permanently
+    across the middle of the screen restating the table row above them, and the one thing
+    they had that the table did not — a run's parameters — was cut off at one line. A
+    drawer costs no rows until it is asked for, and can be as tall as it needs to be.
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("p", "close", "Close"),
+        Binding("q", "close", "Close"),
+    ]
+    CSS = f"""
+    DetailDrawer {{
+        align: right top;
+        background: #101412 40%;
+    }}
+
+    #detail-drawer {{
+        width: 62%;
+        height: 100%;
+        padding: 1 2;
+        background: #101412;
+        border-left: solid {BRAND_BRIGHT_GREEN};
+    }}
+
+    #detail-title {{
+        color: {BRAND_BRIGHT_GREEN};
+        text-style: bold;
+        margin-bottom: 1;
+    }}
+
+    #detail-body {{
+        height: 1fr;
+        background: #101412;
+        scrollbar-size-vertical: 1;
+        scrollbar-color: {BRAND_BRIGHT_GREEN};
+    }}
+
+    #detail-hint {{
+        color: {BRAND_MEDIUM_GRAY};
+        margin-top: 1;
+    }}
+    """
+
+    def __init__(self, *, title: str, payload: dict[str, Any]) -> None:
+        super().__init__()
+        self.drawer_title = title
+        self.payload = payload
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="detail-drawer"):
+            yield Static(Text(self.drawer_title), id="detail-title")
+            with VerticalScroll(id="detail-body"):
+                yield Static(JSON(json.dumps(self.payload, indent=2, sort_keys=True, default=str)))
+            yield Static("Arrow keys scroll. p or escape closes.", id="detail-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#detail-body", VerticalScroll).focus()
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class TimezoneChoiceScreen(ModalScreen[str | None]):
     """Pick the zone the TUI shows times in.
 
@@ -810,8 +1167,14 @@ class RebaseTuiApp(App[None]):
         ("d", "delete_selection", "Delete"),
         ("o", "open_source", "Open source"),
         ("s", "toggle_terminal_select", "Select text"),
+        ("p", "show_details", "Details"),
+        ("l", "toggle_logs", "Logs"),
+        ("m", "maximise_box", "Maximise"),
+        Binding("plus,+,equals_sign,=", "resize_box(1)", "Resize"),
+        Binding("minus,-,underscore,_", "resize_box(-1)", "Shrink", show=False),
+        Binding("0", "reset_box_heights", "Reset sizes", show=False),
         # priority: the screen's default `tab` -> focus_next otherwise shadows this.
-        Binding("tab", "toggle_target_tab", "Switch target", priority=True),
+        Binding("tab", "cycle_box", "Next box", priority=True),
         # Textual's own `ctrl+c,super+c` copies the selection; these adjust it first.
         Binding("shift+right", "adjust_text_selection(1)", "Grow selection", show=False),
         Binding("shift+left", "adjust_text_selection(-1)", "Shrink selection", show=False),
@@ -854,8 +1217,7 @@ class RebaseTuiApp(App[None]):
     #functions-table,
     #asgi-apps-table,
     #runs-table,
-    #events-table,
-    #steps-table {{
+    #timeline-table {{
         overflow-x: hidden;
         scrollbar-size-horizontal: 0;
         scrollbar-background: #101412;
@@ -873,14 +1235,30 @@ class RebaseTuiApp(App[None]):
         height: 1fr;
     }}
 
+    #workspace-empty {{
+        height: auto;
+        padding: 1;
+        color: {BRAND_MEDIUM_GRAY};
+    }}
+
     #projects-table > .datatable--odd-row,
     #projects-table > .datatable--even-row {{
         background: #101412;
     }}
 
     #target-tabs {{
-        height: 10;
-        border-bottom: solid {BRAND_MEDIUM_GRAY};
+        height: 1fr;
+    }}
+
+    /* These headers are splitters. Lighting up under the pointer is the only affordance
+       a terminal can offer for that — there is no cursor to change shape. */
+    DragHeaderTable > .datatable--header-hover {{
+        color: {BRAND_BRIGHT_GREEN};
+        background: #223029;
+    }}
+
+    #project-error {{
+        color: {BRAND_CORAL_RED};
     }}
 
     .panel {{
@@ -889,22 +1267,12 @@ class RebaseTuiApp(App[None]):
         border-bottom: solid {BRAND_MEDIUM_GRAY};
     }}
 
-    #target-detail {{
-        height: 7;
-    }}
-
     #runs-table {{
         height: 8;
-        border-bottom: solid {BRAND_MEDIUM_GRAY};
     }}
 
-    #events-table {{
+    #timeline-table {{
         height: 1fr;
-        border-bottom: solid {BRAND_MEDIUM_GRAY};
-    }}
-
-    #steps-table {{
-        height: 7;
     }}
 
     DataTable {{
@@ -919,7 +1287,7 @@ class RebaseTuiApp(App[None]):
         client: Client | None = None,
         data: RebaseTuiData | None = None,
         project: str | None = None,
-        limit: int = 25,
+        limit: int = 100,
     ) -> None:
         super().__init__()
         self.data = data or RebaseTuiData(client, project=project, limit=limit)
@@ -939,36 +1307,50 @@ class RebaseTuiApp(App[None]):
         self._function_rows: dict[str, dict[str, Any]] = {}
         self._workflow_rows: dict[str, dict[str, Any]] = {}
         self._asgi_app_rows: dict[str, dict[str, Any]] = {}
+        self._steps_by_function: dict[str, list[WorkflowStep]] = {}
         self._endpoints_by_target: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._run_rows: dict[str, dict[str, Any]] = {}
+        self._run_detail: RunDetailData | None = None
+        #: Log entries per run id, kept so toggling `l` back on costs no request.
+        self._run_logs: dict[str, list[dict[str, Any]]] = {}
+        self._logs_expanded = False
         self._marked_count = 0
         self._terminal_select = False
         self._display_timezone: ZoneInfo | None = None
+        self._reveal_level = 0
+        #: Box heights the user has set with `+`/`-` or a header drag, overriding the
+        #: per-level defaults until `0` clears them.
+        self._box_heights: dict[str, int] = {}
+        #: The box `m` gave the whole view to, if any.
+        self._maximised: str | None = None
+        self._drag_box: tuple[str, int, int] | None = None
+        self._has_asgi_apps = False
 
     def compose(self) -> ComposeResult:
         yield RebaseHeader(show_clock=True, icon="• Commands")
         with Vertical(id="workspace-view"):
             yield SelectableDataTable(id="projects-table")
+            yield Static("", id="workspace-empty")
         with Vertical(id="workspace-switcher-view"):
             yield DataTable(id="workspace-profiles-table")
         with Vertical(id="project-view"):
-            yield Static("Select a project.", id="project-detail", classes="panel")
+            yield Static("", id="project-error", classes="panel")
             with TabbedContent(initial="workflows-tab", id="target-tabs"):
                 with TabPane("Workflows", id="workflows-tab"):
                     yield SelectableDataTable(id="workflows-table")
                 with TabPane("Functions", id="functions-tab"):
                     yield SelectableDataTable(id="functions-table")
                 with TabPane("ASGI apps", id="asgi-apps-tab"):
-                    yield DataTable(id="asgi-apps-table")
-            yield Static("Select a workflow or function.", id="target-detail", classes="panel")
-            yield DataTable(id="runs-table")
-            yield Static("Select a run.", id="run-detail", classes="panel")
-            yield DataTable(id="events-table")
-            yield DataTable(id="steps-table")
+                    yield TargetTable(id="asgi-apps-table")
+            yield DragHeaderTable(resizes="#target-tabs", id="runs-table")
+            yield DragHeaderTable(resizes="#runs-table", id="timeline-table")
         yield Footer()
 
     def on_mount(self) -> None:
         self._setup_tables()
+        self._sync_asgi_tab(False)
+        self._reveal(0)
+        self._warn_on_local_workspace_mismatch()
         self._update_workspace_title()
         self._show_workspace_view()
         self.action_refresh()
@@ -997,6 +1379,216 @@ class RebaseTuiApp(App[None]):
                 add_search_path(self._workspace_key(), root)
 
         await asyncio.to_thread(bootstrap)
+
+    def _warn_on_local_workspace_mismatch(self) -> None:
+        """Say so if the directory's pin is not what the data is coming from.
+
+        The pin normally wins outright, so this is a backstop for the cases where it
+        cannot: an unreadable marker, or a session where the workspace was switched by
+        hand. Either way the alternative is opening a workspace the user did not ask for
+        and leaving them to guess.
+        """
+        pinned = local_workspace_id()
+        effective = getattr(self.data.client, "workspace_id", None)
+        if pinned is None or pinned == effective:
+            return
+        self.notify(
+            f"This directory is pinned to workspace {pinned}, but the data is coming from "
+            f"{effective or 'the default workspace'}.",
+            title="Workspace mismatch",
+            severity="warning",
+            timeout=30,
+        )
+
+    def _reveal(self, level: int) -> None:
+        """Show the project view down to *level*, and no further.
+
+        The project view used to paint every box it might ever need and fill them with
+        "Select a ..." placeholders. Now it starts as the target table alone and grows a
+        box at a time as you drill in.
+        """
+        opening = level > self._reveal_level
+        self._reveal_level = level
+        for depth, selectors in enumerate(REVEAL_LEVELS, start=1):
+            for selector in selectors:
+                self.query_one(selector).styles.display = "block" if level >= depth else "none"
+        self._apply_box_heights()
+        boxes = self._visible_boxes()
+        if not boxes:
+            return
+        # Opening a box hands it the focus, so the arrow keys drive what you just asked
+        # for; closing one hands the focus back up rather than stranding it off screen.
+        focused = self.focused
+        if opening or (isinstance(focused, DataTable) and not focused.display):
+            boxes[-1].focus()
+
+    def _default_box_height(self, selector: str) -> int:
+        """What a box is worth before anyone drags or `+`s it.
+
+        Each level costs the ones above it some rows, so the box you just opened is the
+        one with room to show something. Expanded logs are the exception that genuinely
+        wants the whole screen, so both boxes above shrink to a header and a row or two.
+        """
+        if self._reveal_level == 2 and self._logs_expanded:
+            return {"#target-tabs": 5, "#runs-table": 6}.get(selector, MIN_TABLE_HEIGHT)
+        if selector == "#target-tabs":
+            return 14 if self._reveal_level == 1 else 9
+        return 9
+
+    @staticmethod
+    def _min_box_height(selector: str) -> int:
+        """The rows a box can never give up: enough to keep its column header on screen.
+
+        Squeezed that far a box is its headings and nothing else, which is the point — it
+        says what is still open, and what each column of it means, without spending rows
+        on the contents.
+        """
+        return MIN_TARGET_BOX_HEIGHT if selector == BOX_SELECTORS[0] else MIN_TABLE_HEIGHT
+
+    def _box_height(self, selector: str) -> int:
+        return max(self._min_box_height(selector), self._box_heights.get(selector, self._default_box_height(selector)))
+
+    def _box_selectors(self) -> list[str]:
+        return list(BOX_SELECTORS[: self._reveal_level + 1])
+
+    def _flexible_selector(self, selectors: list[str]) -> str:
+        """The one box holding the leftover rows: the maximised one, else the deepest."""
+        return self._maximised if self._maximised in selectors else selectors[-1]
+
+    def _apply_box_heights(self) -> None:
+        """Size the boxes: one holds the leftover rows as `1fr`, the rest are fixed."""
+        selectors = self._box_selectors()
+        flexible = self._flexible_selector(selectors)
+        for selector in selectors:
+            if selector == flexible:
+                height: Any = "1fr"
+            elif self._maximised is not None:
+                height = self._min_box_height(selector)
+            else:
+                height = self._box_height(selector)
+            self.query_one(selector).styles.height = height
+
+    def _available_rows(self) -> int:
+        """Rows the boxes have to share, taken off the view rather than off the boxes.
+
+        Summing the boxes' own heights would fold any over-allocation into the total and
+        make it look like there was less room than there is, which is exactly the state
+        this bound exists to get out of. The boxes have the view to themselves now that
+        the splitters are their own headers, less the error line when there is one.
+        """
+        error = self.query_one("#project-error", Static)
+        spent = error.size.height if error.display else 0
+        return max(0, self.query_one("#project-view", Vertical).size.height - spent)
+
+    def _take_rows(self, wanted: int, donors: list[str]) -> int:
+        """Shrink *donors* in order until *wanted* rows are free. Returns what was freed.
+
+        In order, and not just from the neighbour: growing the timeline should eat the
+        runs table first and then keep going into the target box, rather than stopping
+        dead the moment the box next to it is down to its header.
+        """
+        freed = 0
+        for donor in donors:
+            if freed >= wanted:
+                break
+            current = self._box_height(donor)
+            given = min(wanted - freed, current - self._min_box_height(donor))
+            if given > 0:
+                self._box_heights[donor] = current - given
+                freed += given
+        return freed
+
+    def _grow_box(self, selector: str, rows: int) -> None:
+        """Give *rows* to a box, taking them from the others nearest-first."""
+        selectors = self._box_selectors()
+        if selector not in selectors or rows == 0:
+            return
+        self._maximised = None
+        flexible = self._flexible_selector(selectors)
+        # Nearest first, so the box you are pushing against is the one that gives.
+        index = selectors.index(selector)
+        others = sorted(
+            (box for box in selectors if box != selector), key=lambda box: abs(selectors.index(box) - index)
+        )
+
+        if selector == flexible:
+            if rows > 0:
+                # It has no height of its own; it grows by taking rows off everything else.
+                self._take_rows(rows, others)
+            else:
+                # And it shrinks by handing them to its neighbour — but only what it has.
+                # Without the slack bound the neighbour grew past the bottom of the screen
+                # and pushed this box off it, header and all.
+                nearest = others[0]
+                given = min(-rows, self._flexible_slack(selectors, flexible))
+                self._box_heights[nearest] = self._box_height(nearest) + given
+        elif rows < 0:
+            self._box_heights[selector] = max(self._min_box_height(selector), self._box_height(selector) + rows)
+        else:
+            # The flexible box gives what it can spare, and the fixed ones cover the rest.
+            spare = min(rows, self._flexible_slack(selectors, flexible))
+            taken = self._take_rows(rows - spare, [box for box in others if box != flexible])
+            self._box_heights[selector] = self._box_height(selector) + spare + taken
+        self._apply_box_heights()
+
+    def _flexible_slack(self, selectors: list[str], flexible: str) -> int:
+        """Rows the leftover-holding box could give up before it is down to its header."""
+        fixed = sum(self._box_height(box) for box in selectors if box != flexible)
+        return max(0, self._available_rows() - fixed - self._min_box_height(flexible))
+
+    def action_resize_box(self, delta: int) -> None:
+        """Grow or shrink the focused box, in rows. Bound to `+` and `-`."""
+        selectors = self._box_selectors()
+        if len(selectors) < 2:
+            self.notify("Nothing to resize yet — open a run or its timeline first.", severity="warning")
+            return
+        self._grow_box(self._focused_box_selector(selectors), delta * BOX_STEP)
+
+    def action_maximise_box(self) -> None:
+        """Give the focused box the whole project view. `b` or `m` again gives it back."""
+        selectors = self._box_selectors()
+        if len(selectors) < 2:
+            self.notify("Only one box is open — it already has the screen.", severity="warning")
+            return
+        focused = self._focused_box_selector(selectors)
+        self._maximised = None if self._maximised == focused else focused
+        self._apply_box_heights()
+
+    def _focused_box_selector(self, selectors: list[str]) -> str:
+        """Which box holds the focus. The target tables live inside one rather than being one."""
+        focused = self.focused
+        focused_id = f"#{focused.id}" if focused is not None and focused.id else ""
+        if focused_id in dict(TARGET_TABS).values():
+            return BOX_SELECTORS[0]
+        return focused_id if focused_id in selectors else selectors[-1]
+
+    def action_reset_box_heights(self) -> None:
+        self._box_heights = {}
+        self._maximised = None
+        self._apply_box_heights()
+        self.notify("Box sizes back to their defaults.")
+
+    def begin_box_drag(self, selector: str, y: int) -> None:
+        self._drag_box = (selector, y, self._box_height(selector))
+
+    def drag_box_to(self, y: int) -> None:
+        if self._drag_box is None:
+            return
+        selector, start_y, start_height = self._drag_box
+        self._grow_box(selector, start_height + y - start_y - self._box_height(selector))
+
+    def end_box_drag(self) -> None:
+        self._drag_box = None
+
+    def _set_project_error(self, message: str | None) -> None:
+        """Show the project view's error line, or take it away again.
+
+        The message is wrapped in `Text` like every other panel here: Textual reads a
+        plain `str` as content markup, and API text is full of brackets it would choke on.
+        """
+        panel = self.query_one("#project-error", Static)
+        panel.styles.display = "none" if message is None else "block"
+        panel.update(Text(message or ""))
 
     def _fill_table(self, table_id: str) -> DataTable:
         """Empty a table and give it its header back, ready for rows.
@@ -1041,11 +1633,9 @@ class RebaseTuiApp(App[None]):
         runs.cursor_type = "row"
         runs.zebra_stripes = True
 
-        events = self.query_one("#events-table", DataTable)
-        events.zebra_stripes = True
-
-        steps = self.query_one("#steps-table", DataTable)
-        steps.zebra_stripes = True
+        timeline = self.query_one("#timeline-table", DataTable)
+        timeline.cursor_type = "row"
+        timeline.zebra_stripes = True
 
     def action_refresh(self) -> None:
         if self.current_view == "workspace-switcher":
@@ -1069,6 +1659,15 @@ class RebaseTuiApp(App[None]):
                 self._show_workspace_view()
             return
         if self.current_view == "project":
+            # Back undoes `m` before it starts closing anything.
+            if self._maximised is not None:
+                self._maximised = None
+                self._apply_box_heights()
+                return
+            # Then it walks the reveal levels shut before it leaves the project.
+            if self._reveal_level > 0:
+                self._reveal(self._reveal_level - 1)
+                return
             self.selected_project = None
             self.selected_target = None
             self.selected_target_type = None
@@ -1081,11 +1680,46 @@ class RebaseTuiApp(App[None]):
             event.stop()
             self._open_workspace_switcher()
 
-    def action_toggle_target_tab(self) -> None:
+    def _target_tab_order(self) -> list[tuple[str, str]]:
+        return [tab for tab in TARGET_TABS if tab[0] != "asgi-apps-tab" or self._has_asgi_apps]
+
+    def _visible_boxes(self) -> list[DataTable]:
+        """The tables `tab` moves between, top to bottom, as the screen currently stands."""
+        if self.current_view == "workspace":
+            return [self.query_one("#projects-table", DataTable)]
+        if self.current_view == "workspace-switcher":
+            return [self.query_one("#workspace-profiles-table", DataTable)]
+        active = self.query_one("#target-tabs", TabbedContent).active
+        selectors = [dict(self._target_tab_order()).get(active, "#workflows-table")]
+        # One selector per revealed level, in the order the levels open.
+        selectors.extend(selector for level in REVEAL_LEVELS[: self._reveal_level] for selector in level)
+        return [self.query_one(selector, DataTable) for selector in selectors]
+
+    def action_cycle_box(self) -> None:
+        """Move the focus to the next box on screen, wrapping at the bottom.
+
+        `tab` used to switch the Workflows/Functions tabs and nothing else, which left
+        the focus stuck in the top box while the runs and timeline below it could only be
+        reached with the mouse. Switching those two tabs is `left`/`right` now, bound on
+        the target tables themselves so it costs nothing anywhere else.
+        """
+        boxes = self._visible_boxes()
+        if not boxes:
+            return
+        focused = self.focused
+        current = boxes.index(focused) if isinstance(focused, DataTable) and focused in boxes else -1
+        boxes[(current + 1) % len(boxes)].focus()
+
+    def action_switch_target_tab(self, delta: int) -> None:
+        """Step between the Workflows / Functions / ASGI apps tabs. Bound to left/right."""
+        if self.current_view != "project":
+            return
         tabs = self.query_one("#target-tabs", TabbedContent)
-        order = ["workflows-tab", "functions-tab", "asgi-apps-tab"]
+        order = [tab_id for tab_id, _ in self._target_tab_order()]
         current = order.index(tabs.active) if tabs.active in order else 0
-        tabs.active = order[(current + 1) % len(order)]
+        tabs.active = order[(current + delta) % len(order)]
+        # The focus follows, or `tab` would carry on from the box that is no longer there.
+        self.query_one(dict(TARGET_TABS)[tabs.active], DataTable).focus()
 
     @property
     def display_tzinfo(self) -> tzinfo | None:
@@ -1117,12 +1751,9 @@ class RebaseTuiApp(App[None]):
                 self.notify(f"Unknown timezone {choice}: {exc}", severity="error")
                 return
         self.query_one(RebaseClock).refresh()
-        # Every rendered timestamp is now in the wrong zone; the reload repaints the
-        # tables, and the project panel is redrawn here because nothing else will.
-        if self.selected_project is not None:
-            summary = self._project_rows.get(str(self.selected_project.get("id", "")))
-            if summary is not None:
-                self._render_project_detail(summary)
+        # Every rendered timestamp is now in the wrong zone; the reload repaints the target
+        # and run tables, and the timeline is redrawn here because nothing else will.
+        self._render_timeline()
         self.action_refresh()
         self.notify(f"Times now shown in {self._timezone_label()}.")
 
@@ -1443,7 +2074,6 @@ class RebaseTuiApp(App[None]):
         self._render_project_targets(targets)
 
     async def _load_runs(self, target_type: TargetType, target_id: str) -> None:
-        self.query_one("#run-detail", Static).update(f"Loading latest {target_type} runs...")
         try:
             runs = await asyncio.to_thread(self.data.load_target_runs, target_type, target_id)
         except Exception as exc:
@@ -1452,13 +2082,41 @@ class RebaseTuiApp(App[None]):
         self._render_runs(runs)
 
     async def _load_run_detail(self, run_id: str) -> None:
-        self.query_one("#run-detail", Static).update(f"Loading run {compact_id(run_id)}...")
         try:
             detail = await asyncio.to_thread(self.data.load_run_detail, run_id)
         except Exception as exc:
             self._set_error(exc)
             return
-        self._render_run_detail(detail)
+        self._run_detail = detail
+        self._render_timeline()
+        if self._logs_expanded and run_id not in self._run_logs:
+            self.run_worker(self._load_run_logs(run_id), name="run-logs", group="tui-logs", exclusive=True)
+
+    async def _load_run_logs(self, run_id: str) -> None:
+        try:
+            entries = await asyncio.to_thread(self.data.load_run_logs, run_id)
+        except Exception as exc:
+            self.notify(f"Could not load logs for run {compact_id(run_id)}: {exc}", severity="error")
+            self._logs_expanded = False
+            self._render_timeline()
+            return
+        self._run_logs[run_id] = entries
+        self._render_timeline()
+
+    def action_toggle_logs(self) -> None:
+        """Fold the run's log output into the timeline, all of it at once.
+
+        Expanded means expanded: there is no per-step fold, because the thing worth
+        having is one scrollable read of the whole run rather than a tree to click open.
+        """
+        if self._run_detail is None:
+            self.notify("Select a run first — l folds its logs into the timeline.", severity="warning")
+            return
+        self._logs_expanded = not self._logs_expanded
+        run_id = str(self._run_detail.run.get("id", ""))
+        if self._logs_expanded and run_id not in self._run_logs:
+            self.run_worker(self._load_run_logs(run_id), name="run-logs", group="tui-logs", exclusive=True)
+        self._render_timeline()
 
     def _render_workspace_overview(self, overview: WorkspaceOverviewData) -> None:
         self._project_rows = {
@@ -1467,14 +2125,26 @@ class RebaseTuiApp(App[None]):
             if summary.project.get("id") is not None
         }
 
+        # An empty workspace and a workspace still loading both draw nothing, and the
+        # only way to tell them apart is to say so.
+        empty = self.query_one("#workspace-empty", Static)
+        empty.styles.display = "none" if overview.projects else "block"
+        if not overview.projects:
+            empty.update(
+                Text(
+                    f"No projects in workspace {self._workspace_label()}.\n"
+                    "Press r to refresh, or click the title to switch workspace."
+                )
+            )
+
         projects = self._fill_table("projects-table")
         for project_id, summary in self._project_rows.items():
             project = summary.project
             projects.add_row(
                 str(project.get("name", "-")),
+                str(summary.function_count),
                 str(summary.workflow_count),
                 str(summary.cron_count),
-                str(summary.function_count),
                 str(summary.endpoint_count),
                 key=project_id,
             )
@@ -1494,15 +2164,19 @@ class RebaseTuiApp(App[None]):
             )
 
     def _render_project_targets(self, targets: ProjectTargetsData) -> None:
-        self._function_rows = {str(item["id"]): item for item in targets.functions if item.get("id") is not None}
+        self._steps_by_function = targets.steps_by_function()
+        self._function_rows = self._ordered_functions(targets)
         self._workflow_rows = {str(item["id"]): item for item in targets.workflows if item.get("id") is not None}
         self._asgi_app_rows = {str(item["id"]): item for item in targets.asgi_apps if item.get("id") is not None}
         self._endpoints_by_target = endpoints_by_target(targets.endpoints)
 
         functions = self._fill_table("functions-table")
         for function_id, function in self._function_rows.items():
+            steps = self._steps_by_function.get(function_id, [])
             functions.add_row(
                 str(function.get("name", "-")),
+                format_step_workflows(steps),
+                format_step_keys(steps),
                 str(function.get("run_type") or "-"),
                 format_bool(function.get("enabled")),
                 format_endpoint(self._target_endpoints("function", function_id)),
@@ -1537,8 +2211,45 @@ class RebaseTuiApp(App[None]):
                 key=asgi_app_id,
             )
 
+        self._sync_asgi_tab(bool(targets.asgi_apps))
         self._clear_target_detail(clear_project=False)
-        self.query_one("#target-detail", Static).update("Select a workflow, function, or ASGI app.")
+
+    def _sync_asgi_tab(self, has_asgi_apps: bool) -> None:
+        """Show the ASGI tab only once a project is known to have one.
+
+        A tab with nothing behind it is a box asking to be opened for no reason, and
+        until this ran on mount too, every project flashed a third tab on the way in and
+        then took it away again the moment the data landed.
+        """
+        tabs = self.query_one("#target-tabs", TabbedContent)
+        self._has_asgi_apps = has_asgi_apps
+        if has_asgi_apps:
+            tabs.show_tab("asgi-apps-tab")
+            return
+        if tabs.active == "asgi-apps-tab":
+            tabs.active = "workflows-tab"
+        tabs.hide_tab("asgi-apps-tab")
+
+    @staticmethod
+    def _ordered_functions(targets: ProjectTargetsData) -> dict[str, dict[str, Any]]:
+        """Functions in graph order under the workflow that calls them, strays last.
+
+        The function list comes back in whatever order the API stored it, which puts a
+        workflow's steps nowhere near each other. Grouping them is the whole point of the
+        Workflow column: read down the table and you read the workflow's shape.
+        """
+        by_id = {str(item["id"]): item for item in targets.functions if item.get("id") is not None}
+        workflow_order = {str(item["id"]): index for index, item in enumerate(targets.workflows)}
+        placed: dict[str, dict[str, Any]] = {}
+        for step in sorted(
+            targets.steps, key=lambda s: (workflow_order.get(s.workflow_id, len(workflow_order)), s.order)
+        ):
+            # A function called by two workflows is listed once, under the first of them.
+            if step.function_id in by_id and step.function_id not in placed:
+                placed[step.function_id] = by_id[step.function_id]
+        # Everything the graphs did not account for keeps its original position.
+        placed.update({key: value for key, value in by_id.items() if key not in placed})
+        return placed
 
     def _target_endpoints(self, target_type: str, target_id: str) -> list[dict[str, Any]]:
         return self._endpoints_by_target.get((target_type, target_id), [])
@@ -1550,53 +2261,50 @@ class RebaseTuiApp(App[None]):
             table.add_row(
                 compact_id(run_id),
                 status_text(run.get("status")),
-                str(run.get("execution_backend", "-")),
+                str(run.get("trigger_source") or "-"),
                 self._time(run.get("created_at")),
+                self._time(run.get("started_at")),
                 self._time(run.get("finished_at")),
+                format_duration(run.get("started_at"), run.get("finished_at")),
                 key=run_id,
             )
-        if not runs:
-            self.query_one("#run-detail", Static).update("No runs found for the selected target.")
-        else:
-            self.query_one("#run-detail", Static).update("Select a run.")
-        self.query_one("#events-table", DataTable).clear(columns=True)
-        self.query_one("#steps-table", DataTable).clear(columns=True)
+        self.query_one("#timeline-table", DataTable).clear(columns=True)
 
-    def _render_run_detail(self, detail: RunDetailData) -> None:
-        run = detail.run
-        lines = [
-            f"Run {compact_id(run.get('id'))} | {run.get('target_type', '-')}",
-            f"Status: {run.get('status', 'unknown')} | Backend: {run.get('execution_backend', '-')}",
-            f"Parameters: {format_json_summary(run.get('parameters'), max_length=110)}",
-            f"Result: {format_json_summary(run.get('result'), max_length=130)}",
-        ]
-        if run.get("error"):
-            lines[-1] = f"Error: {format_json_summary(run.get('error'), max_length=130)}"
-        self.query_one("#run-detail", Static).update("\n".join(lines))
+    def _render_timeline(self) -> None:
+        """The selected run's lifecycle events, steps and — when `l` is on — its logs.
 
-        events = self._fill_table("events-table")
-        for event in detail.events:
-            events.add_row(
-                self._time(event.get("created_at")),
-                str(event.get("stage", "-")),
-                status_text(event.get("status")),
-                format_json_summary(event.get("message"), max_length=120),
+        These were two boxes and a detail panel. They are one table because they are one
+        sequence: the platform's own stages, the workflow's steps, and the runtime's log
+        output all describe the same couple of minutes, and reading them apart meant
+        reconstructing the order by eye.
+        """
+        detail = self._run_detail
+        if detail is None:
+            return
+        self._reveal(2)
+        run_id = str(detail.run.get("id", ""))
+        logs = self._run_logs.get(run_id) if self._logs_expanded else None
+        table = self._fill_table("timeline-table")
+        for row in build_timeline(detail.events, detail.steps, logs):
+            indent = "    " if row.kind == "log" else ""
+            table.add_row(
+                self._time(row.at),
+                Text(row.stage, style=MARK_STYLE if row.kind == "step" else ""),
+                status_text(row.status),
+                Text(f"{indent}{row.message}", style=BRAND_MEDIUM_GRAY if row.kind == "log" else ""),
             )
-
-        steps = self._fill_table("steps-table")
-        for step in detail.steps:
-            steps.add_row(
-                str(step.get("name") or step.get("node_key") or "-"),
-                status_text(step.get("status")),
-                str(step.get("attempt", "-")),
-                self._time(step.get("started_at")),
-                self._time(step.get("finished_at")),
-                format_json_summary(step.get("error"), max_length=80),
+        if self._logs_expanded and logs is None:
+            table.add_row("", "", Text("loading", style=BRAND_AMBER), "Fetching logs...")
+        elif logs is not None and len(logs) >= RUN_LOG_LIMIT:
+            table.add_row(
+                "",
+                "",
+                Text("truncated", style=BRAND_AMBER),
+                f"Showing the first {RUN_LOG_LIMIT} log lines of this run.",
             )
 
     def _clear_target_detail(self, *, clear_project: bool = True) -> None:
         if clear_project:
-            self.query_one("#project-detail", Static).update("Select a project.")
             self.query_one("#functions-table", DataTable).clear(columns=True)
             self.query_one("#workflows-table", DataTable).clear(columns=True)
             self.query_one("#asgi-apps-table", DataTable).clear(columns=True)
@@ -1604,24 +2312,12 @@ class RebaseTuiApp(App[None]):
             self._workflow_rows = {}
             self._asgi_app_rows = {}
             self._endpoints_by_target = {}
-        self.query_one("#target-detail", Static).update("Select a workflow, function, or ASGI app.")
+            self._steps_by_function = {}
         self.query_one("#runs-table", DataTable).clear(columns=True)
-        self.query_one("#run-detail", Static).update("Select a run.")
-        self.query_one("#events-table", DataTable).clear(columns=True)
-        self.query_one("#steps-table", DataTable).clear(columns=True)
+        self.query_one("#timeline-table", DataTable).clear(columns=True)
         self._run_rows = {}
-
-    def _render_project_detail(self, summary: ProjectSummary) -> None:
-        project = summary.project
-        description = format_json_summary(project.get("description"), max_length=110)
-        lines = [
-            f"Project {project.get('name', '-')}",
-            f"Functions: {summary.function_count} | Workflows: {summary.workflow_count} | "
-            f"Cron jobs: {summary.cron_count} | Endpoints: {summary.endpoint_count}",
-            f"Updated: {self._time(project.get('updated_at'))} | ID: {project.get('id', '-')}",
-            f"Description: {description}",
-        ]
-        self.query_one("#project-detail", Static).update("\n".join(lines))
+        self._run_detail = None
+        self._reveal(0)
 
     def _select_project(self, project_id: str) -> None:
         summary = self._project_rows.get(project_id)
@@ -1631,7 +2327,7 @@ class RebaseTuiApp(App[None]):
         self.selected_target = None
         self.selected_target_type = None
         self.project_targets = None
-        self._render_project_detail(summary)
+        self._set_project_error(None)
         self._clear_target_detail(clear_project=False)
         self.run_worker(
             self._load_project_targets(summary.project),
@@ -1643,6 +2339,7 @@ class RebaseTuiApp(App[None]):
 
     def _show_workspace_view(self) -> None:
         self.current_view = "workspace"
+        self.call_after_refresh(self._update_workspace_title)
         self.query_one("#workspace-view", Vertical).styles.display = "block"
         self.query_one("#project-view", Vertical).styles.display = "none"
         self.query_one("#workspace-switcher-view", Vertical).styles.display = "none"
@@ -1650,9 +2347,15 @@ class RebaseTuiApp(App[None]):
 
     def _show_project_view(self) -> None:
         self.current_view = "project"
+        self.call_after_refresh(self._update_workspace_title)
         self.query_one("#workspace-view", Vertical).styles.display = "none"
         self.query_one("#project-view", Vertical).styles.display = "block"
         self.query_one("#workspace-switcher-view", Vertical).styles.display = "none"
+        # The focus would otherwise stay on the projects table, which is no longer on
+        # screen — and `tab`, `d` and `p` all read it.
+        boxes = self._visible_boxes()
+        if boxes and self.focused not in boxes:
+            boxes[0].focus()
 
     def _show_workspace_switcher_view(self) -> None:
         self.current_view = "workspace-switcher"
@@ -1680,7 +2383,16 @@ class RebaseTuiApp(App[None]):
         self.profile_name = selected_profile_name()
         self.profile_data = load_profile(self.profile_name)
         self.project = None
-        self.data = RebaseTuiData(Client(profile=self.profile_name), limit=self.limit)
+        chosen_workspace_id = self.profile_data.get("workspace_id")
+        self.data = RebaseTuiData(
+            Client(
+                profile=self.profile_name,
+                # Explicit beats the directory marker: picking a workspace here is a
+                # deliberate act, and it would otherwise be overridden on the next request.
+                workspace_id=chosen_workspace_id if isinstance(chosen_workspace_id, str) else None,
+            ),
+            limit=self.limit,
+        )
         self.workspace_overview = None
         self.project_targets = None
         self.selected_project = None
@@ -1690,6 +2402,7 @@ class RebaseTuiApp(App[None]):
         self._function_rows = {}
         self._workflow_rows = {}
         self._asgi_app_rows = {}
+        self._steps_by_function = {}
         self._endpoints_by_target = {}
         self._run_rows = {}
         self._update_workspace_title()
@@ -1697,33 +2410,105 @@ class RebaseTuiApp(App[None]):
         self._show_workspace_view()
         self.action_refresh()
 
-    def _render_target_detail(self, target_type: TargetType, target: dict[str, Any]) -> None:
-        lines = [
-            f"{target_type.title()} {target.get('name', '-')}",
-            f"Project: {self._project_name(target)} | Run type: {target.get('run_type') or '-'}",
-            "State: "
-            f"{format_bool(target.get('enabled'))} | Current version: {compact_id(target.get('current_version_id'))}",
-            f"ID: {target.get('id', '-')}",
-        ]
-        lines.extend(
-            format_endpoint_detail(
-                self._target_endpoints(target_type, str(target.get("id", ""))),
-                api_url=self._api_url(),
-            )
-        )
-        self.query_one("#target-detail", Static).update("\n".join(lines))
+    def action_show_details(self) -> None:
+        """Open the drawer on whatever row the cursor is on."""
+        details = self._selected_details()
+        if details is None:
+            self.notify("Select a row first — p shows its full record.", severity="warning")
+            return
+        title, payload = details
+        self.push_screen(DetailDrawer(title=title, payload=payload))
 
-    def _render_asgi_app_detail(self, asgi_app: dict[str, Any]) -> None:
-        lines = [
-            f"ASGI app {asgi_app.get('name', '-')}",
-            f"Project: {self._project_name(asgi_app)} | Base path: {asgi_app.get('base_path') or '-'} | "
-            f"Auth: {asgi_app.get('auth') or '-'}",
-            f"State: {format_bool(asgi_app.get('enabled'))} | "
-            f"Current version: {compact_id(asgi_app.get('current_version_id'))}",
-            f"ID: {asgi_app.get('id', '-')}",
-            f"URL: {format_url(asgi_app, api_url=self._api_url())}",
+    def _selected_details(self) -> tuple[str, dict[str, Any]] | None:
+        """The title and JSON body the drawer should show for the focused table's row."""
+        focused = self.focused
+        table_id = str(focused.id) if isinstance(focused, DataTable) else ""
+        key = focused.cursor_key if isinstance(focused, SelectableDataTable) else self._cursor_key(focused)
+        if key is None:
+            return None
+        if table_id == "runs-table":
+            run = self._run_rows.get(key)
+            if run is None:
+                return None
+            # A run's own record is mostly plumbing — backend ids, version ids, flags —
+            # and the table above already shows its status and timings. What is not
+            # anywhere else, and is the reason to open a run at all, is what it was asked
+            # to do and what came back.
+            payload: dict[str, Any] = {"parameters": run.get("parameters") or {}, "result": run.get("result")}
+            if run.get("error"):
+                payload["error"] = run["error"]
+            return f"Run {compact_id(key)} · {run.get('status', 'unknown')}", payload
+        if table_id == "projects-table":
+            summary = self._project_rows.get(key)
+            if summary is None:
+                return None
+            return (
+                f"Project {summary.project.get('name', '-')}",
+                detail_payload(
+                    summary.project,
+                    functions=summary.function_count,
+                    workflows=summary.workflow_count,
+                    cron_jobs=summary.cron_count,
+                    endpoints=summary.endpoint_count,
+                ),
+            )
+        if table_id == "functions-table":
+            item = self._function_rows.get(key)
+            if item is None:
+                return None
+            steps = self._steps_by_function.get(key, [])
+            return (
+                f"Function {item.get('name', '-')}",
+                detail_payload(
+                    item,
+                    endpoints=self._endpoint_details("function", key),
+                    step_of=[
+                        {"workflow": step.workflow_name, "node_key": step.node_key, "after": list(step.upstream)}
+                        for step in steps
+                    ],
+                ),
+            )
+        if table_id == "workflows-table":
+            item = self._workflow_rows.get(key)
+            if item is None:
+                return None
+            own = sorted(
+                (step for steps in self._steps_by_function.values() for step in steps if step.workflow_id == key),
+                key=lambda step: step.order,
+            )
+            return (
+                f"Workflow {item.get('name', '-')}",
+                detail_payload(
+                    item,
+                    endpoints=self._endpoint_details("workflow", key),
+                    steps=[
+                        {"node_key": step.node_key, "function": step.name, "after": list(step.upstream)} for step in own
+                    ],
+                ),
+            )
+        if table_id == "asgi-apps-table":
+            item = self._asgi_app_rows.get(key)
+            if item is None:
+                return None
+            return (
+                f"ASGI app {item.get('name', '-')}",
+                detail_payload(item, url=format_url(item, api_url=self._api_url())),
+            )
+        return None
+
+    @staticmethod
+    def _cursor_key(table: Any) -> str | None:
+        if not isinstance(table, DataTable) or not 0 <= table.cursor_row < len(table.ordered_rows):
+            return None
+        value = table.ordered_rows[table.cursor_row].key.value
+        return None if value is None else str(value)
+
+    def _endpoint_details(self, target_type: str, target_id: str) -> list[dict[str, Any]]:
+        """Endpoints of a target, each with the absolute URL the table has no room for."""
+        return [
+            {**endpoint, "url": format_url(endpoint, api_url=self._api_url())}
+            for endpoint in self._target_endpoints(target_type, target_id)
         ]
-        self.query_one("#target-detail", Static).update("\n".join(lines))
 
     def _api_url(self) -> str:
         return str(getattr(self.data.client, "api_url", ""))
@@ -1740,7 +2525,7 @@ class RebaseTuiApp(App[None]):
                 return
             self.selected_target_type = "function"
             self.selected_target = target
-            self._render_target_detail("function", target)
+            self._reveal(1)
             self.run_worker(self._load_runs("function", row_id), name="runs", group="tui", exclusive=True)
         elif event.data_table.id == "workflows-table":
             target = self._workflow_rows.get(row_id)
@@ -1748,18 +2533,18 @@ class RebaseTuiApp(App[None]):
                 return
             self.selected_target_type = "workflow"
             self.selected_target = target
-            self._render_target_detail("workflow", target)
+            self._reveal(1)
             self.run_worker(self._load_runs("workflow", row_id), name="runs", group="tui", exclusive=True)
         elif event.data_table.id == "asgi-apps-table":
             asgi_app = self._asgi_app_rows.get(row_id)
             if asgi_app is None:
                 return
-            # ASGI apps serve HTTP directly, so they have no runs to drill into.
+            # ASGI apps serve HTTP directly: no runs, so nothing below to open.
             self.selected_target_type = None
             self.selected_target = None
-            self._render_asgi_app_detail(asgi_app)
             self._render_runs([])
-            self.query_one("#run-detail", Static).update("ASGI apps serve requests directly and have no runs.")
+            self._reveal(0)
+            self.notify("ASGI apps serve HTTP directly and have no run history. Press p for the full record.")
         elif event.data_table.id == "runs-table" and row_id in self._run_rows:
             self.run_worker(self._load_run_detail(row_id), name="run-detail", group="tui", exclusive=True)
         elif event.data_table.id == "workspace-profiles-table":
@@ -1772,6 +2557,14 @@ class RebaseTuiApp(App[None]):
         return self.workspace_overview.project_names.get(project_id, project_id or "-")
 
     def _workspace_label(self) -> str:
+        """The workspace the data actually comes from, which a marker may have pinned.
+
+        The profile's own `workspace_name` is the nicer label, but it is only the truth
+        while the profile is what decided the workspace.
+        """
+        effective = getattr(self.data.client, "workspace_id", None)
+        if isinstance(effective, str) and effective and self.profile_data.get("workspace_id") != effective:
+            return effective
         return self._profile_workspace_label(self.profile_data, fallback=self.profile_name)
 
     @staticmethod
@@ -1791,6 +2584,8 @@ class RebaseTuiApp(App[None]):
 
     def _update_workspace_title(self) -> None:
         title = f"Rebase TUI - Workspace: {self._workspace_label()}"
+        if self.current_view == "project" and self.selected_project is not None:
+            title = f"{title} / {self.selected_project.get('name', '-')}"
         if self._marked_count:
             title = f"{title} - {self._marked_count} marked"
         if self._terminal_select:
@@ -1798,14 +2593,10 @@ class RebaseTuiApp(App[None]):
         self.title = title
 
     def _set_error(self, error: Exception) -> None:
-        # The summary bar used to carry the error text; the detail panel is now the only
-        # place a failed load can say what went wrong, so it gets the message itself.
         self._show_project_view()
-        self.query_one("#project-detail", Static).update(
-            f"The Rebase API request failed. Press r to retry.\nError: {error}"
-        )
+        self._set_project_error(f"The Rebase API request failed. Press r to retry.\nError: {error}")
         self.notify(f"Rebase API request failed: {error}", severity="error")
 
 
-def run_tui(*, project: str | None = None, limit: int = 25, client: Client | None = None) -> None:
+def run_tui(*, project: str | None = None, limit: int = 100, client: Client | None = None) -> None:
     RebaseTuiApp(client=client, project=project, limit=limit).run()

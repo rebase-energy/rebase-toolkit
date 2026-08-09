@@ -20,12 +20,14 @@ from textual.selection import Selection
 from textual.widgets import DataTable, Header, Input, OptionList, Static, TabbedContent
 
 from rebase import config as config_module
+from rebase import tui as tui_module
 from rebase.brand import BRAND_MEDIUM_GRAY
 from rebase.client import Client, RebaseWorkflowError
 from rebase.editor import EditorCommand
 from rebase.tui import (
     MARK_STYLE,
     DeleteConfirmScreen,
+    DetailDrawer,
     OpenSourceChoiceScreen,
     RebaseClock,
     RebaseTuiApp,
@@ -33,9 +35,13 @@ from rebase.tui import (
     SelectableDataTable,
     TimezoneChoiceScreen,
     compact_id,
+    detail_payload,
     endpoints_by_target,
+    format_duration,
     format_endpoint,
     format_json_summary,
+    format_step_keys,
+    format_step_workflows,
     format_timestamp,
     status_style,
 )
@@ -63,6 +69,16 @@ class FakeClient:
             {"id": "project-id", "name": "energy"},
             {"id": "other-project-id", "name": "trading"},
         ]
+        self.version_calls: list[tuple[str, str]] = []
+        self.log_calls: list[str] = []
+        # One line between the run's only event and its only step, so the timeline has to
+        # interleave the three routes rather than concatenate them.
+        self.log_entries: list[dict[str, Any]] = [
+            {"timestamp": "2026-06-16T14:00:02Z", "severity": "INFO", "message": "Fetching curves."}
+        ]
+        # None is the ordinary case: a workflow whose body does the work itself has no
+        # step graph at all. `SteppedClient` is the other kind.
+        self.step_graph: dict[str, Any] | None = None
         self.functions = [
             {
                 "id": "function-id",
@@ -128,10 +144,20 @@ class FakeClient:
                 "execution_backend": "prefect_cloud_run_service",
                 "parameters": {"site_id": "site-001"},
                 "result": {"ok": True},
+                "trigger_source": "schedule",
                 "created_at": "2026-06-16T14:00:00Z",
+                "started_at": "2026-06-16T14:00:10Z",
                 "finished_at": "2026-06-16T14:01:00Z",
             }
         ]
+
+    def get_workflow_version(self, workflow_id: str, version_id: str) -> dict[str, Any]:
+        self.version_calls.append((workflow_id, version_id))
+        return {"id": version_id, "workflow_id": workflow_id, "step_graph": self.step_graph}
+
+    def get_run_logs(self, run_id: str, *, since: str | None = None, limit: int | None = None) -> dict[str, Any]:
+        self.log_calls.append(run_id)
+        return {"run_id": run_id, "source": "prefect", "entries": self.log_entries}
 
     def list_projects(self) -> list[dict[str, Any]]:
         return self.projects
@@ -239,6 +265,62 @@ class FakeClient:
         ]
 
 
+class SteppedClient(FakeClient):
+    """A project whose workflow is built out of steps, which are functions of its own."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Deliberately out of graph order, and with a function no workflow calls: the API
+        # stores functions however it likes, and the table is what puts them back in shape.
+        self.functions = [
+            self.functions[0],
+            {
+                "id": "load-function-id",
+                "project_id": "project-id",
+                "name": "load_weather",
+                "enabled": True,
+                "current_version_id": "load-version-id-123456",
+                "updated_at": "2026-06-16T11:00:00Z",
+            },
+            {
+                "id": "standalone-function-id",
+                "project_id": "project-id",
+                "name": "healthcheck",
+                "enabled": True,
+                "current_version_id": "health-version-id-123456",
+                "updated_at": "2026-06-16T10:00:00Z",
+            },
+        ]
+        self.step_graph = {
+            "schema_version": 1,
+            "engine": "prefect",
+            "nodes": [
+                {
+                    "node_key": "load_weather",
+                    "name": "load_weather",
+                    "function_id": "load-function-id",
+                    "upstream_node_keys": [],
+                },
+                {
+                    "node_key": "normalize",
+                    "name": "normalize",
+                    "function_id": "function-id",
+                    "upstream_node_keys": ["load_weather"],
+                },
+            ],
+        }
+
+
+class EmptyWorkspaceClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.projects = []
+        self.functions = []
+        self.workflows = []
+        self.endpoints = []
+        self.asgi_apps = []
+
+
 def fake_tui_data(client: Any, **kwargs: Any) -> RebaseTuiData:
     """FakeClient duck-types Client; the cast keeps the type checker honest at that seam."""
     return RebaseTuiData(cast(Client, client), **kwargs)
@@ -303,6 +385,92 @@ def test_tui_endpoint_column_counts_extra_endpoints_and_dims_disabled() -> None:
     assert str(format_endpoint([extra, disabled])) == "GET /b (+1)"
 
 
+def test_tui_data_reads_the_step_graph_off_the_current_workflow_version() -> None:
+    client = SteppedClient()
+    data = fake_tui_data(client, project="energy")
+    overview = data.load_workspace_overview()
+
+    targets = data.load_project_targets(overview.project_summaries[0].project)
+
+    assert client.version_calls == [("workflow-id", "workflow-version-id-123456")]
+    assert [(step.workflow_name, step.node_key, step.upstream) for step in targets.steps] == [
+        ("forecast", "load_weather", ()),
+        ("forecast", "normalize", ("load_weather",)),
+    ]
+    assert set(targets.steps_by_function()) == {"load-function-id", "function-id"}
+
+
+def test_tui_data_reports_no_steps_for_a_workflow_that_is_its_own_body() -> None:
+    """The common case: `step_graph` is null, and that is not a failure."""
+    client = FakeClient()
+    data = fake_tui_data(client, project="energy")
+    overview = data.load_workspace_overview()
+
+    targets = data.load_project_targets(overview.project_summaries[0].project)
+
+    assert client.version_calls == [("workflow-id", "workflow-version-id-123456")]
+    assert targets.steps == ()
+    assert targets.steps_by_function() == {}
+
+
+def test_tui_data_tolerates_a_workflow_version_route_that_fails() -> None:
+    """The Workflow column is supplementary; losing it must not empty the project view."""
+
+    class Unsupported(SteppedClient):
+        def get_workflow_version(self, workflow_id: str, version_id: str) -> dict[str, Any]:
+            raise RebaseWorkflowError("404 Not Found")
+
+    data = fake_tui_data(Unsupported(), project="energy")
+    overview = data.load_workspace_overview()
+
+    targets = data.load_project_targets(overview.project_summaries[0].project)
+
+    assert targets.steps == ()
+    assert [item["name"] for item in targets.functions] == ["normalize", "load_weather", "healthcheck"]
+    assert [item["name"] for item in targets.workflows] == ["forecast"]
+
+
+def test_tui_workflow_steps_skips_nodes_with_nothing_behind_them() -> None:
+    assert tui_module.workflow_steps("workflow-id", "forecast", None) == ()
+    assert tui_module.workflow_steps("workflow-id", "forecast", {"nodes": "not-a-list"}) == ()
+    steps = tui_module.workflow_steps(
+        "workflow-id",
+        "forecast",
+        {"nodes": [{"node_key": "a", "name": "a"}, {"node_key": "b_2", "name": "b", "function_id": "fn"}]},
+    )
+    assert [(step.node_key, step.name, step.function_id, step.order) for step in steps] == [("b_2", "b", "fn", 1)]
+
+
+def test_tui_step_column_formatters() -> None:
+    def step(workflow_name: str, node_key: str) -> tui_module.WorkflowStep:
+        return tui_module.WorkflowStep(
+            workflow_id=workflow_name,
+            workflow_name=workflow_name,
+            node_key=node_key,
+            name=node_key,
+            function_id="fn",
+            upstream=(),
+            order=0,
+        )
+
+    assert format_step_workflows([]) == "-"
+    assert format_step_keys([]) == "-"
+    assert format_step_workflows([step("forecast", "a")]) == "forecast"
+    assert format_step_workflows([step("forecast", "a"), step("forecast", "a_2")]) == "forecast"
+    assert format_step_workflows([step("forecast", "a"), step("backfill", "a")]) == "forecast (+1)"
+    assert format_step_keys([step("forecast", "a"), step("forecast", "a_2")]) == "a, a_2"
+
+
+def test_tui_format_duration() -> None:
+    assert format_duration("2026-06-16T14:00:10Z", "2026-06-16T14:01:00Z") == "50.0s"
+    assert format_duration("2026-06-16T14:00:10Z", "2026-06-16T14:05:40Z") == "5m30s"
+    assert format_duration("2026-06-16T14:00:00Z", "2026-06-16T16:30:00Z") == "2h30m"
+    # A run that has not started, or not finished, has no duration to report yet.
+    assert format_duration(None, "2026-06-16T14:01:00Z") == "-"
+    assert format_duration("2026-06-16T14:00:10Z", None) == "-"
+    assert format_duration("nonsense", "2026-06-16T14:01:00Z") == "-"
+
+
 def test_tui_data_tolerates_missing_endpoint_and_asgi_routes() -> None:
     class Unsupported(FakeClient):
         def list_project_endpoints(self, project_id: str) -> list[dict[str, Any]]:
@@ -338,6 +506,39 @@ def test_tui_overview_reads_all_workflows_and_endpoints_in_one_call_each() -> No
         (summary.function_count, summary.workflow_count, summary.endpoint_count, summary.cron_count)
         for summary in overview.project_summaries
     ] == [(1, 1, 1, 1), (0, 0, 0, 0), (0, 0, 0, 0)]
+
+
+def test_tui_project_row_puts_each_count_under_its_own_header() -> None:
+    """Distinct counts, so swapping two columns cannot pass."""
+
+    async def scenario() -> None:
+        client = FakeClient()
+        # energy: 3 functions, 2 workflows of which 1 is a cron, 1 endpoint.
+        client.functions.extend(
+            [
+                {"id": "second-function-id", "project_id": "project-id", "name": "clean"},
+                {"id": "third-function-id", "project_id": "project-id", "name": "publish"},
+            ]
+        )
+        client.workflows.append(
+            {"id": "ad-hoc-workflow-id", "project_id": "project-id", "name": "ad-hoc", "enabled": True}
+        )
+        app = RebaseTuiApp(data=fake_tui_data(client, limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            assert [str(column.label) for column in projects.columns.values()] == [
+                "Project",
+                "Functions",
+                "Workflows",
+                "Cron jobs",
+                "Endpoints",
+            ]
+            assert [str(cell) for cell in projects.get_row_at(0)] == ["energy", "3", "2", "1", "1"]
+            assert [str(cell) for cell in projects.get_row_at(1)] == ["trading", "0", "0", "0", "0"]
+
+    asyncio.run(scenario())
 
 
 def test_tui_counts_only_workflows_the_api_says_will_fire_as_cron_jobs() -> None:
@@ -440,10 +641,25 @@ def test_tui_app_mounts_and_renders_selected_workflow_run() -> None:
             await pilot.press("enter")
             await pilot.pause(0.2)
 
-            run_detail = app.query_one("#run-detail", Static)
-            assert "Run run-id" in str(run_detail.content)
-            assert app.query_one("#events-table", DataTable).row_count == 1
-            assert app.query_one("#steps-table", DataTable).row_count == 1
+            # The event and the step land in one timeline, in the order they happened.
+            timeline = app.query_one("#timeline-table", DataTable)
+            assert timeline.row_count == 2
+            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(2)] == [
+                "dispatch",
+                "load_weather",
+            ]
+
+            # Back closes the timeline, then the runs box, and only then leaves the project.
+            await pilot.press("b")
+            await pilot.pause(0.2)
+            assert app.query_one("#timeline-table").styles.display == "none"
+            assert app.query_one("#runs-table").styles.display == "block"
+            assert app.query_one("#project-view").styles.display == "block"
+
+            await pilot.press("b")
+            await pilot.pause(0.2)
+            assert app.query_one("#runs-table").styles.display == "none"
+            assert app.query_one("#project-view").styles.display == "block"
 
             await pilot.press("b")
             await pilot.pause(0.2)
@@ -468,41 +684,58 @@ def test_tui_app_shows_endpoint_column_and_asgi_apps_tab() -> None:
 
             workflows = app.query_one("#workflows-table", DataTable)
             functions = app.query_one("#functions-table", DataTable)
+            # Endpoint is the 4th workflow column and the 6th function column, which
+            # carries two more up front for the step graph.
             assert str(workflows.get_cell_at(Coordinate(0, 3))) == "POST /forecast"
-            assert str(functions.get_cell_at(Coordinate(0, 3))) == "-"
+            assert str(functions.get_cell_at(Coordinate(0, 5))) == "-"
 
-            # Selecting the workflow surfaces its endpoint and full URL in the detail panel.
+            # The workflow's endpoint, with the full URL the column has no room for.
             workflows.focus()
             workflows.move_cursor(row=0)
-            await pilot.press("enter")
+            await pilot.press("p")
             await pilot.pause(0.2)
-            target_detail = str(app.query_one("#target-detail", Static).content)
-            assert "Endpoint: POST /forecast | auth: workspace | mode: async | enabled" in target_detail
-            assert "URL: https://api.example.com/e/energy-workspace/energy/forecast" in target_detail
+            drawer = app.screen
+            assert isinstance(drawer, DetailDrawer)
+            assert drawer.drawer_title == "Workflow forecast"
+            assert drawer.payload["endpoints"][0]["url"] == "https://api.example.com/e/energy-workspace/energy/forecast"
+            await pilot.press("escape")
+            await pilot.pause(0.2)
 
-            # tab cycles workflows -> functions -> asgi apps.
+            # left/right cycles workflows -> functions -> asgi apps and back.
             tabs = app.query_one("#target-tabs", TabbedContent)
             assert tabs.active == "workflows-tab"
-            await pilot.press("tab")
+            await pilot.press("right")
             await pilot.pause(0.1)
             assert tabs.active == "functions-tab"
-            await pilot.press("tab")
+            await pilot.press("right")
             await pilot.pause(0.1)
             assert tabs.active == "asgi-apps-tab"
+            await pilot.press("left")
+            await pilot.pause(0.1)
+            assert tabs.active == "functions-tab"
+            await pilot.press("right")
+            await pilot.pause(0.1)
 
             asgi_apps = app.query_one("#asgi-apps-table", DataTable)
             assert asgi_apps.row_count == 1
             asgi_apps.focus()
             asgi_apps.move_cursor(row=0)
-            await pilot.press("enter")
+            await pilot.press("p")
             await pilot.pause(0.2)
 
-            asgi_detail = str(app.query_one("#target-detail", Static).content)
-            assert "ASGI app grid-api" in asgi_detail
+            drawer = app.screen
+            assert isinstance(drawer, DetailDrawer)
+            assert drawer.drawer_title == "ASGI app grid-api"
             # ASGI apps only carry url_path, so the TUI joins it onto the client's api_url.
-            assert "URL: https://api.example.com/e/energy-workspace/energy/api" in asgi_detail
-            assert app.query_one("#runs-table", DataTable).row_count == 0
-            assert "no runs" in str(app.query_one("#run-detail", Static).content)
+            assert drawer.payload["url"] == "https://api.example.com/e/energy-workspace/energy/api"
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+
+            # Selecting one opens nothing below: an ASGI app answers HTTP and has no runs.
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            assert app.query_one("#runs-table").styles.display == "none"
+            assert app.query_one("#timeline-table").styles.display == "none"
 
     asyncio.run(scenario())
 
@@ -535,6 +768,22 @@ def local_rebase_api() -> Iterator[tuple[str, list[tuple[str, dict[str, list[str
             "updated_at": "2026-06-16T13:00:00Z",
         }
     ]
+    workflow_version = {
+        "id": "workflow-version-id",
+        "workflow_id": "workflow-id",
+        "step_graph": {
+            "schema_version": 1,
+            "engine": "prefect",
+            "nodes": [
+                {
+                    "node_key": "normalize",
+                    "name": "normalize",
+                    "function_id": "function-id",
+                    "upstream_node_keys": [],
+                }
+            ],
+        },
+    }
     endpoints = [
         {
             "id": "endpoint-id",
@@ -595,6 +844,12 @@ def local_rebase_api() -> Iterator[tuple[str, list[tuple[str, dict[str, list[str
             "error": None,
         }
     ]
+    # One line inside each of the two windows above, so the timeline has to interleave
+    # them rather than append them: log, event, log, step is the wrong order to show.
+    log_entries = [
+        {"timestamp": "2026-06-16T14:00:02Z", "severity": "INFO", "message": "Fetching curves."},
+        {"timestamp": "2026-06-16T14:00:07Z", "severity": "INFO", "message": "Wrote 96 rows."},
+    ]
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -613,6 +868,8 @@ def local_rebase_api() -> Iterator[tuple[str, list[tuple[str, dict[str, list[str
                 payload = endpoints
             elif parsed.path == "/projects/project-id/asgi-apps":
                 payload = asgi_apps
+            elif parsed.path == "/workflows/workflow-id/versions/workflow-version-id":
+                payload = workflow_version
             elif parsed.path == "/runs":
                 payload = [run] if query.get("workflow_id") == ["workflow-id"] else []
             elif parsed.path == "/runs/run-id":
@@ -621,6 +878,8 @@ def local_rebase_api() -> Iterator[tuple[str, list[tuple[str, dict[str, list[str
                 payload = events
             elif parsed.path == "/runs/run-id/steps":
                 payload = steps
+            elif parsed.path == "/runs/run-id/logs":
+                payload = {"run_id": "run-id", "source": "prefect", "entries": log_entries}
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -658,7 +917,7 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
 
                 projects = app.query_one("#projects-table", DataTable)
                 assert projects.row_count == 1
-                # Project, Workflows, Cron jobs, Functions, Endpoints.
+                # Project, Functions, Workflows, Cron jobs, Endpoints.
                 assert [str(cell) for cell in projects.get_row_at(0)] == ["energy", "1", "1", "1", "1"]
                 assert app.query_one("#workspace-view").styles.display == "block"
                 assert app.query_one("#project-view").styles.display == "none"
@@ -667,11 +926,13 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
                 await pilot.press("enter")
                 await pilot.pause(0.2)
 
-                detail = app.query_one("#project-detail", Static)
-                assert "Project energy" in str(detail.content)
-                assert "Functions: 1 | Workflows: 1 | Cron jobs: 1 | Endpoints: 1" in str(detail.content)
+                assert app.title.endswith("/ energy")
                 assert app.query_one("#workspace-view").styles.display == "none"
                 assert app.query_one("#project-view").styles.display == "block"
+
+                # The step graph came off the workflow version and named the function's caller.
+                functions = app.query_one("#functions-table", DataTable)
+                assert [str(cell) for cell in functions.get_row_at(0)][:3] == ["normalize", "forecast", "normalize"]
 
                 workflows = app.query_one("#workflows-table", DataTable)
                 assert workflows.row_count == 1
@@ -687,11 +948,24 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
                 await pilot.press("enter")
                 await pilot.pause(0.2)
 
-                assert "Run run-id" in str(app.query_one("#run-detail", Static).content)
-                assert app.query_one("#events-table", DataTable).row_count == 1
-                assert app.query_one("#steps-table", DataTable).row_count == 1
+                timeline = app.query_one("#timeline-table", DataTable)
+                assert timeline.row_count == 2
 
-                await pilot.press("b")
+                # `l` folds the log lines in, each under the step or stage it followed.
+                await pilot.press("l")
+                await pilot.pause(0.3)
+                assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(4)] == [
+                    "dispatch",
+                    "",
+                    "load_weather",
+                    "",
+                ]
+                assert str(timeline.get_cell_at(Coordinate(1, 3))).strip() == "Fetching curves."
+                await pilot.press("l")
+                await pilot.pause(0.3)
+                assert timeline.row_count == 2
+
+                await pilot.press("b", "b", "b")
                 await pilot.pause(0.2)
                 assert app.query_one("#workspace-view").styles.display == "block"
                 assert app.query_one("#project-view").styles.display == "none"
@@ -709,6 +983,7 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
                 and query.get("limit") == ["5"]
                 for path, query, _ in seen_requests
             )
+            assert any(path == "/workflows/workflow-id/versions/workflow-version-id" for path, _, _ in seen_requests)
             assert any(path == "/runs/run-id/events" for path, _, _ in seen_requests)
             assert any(path == "/runs/run-id/steps" for path, _, _ in seen_requests)
 
@@ -1046,20 +1321,15 @@ def test_tui_delete_follows_the_active_target_tab_and_skips_asgi_apps() -> None:
 
 def test_tui_text_selection_adjusts_with_shift_arrows_and_copies_with_cmd_c() -> None:
     async def scenario() -> None:
-        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+        app = RebaseTuiApp(data=fake_tui_data(EmptyWorkspaceClient(), limit=5))
 
         async with app.run_test(size=(140, 42)) as pilot:
-            await pilot.pause(0.2)
-            projects = app.query_one("#projects-table", SelectableDataTable)
-            projects.focus()
-            projects.move_cursor(row=0)
-            await pilot.press("enter")
             await pilot.pause(0.3)
 
-            # Drag a selection across the first line of the project detail panel. Pilot has
-            # no drag helper, so the mid-drag move goes through the same private hook its
-            # click helpers use.
-            detail = app.query_one("#project-detail", Static)
+            # Drag a selection across the first line of the empty-workspace notice. Pilot
+            # has no drag helper, so the mid-drag move goes through the same private hook
+            # its click helpers use.
+            detail = app.query_one("#workspace-empty", Static)
             await pilot.mouse_down(detail, offset=(0, 0))
             await pilot._post_mouse_events([MouseMove], widget=detail, offset=(7, 0), button=1)
             await pilot.mouse_up(detail, offset=(7, 0))
@@ -1067,12 +1337,12 @@ def test_tui_text_selection_adjusts_with_shift_arrows_and_copies_with_cmd_c() ->
 
             dragged = app.screen.get_selected_text()
             assert dragged is not None
-            assert "Project"[: len(dragged)] == dragged
+            assert "No projects in workspace"[: len(dragged)] == dragged
 
             await pilot.press("shift+right")
             await pilot.pause(0.1)
             grown = app.screen.get_selected_text()
-            assert grown is not None and grown == "Project energy"[: len(dragged) + 1]
+            assert grown is not None and grown == "No projects in workspace"[: len(dragged) + 1]
 
             await pilot.press("shift+left", "shift+left")
             await pilot.pause(0.1)
@@ -1089,17 +1359,12 @@ def test_tui_text_selection_adjusts_with_shift_arrows_and_copies_with_cmd_c() ->
 
 def test_tui_selection_adjustment_stops_at_the_line_edges() -> None:
     async def scenario() -> None:
-        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+        app = RebaseTuiApp(data=fake_tui_data(EmptyWorkspaceClient(), limit=5))
 
         async with app.run_test(size=(140, 42)) as pilot:
-            await pilot.pause(0.2)
-            projects = app.query_one("#projects-table", SelectableDataTable)
-            projects.focus()
-            projects.move_cursor(row=0)
-            await pilot.press("enter")
             await pilot.pause(0.3)
 
-            detail = app.query_one("#project-detail", Static)
+            detail = app.query_one("#workspace-empty", Static)
             first_line = str(detail.content).splitlines()[0]
             app.screen.selections = {detail: Selection(Offset(0, 0), Offset(len(first_line), 0))}
             await pilot.pause(0.1)
@@ -1129,7 +1394,7 @@ def test_tui_s_hands_the_mouse_to_the_terminal_and_takes_it_back() -> None:
             app._driver._disable_mouse_support = lambda: calls.append("disable")  # type: ignore[union-attr]
             app._driver._enable_mouse_support = lambda: calls.append("enable")  # type: ignore[union-attr]
 
-            detail = app.query_one("#project-detail", Static)
+            detail = app.query_one("#projects-table", SelectableDataTable)
             app.screen.selections = {detail: Selection(Offset(0, 0), Offset(4, 0))}
 
             await pilot.press("s")
@@ -1536,9 +1801,9 @@ def test_tui_tables_have_no_header_until_their_rows_arrive() -> None:
             assert projects.row_count == 2
             assert [str(column.label) for column in projects.columns.values()] == [
                 "Project",
+                "Functions",
                 "Workflows",
                 "Cron jobs",
-                "Functions",
                 "Endpoints",
             ]
 
@@ -1611,3 +1876,825 @@ def test_tui_header_parts_still_exist() -> None:
 
     assert issubclass(RebaseClock, HeaderClock)
     assert callable(HeaderIcon) and callable(HeaderTitle)
+
+
+def test_tui_project_view_opens_a_box_at_a_time() -> None:
+    """Entering a project shows the target table alone; each drill-down adds one box."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            # Level 0: the switcher and its table, and nothing else.
+            assert app._reveal_level == 0
+            for selector in ("#runs-table", "#timeline-table"):
+                assert app.query_one(selector).styles.display == "none", selector
+            assert app.query_one("#target-tabs").styles.height.value == 1  # 1fr
+            assert app.title.endswith("/ energy")
+
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            workflows.focus()
+            workflows.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            # Level 1: the runs, still no timeline.
+            assert app._reveal_level == 1
+            assert app.query_one("#runs-table").styles.display == "block"
+            assert app.query_one("#timeline-table").styles.display == "none"
+
+            runs = app.query_one("#runs-table", DataTable)
+            runs.focus()
+            runs.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            # Level 2: the run's timeline.
+            assert app._reveal_level == 2
+            assert app.query_one("#timeline-table").styles.display == "block"
+
+    asyncio.run(scenario())
+
+
+def test_tui_hides_the_asgi_tab_for_a_project_without_one() -> None:
+    class NoAsgiClient(FakeClient):
+        def list_asgi_apps(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
+            return []
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(NoAsgiClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            tabs = app.query_one("#target-tabs", TabbedContent)
+            assert tabs.active == "workflows-tab"
+            # right now cycles between the two that have something behind them.
+            await pilot.press("right")
+            await pilot.pause(0.1)
+            assert tabs.active == "functions-tab"
+            await pilot.press("right")
+            await pilot.pause(0.1)
+            assert tabs.active == "workflows-tab"
+
+    asyncio.run(scenario())
+
+
+def test_tui_tab_walks_every_box_on_screen() -> None:
+    """`tab` used to switch the top box's two tabs and leave the rest unreachable."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            # With only the target table open, tab has nowhere else to go.
+            assert str(app.focused.id) == "workflows-table"
+            await pilot.press("tab")
+            await pilot.pause(0.1)
+            assert str(app.focused.id) == "workflows-table"
+
+            # Opening a box hands it the focus: the arrows drive it without a tab first.
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            assert str(app.focused.id) == "runs-table"
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            assert str(app.focused.id) == "timeline-table"
+
+            # And tab still walks all three, wrapping at the bottom.
+            await pilot.press("tab")
+            await pilot.pause(0.1)
+            assert str(app.focused.id) == "workflows-table"
+            await pilot.press("tab")
+            await pilot.pause(0.1)
+            assert str(app.focused.id) == "runs-table"
+
+            # Switching the target tab takes the focus with it, so tab keeps its place.
+            app.query_one("#workflows-table", SelectableDataTable).focus()
+            await pilot.press("right")
+            await pilot.pause(0.1)
+            assert str(app.focused.id) == "functions-table"
+            await pilot.press("tab")
+            await pilot.pause(0.1)
+            assert str(app.focused.id) == "runs-table"
+
+            # Closing a box moves the focus off it rather than stranding it off screen.
+            app.query_one("#timeline-table", DataTable).focus()
+            await pilot.pause(0.1)
+            await pilot.press("b")
+            await pilot.pause(0.3)
+            assert str(app.focused.id) == "runs-table"
+
+    asyncio.run(scenario())
+
+
+def test_tui_plus_and_minus_resize_the_focused_box() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            # One box open: there is no second box to take the rows from.
+            await pilot.press("+")
+            await pilot.pause(0.1)
+            assert any("Nothing to resize yet" in n.message for n in app._notifications)
+
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            tabs = app.query_one("#target-tabs")
+            runs = app.query_one("#runs-table")
+
+            # The focus is on the bottom box, which grows by taking rows off the one above.
+            assert str(app.focused.id) == "runs-table"
+            before = runs.size.height
+            await pilot.press("+")
+            await pilot.pause(0.1)
+            assert runs.size.height == before + 2
+            await pilot.press("-", "-")
+            await pilot.pause(0.1)
+            assert runs.size.height == before - 2
+
+            # On a fixed box, + grows the box itself.
+            app.query_one("#workflows-table", SelectableDataTable).focus()
+            await pilot.pause(0.1)
+            tall = tabs.size.height
+            await pilot.press("+")
+            await pilot.pause(0.1)
+            assert tabs.size.height == tall + 2
+
+            # 0 puts every box back where it started.
+            await pilot.press("0")
+            await pilot.pause(0.1)
+            assert runs.size.height == before
+
+    asyncio.run(scenario())
+
+
+def test_tui_a_squeezed_box_keeps_only_its_header() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            app.query_one("#workflows-table", SelectableDataTable).focus()
+            await pilot.pause(0.1)
+            assert app._reveal_level == 2
+            await pilot.press(*["-"] * 20)
+            await pilot.pause(0.2)
+            # The tabbed box keeps its tab strip *and* the column header under it — Textual
+            # spends two rows on the strip before the table gets to draw anything.
+            assert app.query_one("#target-tabs").size.height == tui_module.MIN_TARGET_BOX_HEIGHT
+            assert app.query_one("#workflows-table", SelectableDataTable).size.height >= 1
+
+            await pilot.press(*["+"] * 40)
+            await pilot.pause(0.2)
+            # And the tables below it are down to a column header each.
+            assert app.query_one("#runs-table").size.height == tui_module.MIN_TABLE_HEIGHT
+            assert app.query_one("#timeline-table").size.height == tui_module.MIN_TABLE_HEIGHT
+
+    asyncio.run(scenario())
+
+
+def test_tui_growing_a_box_eats_past_its_neighbour() -> None:
+    """Pushing the timeline up should not stop the moment the runs box runs out."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            assert str(app.focused.id) == "timeline-table"
+
+            tabs, runs, timeline = (app.query_one(box) for box in tui_module.BOX_SELECTORS)
+            tall = tabs.size.height
+
+            # The neighbour goes first, and the box above it is untouched while it lasts.
+            await pilot.press(*["+"] * 4)
+            await pilot.pause(0.2)
+            assert runs.size.height == tui_module.MIN_TABLE_HEIGHT
+            assert tabs.size.height == tall
+
+            # Then the pushing carries on into the box above.
+            await pilot.press(*["+"] * 3)
+            await pilot.pause(0.2)
+            assert tabs.size.height < tall
+            assert runs.size.height == tui_module.MIN_TABLE_HEIGHT
+
+            await pilot.press(*["+"] * 20)
+            await pilot.pause(0.2)
+            assert tabs.size.height == tui_module.MIN_TARGET_BOX_HEIGHT
+            assert timeline.size.height == 42 - 2 - tui_module.MIN_TARGET_BOX_HEIGHT - 1
+
+    asyncio.run(scenario())
+
+
+def test_tui_shrinking_a_box_cannot_push_the_one_below_off_screen() -> None:
+    """`-` on the bottom box hands rows to its neighbour, and only what it has to give."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            assert str(app.focused.id) == "timeline-table"
+
+            await pilot.press(*["-"] * 40)
+            await pilot.pause(0.3)
+            timeline = app.query_one("#timeline-table")
+            assert timeline.styles.display == "block"
+            assert timeline.size.height == tui_module.MIN_TABLE_HEIGHT
+            # Everything still fits between the header and the footer.
+            boxes = [app.query_one(box).size.height for box in tui_module.BOX_SELECTORS]
+            assert sum(boxes) == app.query_one("#project-view").size.height
+
+    asyncio.run(scenario())
+
+
+def test_tui_m_maximises_the_focused_box_and_b_gives_it_back() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            # One box open: it already has the screen.
+            await pilot.press("m")
+            await pilot.pause(0.1)
+            assert any("already has the screen" in n.message for n in app._notifications)
+
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            tabs, runs, timeline = (app.query_one(box) for box in tui_module.BOX_SELECTORS)
+
+            # Maximise the middle box, not just the bottom one.
+            app.query_one("#runs-table", DataTable).focus()
+            await pilot.pause(0.1)
+            await pilot.press("m")
+            await pilot.pause(0.2)
+            assert tabs.size.height == tui_module.MIN_TARGET_BOX_HEIGHT
+            assert timeline.size.height == tui_module.MIN_TABLE_HEIGHT
+            assert runs.size.height == 42 - 2 - tui_module.MIN_TARGET_BOX_HEIGHT - 1
+
+            # b gives the screen back without also closing the box.
+            await pilot.press("b")
+            await pilot.pause(0.2)
+            assert app._reveal_level == 2
+            assert timeline.size.height > tui_module.MIN_TABLE_HEIGHT
+
+            # And m toggles it off again itself.
+            await pilot.press("m")
+            await pilot.pause(0.2)
+            assert timeline.size.height == tui_module.MIN_TABLE_HEIGHT
+            await pilot.press("m")
+            await pilot.pause(0.2)
+            assert timeline.size.height > tui_module.MIN_TABLE_HEIGHT
+
+    asyncio.run(scenario())
+
+
+def test_tui_dragging_a_column_header_resizes_the_box_above_it() -> None:
+    """The splitter is the header itself, so no box spends a row on a handle."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            runs = app.query_one("#runs-table", tui_module.DragHeaderTable)
+            assert runs.resizes == "#target-tabs"
+            start = app.query_one("#target-tabs").size.height
+
+            # A press on a data row is still a press on a data row.
+            await pilot.mouse_down(runs, offset=(4, 2))
+            await pilot.pause(0.1)
+            assert app._drag_box is None
+            await pilot.mouse_up(runs, offset=(4, 2))
+
+            # A press on the header row starts a drag, and releasing ends it.
+            await pilot.mouse_down(runs, offset=(4, 0))
+            await pilot.pause(0.1)
+            assert app._drag_box is not None
+            await pilot.mouse_up(runs, offset=(4, 0))
+            await pilot.pause(0.1)
+            assert app._drag_box is None
+            assert app.query_one("#target-tabs").size.height == start
+
+            # The move itself goes through the app rather than the pilot: a pilot offset
+            # is relative to a widget that moves under the pointer mid-drag, where a real
+            # pointer stays put and lets the widget come to it.
+            grabbed_at = runs.region.y
+            await pilot.mouse_down(runs, offset=(4, 0))
+            await pilot.pause(0.1)
+            app.drag_box_to(grabbed_at + 4)
+            app.end_box_drag()
+            await pilot.pause(0.2)
+            assert app.query_one("#target-tabs").size.height == start + 4
+
+    asyncio.run(scenario())
+
+
+def test_tui_l_folds_the_run_logs_into_the_timeline() -> None:
+    async def scenario() -> None:
+        client = FakeClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            # Nothing selected yet: `l` says so rather than doing nothing.
+            await pilot.press("l")
+            await pilot.pause(0.1)
+            assert any("Select a run first" in n.message for n in app._notifications)
+
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            app.query_one("#runs-table", DataTable).focus()
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            timeline = app.query_one("#timeline-table", DataTable)
+            assert timeline.row_count == 2
+
+            await pilot.press("l")
+            await pilot.pause(0.4)
+            # The log line at 14:00:02 sits between the 14:00:01 event and the 14:00:05 step.
+            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(3)] == [
+                "dispatch",
+                "",
+                "load_weather",
+            ]
+            assert str(timeline.get_cell_at(Coordinate(1, 3))).strip() == "Fetching curves."
+            assert client.log_calls == ["run-id"]
+
+            # Folding them away and back costs no second request.
+            await pilot.press("l")
+            await pilot.pause(0.2)
+            assert timeline.row_count == 2
+            await pilot.press("l")
+            await pilot.pause(0.2)
+            assert timeline.row_count == 3
+            assert client.log_calls == ["run-id"]
+
+    asyncio.run(scenario())
+
+
+def test_tui_expanded_logs_take_the_room_from_the_boxes_above() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            app.query_one("#runs-table", DataTable).focus()
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            packed = app.query_one("#timeline-table").size.height
+            await pilot.press("l")
+            await pilot.pause(0.4)
+            assert app.query_one("#timeline-table").size.height > packed
+
+    asyncio.run(scenario())
+
+
+def test_tui_reports_a_failed_log_request_and_folds_back_up() -> None:
+    class NoLogs(FakeClient):
+        def get_run_logs(self, run_id: str, *, since: str | None = None, limit: int | None = None) -> dict[str, Any]:
+            raise RebaseWorkflowError("404 Not Found")
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(NoLogs(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            app.query_one("#runs-table", DataTable).focus()
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            await pilot.press("l")
+            await pilot.pause(0.4)
+            assert any("Could not load logs" in n.message for n in app._notifications)
+            assert app._logs_expanded is False
+            assert app.query_one("#timeline-table", DataTable).row_count == 2
+
+    asyncio.run(scenario())
+
+
+def test_tui_p_opens_the_selected_row_as_json() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+
+            # In the workspace view it is the project, counts included.
+            await pilot.press("p")
+            await pilot.pause(0.2)
+            assert isinstance(app.screen, DetailDrawer)
+            assert app.screen.drawer_title == "Project energy"
+            assert app.screen.payload["workflows"] == 1
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            app.query_one("#runs-table", DataTable).focus()
+            await pilot.pause(0.1)
+
+            # And on a run it is the parameters the run was dispatched with.
+            await pilot.press("p")
+            await pilot.pause(0.2)
+            drawer = app.screen
+            assert isinstance(drawer, DetailDrawer)
+            assert drawer.drawer_title == "Run run-id · succeeded"
+            assert drawer.payload == {"parameters": {"site_id": "site-001"}, "result": {"ok": True}}
+
+            # p closes it again, the way it opened it.
+            await pilot.press("p")
+            await pilot.pause(0.2)
+            assert not isinstance(app.screen, DetailDrawer)
+
+    asyncio.run(scenario())
+
+
+def test_tui_detail_payload_elides_the_deployed_source() -> None:
+    payload = detail_payload({"name": "forecast", "source_code": "x" * 4096}, url="https://example.com")
+    assert payload["name"] == "forecast"
+    assert payload["source_code"] == "<4096 characters — press o to open the source>"
+    assert payload["url"] == "https://example.com"
+    # Nothing to say is not worth a key.
+    assert "endpoints" not in detail_payload({"name": "forecast"}, endpoints=[])
+
+
+def test_tui_build_timeline_interleaves_events_steps_and_logs() -> None:
+    events = [
+        {"stage": "dispatch", "status": "completed", "message": "Accepted.", "created_at": "2026-06-16T14:00:01Z"}
+    ]
+    steps = [
+        {
+            "name": "load_weather",
+            "status": "succeeded",
+            "attempt": 1,
+            "started_at": "2026-06-16T14:00:05Z",
+            "finished_at": "2026-06-16T14:00:20Z",
+        }
+    ]
+    logs = [
+        {"timestamp": "2026-06-16T14:00:02Z", "severity": "INFO", "message": "Fetching."},
+        {"timestamp": "2026-06-16T14:00:06Z", "severity": "ERROR", "message": "Retrying."},
+    ]
+
+    assert [(row.kind, row.stage) for row in tui_module.build_timeline(events, steps, None)] == [
+        ("event", "dispatch"),
+        ("step", "load_weather"),
+    ]
+    assert [(row.kind, row.stage) for row in tui_module.build_timeline(events, steps, logs)] == [
+        ("event", "dispatch"),
+        ("log", ""),
+        ("step", "load_weather"),
+        ("log", ""),
+    ]
+    # A step with no error says what it did instead of showing a bare dash.
+    with_steps = tui_module.build_timeline([], steps, None)
+    assert "attempt 1" in with_steps[0].message and "finished" in with_steps[0].message
+    assert tui_module.build_timeline([], [{"name": "a", "error": "boom"}], None)[0].message == "boom"
+
+
+def test_tui_build_timeline_keeps_rows_with_no_usable_timestamp() -> None:
+    rows = tui_module.build_timeline(
+        [{"stage": "late", "created_at": "2026-06-16T14:00:01Z"}, {"stage": "undated", "created_at": None}], [], None
+    )
+    assert [row.stage for row in rows] == ["undated", "late"]
+
+
+def test_tui_functions_table_names_the_workflow_each_step_belongs_to() -> None:
+    """A step is registered as a function, with nothing on the row to say whose step it is."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(SteppedClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(160, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            functions = app.query_one("#functions-table", DataTable)
+            # Graph order first — load_weather then normalize — and the stray function last.
+            assert [str(functions.get_cell_at(Coordinate(row, 0))) for row in range(3)] == [
+                "load_weather",
+                "normalize",
+                "healthcheck",
+            ]
+            # Name, Workflow, Step.
+            assert [str(functions.get_cell_at(Coordinate(row, 1))) for row in range(3)] == [
+                "forecast",
+                "forecast",
+                "-",
+            ]
+            assert [str(functions.get_cell_at(Coordinate(row, 2))) for row in range(3)] == [
+                "load_weather",
+                "normalize",
+                "-",
+            ]
+
+            # The drawer spells the wiring out, in both directions.
+            app.query_one("#target-tabs", TabbedContent).active = "functions-tab"
+            functions.focus()
+            functions.move_cursor(row=1)
+            await pilot.press("p")
+            await pilot.pause(0.3)
+            drawer = app.screen
+            assert isinstance(drawer, DetailDrawer)
+            assert drawer.payload["step_of"] == [
+                {"workflow": "forecast", "node_key": "normalize", "after": ["load_weather"]}
+            ]
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            app.query_one("#target-tabs", TabbedContent).active = "workflows-tab"
+            workflows.focus()
+            workflows.move_cursor(row=0)
+            await pilot.press("p")
+            await pilot.pause(0.3)
+            drawer = app.screen
+            assert isinstance(drawer, DetailDrawer)
+            assert [step["node_key"] for step in drawer.payload["steps"]] == ["load_weather", "normalize"]
+
+    asyncio.run(scenario())
+
+
+def test_tui_functions_table_leaves_the_step_columns_empty_for_a_plain_function() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(160, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            functions = app.query_one("#functions-table", DataTable)
+            assert str(functions.get_cell_at(Coordinate(0, 1))) == "-"
+            assert str(functions.get_cell_at(Coordinate(0, 2))) == "-"
+
+            # And the drawer carries no step keys for either side of the pair.
+            app.query_one("#target-tabs", TabbedContent).active = "functions-tab"
+            functions.focus()
+            functions.move_cursor(row=0)
+            await pilot.press("p")
+            await pilot.pause(0.3)
+            drawer = app.screen
+            assert isinstance(drawer, DetailDrawer)
+            assert "step_of" not in drawer.payload
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            app.query_one("#target-tabs", TabbedContent).active = "workflows-tab"
+            workflows.focus()
+            workflows.move_cursor(row=0)
+            await pilot.press("p")
+            await pilot.pause(0.3)
+            drawer = app.screen
+            assert isinstance(drawer, DetailDrawer)
+            assert "steps" not in drawer.payload
+
+    asyncio.run(scenario())
+
+
+def test_tui_runs_table_reports_when_each_run_started_and_how_long_it_took() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(160, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            workflows.focus()
+            workflows.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            runs = app.query_one("#runs-table", DataTable)
+            assert [str(column.label) for column in runs.columns.values()] == [
+                "Run",
+                "Status",
+                "Trigger",
+                "Created",
+                "Started",
+                "Finished",
+                "Duration",
+            ]
+
+            # Timestamps render in the display zone, which is the machine's until changed.
+            def shown(value: str) -> str:
+                return format_timestamp(value, app.display_tzinfo)
+
+            assert [str(cell) for cell in runs.get_row_at(0)] == [
+                "run-id",
+                "succeeded",
+                "schedule",
+                shown("2026-06-16T14:00:00Z"),
+                shown("2026-06-16T14:00:10Z"),
+                shown("2026-06-16T14:01:00Z"),
+                "50.0s",
+            ]
+
+    asyncio.run(scenario())
+
+
+def test_tui_keeps_the_asgi_tab_hidden_until_a_project_is_known_to_have_one() -> None:
+    """It used to appear on every project and vanish again once the data landed."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            assert app.query_one("#target-tabs", TabbedContent).get_tab("asgi-apps-tab").display is False
+
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            # This project does have one, so now it is there.
+            assert app.query_one("#target-tabs", TabbedContent).get_tab("asgi-apps-tab").display is True
+
+    asyncio.run(scenario())
+
+
+def test_tui_says_so_when_the_workspace_has_no_projects() -> None:
+    """A blank table reads as "still loading"; an empty workspace should say it is empty."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(EmptyWorkspaceClient(), limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            empty = app.query_one("#workspace-empty", Static)
+            assert empty.styles.display == "block"
+            assert "No projects in workspace" in str(empty.content)
+            assert app.query_one("#projects-table", SelectableDataTable).row_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_tui_hides_the_empty_notice_once_projects_arrive() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            assert app.query_one("#projects-table", SelectableDataTable).row_count == 2
+            assert app.query_one("#workspace-empty").styles.display == "none"
+
+    asyncio.run(scenario())
+
+
+def test_tui_warns_when_the_directory_pin_is_not_what_the_data_came_from() -> None:
+    """The pin normally wins; when something overrode it, say so rather than guess."""
+
+    async def scenario(monkeypatch) -> None:
+        monkeypatch.setattr(tui_module, "local_workspace_id", lambda: "rebase-grid")
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            messages = [notification.message for notification in app._notifications]
+            assert any("pinned to workspace rebase-grid" in message for message in messages), messages
+            assert any("data is coming from" in message for message in messages)
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        asyncio.run(scenario(monkeypatch))
+
+
+def test_tui_stays_quiet_when_the_directory_pins_nothing() -> None:
+    async def scenario(monkeypatch) -> None:
+        monkeypatch.setattr(tui_module, "local_workspace_id", lambda: None)
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            messages = [notification.message for notification in app._notifications]
+            assert not any("pinned to workspace" in message for message in messages), messages
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        asyncio.run(scenario(monkeypatch))
+
+
+def test_tui_title_names_the_workspace_a_marker_pinned() -> None:
+    """The profile's own label would name the workspace the pin overrode."""
+
+    async def scenario() -> None:
+        client = FakeClient()
+        client.workspace_id = "rebase-grid"
+        app = RebaseTuiApp(data=fake_tui_data(client, limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            assert "rebase-grid" in app.title
+
+    asyncio.run(scenario())
