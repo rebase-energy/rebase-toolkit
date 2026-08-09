@@ -55,6 +55,13 @@
   one in prose. An empty filter says why it is empty rather than showing a blank table, which is
   how a workflow with no step graph now tells you so. One `Tabs` over one table, not four panes
   holding four slices of the same run.
+- **A timeline row too wide for the pane can be read two ways.** The table scrolls sideways —
+  `^pgup`/`^pgdn`, the wheel, or the bar — where the others stay clipped, because a log line is
+  not a column you can widen your way out of. And `enter`, or a click, opens the row out: the
+  full text wrapped to the pane, the row grown to fit, `enter` again to close it. Wrapped
+  explicitly rather than left to the column, since the column is as wide as the longest
+  *unexpanded* line and that is the width the row is trying to escape. Changing filter or run
+  closes them all, rather than leaving an expansion attached to whatever line took that place.
 - **Log output arrives with the run** rather than on request. It joins the four reads already
   issued together, so the Logs chip is instant and costs no extra wait.
 - **`rebase init [WORKSPACE]`** connects the repository you are in to a workspace you already

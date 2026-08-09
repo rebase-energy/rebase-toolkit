@@ -2872,3 +2872,64 @@ def test_tui_l_jumps_to_the_logs_chip_and_back() -> None:
             assert app._timeline_filter == "timeline-all"
 
     asyncio.run(scenario())
+
+
+def test_tui_enter_opens_a_timeline_row_out_to_its_full_text() -> None:
+    """A log line is the one thing here that does not fit its row."""
+
+    async def scenario() -> None:
+        client = FakeClient()
+        client.log_entries = [
+            {
+                "timestamp": "2026-06-16T14:00:02Z",
+                "severity": "INFO",
+                "message": "Worker 'CloudRunWorker d65ce4e6-7de4-4894-81d7-d403986f0ef5' submitting "
+                "flow run '019fdd5e-2dba-7aaf-a9c2-3b9b26054810' to infrastructure",
+            }
+        ]
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _open_run(app, pilot)
+            timeline = app.query_one("#timeline-table", DataTable)
+            log_row = next(
+                row for row in range(timeline.row_count) if str(timeline.get_cell_at(Coordinate(row, 1))) == "log"
+            )
+
+            assert timeline.rows[timeline.coordinate_to_cell_key(Coordinate(log_row, 0)).row_key].height == 1
+            timeline.focus()
+            timeline.move_cursor(row=log_row)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            # Same row, now several lines tall, carrying the whole message.
+            key = timeline.coordinate_to_cell_key(Coordinate(log_row, 0)).row_key
+            assert timeline.rows[key].height > 1
+            message = str(timeline.get_cell_at(Coordinate(log_row, 4)))
+            assert "\n" in message
+            # Wrapping only moves the line breaks; nothing is dropped or truncated.
+            assert " ".join(message.split()) == client.log_entries[0]["message"]
+            # Wrapped to the pane, not left running off the side.
+            assert max(len(line) for line in message.splitlines()) <= 120
+
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            key = timeline.coordinate_to_cell_key(Coordinate(log_row, 0)).row_key
+            assert timeline.rows[key].height == 1
+
+    asyncio.run(scenario())
+
+
+def test_tui_timeline_scrolls_sideways_where_the_other_tables_clip() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _open_run(app, pilot)
+            timeline = app.query_one("#timeline-table", DataTable)
+            assert timeline.styles.overflow_x == "auto"
+            assert timeline.styles.scrollbar_size_horizontal == 1
+            # The tables of fixed-width fields stay clipped; only prose scrolls.
+            assert app.query_one("#runs-table").styles.overflow_x == "hidden"
+
+    asyncio.run(scenario())

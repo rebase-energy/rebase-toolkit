@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import textwrap
 from collections import Counter
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -141,6 +142,10 @@ MIN_TABLE_HEIGHT = 1
 MIN_TARGET_BOX_HEIGHT = 2
 #: How many rows `+`/`-` move a box.
 BOX_STEP = 2
+#: How wide to wrap an expanded timeline row when the pane's width cannot be read,
+#: and the narrowest it is worth wrapping to.
+TIMELINE_WRAP_FALLBACK = 80
+TIMELINE_WRAP_MINIMUM = 30
 #: Log lines fetched per run. The API answers an empty list — not an error — somewhere
 #: above 200, so this is a ceiling to respect rather than one to raise on a hunch.
 RUN_LOG_LIMIT = 200
@@ -1433,8 +1438,16 @@ class RebaseTuiApp(App[None]):
         height: 1fr;
     }}
 
+    /* The one table whose content is prose. It is allowed to run off the right and
+       be scrolled back — `^pgup`/`^pgdn`, the wheel, or the bar — where the others are
+       clipped, because a log line is not a column you can widen your way out of. */
     #timeline-table {{
         height: 1fr;
+        overflow-x: auto;
+        scrollbar-size-horizontal: 1;
+        scrollbar-color: {BRAND_MEDIUM_GRAY};
+        scrollbar-color-hover: {BRAND_BRIGHT_GREEN};
+        scrollbar-color-active: {BRAND_BRIGHT_GREEN};
     }}
 
     DataTable {{
@@ -1531,6 +1544,10 @@ class RebaseTuiApp(App[None]):
         self._run_detail: RunDetailData | None = None
         #: Which of the timeline's chips is showing. `l` jumps to the logs one.
         self._timeline_filter = TIMELINE_FILTERS[0][0]
+        #: Timeline rows opened out to their full text, by position in the current view.
+        #: Position, not identity: changing filter or run reshuffles the list, and both
+        #: clear this rather than leaving an expansion attached to some other line.
+        self._expanded_timeline: set[int] = set()
         #: Log entries per run id, kept so toggling `l` back on costs no request.
         self._run_logs: dict[str, list[dict[str, Any]]] = {}
         self._marked_count = 0
@@ -2341,6 +2358,7 @@ class RebaseTuiApp(App[None]):
             self._set_error(exc)
             return
         self._run_detail = detail
+        self._expanded_timeline.clear()
         self._run_logs[run_id] = detail.logs
         self._render_timeline()
 
@@ -2359,6 +2377,7 @@ class RebaseTuiApp(App[None]):
 
     def _select_timeline_filter(self, tab_id: str) -> None:
         self._timeline_filter = tab_id
+        self._expanded_timeline.clear()
         tabs = self.query_one("#timeline-tabs", Tabs)
         if tabs.active != tab_id:
             tabs.active = tab_id
@@ -2373,6 +2392,7 @@ class RebaseTuiApp(App[None]):
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
         if event.tabs.id == "timeline-tabs" and event.tab.id != self._timeline_filter:
             self._timeline_filter = str(event.tab.id)
+            self._expanded_timeline.clear()
             self._render_timeline()
 
     def _render_workspace_overview(self, overview: WorkspaceOverviewData) -> None:
@@ -2513,6 +2533,7 @@ class RebaseTuiApp(App[None]):
         logs = self._run_logs.get(run_id)
         kinds = dict((tab_id, kinds) for tab_id, _, kinds in TIMELINE_FILTERS)[self._timeline_filter]
         showing_all = self._timeline_filter == TIMELINE_FILTERS[0][0]
+        message_width = self._timeline_message_width()
         table = self._fill_table("timeline-table-all" if showing_all else "timeline-table", widget="timeline-table")
         shown = 0
         for row in build_timeline(detail.events, detail.steps, logs, detail.tasks):
@@ -2527,14 +2548,20 @@ class RebaseTuiApp(App[None]):
             cells: list[Any] = [self._time(row.at)]
             if showing_all:
                 cells.append(Text(row.kind, style=BRAND_MEDIUM_GRAY))
+            # An expanded row keeps its full text, wrapped to what is on screen, and
+            # grows to fit. Wrapped here rather than left to the column, because the
+            # column is as wide as the longest *un*expanded line and that is the width
+            # this row is trying to escape.
+            expanded = shown - 1 in self._expanded_timeline
+            message = textwrap.fill(row.message, message_width) if expanded else row.message
             cells.extend(
                 (
                     Text(f"{indent}{row.stage}", style=MARK_STYLE if row.kind == "step" else ""),
                     status_text(row.status),
-                    Text(row.message, style=BRAND_MEDIUM_GRAY if row.kind == "log" else ""),
+                    Text(message, style=BRAND_MEDIUM_GRAY if row.kind == "log" else ""),
                 )
             )
-            table.add_row(*cells)
+            table.add_row(*cells, height=message.count("\n") + 1 if expanded else 1, key=str(shown - 1))
         # An empty table looks broken; saying why it is empty is the whole point of
         # having asked for Steps on a workflow that has none.
         if not shown:
@@ -2546,6 +2573,20 @@ class RebaseTuiApp(App[None]):
                     showing_all, "truncated", f"Showing the first {RUN_LOG_LIMIT} log lines of this run."
                 )
             )
+
+    def _timeline_message_width(self) -> int:
+        """How wide the Message column can be before it needs the horizontal scrollbar.
+
+        Read off the columns as they were last laid out: everything to the left of
+        Message keeps its width, and Message gets whatever the pane has left.
+        """
+        table = self.query_one("#timeline-table", DataTable)
+        columns = list(table.columns.values())
+        visible = table.scrollable_content_region.width
+        if len(columns) < 2 or visible <= 0:
+            return TIMELINE_WRAP_FALLBACK
+        spent = sum(column.get_render_width(table) for column in columns[:-1])
+        return max(TIMELINE_WRAP_MINIMUM, visible - spent - 2)
 
     @staticmethod
     def _timeline_note(showing_all: bool, status: str, message: str) -> list[Any]:
@@ -2809,6 +2850,16 @@ class RebaseTuiApp(App[None]):
             self.selected_target = target
             self._reveal(1)
             self.run_worker(self._load_runs("workflow", row_id), name="runs", group="tui", exclusive=True)
+        elif event.data_table.id == "timeline-table":
+            # Enter, or a click, opens the row out to its full text and closes it again.
+            # A log line is the one thing here that does not fit its row, and scrolling
+            # sideways to read one sentence is worse than letting it wrap.
+            position = int(row_id) if str(row_id).isdigit() else None
+            if position is None:
+                return
+            self._expanded_timeline.symmetric_difference_update({position})
+            self._render_timeline()
+            self.query_one("#timeline-table", DataTable).move_cursor(row=position)
         elif event.data_table.id == "runs-table" and row_id in self._run_rows:
             self.run_worker(self._load_run_detail(row_id), name="run-detail", group="tui", exclusive=True)
         elif event.data_table.id == "workspace-profiles-table":
