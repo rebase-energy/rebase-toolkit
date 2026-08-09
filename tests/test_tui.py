@@ -2859,3 +2859,36 @@ def test_tui_background_is_the_same_in_every_view() -> None:
             assert workflows.styles.background_tint.a == 0
 
     asyncio.run(scenario())
+
+
+def test_tui_run_detail_issues_its_reads_together() -> None:
+    """Four sequential round trips was over a second of lag on a keypress."""
+    order: list[str] = []
+    started = threading.Barrier(4, timeout=5)
+
+    class SlowClient(FakeClient):
+        def _trip(self, name: str) -> None:
+            order.append(name)
+            # Blocks until all four have started; times out if any runs sequentially.
+            started.wait()
+
+        def get_run(self, run_id: str) -> dict[str, Any]:
+            self._trip("run")
+            return super().get_run(run_id)
+
+        def list_run_events(self, run_id: str) -> list[dict[str, Any]]:
+            self._trip("events")
+            return super().list_run_events(run_id)
+
+        def list_run_steps(self, run_id: str) -> list[dict[str, Any]]:
+            self._trip("steps")
+            return super().list_run_steps(run_id)
+
+        def list_run_tasks(self, run_id: str, *, step_run_id: str | None = None) -> list[dict[str, Any]]:
+            self._trip("tasks")
+            return super().list_run_tasks(run_id, step_run_id=step_run_id)
+
+    detail = fake_tui_data(SlowClient()).load_run_detail("run-id", target_type="workflow")
+    assert sorted(order) == ["events", "run", "steps", "tasks"]
+    assert detail.run["id"] == "run-id"
+    assert [step["name"] for step in detail.steps] == ["load_weather"]

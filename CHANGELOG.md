@@ -205,6 +205,13 @@
 
 ### Fixed
 
+- **Opening a run took about 1.3 seconds.** The run, its events, its steps and its tasks were
+  four sequential round trips behind one keypress — measured at 266ms, 330ms, 314ms and 353ms
+  against the deployed API — and none of them needs another's answer. Issued together they cost
+  the slowest one instead of the sum, so the wait is now about 350ms. The caller passes the run's
+  target type from the row it just selected, so the steps and tasks reads no longer wait to be
+  told whether they apply.
+
 - **The background no longer changes shade between views.** Textual tints a focused DataTable
   five percent lighter, and in the workspace view one table fills the screen — so walking into a
   project visibly darkened the whole app and walking back out lightened it again. The tint is

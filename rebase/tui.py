@@ -89,6 +89,9 @@ MARK_STYLE = f"bold {BRAND_AMBER}"
 OVERVIEW_FANOUT_WORKERS = 16
 #: Concurrent requests used to collect a project's per-workflow step graphs.
 STEP_GRAPH_FANOUT_WORKERS = 8
+#: The run, its events, its steps and its tasks: four independent reads behind one
+#: keypress, so they go together rather than one after another.
+RUN_DETAIL_FANOUT_WORKERS = 4
 #: What each level of the project view adds, outermost first. Level 0 is the target
 #: table alone; selecting a target reveals level 1, selecting a run reveals level 2.
 REVEAL_LEVELS: tuple[tuple[str, ...], ...] = (
@@ -338,18 +341,34 @@ class RebaseTuiData:
             return self.client.list_runs(function_id=target_id, target_type="function", limit=self.limit)
         return self.client.list_runs(workflow_id=target_id, target_type="workflow", limit=self.limit)
 
-    def load_run_detail(self, run_id: str) -> RunDetailData:
-        run = self.client.get_run(run_id)
-        events = self.client.list_run_events(run_id)
-        is_workflow = run.get("target_type") == "workflow"
-        return RunDetailData(
-            run=run,
-            events=events,
-            steps=self.client.list_run_steps(run_id) if is_workflow else [],
+    def load_run_detail(self, run_id: str, *, target_type: str | None = None) -> RunDetailData:
+        """Everything behind one run, fetched in one round trip's worth of waiting.
+
+        These were four sequential calls — the run, its events, its steps, its tasks —
+        and none of them needs another's answer, so pressing enter on a run cost the sum
+        of all four: about 1.3 seconds against the deployed API. Issued together it costs
+        the slowest one.
+
+        `target_type` saves asking what the run is before knowing which reads apply; the
+        caller has it on the row it just selected. Without it both are issued anyway and
+        the answers dropped, which is cheaper than a round trip spent finding out.
+        """
+        with ThreadPoolExecutor(max_workers=RUN_DETAIL_FANOUT_WORKERS) as executor:
+            run = executor.submit(self.client.get_run, run_id)
+            events = executor.submit(self.client.list_run_events, run_id)
             # Supplementary, like the endpoint list: an API without the route costs the
-            # task rows and not the run view. `list_run_tasks` already absorbs that.
-            tasks=self.client.list_run_tasks(run_id) if is_workflow else [],
-        )
+            # rows and not the run view.
+            wanted = target_type in (None, "workflow")
+            steps = executor.submit(_optional_list, lambda: self.client.list_run_steps(run_id)) if wanted else None
+            tasks = executor.submit(_optional_list, lambda: self.client.list_run_tasks(run_id)) if wanted else None
+            resolved = run.result()
+            is_workflow = resolved.get("target_type") == "workflow"
+            return RunDetailData(
+                run=resolved,
+                events=events.result(),
+                steps=steps.result() if steps is not None and is_workflow else [],
+                tasks=tasks.result() if tasks is not None and is_workflow else [],
+            )
 
     def load_run_logs(self, run_id: str) -> list[dict[str, Any]]:
         entries = self.client.get_run_logs(run_id, limit=RUN_LOG_LIMIT).get("entries")
@@ -2234,8 +2253,9 @@ class RebaseTuiApp(App[None]):
         self._render_runs(runs)
 
     async def _load_run_detail(self, run_id: str) -> None:
+        target_type = (self._run_rows.get(run_id) or {}).get("target_type")
         try:
-            detail = await asyncio.to_thread(self.data.load_run_detail, run_id)
+            detail = await asyncio.to_thread(self.data.load_run_detail, run_id, target_type=target_type)
         except Exception as exc:
             self._set_error(exc)
             return
