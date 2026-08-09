@@ -193,6 +193,17 @@
 
 ### Fixed
 
+- **Every project's runs showed under every other project's workflow.** Opening a workflow in
+  the TUI, or running `rebase workflow runs <name>`, listed every run in the workspace: the
+  nordpool workflow showed epex's runs, with epex's parameters and epex's GCS paths in them.
+  `/runs` filters on `target_id` — a run names what it ran through `target_type` + `target_id`,
+  and its own `workflow_id` column is null for an ordinary registered run — but the client sent
+  `workflow_id`, a parameter the route does not have. FastAPI drops unknown query parameters
+  without complaint, so what looked like a filter was nothing at all and the whole workspace came
+  back. `list_runs` now sends `target_id`; `workflow_id` / `function_id` / `model_id` are kept as
+  spellings of it, and contradicting them raises rather than silently picking one. The fake API
+  in the tests had the same phantom parameter, which is why the suite never noticed.
+
 - **Deleting a project failed with `Method Not Allowed` against an API without the batch-delete
   route.** The fallback to one request per project was reached on a 404, and 404 is not what such
   an API answers: `/projects/batch-delete` is matched by `/projects/{project_id}`, so the path

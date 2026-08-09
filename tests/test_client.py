@@ -233,6 +233,52 @@ def test_client_list_run_tasks_tolerates_an_api_without_the_route(monkeypatch) -
         client.list_run_tasks("run-1")
 
 
+def test_client_list_runs_filters_on_target_id_not_workflow_id(monkeypatch) -> None:
+    """`/runs` has no `workflow_id` parameter, and FastAPI drops unknown ones in silence.
+
+    Sending it looked like a filter and was not: every run in the workspace came back,
+    so one project's runs appeared under another project's workflow.
+    """
+    seen: list[dict[str, Any]] = []
+
+    def fake_request(method: str, path: str, params: Any = None) -> Any:
+        seen.append(params)
+        return []
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "request", fake_request)
+
+    client.list_runs(workflow_id="wf-1", target_type="workflow", limit=5)
+    assert seen[-1] == {"target_id": "wf-1", "target_type": "workflow", "limit": 5}
+    assert "workflow_id" not in seen[-1]
+
+    # The kind is inferred when only the id is given.
+    client.list_runs(function_id="fn-1", limit=5)
+    assert seen[-1] == {"target_id": "fn-1", "target_type": "function", "limit": 5}
+    client.list_runs(model_id="m-1", limit=5)
+    assert seen[-1] == {"target_id": "m-1", "target_type": "model", "limit": 5}
+
+    # And target_id still works on its own, for callers that already speak the API's shape.
+    client.list_runs(target_id="wf-1", target_type="workflow", limit=5)
+    assert seen[-1] == {"target_id": "wf-1", "target_type": "workflow", "limit": 5}
+
+    # An unfiltered listing stays unfiltered.
+    client.list_runs(limit=5)
+    assert seen[-1] == {"limit": 5}
+
+
+def test_client_list_runs_rejects_contradictory_targets(monkeypatch) -> None:
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "request", lambda *a, **k: [])
+
+    with pytest.raises(rb.RebaseWorkflowError, match="one target at a time"):
+        client.list_runs(workflow_id="wf-1", function_id="fn-1")
+    with pytest.raises(rb.RebaseWorkflowError, match="target_id=other"):
+        client.list_runs(workflow_id="wf-1", target_id="other")
+    with pytest.raises(rb.RebaseWorkflowError, match="target_type='function'"):
+        client.list_runs(workflow_id="wf-1", target_type="function")
+
+
 def test_current_run_reads_the_runner_s_environment(monkeypatch) -> None:
     """Read per call, not cached: the steps of one run share a process."""
     monkeypatch.delenv("REBASE_RUN_ID", raising=False)
@@ -748,7 +794,8 @@ def test_client_lists_runs_serializes_time_and_source_filters(monkeypatch) -> No
     )
 
     assert observed["params"] == {
-        "workflow_id": "workflow-id",
+        "target_id": "workflow-id",
+        "target_type": "workflow",
         "since": "2026-07-04T09:00:00+00:00",
         "until": "2026-07-11T09:00:00+00:00",
         "status": "succeeded",

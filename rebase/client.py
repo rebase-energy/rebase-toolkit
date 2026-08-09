@@ -179,6 +179,39 @@ PROJECT_BATCH_DELETE_LIMIT = 100
 ROUTE_ABSENT_STATUSES = frozenset({404, 405})
 
 
+def _resolve_run_target(
+    *,
+    target_id: str | None,
+    target_type: str | None,
+    workflow_id: str | None,
+    function_id: str | None,
+    model_id: str | None,
+) -> tuple[str | None, str | None]:
+    """Collapse the per-kind run filters onto the `(target_id, target_type)` the API has.
+
+    `/runs` has never had a `workflow_id` parameter. Sending one looked like a filter
+    and was not: unknown query parameters are dropped without complaint, so the call
+    came back with every run in the workspace and one project's runs showed up under
+    another project's workflow.
+    """
+    named = [
+        (identifier, kind)
+        for identifier, kind in ((workflow_id, "workflow"), (function_id, "function"), (model_id, "model"))
+        if identifier is not None
+    ]
+    if len(named) > 1:
+        kinds = ", ".join(kind for _, kind in named)
+        raise RebaseWorkflowError(f"list_runs takes one target at a time, got {kinds}")
+    if not named:
+        return target_id, target_type
+    identifier, kind = named[0]
+    if target_id is not None and target_id != identifier:
+        raise RebaseWorkflowError(f"list_runs got target_id={target_id} and {kind}_id={identifier}")
+    if target_type is not None and target_type != kind:
+        raise RebaseWorkflowError(f"list_runs got target_type={target_type!r} and {kind}_id={identifier}")
+    return identifier, kind
+
+
 def _batch_failure_message(failure: dict[str, Any]) -> str:
     """Flatten one batch-delete failure into a line worth showing a user."""
     detail = failure.get("detail")
@@ -3662,6 +3695,7 @@ class Client:
         workflow_id: str | None = None,
         function_id: str | None = None,
         model_id: str | None = None,
+        target_id: str | None = None,
         target_type: str | None = None,
         since: datetime | str | None = None,
         until: datetime | str | None = None,
@@ -3669,14 +3703,26 @@ class Client:
         trigger_source: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
+        """Runs, newest first. Name what ran with `target_id` + `target_type`.
+
+        `workflow_id` / `function_id` / `model_id` are kept as spellings of the same
+        filter, because a run's own `workflow_id` column is null for an ordinary
+        registered run -- what it ran is `target_type` + `target_id`, and that is what
+        `/runs` filters on.
+        """
+        resolved_id, resolved_type = _resolve_run_target(
+            target_id=target_id,
+            target_type=target_type,
+            workflow_id=workflow_id,
+            function_id=function_id,
+            model_id=model_id,
+        )
         params = {
             key: value
             for key, value in {
                 "project_id": project_id,
-                "workflow_id": workflow_id,
-                "function_id": function_id,
-                "model_id": model_id,
-                "target_type": target_type,
+                "target_id": resolved_id,
+                "target_type": resolved_type,
                 "since": since.isoformat() if isinstance(since, datetime) else since,
                 "until": until.isoformat() if isinstance(until, datetime) else until,
                 "status": status,

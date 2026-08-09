@@ -857,7 +857,9 @@ def local_rebase_api() -> Iterator[tuple[str, list[tuple[str, dict[str, list[str
             elif parsed.path == "/workflows/workflow-id/versions/workflow-version-id":
                 payload = workflow_version
             elif parsed.path == "/runs":
-                payload = [run] if query.get("workflow_id") == ["workflow-id"] else []
+                # Mirrors the real API: it filters on target_id and has no
+                # workflow_id parameter at all.
+                payload = [run] if query.get("target_id") == ["workflow-id"] else []
             elif parsed.path == "/runs/run-id":
                 payload = run
             elif parsed.path == "/runs/run-id/events":
@@ -964,7 +966,7 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
             assert any(path == "/workflows" for path, _, _ in seen_requests)
             assert any(
                 path == "/runs"
-                and query.get("workflow_id") == ["workflow-id"]
+                and query.get("target_id") == ["workflow-id"]
                 and query.get("target_type") == ["workflow"]
                 and query.get("limit") == ["5"]
                 for path, query, _ in seen_requests
