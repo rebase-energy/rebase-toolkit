@@ -162,14 +162,18 @@ class TestBatchDeleteProjects:
         monkeypatch.setattr("requests.request", explode)
         assert _client().delete_projects([]) == []
 
-    def test_an_api_without_the_route_falls_back_to_one_by_one(self, monkeypatch) -> None:
+    # 404 is the obvious way for an API to say "no such route". 405 is what it actually
+    # says: without the batch route, `/projects/batch-delete` is matched by
+    # `/projects/{project_id}`, so the path resolves and only the method is refused.
+    @pytest.mark.parametrize(("status", "detail"), [(404, "Not Found"), (405, "Method Not Allowed")])
+    def test_an_api_without_the_route_falls_back_to_one_by_one(self, monkeypatch, status, detail) -> None:
         """A toolkit ahead of its platform must still delete."""
         calls: list[tuple[str, str]] = []
 
         def fake_request(method: str, url: str, **_kwargs: Any) -> Any:
             calls.append((method, url))
             if method == "POST":
-                return FakeConflictResponse("Not Found", status_code=404)
+                return FakeConflictResponse(detail, status_code=status)
             return FakeNoContentResponse()
 
         monkeypatch.setattr("requests.request", fake_request)

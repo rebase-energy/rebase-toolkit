@@ -153,6 +153,13 @@
 
 ### Fixed
 
+- **Deleting a project failed with `Method Not Allowed` against an API without the batch-delete
+  route.** The fallback to one request per project was reached on a 404, and 404 is not what such
+  an API answers: `/projects/batch-delete` is matched by `/projects/{project_id}`, so the path
+  resolves with `project_id="batch-delete"` and only the method is refused — `POST` comes back 405
+  with `Allow: GET`. The 405 was treated as a genuine error and surfaced instead, so `d` on a
+  project could not delete anything at all. Both statuses now mean "this route is not here".
+
 - **An empty workspace no longer looks like one that is still loading.** The TUI drew nothing
   either way, so pointing a profile at an empty workspace read as a hang. It now says
   `No projects in workspace <id>` and how to refresh or switch.

@@ -169,6 +169,13 @@ def _endpoint_for_callable(fn: Callable[..., Any] | None) -> EndpointConfig | No
 #: Projects per batch-delete request. Must not exceed the API's own ceiling,
 #: which rejects a longer list rather than truncating it.
 PROJECT_BATCH_DELETE_LIMIT = 100
+#: What an API that does not have a route answers, and 404 is not the whole of it.
+#: `/projects/batch-delete` is matched by `/projects/{project_id}` on a deployment
+#: without the batch route, so the path resolves and only the method is refused:
+#: `POST` comes back 405 with `Allow: GET`, never 404. Treating that as a genuine
+#: error is what surfaced "Delete failed -- Method Not Allowed" instead of falling
+#: back to one request per project.
+ROUTE_ABSENT_STATUSES = frozenset({404, 405})
 
 
 def _batch_failure_message(failure: dict[str, Any]) -> str:
@@ -2546,7 +2553,8 @@ class Client:
         rather than raising on them.
 
         Falls back to one request per project against an API too old to have the
-        batch route, so a toolkit ahead of its platform still deletes.
+        batch route -- see `ROUTE_ABSENT_STATUSES` for how such an API says so --
+        so a toolkit ahead of its platform still deletes.
         """
         if not project_ids:
             return []
@@ -2558,7 +2566,7 @@ class Client:
             try:
                 response = self.request("POST", "/projects/batch-delete", json={"project_ids": chunk, "force": force})
             except RebaseWorkflowError as exc:
-                if exc.status_code != 404:
+                if exc.status_code not in ROUTE_ABSENT_STATUSES:
                     raise
                 failures.extend(self._delete_projects_one_by_one(chunk, force=force))
                 continue
