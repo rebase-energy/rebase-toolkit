@@ -45,16 +45,17 @@
   rows are where "which one of them failed" survives. Against an API without the route the
   method returns no tasks rather than raising, so an older platform costs the rows and not the
   run view.
-- **`[ All ] [ Steps ] [ Logs ] [ Tasks ]` over the timeline.** A run's lifecycle events, its
-  steps, the tasks fanned out inside them and its log output were one undifferentiated list, and
-  the question was usually about one of them. The chips filter it; `left`/`right` step between
-  them, the same gesture the target pane already uses, and `l` jumps straight to Logs. `All`
+- **`[ All ] [ Steps ] [ Events ] [ Logs ] [ Tasks ]` over the timeline.** A run's lifecycle
+  events, its steps, the tasks fanned out inside them and its log output were one
+  undifferentiated list, and the question was usually about one of them. The chips filter it;
+  `left`/`right` step between them, the same gesture the target pane already uses, while `l`
+  jumps straight to Logs and `e` to Events, each going back to All on a second press. `All`
   keeps everything interleaved by time and adds a Type column saying which each row is — dropped
-  under the other three, where every row would repeat one word. `Logs` carries the platform's
-  own stage events alongside the runtime's output: both are the run talking, one in stages and
-  one in prose. An empty filter says why it is empty rather than showing a blank table, which is
-  how a workflow with no step graph now tells you so. One `Tabs` over one table, not four panes
-  holding four slices of the same run.
+  under the others, where every row would repeat one word. `Events` and `Logs` overlap on
+  purpose: the stages are the run's own account of itself, so they belong both to "what
+  happened" and to "everything it said". An empty filter says why it is empty rather than
+  showing a blank table, which is how a workflow with no step graph now tells you so. One `Tabs`
+  over one table, not five panes holding five slices of the same run.
 - **A timeline row too wide for the pane can be read two ways.** The table scrolls sideways —
   `^pgup`/`^pgdn`, the wheel, or the bar — where the others stay clipped, because a log line is
   not a column you can widen your way out of. And `enter`, or a click, opens the row out: the
