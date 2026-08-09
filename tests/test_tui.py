@@ -17,7 +17,7 @@ from textual.coordinate import Coordinate
 from textual.events import MouseMove
 from textual.geometry import Offset
 from textual.selection import Selection
-from textual.widgets import DataTable, Header, Input, OptionList, Static, TabbedContent
+from textual.widgets import DataTable, Footer, Header, Input, OptionList, Static, TabbedContent
 from textual.widgets._toast import Toast
 
 from rebase import config as config_module
@@ -2789,16 +2789,48 @@ def test_tui_notifications_wear_the_app_s_colours_and_hug_their_text() -> None:
             await pilot.pause(0.3)
 
             toast = app.query_one(Toast)
-            assert toast.size.height == 1  # not Textual's four
-            assert toast.styles.background.hex == "#1A201D"
-            assert toast.styles.border_left[1].hex == "#03C497"
+            assert toast.styles.border_top[1].hex == "#03C497"
+            # Standing clear of the footer, not sharing its row: the footer is the last
+            # line, and the toast's region has to end above it.
+            footer = app.query_one(Footer)
+            assert toast.region.y + toast.region.height <= footer.region.y
 
-            # Each hugs its own text rather than all being one fixed width.
+            # Each is sized to its own text rather than all being one fixed width.
             app.notify("Could not load logs for run 8547eb63: 404 Not Found", severity="error")
             await pilot.pause(0.3)
-            widths = {t.size.width for t in app.query(Toast)}
-            assert len(widths) == 2, widths
+            assert len({t.region.width for t in app.query(Toast)}) == 2
             error = next(t for t in app.query(Toast) if t.has_class("-error"))
-            assert error.styles.border_left[1].hex == "#E46962"
+            assert error.styles.border_top[1].hex == "#E46962"
+
+    asyncio.run(scenario())
+
+
+def test_tui_footer_shows_only_the_keys_you_move_around_with() -> None:
+    """Ten hints did not fit the width; the rest are one keystroke away in the key panel."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
+
+        async with app.run_test(size=(150, 26)) as pilot:
+            await pilot.pause(0.3)
+            shown = [
+                binding.key
+                for _, binding, enabled, _ in app.screen.active_bindings.values()
+                if enabled and binding.show
+            ]
+            assert shown == ["tab", "q", "r", "b"]
+
+            # Hidden, but still bound and still listed by the key panel.
+            hidden = {
+                binding.key: binding.description
+                for _, binding, _, _ in app.screen.active_bindings.values()
+                if not binding.show
+            }
+            for key in ("d", "o", "s", "p", "l", "m"):
+                assert key in hidden, key
+            assert hidden["m"] == "Maximise pane"
+
+            tab = next(b for _, b, _, _ in app.screen.active_bindings.values() if b.key == "tab")
+            assert tab.description == "Next pane"
 
     asyncio.run(scenario())

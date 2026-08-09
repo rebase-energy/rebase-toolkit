@@ -19,6 +19,11 @@
   a step. `input_bindings` is untouched, so the graph still distinguishes a dependency that
   carries a value from one that is only order. Existing deployments keep the graph they were
   compiled with; the change applies from the next deploy.
+- **The footer shows the four keys you move around with** — `tab` (now *Next pane*), `q`, `r`,
+  `b` — and the command palette. Ten hints did not fit the width, so `m Maximi` was being cut in
+  half and anything after it was simply gone. The rest are still bound and are listed in the key
+  panel, which shows hidden bindings too, so nothing became less discoverable than the half-hint
+  it replaced.
 - **`rb.current_run()`, and `Function.map` attributes its batch to the step that issued it.**
   A map from inside a workflow step *is* that step's tasks, but the platform could not know it:
   the batch is created by the map request, and the request said nothing about where it came
@@ -201,11 +206,11 @@
 ### Fixed
 
 - **Notifications no longer look like they belong to another program.** Textual's toast is a
-  grey `$panel` slab 60 cells wide and four rows tall whatever it has to say, floating a row
-  above the footer — the one widget on screen still wearing the default theme. It now takes the
-  app's own background, hugs its text on a single row, and sits down on the footer. Stacking and
-  the severity colours are Textual's and are kept, re-pointed at the brand green, amber and
-  coral so a warning and an error still read apart at a glance.
+  grey `$panel` slab 60 cells wide whatever it has to say — the one widget on screen still
+  wearing the default theme. It is a bordered card in the brand green now, sized to its text and
+  standing clear of the footer instead of sharing a row with the key hints. Stacking and the
+  severity split are Textual's and are kept, re-pointed at the brand green, amber and coral, so
+  a warning and an error read apart before you read them.
 
 - **`p` did nothing in the timeline box.** The drawer resolved a record per row, and a log line
   or a lifecycle stage has none, so it said "select a row first" while sitting on a run's own

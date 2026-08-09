@@ -1217,17 +1217,20 @@ class RebaseTuiApp(App[None]):
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
         ("b", "back", "Back"),
-        ("d", "delete_selection", "Delete"),
-        ("o", "open_source", "Open source"),
-        ("s", "toggle_terminal_select", "Select text"),
-        ("p", "show_details", "Details"),
-        ("l", "toggle_logs", "Logs"),
-        ("m", "maximise_box", "Maximise"),
-        Binding("plus,+,equals_sign,=", "resize_box(1)", "Resize"),
-        Binding("minus,-,underscore,_", "resize_box(-1)", "Shrink", show=False),
-        Binding("0", "reset_box_heights", "Reset sizes", show=False),
+        # Everything below stays out of the footer and lives in the key panel, which
+        # lists `show=False` bindings too. Ten hints did not fit the width, so the four
+        # you move around with kept their places and the rest went one keystroke away.
+        Binding("d", "delete_selection", "Delete", show=False),
+        Binding("o", "open_source", "Open source", show=False),
+        Binding("s", "toggle_terminal_select", "Select text", show=False),
+        Binding("p", "show_details", "Details", show=False),
+        Binding("l", "toggle_logs", "Logs", show=False),
+        Binding("m", "maximise_box", "Maximise pane", show=False),
+        Binding("plus,+,equals_sign,=", "resize_box(1)", "Grow pane", show=False),
+        Binding("minus,-,underscore,_", "resize_box(-1)", "Shrink pane", show=False),
+        Binding("0", "reset_box_heights", "Reset pane sizes", show=False),
         # priority: the screen's default `tab` -> focus_next otherwise shadows this.
-        Binding("tab", "cycle_box", "Next box", priority=True),
+        Binding("tab", "cycle_box", "Next pane", priority=True),
         # Textual's own `ctrl+c,super+c` copies the selection; these adjust it first.
         Binding("shift+right", "adjust_text_selection(1)", "Grow selection", show=False),
         Binding("shift+left", "adjust_text_selection(-1)", "Shrink selection", show=False),
@@ -1362,35 +1365,40 @@ class RebaseTuiApp(App[None]):
         scrollbar-size-vertical: 1;
     }}
 
-    /* Textual's toast is the one widget still wearing the default theme: a grey
-       `$panel` slab 60 cells wide with a message four words long in it, floating a row
-       above the footer. Hug the text, take the app's own background, and sit down on
-       the footer. Stacking and the severity colours are Textual's and are kept. */
+    /* Textual's toast is a grey `$panel` slab 60 cells wide whatever it has to say.
+       This one is the app's own: a bordered card in the brand green, sized to its text,
+       standing clear of the footer rather than sharing a row with the key hints. The
+       border is the whole point — a message has to be unmissable, and a background a
+       shade off the app's is not. Stacking and severity are Textual's, re-coloured. */
     ToastRack {{
-        margin-bottom: 0;
+        margin-bottom: 1;
+        margin-right: 2;
     }}
 
     Toast {{
         width: auto;
+        min-width: 32;
         max-width: 60%;
-        padding: 0 1;
-        margin-top: 0;
-        margin-right: 1;
-        background: #1a201d;
+        padding: 0 2;
+        margin-top: 1;
+        background: #16211d;
         color: #E8F0ED;
-        border-left: outer {BRAND_BRIGHT_GREEN};
+        text-style: bold;
+        border: round {BRAND_BRIGHT_GREEN};
     }}
 
     Toast.-information {{
-        border-left: outer {BRAND_BRIGHT_GREEN};
+        border: round {BRAND_BRIGHT_GREEN};
     }}
 
     Toast.-warning {{
-        border-left: outer {BRAND_AMBER};
+        border: round {BRAND_AMBER};
+        background: #241f14;
     }}
 
     Toast.-error {{
-        border-left: outer {BRAND_CORAL_RED};
+        border: round {BRAND_CORAL_RED};
+        background: #241618;
     }}
 
     Toast .toast--title {{
@@ -1683,7 +1691,7 @@ class RebaseTuiApp(App[None]):
         """Give the focused box the whole project view. `b` or `m` again gives it back."""
         selectors = self._box_selectors()
         if len(selectors) < 2:
-            self.notify("Only one box is open — it already has the screen.", severity="warning")
+            self.notify("Only one pane is open — it already has the screen.", severity="warning")
             return
         focused = self._focused_box_selector(selectors)
         self._maximised = None if self._maximised == focused else focused
@@ -1701,7 +1709,7 @@ class RebaseTuiApp(App[None]):
         self._box_heights = {}
         self._maximised = None
         self._apply_box_heights()
-        self.notify("Box sizes back to their defaults.")
+        self.notify("Pane sizes back to their defaults.")
 
     def begin_box_drag(self, selector: str, y: int) -> None:
         self._drag_box = (selector, y, self._box_height(selector))
