@@ -29,10 +29,11 @@
   A map from a laptop still belongs to no run, which the platform accepts.
 - **The run drawer separates what a run was given from what it returned.** Its head is labelled
   lines — `Run ID:` spelled out in full rather than truncated, since the drawer is where you go
-  to copy it, and `Status:` on its own line in its own colour — closed by a rule. Below it
-  `Input — parameters` and `Output — result` each head a rule of their own rather than being two
-  keys in one JSON blob, and a failed run shows `Output — error` above its result. The rules are
-  Rich's, drawn to the drawer's real width, so they are lines rather than a guess at one.
+  to copy it, and `Status:` on its own line in its own colour. Two full-width rules then split
+  it into three: that head, the run's `parameters`, and its `result` (with `error` alongside,
+  for a run that has one). Each body keeps its own top-level key rather than taking a caption,
+  because the key is genuinely part of the document. The rules are Rich's, drawn to the drawer's
+  real width, so they are lines rather than a guess at one.
 - **`Client.list_run_tasks(run_id, step_run_id=...)`**, and **the TUI's timeline shows a step's
   tasks** indented under it, one row per unit of work with its own status, its parameters and
   either its result or its error. A step reports one outcome for everything inside it; the task

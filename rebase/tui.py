@@ -1049,11 +1049,7 @@ class DetailDrawer(ModalScreen[None]):
        to the drawer's width, so they stay lines rather than a guess at a line. */
     .detail-rule {{
         color: {BRAND_MEDIUM_GRAY};
-    }}
-
-    .detail-heading {{
-        color: {BRAND_AMBER};
-        margin-top: 1;
+        margin: 1 0;
     }}
 
     #detail-body {{
@@ -1069,12 +1065,13 @@ class DetailDrawer(ModalScreen[None]):
     }}
     """
 
-    def __init__(self, *, fields: Sequence[DetailField], sections: Sequence[tuple[str, Any]]) -> None:
+    def __init__(self, *, fields: Sequence[DetailField], sections: Sequence[Any]) -> None:
         super().__init__()
         #: Labelled lines at the top: what this is, and its state.
         self.fields = list(fields)
-        #: (heading, payload) pairs, each under its own titled rule. An empty heading
-        #: renders the payload alone, for a record that does not divide in two.
+        #: One JSON body per section, separated by a rule. The section says what it is
+        #: through its own top-level key -- `parameters`, `result` -- rather than through
+        #: a caption above it, because that key is genuinely part of the document.
         self.sections = list(sections)
 
     @property
@@ -1084,7 +1081,7 @@ class DetailDrawer(ModalScreen[None]):
     @property
     def payload(self) -> Any:
         """The first section's body, which is the whole record for a single-section drawer."""
-        return self.sections[0][1] if self.sections else None
+        return self.sections[0] if self.sections else None
 
     def compose(self) -> ComposeResult:
         # Labels padded to a common width so the values line up under each other.
@@ -1099,9 +1096,9 @@ class DetailDrawer(ModalScreen[None]):
                 )
             yield Static(Rule(style=BRAND_MEDIUM_GRAY), classes="detail-rule")
             with VerticalScroll(id="detail-body"):
-                for heading, payload in self.sections:
-                    if heading:
-                        yield Static(Rule(heading, align="left", style=BRAND_MEDIUM_GRAY), classes="detail-heading")
+                for index, payload in enumerate(self.sections):
+                    if index:
+                        yield Static(Rule(style=BRAND_MEDIUM_GRAY), classes="detail-rule")
                     yield Static(JSON(json.dumps(payload, indent=2, sort_keys=True, default=str)))
             yield Static("Arrow keys scroll. p or escape closes.", id="detail-hint")
 
@@ -2490,10 +2487,12 @@ class RebaseTuiApp(App[None]):
         come to copy it — and the status gets its own line instead of riding along
         after a separator.
         """
-        sections: list[tuple[str, Any]] = [("Input — parameters", run.get("parameters") or {})]
+        # The key stays on the document rather than becoming a caption above it: what
+        # you are looking at is the run's `parameters`, and that is what it should say.
+        output: dict[str, Any] = {"result": run.get("result")}
         if run.get("error"):
-            sections.append(("Output — error", run["error"]))
-        sections.append(("Output — result", run.get("result")))
+            output["error"] = run["error"]
+        sections: list[Any] = [{"parameters": run.get("parameters") or {}}, output]
         status = str(run.get("status", "unknown"))
         return DetailDrawer(
             fields=[
@@ -2524,16 +2523,13 @@ class RebaseTuiApp(App[None]):
             return DetailDrawer(
                 fields=[DetailField("Project", str(summary.project.get("name", "-")))],
                 sections=[
-                    (
-                        "",
-                        detail_payload(
-                            summary.project,
-                            functions=summary.function_count,
-                            workflows=summary.workflow_count,
-                            cron_jobs=summary.cron_count,
-                            endpoints=summary.endpoint_count,
-                        ),
-                    )
+                    detail_payload(
+                        summary.project,
+                        functions=summary.function_count,
+                        workflows=summary.workflow_count,
+                        cron_jobs=summary.cron_count,
+                        endpoints=summary.endpoint_count,
+                    ),
                 ],
             )
         if table_id == "functions-table":
@@ -2547,21 +2543,18 @@ class RebaseTuiApp(App[None]):
                     DetailField("State", format_bool(item.get("enabled"))),
                 ],
                 sections=[
-                    (
-                        "",
-                        detail_payload(
-                            item,
-                            endpoints=self._endpoint_details("function", key),
-                            step_of=[
-                                {
-                                    "workflow": step.workflow_name,
-                                    "node_key": step.node_key,
-                                    "after": list(step.upstream),
-                                }
-                                for step in steps
-                            ],
-                        ),
-                    )
+                    detail_payload(
+                        item,
+                        endpoints=self._endpoint_details("function", key),
+                        step_of=[
+                            {
+                                "workflow": step.workflow_name,
+                                "node_key": step.node_key,
+                                "after": list(step.upstream),
+                            }
+                            for step in steps
+                        ],
+                    ),
                 ],
             )
         if table_id == "workflows-table":
@@ -2578,17 +2571,14 @@ class RebaseTuiApp(App[None]):
                     DetailField("State", format_bool(item.get("enabled"))),
                 ],
                 sections=[
-                    (
-                        "",
-                        detail_payload(
-                            item,
-                            endpoints=self._endpoint_details("workflow", key),
-                            steps=[
-                                {"node_key": step.node_key, "function": step.name, "after": list(step.upstream)}
-                                for step in own
-                            ],
-                        ),
-                    )
+                    detail_payload(
+                        item,
+                        endpoints=self._endpoint_details("workflow", key),
+                        steps=[
+                            {"node_key": step.node_key, "function": step.name, "after": list(step.upstream)}
+                            for step in own
+                        ],
+                    ),
                 ],
             )
         return None

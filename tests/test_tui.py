@@ -2352,6 +2352,7 @@ def test_tui_p_opens_the_selected_row_as_json() -> None:
             assert isinstance(app.screen, DetailDrawer)
             assert [(f.label, f.value) for f in app.screen.fields] == [("Project", "energy")]
             assert app.screen.payload["workflows"] == 1
+            assert len(app.screen.sections) == 1
             await pilot.press("escape")
             await pilot.pause(0.2)
 
@@ -2372,10 +2373,11 @@ def test_tui_p_opens_the_selected_row_as_json() -> None:
                 ("Run ID", "run-id"),
                 ("Status", "succeeded"),
             ]
-            # Input and output are separate sections, not one blob.
+            # Input and output are separate sections, each naming itself with the key
+            # it actually has in the record rather than a caption above it.
             assert drawer.sections == [
-                ("Input — parameters", {"site_id": "site-001"}),
-                ("Output — result", {"ok": True}),
+                {"parameters": {"site_id": "site-001"}},
+                {"result": {"ok": True}},
             ]
 
             # p closes it again, the way it opened it.
@@ -2767,8 +2769,6 @@ def test_tui_run_drawer_puts_an_error_before_the_result() -> None:
     drawer = app._run_drawer(run)
 
     assert [(f.label, f.value) for f in drawer.fields] == [("Run ID", "run-9"), ("Status", "failed")]
-    assert [heading for heading, _ in drawer.sections] == [
-        "Input — parameters",
-        "Output — error",
-        "Output — result",
-    ]
+    # Two sections, so two rules: what it was given, and what came back — the error
+    # belonging with the result rather than to a section of its own.
+    assert drawer.sections == [{"parameters": {"a": 1}}, {"error": "boom", "result": None}]
