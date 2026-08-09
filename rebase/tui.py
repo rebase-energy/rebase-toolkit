@@ -13,6 +13,7 @@ from typing import Any, Literal
 from zoneinfo import ZoneInfo, available_timezones
 
 from rich.json import JSON
+from rich.rule import Rule
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult, RenderResult, SuspendNotSupported
@@ -144,6 +145,15 @@ class WorkspaceOverviewData:
     projects: list[dict[str, Any]]
     project_summaries: list[ProjectSummary]
     project_names: dict[str, str]
+
+
+@dataclass(frozen=True)
+class DetailField:
+    """One labelled line at the top of the details drawer."""
+
+    label: str
+    value: str
+    style: str = ""
 
 
 @dataclass(frozen=True)
@@ -1034,20 +1044,15 @@ class DetailDrawer(ModalScreen[None]):
         border-left: solid {BRAND_BRIGHT_GREEN};
     }}
 
-    #detail-title {{
-        color: {BRAND_BRIGHT_GREEN};
-        text-style: bold;
+    /* Rules the eye stops at. The input a run was given and the output it produced are
+       two different things, and one JSON blob made them look like one. Rich draws these
+       to the drawer's width, so they stay lines rather than a guess at a line. */
+    .detail-rule {{
+        color: {BRAND_MEDIUM_GRAY};
     }}
 
-    #detail-subtitle {{
-        margin-bottom: 1;
-    }}
-
-    /* A rule the eye stops at. The input a run was given and the output it produced
-       are two different things, and a single JSON blob made them look like one. */
     .detail-heading {{
         color: {BRAND_AMBER};
-        text-style: bold;
         margin-top: 1;
     }}
 
@@ -1064,21 +1069,17 @@ class DetailDrawer(ModalScreen[None]):
     }}
     """
 
-    def __init__(
-        self,
-        *,
-        title: str,
-        sections: Sequence[tuple[str, Any]],
-        subtitle: str = "",
-        subtitle_style: str = "",
-    ) -> None:
+    def __init__(self, *, fields: Sequence[DetailField], sections: Sequence[tuple[str, Any]]) -> None:
         super().__init__()
-        self.drawer_title = title
-        self.subtitle = subtitle
-        self.subtitle_style = subtitle_style
-        #: (heading, payload) pairs, rendered in order under their own rule. An empty
-        #: heading renders the payload alone, for records that are not split in two.
+        #: Labelled lines at the top: what this is, and its state.
+        self.fields = list(fields)
+        #: (heading, payload) pairs, each under its own titled rule. An empty heading
+        #: renders the payload alone, for a record that does not divide in two.
         self.sections = list(sections)
+
+    @property
+    def drawer_title(self) -> str:
+        return self.fields[0].value if self.fields else ""
 
     @property
     def payload(self) -> Any:
@@ -1086,13 +1087,21 @@ class DetailDrawer(ModalScreen[None]):
         return self.sections[0][1] if self.sections else None
 
     def compose(self) -> ComposeResult:
+        # Labels padded to a common width so the values line up under each other.
+        width = max((len(field.label) for field in self.fields), default=0)
         with Vertical(id="detail-drawer"):
-            yield Static(Text(self.drawer_title), id="detail-title")
-            yield Static(Text(self.subtitle, style=self.subtitle_style), id="detail-subtitle")
+            for field in self.fields:
+                yield Static(
+                    Text.assemble(
+                        (f"{field.label + ':':<{width + 1}} ", f"bold {BRAND_BRIGHT_GREEN}"),
+                        (field.value, field.style),
+                    )
+                )
+            yield Static(Rule(style=BRAND_MEDIUM_GRAY), classes="detail-rule")
             with VerticalScroll(id="detail-body"):
                 for heading, payload in self.sections:
                     if heading:
-                        yield Static(Text(heading), classes="detail-heading")
+                        yield Static(Rule(heading, align="left", style=BRAND_MEDIUM_GRAY), classes="detail-heading")
                     yield Static(JSON(json.dumps(payload, indent=2, sort_keys=True, default=str)))
             yield Static("Arrow keys scroll. p or escape closes.", id="detail-hint")
 
@@ -2485,10 +2494,12 @@ class RebaseTuiApp(App[None]):
         if run.get("error"):
             sections.append(("Output — error", run["error"]))
         sections.append(("Output — result", run.get("result")))
+        status = str(run.get("status", "unknown"))
         return DetailDrawer(
-            title=f"Run {run.get('id', '-')}",
-            subtitle=str(run.get("status", "unknown")),
-            subtitle_style=status_style(run.get("status")),
+            fields=[
+                DetailField("Run ID", str(run.get("id", "-"))),
+                DetailField("Status", status, status_style(status)),
+            ],
             sections=sections,
         )
 
@@ -2511,7 +2522,7 @@ class RebaseTuiApp(App[None]):
             if summary is None:
                 return None
             return DetailDrawer(
-                title=f"Project {summary.project.get('name', '-')}",
+                fields=[DetailField("Project", str(summary.project.get("name", "-")))],
                 sections=[
                     (
                         "",
@@ -2531,7 +2542,10 @@ class RebaseTuiApp(App[None]):
                 return None
             steps = self._steps_by_function.get(key, [])
             return DetailDrawer(
-                title=f"Function {item.get('name', '-')}",
+                fields=[
+                    DetailField("Function", str(item.get("name", "-"))),
+                    DetailField("State", format_bool(item.get("enabled"))),
+                ],
                 sections=[
                     (
                         "",
@@ -2559,7 +2573,10 @@ class RebaseTuiApp(App[None]):
                 key=lambda step: step.order,
             )
             return DetailDrawer(
-                title=f"Workflow {item.get('name', '-')}",
+                fields=[
+                    DetailField("Workflow", str(item.get("name", "-"))),
+                    DetailField("State", format_bool(item.get("enabled"))),
+                ],
                 sections=[
                     (
                         "",

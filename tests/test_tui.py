@@ -709,7 +709,10 @@ def test_tui_app_shows_the_endpoint_column_and_the_two_target_chips() -> None:
             await pilot.pause(0.2)
             drawer = app.screen
             assert isinstance(drawer, DetailDrawer)
-            assert drawer.drawer_title == "Workflow forecast"
+            assert [(f.label, f.value) for f in drawer.fields] == [
+                ("Workflow", "forecast"),
+                ("State", "enabled"),
+            ]
             assert drawer.payload["endpoints"][0]["url"] == "https://api.example.com/e/energy-workspace/energy/forecast"
             await pilot.press("escape")
             await pilot.pause(0.2)
@@ -2347,7 +2350,7 @@ def test_tui_p_opens_the_selected_row_as_json() -> None:
             await pilot.press("p")
             await pilot.pause(0.2)
             assert isinstance(app.screen, DetailDrawer)
-            assert app.screen.drawer_title == "Project energy"
+            assert [(f.label, f.value) for f in app.screen.fields] == [("Project", "energy")]
             assert app.screen.payload["workflows"] == 1
             await pilot.press("escape")
             await pilot.pause(0.2)
@@ -2364,9 +2367,11 @@ def test_tui_p_opens_the_selected_row_as_json() -> None:
             await pilot.pause(0.2)
             drawer = app.screen
             assert isinstance(drawer, DetailDrawer)
-            # The id is spelled out in full, and the status has a line of its own.
-            assert drawer.drawer_title == "Run run-id"
-            assert drawer.subtitle == "succeeded"
+            # The id is spelled out in full, each on a labelled line of its own.
+            assert [(f.label, f.value) for f in drawer.fields] == [
+                ("Run ID", "run-id"),
+                ("Status", "succeeded"),
+            ]
             # Input and output are separate sections, not one blob.
             assert drawer.sections == [
                 ("Input — parameters", {"site_id": "site-001"}),
@@ -2748,8 +2753,10 @@ def test_tui_p_in_the_timeline_opens_the_run_it_belongs_to() -> None:
             await pilot.pause(0.2)
             drawer = app.screen
             assert isinstance(drawer, DetailDrawer)
-            assert drawer.drawer_title == "Run run-id"
-            assert drawer.subtitle == "succeeded"
+            assert [(f.label, f.value) for f in drawer.fields] == [
+                ("Run ID", "run-id"),
+                ("Status", "succeeded"),
+            ]
 
     asyncio.run(scenario())
 
@@ -2759,8 +2766,7 @@ def test_tui_run_drawer_puts_an_error_before_the_result() -> None:
     app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
     drawer = app._run_drawer(run)
 
-    assert drawer.drawer_title == "Run run-9"
-    assert drawer.subtitle == "failed"
+    assert [(f.label, f.value) for f in drawer.fields] == [("Run ID", "run-9"), ("Status", "failed")]
     assert [heading for heading, _ in drawer.sections] == [
         "Input — parameters",
         "Output — error",

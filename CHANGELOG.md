@@ -27,11 +27,12 @@
   answer "which task failed, and in which step". Read per call rather than cached, because the
   steps of one run share a process and a value captured at import would name the wrong step.
   A map from a laptop still belongs to no run, which the platform accepts.
-- **The run drawer separates what a run was given from what it returned.** The id is spelled
-  out in full instead of truncated — the drawer is where you go to copy it — the status has a
-  line of its own rather than riding after a separator, and `Input — parameters` and
-  `Output — result` sit under their own rules instead of being two keys in one JSON blob. A
-  failed run shows its error under `Output — error`, above the result.
+- **The run drawer separates what a run was given from what it returned.** Its head is labelled
+  lines — `Run ID:` spelled out in full rather than truncated, since the drawer is where you go
+  to copy it, and `Status:` on its own line in its own colour — closed by a rule. Below it
+  `Input — parameters` and `Output — result` each head a rule of their own rather than being two
+  keys in one JSON blob, and a failed run shows `Output — error` above its result. The rules are
+  Rich's, drawn to the drawer's real width, so they are lines rather than a guess at one.
 - **`Client.list_run_tasks(run_id, step_run_id=...)`**, and **the TUI's timeline shows a step's
   tasks** indented under it, one row per unit of work with its own status, its parameters and
   either its result or its error. A step reports one outcome for everything inside it; the task
