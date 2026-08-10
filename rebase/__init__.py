@@ -64,6 +64,7 @@ from rebase.public import (
 )
 from rebase.runtime import RunContext, current_run
 from rebase.stitch import Exclude, Layer, StitchError, stitch
+from rebase.tasks import Task, TaskReportingError, task
 from rebase.timing import Duration, ForecastWindow
 from rebase.version import __version__
 
@@ -112,6 +113,8 @@ __all__ = [
     "Volume",
     "Simulator",
     "Step",
+    "Task",
+    "TaskReportingError",
     "TriggerContext",
     "Workflow",
     "__version__",
@@ -134,6 +137,7 @@ __all__ = [
     "projects",
     "sources",
     "step",
+    "task",
     "stitch",
     "update_workspace",
     "workspace",

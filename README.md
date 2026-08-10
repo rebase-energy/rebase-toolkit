@@ -180,6 +180,37 @@ project.deploy()
 print(forecast.remote(site_id="site-001"))
 ```
 
+## Tasks
+
+Use `rb.task` to report named units of work inside a function or workflow. The
+body still runs inline in the current process; a task adds status visibility, not
+new compute or retries.
+
+```python
+@project.workflow()
+def capture(datasets: list[str]) -> dict:
+    failed = []
+    for dataset in datasets:
+        try:
+            with rb.task(
+                f"Capture {dataset}",
+                key=dataset,
+                parameters={"dataset": dataset},
+            ) as task:
+                rows = fetch_and_store(dataset)
+                task.set_result({"outcome": "captured", "rows": rows})
+        except Exception as exc:
+            failed.append({"dataset": dataset, "error": str(exc)})
+    return {"failed": failed}
+```
+
+Entering the context reports `running`; a normal exit reports `succeeded`, and
+an exception reports `failed` before being re-raised. Catch outside the context
+when later tasks should continue. `set_result()` is optional and records a
+JSON-object domain result; lifecycle status stays `succeeded` for outcomes such
+as skipped or pending. Outside a hosted Rebase run the same context manager is a
+transparent in-memory no-op, which keeps local execution ordinary Python.
+
 Deploy a file from the command line:
 
 ```bash

@@ -4158,12 +4158,10 @@ class Client:
         return response
 
     def list_run_tasks(self, run_id: str, *, step_run_id: str | None = None) -> list[dict[str, Any]]:
-        """The individual pieces of work fanned out inside a run's steps.
+        """The named inline and Function.map tasks reported for a run.
 
-        A step reports one outcome for everything inside it; its tasks are where
-        "which one failed" survives. Empty for a run whose steps fan out into nothing,
-        and against an API without the route — the caller gets a run with no tasks
-        rather than a broken run view.
+        Empty when no tasks were reported, and against an API without the route —
+        the caller gets a run with no tasks rather than a broken run view.
         """
         params = {"step_run_id": step_run_id} if step_run_id is not None else None
         try:
@@ -4174,6 +4172,18 @@ class Client:
             raise
         if not isinstance(response, list):
             raise RebaseWorkflowError("expected run task list response")
+        return response
+
+    def create_run_task(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self.request("POST", f"/runs/{run_id}/tasks", json=payload)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected run task response")
+        return response
+
+    def complete_run_task(self, run_id: str, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self.request("PATCH", f"/runs/{run_id}/tasks/{task_id}", json=payload)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected run task response")
         return response
 
     def list_run_events(self, run_id: str) -> list[dict[str, Any]]:
@@ -5970,6 +5980,9 @@ class Run:
 
     def steps(self) -> list[dict[str, Any]]:
         return self.client.list_run_steps(self.id)
+
+    def tasks(self) -> list[dict[str, Any]]:
+        return self.client.list_run_tasks(self.id)
 
     def events(self) -> list[dict[str, Any]]:
         return self.client.list_run_events(self.id)
