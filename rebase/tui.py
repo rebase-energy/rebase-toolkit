@@ -4,12 +4,14 @@ import asyncio
 import json
 import textwrap
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, tzinfo
+from functools import partial
 from pathlib import Path
+from time import monotonic
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, available_timezones
 
@@ -22,6 +24,7 @@ from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.content import Content
 from textual.coordinate import Coordinate
+from textual.css.query import NoMatches
 from textual.geometry import Offset
 from textual.message import Message
 from textual.screen import ModalScreen
@@ -90,6 +93,11 @@ CONFIRM_WORD = "delete"
 MARK_STYLE = f"bold {BRAND_AMBER}"
 #: Concurrent requests used to collect the workspace overview's per-project function counts.
 OVERVIEW_FANOUT_WORKERS = 16
+#: How many of a project's runs to read when working out when each function last ran.
+LAST_RUN_SCAN_LIMIT = 200
+#: How many recent workflow runs to open for their step rows. A step's executions are
+#: only reachable per run, so this bounds the cost of answering for steps at all.
+LAST_RUN_STEP_SCAN = 5
 #: Concurrent requests used to collect a project's per-workflow step graphs.
 STEP_GRAPH_FANOUT_WORKERS = 8
 #: The run, its events, its steps and its tasks: four independent reads behind one
@@ -105,8 +113,32 @@ REVEAL_LEVELS: tuple[tuple[str, ...], ...] = (
 TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "projects-table": ("Project", "Functions", "Workflows", "Cron jobs", "Endpoints"),
     "workspace-profiles-table": ("Active", "Profile", "Workspace", "Workspace ID", "API URL"),
-    "functions-table": ("Name", "Workflow", "Step", "Run type", "State", "Endpoint", "Version", "Updated"),
-    "workflows-table": ("Name", "Run type", "State", "Endpoint", "Schedule", "Next run", "Version", "Updated"),
+    # `Origin` sits second in both: you read what a thing is called, then what kind of
+    # thing it is, and every column after it is one a one-off has no answer for.
+    "functions-table": (
+        "Name",
+        "Origin",
+        "Workflow",
+        "Step",
+        "Run type",
+        "State",
+        "Endpoint",
+        "Last run",
+        "Version",
+        "Updated",
+    ),
+    "workflows-table": (
+        "Name",
+        "Origin",
+        "Run type",
+        "State",
+        "Endpoint",
+        "Schedule",
+        "Next run",
+        "Last run",
+        "Version",
+        "Updated",
+    ),
     "runs-table": ("Run", "Status", "Trigger", "Created", "Started", "Finished", "Duration"),
     # The Type column only earns its place under `All`; every other filter would
     # repeat one word down the whole table. See `_timeline_columns`.
@@ -118,9 +150,44 @@ TARGET_TABS: tuple[tuple[str, str], ...] = (
     ("workflows-tab", "#workflows-table"),
     ("functions-tab", "#functions-table"),
 )
+#: The two tables a project's targets are drawn into, without their `#`.
+TARGET_TABLE_IDS: tuple[str, ...] = ("workflows-table", "functions-table")
+#: How often the screen refreshes itself. `rebase tui --refresh-interval 0` turns it off.
+AUTO_REFRESH_SECONDS = 10.0
+#: How long after a keypress to leave the screen alone, so rows do not move under a
+#: cursor that is still being driven.
+KEYPRESS_QUIET_SECONDS = 2.0
+#: Consecutive silent failures before a refresh problem is worth interrupting for. One
+#: flaky request on a timer is not news; three in a row is.
+AUTO_REFRESH_FAILURE_LIMIT = 3
+#: Run states still worth re-reading. Anything else has finished and cannot change, so
+#: polling its timeline is pure cost — and that is exactly where a reader is scrolling.
+LIVE_RUN_STATUSES = frozenset({"queued", "submitted", "accepted", "starting", "pending", "running"})
+#: Tables whose place is put back after a repaint. Anything the reader can move a cursor
+#: through, mark rows in, or scroll sideways — see `RebaseTuiApp._preserve_view`.
+PRESERVED_TABLE_IDS: tuple[str, ...] = (
+    "projects-table",
+    *TARGET_TABLE_IDS,
+    "runs-table",
+    "timeline-table",
+)
 #: The project view's stacked boxes, top to bottom. One per reveal level. Each box below
 #: the first resizes the one above it by its own column header — see `DragHeaderTable`.
 BOX_SELECTORS: tuple[str, ...] = ("#target-tabs", "#runs-table", "#timeline-pane")
+#: Prefixes a synthetic row's key so it cannot collide with a target's uuid, and so the
+#: selection handler can tell the two apart from the key alone.
+EPHEMERAL_ROW_PREFIX = "ephemeral:"
+#: The Origin column. A one-off run — `rebase run` against local source — registers no
+#: target, so it has no row of its own and used to be invisible here. It is grouped under
+#: the name it ran as and listed among the deployed targets, told apart by this column
+#: rather than by a filter: both kinds answer "what has run as `collect`", and a toggle
+#: would mean only ever seeing half the answer. Deploying the same name adds a `deployed`
+#: row beside the `one-off` one, carrying the schedule and version it now has.
+ORIGIN_DEPLOYED = "deployed"
+ORIGIN_ONE_OFF = "one-off"
+#: Runs scanned when grouping one-off runs into rows, and the ceiling on how many of a
+#: single group's runs the runs table then lists.
+EPHEMERAL_SCAN_LIMIT = 200
 #: What the timeline's chips filter down to. `logs` carries the platform's own
 #: lifecycle events as well: both are the run talking, one in stages and one in output.
 TIMELINE_FILTERS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
@@ -155,6 +222,16 @@ TIMELINE_WRAP_MINIMUM = 30
 RUN_LOG_LIMIT = 200
 #: Fields too long to belong in the details drawer, and what to say instead.
 ELIDED_DETAIL_KEYS = ("source_code",)
+
+
+@dataclass(frozen=True)
+class TableView:
+    """Where the reader was inside one table, so a repaint can put them back."""
+
+    cursor_key: str | None
+    marked: tuple[str, ...]
+    scroll_x: float
+    scroll_y: float
 
 
 @dataclass(frozen=True)
@@ -210,6 +287,26 @@ class WorkflowStep:
 
 
 @dataclass(frozen=True)
+class EphemeralGroup:
+    """The one-off runs of a single unregistered target, as one row.
+
+    Grouped by the name the run declared rather than by run, because a name is what the
+    author re-runs: five `rebase run …::collect` invocations are one thing tried five
+    times, and listing them as five rows would bury the deployed targets they sit next to.
+    """
+
+    name: str
+    target_type: str
+    run_type: str
+    runs: int
+    last_run: str | None
+
+    @property
+    def row_key(self) -> str:
+        return f"{EPHEMERAL_ROW_PREFIX}{self.target_type}:{self.name}"
+
+
+@dataclass(frozen=True)
 class ProjectTargetsData:
     project: dict[str, Any]
     functions: list[dict[str, Any]]
@@ -217,12 +314,19 @@ class ProjectTargetsData:
     endpoints: list[dict[str, Any]]
     #: Every step of every workflow in the project, workflow by workflow.
     steps: tuple[WorkflowStep, ...] = ()
+    #: When each function last executed, by function id. See `load_last_runs`.
+    last_runs: dict[str, str] = field(default_factory=dict)
+    #: One entry per name that has only ever run one-off. See `group_ephemeral_runs`.
+    ephemeral: tuple[EphemeralGroup, ...] = ()
 
     def steps_by_function(self) -> dict[str, list[WorkflowStep]]:
         grouped: dict[str, list[WorkflowStep]] = {}
         for step in self.steps:
             grouped.setdefault(step.function_id, []).append(step)
         return grouped
+
+    def ephemeral_by_type(self, target_type: str) -> tuple[EphemeralGroup, ...]:
+        return tuple(group for group in self.ephemeral if group.target_type == target_type)
 
 
 @dataclass(frozen=True)
@@ -262,6 +366,55 @@ def _optional_list(load: Callable[[], list[dict[str, Any]]]) -> list[dict[str, A
         return []
 
 
+def _ephemeral_identity(run: dict[str, Any]) -> tuple[str, str] | None:
+    """The (target_type, name) a one-off run ran as, or None if it is not one.
+
+    `is_ephemeral` is the authority rather than a null `target_id`: a run can be missing
+    a target for other reasons, and inferring "one-off" from absence would sweep those in
+    under a name that was never declared.
+    """
+    if not run.get("is_ephemeral"):
+        return None
+    target = run.get("ephemeral_target")
+    if not isinstance(target, dict):
+        return None
+    name = target.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    target_type = run.get("target_type")
+    return (target_type if isinstance(target_type, str) and target_type else "workflow", name)
+
+
+def group_ephemeral_runs(runs: list[dict[str, Any]]) -> tuple[EphemeralGroup, ...]:
+    """One row per name that has run one-off, most recently run first.
+
+    Ordered by recency rather than by name because these rows sit under the deployed
+    ones, where the useful question is what you ran last, not what it was called.
+    """
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for run in runs:
+        identity = _ephemeral_identity(run)
+        if identity is None:
+            continue
+        when = run.get("started_at") or run.get("created_at")
+        entry = grouped.setdefault(identity, {"runs": 0, "last_run": None, "run_type": run.get("run_type")})
+        entry["runs"] += 1
+        if isinstance(when, str) and when > (entry["last_run"] or ""):
+            entry["last_run"] = when
+    return tuple(
+        EphemeralGroup(
+            name=name,
+            target_type=target_type,
+            run_type=str(entry["run_type"] or "-"),
+            runs=int(entry["runs"]),
+            last_run=entry["last_run"],
+        )
+        for (target_type, name), entry in sorted(
+            grouped.items(), key=lambda item: (item[1]["last_run"] or "", item[0][1]), reverse=True
+        )
+    )
+
+
 class RebaseTuiData:
     def __init__(self, client: Client | None = None, *, project: str | None = None, limit: int = 100) -> None:
         self.client = client or Client()
@@ -290,25 +443,25 @@ class RebaseTuiData:
         )
 
     def _overview_counts(self, projects: list[dict[str, Any]]) -> OverviewCounts:
-        """Every count the project table shows, gathered concurrently.
+        """Every count the project table shows: three workspace-wide calls, in parallel.
 
-        Workflows and endpoints each come from one workspace-wide call, because those
-        objects carry their `project_id`. Functions have no such route and stay one
-        request per project. All of it shares a single pool, so the overview costs
-        roughly one round trip's wait instead of one per project.
+        Every one of these objects carries its own `project_id`, so each column is one
+        request for the whole workspace rather than one per project. Functions used to be
+        the exception — no workspace-wide route existed, so the overview issued a request
+        per project purely to fill a column — serially, inside the client — and opening the
+        workspace view got slower with every project added. `GET /functions` closed that;
+        the client keeps a per-project fallback for an older API, so a toolkit ahead of its
+        platform loses the speed rather than the column.
         """
-        project_ids = [str(project["id"]) for project in projects]
-        with ThreadPoolExecutor(max_workers=min(OVERVIEW_FANOUT_WORKERS, len(project_ids) + 2)) as executor:
+        with ThreadPoolExecutor(max_workers=OVERVIEW_FANOUT_WORKERS) as executor:
             workflows = executor.submit(self._workflow_and_cron_counts)
             # Endpoints are supplementary here, as they are in load_project_targets: an API
             # without the route should cost the column, not the whole overview.
             endpoints = executor.submit(self._counts_by_project, lambda: _optional_list(self.client.list_endpoints))
-            functions = list(
-                executor.map(lambda project_id: len(self.client.list_functions(project_id=project_id)), project_ids)
-            )
+            functions = executor.submit(self._counts_by_project, self.client.list_functions)
         workflow_counts, cron_counts = workflows.result()
         return OverviewCounts(
-            functions=dict(zip(project_ids, functions, strict=True)),
+            functions=functions.result(),
             workflows=workflow_counts,
             endpoints=endpoints.result(),
             crons=cron_counts,
@@ -337,16 +490,122 @@ class RebaseTuiData:
         return Counter(str(item["project_id"]) for item in load() if item.get("project_id"))
 
     def load_project_targets(self, project: dict[str, Any]) -> ProjectTargetsData:
+        """Everything behind opening a project, for callers that want it in one piece."""
+        base, runs = self.load_project_base(project)
+        return self.load_project_detail(base, runs)
+
+    def load_project_base(self, project: dict[str, Any]) -> tuple[ProjectTargetsData, list[dict[str, Any]]]:
+        """The four reads that depend on nothing, issued together.
+
+        These used to be four statements, which made them four round trips: the argument
+        list of a constructor is evaluated in order, so `list_functions` waited on
+        `list_runs` for no reason other than where it was written. Nothing here needs
+        anything from the others, and the API answers concurrent reads in the time of the
+        slowest one, so together they cost one round trip instead of four.
+
+        Returns the runs alongside the targets because `load_project_detail` needs them
+        and they are the most expensive read here — asking twice would give the second
+        phase its own round trip and undo the point.
+        """
         project_id = str(project["id"])
-        workflows = self.client.list_workflows(project_id=project_id)
-        return ProjectTargetsData(
-            project=project,
-            functions=self.client.list_functions(project_id=project_id),
-            workflows=workflows,
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            workflows = executor.submit(self.client.list_workflows, project_id=project_id)
+            functions = executor.submit(self.client.list_functions, project_id=project_id)
             # Supplementary data: never let it take down the function/workflow view.
-            endpoints=_optional_list(lambda: self.client.list_project_endpoints(project_id)),
-            steps=self.load_workflow_steps(workflows),
+            endpoints = executor.submit(lambda: _optional_list(lambda: self.client.list_project_endpoints(project_id)))
+            runs = executor.submit(
+                lambda: _optional_list(lambda: self.client.list_runs(project_id=project_id, limit=EPHEMERAL_SCAN_LIMIT))
+            )
+        run_rows = runs.result()
+        return (
+            ProjectTargetsData(
+                project=project,
+                functions=functions.result(),
+                workflows=workflows.result(),
+                endpoints=endpoints.result(),
+                # Grouping one-off runs is local work on the runs already read, so the
+                # rows it produces are there from the first paint.
+                ephemeral=group_ephemeral_runs(run_rows),
+            ),
+            run_rows,
         )
+
+    def load_project_detail(self, base: ProjectTargetsData, runs: list[dict[str, Any]]) -> ProjectTargetsData:
+        """The two reads that needed the first phase's answers, also issued together.
+
+        Step graphs need the workflows and last-run times need the runs, but neither
+        needs the other.
+        """
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            steps = executor.submit(self.load_workflow_steps, base.workflows)
+            last_runs = executor.submit(self.load_last_runs, str(base.project["id"]), runs)
+        return replace(base, steps=steps.result(), last_runs=last_runs.result())
+
+    def load_ephemeral_runs(self, name: str, target_type: str, project_id: str) -> list[dict[str, Any]]:
+        """The one-off runs that ran under *name*, newest first.
+
+        Filtered here rather than by the API: `/runs` selects on `target_id`, which is
+        exactly what these runs do not have. The name lives in `ephemeral_target`, a
+        column the route does not filter on, so the project's runs are read and matched
+        locally.
+        """
+        runs = self.client.list_runs(project_id=project_id, limit=EPHEMERAL_SCAN_LIMIT)
+        return [run for run in runs if _ephemeral_identity(run) == (target_type, name)]
+
+    def load_last_runs(self, project_id: str, runs: list[dict[str, Any]] | None = None) -> dict[str, str]:
+        """When each workflow and function last executed, by target id.
+
+        Keyed on the run's `target_id`, not `function_id` or `workflow_id`: those two
+        come back null on the list route, so keying on them finds nothing. Ids do not
+        collide across kinds, so one mapping serves both tables.
+
+        Two sources, because a function is executed two different ways. A workflow or a
+        standalone function gets its own run, so the project's run list answers for those
+        in one request. A *step* never does — its executions live in `step_runs`, which
+        the API exposes only per run — so this also reads the step rows of the most recent
+        workflow runs, capped at `LAST_RUN_STEP_SCAN` requests.
+
+        That cap is the honest limit of this column: a step that last ran longer ago than
+        the scanned window shows no time rather than a wrong one. An ephemeral run has no
+        registered target and so belongs to no *deployed* row, which is why its null
+        target_id is skipped here rather than treated as missing data — it is picked up
+        instead by `group_ephemeral_runs`, which gives it a row of its own. Supplementary
+        like the endpoint list — a run history that will not load must not cost you the
+        table.
+
+        Takes `runs` when the caller has already read them, so the project view pays for
+        the project's run list once rather than once per thing derived from it.
+        """
+        if runs is None:
+            runs = _optional_list(lambda: self.client.list_runs(project_id=project_id, limit=LAST_RUN_SCAN_LIMIT))
+        latest: dict[str, str] = {}
+
+        def record(target_id: Any, when: Any) -> None:
+            if not isinstance(target_id, str) or not isinstance(when, str) or not when:
+                return
+            if when > latest.get(target_id, ""):
+                latest[target_id] = when
+
+        workflow_run_ids: list[str] = []
+        for run in runs:
+            record(run.get("target_id"), run.get("started_at") or run.get("created_at"))
+            # Ephemeral runs are skipped here as well as above: their steps are not
+            # registered functions either, so opening them spends one of a capped number
+            # of requests to attribute a time to a row that does not exist.
+            if run.get("is_ephemeral"):
+                continue
+            if run.get("target_type") == "workflow" and isinstance(run.get("id"), str):
+                workflow_run_ids.append(str(run["id"]))
+
+        scanned = workflow_run_ids[:LAST_RUN_STEP_SCAN]
+        if scanned:
+            with ThreadPoolExecutor(max_workers=min(OVERVIEW_FANOUT_WORKERS, len(scanned))) as executor:
+                for steps in executor.map(
+                    lambda run_id: _optional_list(lambda: self.client.list_run_steps(run_id)), scanned
+                ):
+                    for step in steps:
+                        record(step.get("function_id"), step.get("started_at") or step.get("created_at"))
+        return latest
 
     def load_workflow_steps(self, workflows: list[dict[str, Any]]) -> tuple[WorkflowStep, ...]:
         """The step graph of every workflow in the project, read concurrently.
@@ -854,6 +1113,9 @@ class SelectableDataTable(DataTable):
     def watch_cursor_coordinate(self, old_coordinate: Coordinate, new_coordinate: Coordinate) -> None:
         super().watch_cursor_coordinate(old_coordinate, new_coordinate)
         # Moving off a range without shift held is how you abandon it.
+        app = self.app
+        if isinstance(app, RebaseTuiApp):
+            app.note_interaction()
         if getattr(self, "_extending", True) or old_coordinate.row == new_coordinate.row:
             return
         if getattr(self, "_marked", None):
@@ -877,6 +1139,18 @@ class SelectableDataTable(DataTable):
     def action_clear_marks(self) -> None:
         self._anchor = None
         self._apply_marks(set())
+
+    def restore_marks(self, keys: Iterable[str]) -> None:
+        """Re-mark *keys*, ignoring any whose row is gone.
+
+        A repaint rebuilds the rows, so marks cannot survive on their own. Rows that
+        disappeared are dropped rather than remembered: a mark on a row that is no longer
+        there would be a delete waiting to act on nothing. The anchor is reset for the
+        same reason — its index no longer means anything after a rebuild.
+        """
+        present = {str(row.key.value) for row in self.ordered_rows if row.key.value is not None}
+        self._anchor = None
+        self._apply_marks({key for key in keys if key in present})
 
     def _apply_marks(self, marked: set[str]) -> None:
         if marked == self._marked:
@@ -1346,12 +1620,22 @@ class RebaseTuiApp(App[None]):
     }}
 
     #projects-table,
-    #workflows-table,
-    #functions-table,
     #runs-table,
     #timeline-table {{
         overflow-x: hidden;
         scrollbar-size-horizontal: 0;
+        scrollbar-background: #101412;
+        scrollbar-background-hover: #101412;
+        scrollbar-background-active: #101412;
+    }}
+
+    /* The target tables outgrow their width: nine columns each, three of them
+       timestamps. They keep a horizontal scrollbar rather than clipping, so "Last run"
+       is reachable on a narrow terminal instead of merely absent. */
+    #functions-table,
+    #workflows-table {{
+        overflow-x: auto;
+        scrollbar-size-horizontal: 1;
         scrollbar-background: #101412;
         scrollbar-background-hover: #101412;
         scrollbar-background-active: #101412;
@@ -1525,11 +1809,20 @@ class RebaseTuiApp(App[None]):
         data: RebaseTuiData | None = None,
         project: str | None = None,
         limit: int = 100,
+        refresh_interval: float = AUTO_REFRESH_SECONDS,
     ) -> None:
         super().__init__()
         self.data = data or RebaseTuiData(client, project=project, limit=limit)
         self.project = project
         self.limit = limit
+        #: Seconds between automatic refreshes; 0 disables the timer entirely.
+        self._refresh_interval = max(0.0, refresh_interval)
+        self._last_key_at = 0.0
+        self._refresh_failures = 0
+        #: How to re-read the open runs box, captured when a target was selected. A
+        #: deployed target and a one-off group are read two different ways, and the tick
+        #: should not have to re-derive which it is looking at.
+        self._runs_reload: Callable[[bool], Awaitable[None]] | None = None
         self.profile_name = selected_profile_name()
         self.profile_data = load_profile(self.profile_name)
         self.workspace_overview: WorkspaceOverviewData | None = None
@@ -1537,6 +1830,8 @@ class RebaseTuiApp(App[None]):
         self.selected_project: dict[str, Any] | None = None
         self.selected_target_type: TargetType | None = None
         self.selected_target: dict[str, Any] | None = None
+        #: One-off run groups by synthetic row key, alongside the real target rows.
+        self._ephemeral_rows: dict[str, EphemeralGroup] = {}
         self.current_view: ViewName = "workspace"
         self.view_before_switcher: ViewName = "workspace"
         self._project_rows: dict[str, ProjectSummary] = {}
@@ -1545,6 +1840,7 @@ class RebaseTuiApp(App[None]):
         self._workflow_rows: dict[str, dict[str, Any]] = {}
         self._steps_by_function: dict[str, list[WorkflowStep]] = {}
         self._endpoints_by_target: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self._last_runs: dict[str, str] = {}
         self._run_rows: dict[str, dict[str, Any]] = {}
         self._run_detail: RunDetailData | None = None
         #: Which of the timeline's chips is showing. `l` jumps to the logs one.
@@ -1609,6 +1905,8 @@ class RebaseTuiApp(App[None]):
         self.action_refresh()
         # Own group: this must never cancel, or be cancelled by, the overview load.
         self.run_worker(self._bootstrap_search_path(), name="bootstrap", group="tui-bootstrap")
+        if self._refresh_interval:
+            self.set_interval(self._refresh_interval, self._refresh_tick)
 
     def _workspace_key(self) -> str:
         # A method rather than a cached attribute so switching workspace picks up the
@@ -1858,6 +2156,59 @@ class RebaseTuiApp(App[None]):
         panel.styles.display = "none" if message is None else "block"
         panel.update(Text(message or ""))
 
+    @contextmanager
+    def _preserve_view(self) -> Iterator[None]:
+        """Put the reader back where they were after the block repaints.
+
+        A repaint rebuilds every row, so the cursor drops to the top, marked rows are
+        forgotten and the horizontal scroll resets. That is a nuisance when *you* pressed
+        `r` and unusable when a timer did, so every refresh path wraps its render in this.
+
+        Restores by row key rather than index, because a repaint is also what reorders and
+        removes rows. Focus is restored too: a repaint of the table that has it can leave
+        the focus somewhere the keys no longer do what the reader expects.
+        """
+        snapshot = {
+            table_id: view for table_id in PRESERVED_TABLE_IDS if (view := self._table_view(table_id)) is not None
+        }
+        focused_id = self.focused.id if self.focused is not None else None
+        try:
+            yield
+        finally:
+            for table_id, view in snapshot.items():
+                self._restore_table_view(table_id, view)
+            if focused_id is not None:
+                with suppress(NoMatches):
+                    self.query_one(f"#{focused_id}").focus()
+
+    def _table_view(self, table_id: str) -> TableView | None:
+        try:
+            table = self.query_one(f"#{table_id}", DataTable)
+        except NoMatches:
+            return None
+        marked = tuple(table.marked_keys) if isinstance(table, SelectableDataTable) else ()
+        return TableView(
+            cursor_key=self._cursor_key(table),
+            marked=marked,
+            scroll_x=table.scroll_x,
+            scroll_y=table.scroll_y,
+        )
+
+    def _restore_table_view(self, table_id: str, view: TableView) -> None:
+        try:
+            table = self.query_one(f"#{table_id}", DataTable)
+        except NoMatches:
+            return
+        if view.cursor_key is not None:
+            # The row may be gone — a run finished and dropped off the page, a function was
+            # deleted. Leaving the cursor at the top is the honest answer then.
+            with suppress(Exception):
+                table.move_cursor(row=table.get_row_index(view.cursor_key))
+        if view.marked and isinstance(table, SelectableDataTable):
+            table.restore_marks(view.marked)
+        if view.scroll_x or view.scroll_y:
+            table.scroll_to(x=view.scroll_x, y=view.scroll_y, animate=False)
+
     def _fill_table(self, table_id: str, *, widget: str | None = None) -> DataTable:
         """Empty a table and give it its header back, ready for rows.
 
@@ -1907,13 +2258,90 @@ class RebaseTuiApp(App[None]):
             return
         if self.current_view == "project" and self.selected_project is not None:
             self.run_worker(
-                self._load_project_targets(self.selected_project),
+                self._load_project_targets(self.selected_project, preserve=True),
                 name="project-targets",
                 group="tui",
                 exclusive=True,
             )
             return
-        self.run_worker(self._load_workspace_overview(), name="overview", group="tui", exclusive=True)
+        self.run_worker(self._load_workspace_overview(preserve=True), name="overview", group="tui", exclusive=True)
+
+    def on_key(self, event: events.Key) -> None:
+        """Note that the reader is driving, so the timer can leave them alone.
+
+        Best effort: a key a focused widget consumes never reaches here, which is why the
+        tables also report cursor movement through `note_interaction`.
+        """
+        self.note_interaction()
+
+    def note_interaction(self) -> None:
+        self._last_key_at = monotonic()
+
+    def _refresh_tick(self) -> None:
+        """Re-read whatever is on screen, quietly, on the timer.
+
+        Nothing here is new work: it drives the same loaders `r` does, with `preserve` so
+        the reader keeps their place and `announce=False` so a blip on a timer does not
+        yank the view or raise a toast. `exclusive=True` on the shared worker group means a
+        tick that arrives while the last one is still running is dropped, not queued.
+        """
+        if self._refresh_tick_paused():
+            return
+        if self.current_view == "workspace":
+            self.run_worker(
+                self._load_workspace_overview(preserve=True, announce=False),
+                name="auto-refresh",
+                group="tui",
+                exclusive=True,
+            )
+            return
+        if self.current_view == "project" and self.selected_project is not None:
+            self.run_worker(self._refresh_tick_project(), name="auto-refresh", group="tui", exclusive=True)
+
+    def _refresh_tick_paused(self) -> bool:
+        """Whether now is a bad moment to move the screen.
+
+        Each of these is a case where a repaint would take something away from the reader
+        rather than give them something: a dialog whose row list is what they are about to
+        act on, a text selection they are halfway through making, a delete already in
+        flight, or a cursor they are still driving.
+        """
+        if len(self.screen_stack) > 1:
+            return True
+        if self._terminal_select:
+            return True
+        if self.screen.selections:
+            return True
+        if any(worker.group == "tui-delete" for worker in self.workers):
+            return True
+        return monotonic() - self._last_key_at < KEYPRESS_QUIET_SECONDS
+
+    async def _refresh_tick_project(self) -> None:
+        """The project view, top box to bottom, stopping where the screen stops.
+
+        Only the boxes that are open are re-read, and a finished run's timeline is left
+        alone: it cannot change, and it is the one place the reader is most likely to be
+        scrolling through output.
+        """
+        if self.selected_project is None:
+            return
+        await self._load_project_targets(self.selected_project, preserve=True, announce=False)
+        if self._reveal_level >= 1 and self._runs_reload is not None:
+            await self._runs_reload(False)
+        if self._reveal_level >= 2 and self._live_run_id is not None:
+            await self._load_run_detail(self._live_run_id, preserve=True, announce=False)
+
+    @property
+    def _live_run_id(self) -> str | None:
+        """The selected run's id while it can still change, else None."""
+        detail = self._run_detail
+        if detail is None:
+            return None
+        run = detail.run
+        if str(run.get("status") or "").lower() not in LIVE_RUN_STATUSES:
+            return None
+        run_id = run.get("id")
+        return str(run_id) if run_id else None
 
     def action_back(self) -> None:
         if self.current_view == "workspace-switcher":
@@ -2100,6 +2528,15 @@ class RebaseTuiApp(App[None]):
         keys = table.marked_keys or [key for key in (table.cursor_key,) if key is not None]
         items = [(key, name) for key in keys if (name := self._delete_label(kind, key)) is not None]
         if not items:
+            # A one-off row is dropped by `_delete_label` along with anything else that
+            # names no target, which is the safe outcome but a confusing thing to be told
+            # "nothing selected" about when a row is plainly under the cursor.
+            if keys and all(str(key).startswith(EPHEMERAL_ROW_PREFIX) for key in keys):
+                self.notify(
+                    "A one-off run registers no target, so there is nothing to delete.",
+                    severity="warning",
+                )
+                return
             self.notify(f"No {kind} selected.", severity="warning")
             return
         self.push_screen(
@@ -2323,49 +2760,116 @@ class RebaseTuiApp(App[None]):
         self._marked_count = len(event.marked)
         self._update_workspace_title()
 
-    async def _load_workspace_overview(self) -> None:
+    async def _load_workspace_overview(self, *, preserve: bool = False, announce: bool = True) -> None:
         try:
             overview = await asyncio.to_thread(self.data.load_workspace_overview)
         except Exception as exc:
-            self._set_error(exc)
+            self._set_error(exc, announce=announce)
             return
+        self._refresh_failures = 0
         self.workspace_overview = overview
         self.project_targets = None
         self.selected_project = None
         self.selected_target = None
         self.selected_target_type = None
-        self._render_workspace_overview(overview)
+        with self._preserve_view() if preserve else nullcontext():
+            self._render_workspace_overview(overview)
         self._clear_target_detail()
         self._show_workspace_view()
 
-    async def _load_project_targets(self, project: dict[str, Any]) -> None:
+    async def _load_project_targets(
+        self, project: dict[str, Any], *, preserve: bool = False, announce: bool = True
+    ) -> None:
+        """Paint the tables as soon as the targets are known, then fill in the rest.
+
+        Step graphs and last-run times take a second round trip, and holding the whole
+        view back for them meant staring at an empty box for twice as long as the names
+        actually took to arrive. The first paint is everything the first phase read; the
+        second fills the Last run column and the functions' workflow grouping.
+        """
         try:
-            targets = await asyncio.to_thread(self.data.load_project_targets, project)
+            base, runs = await asyncio.to_thread(self.data.load_project_base, project)
         except Exception as exc:
-            self._set_error(exc)
+            self._set_error(exc, announce=announce)
+            return
+        self._refresh_failures = 0
+        self.project_targets = base
+        with self._preserve_view() if preserve else nullcontext():
+            self._render_project_targets(base, preserve=preserve)
+
+        try:
+            targets = await asyncio.to_thread(self.data.load_project_detail, base, runs)
+        except Exception as exc:
+            # The names are already on screen and still usable; say what is missing
+            # rather than replacing a working table with an error.
+            self._set_error(exc, announce=announce)
             return
         self.project_targets = targets
-        self._render_project_targets(targets)
+        # Preserved: by now the reader may have moved the cursor, or opened a target and
+        # be looking at its runs. The second paint is a detail they did not ask for, and
+        # it must not take a selection away to deliver one.
+        with self._preserve_view():
+            self._render_project_targets(targets, preserve=True)
 
-    async def _load_runs(self, target_type: TargetType, target_id: str) -> None:
+    async def _load_runs(self, target_type: TargetType, target_id: str, announce: bool = True) -> None:
         try:
             runs = await asyncio.to_thread(self.data.load_target_runs, target_type, target_id)
         except Exception as exc:
-            self._set_error(exc)
+            self._set_error(exc, announce=announce)
             return
-        self._render_runs(runs)
+        with self._preserve_view() if not announce else nullcontext():
+            self._render_runs(runs)
 
-    async def _load_run_detail(self, run_id: str) -> None:
+    def _select_ephemeral(self, row_key: str) -> None:
+        """Open a one-off row's runs, the same way selecting a deployed target does."""
+        group = self._ephemeral_rows.get(row_key)
+        if group is None or self.selected_project is None:
+            return
+        self.selected_target_type = "workflow" if group.target_type == "workflow" else "function"
+        # A dict standing in for the target row the drawer and the runs box expect. It
+        # carries no id or version because there is no registered object behind it.
+        self.selected_target = {
+            "name": group.name,
+            "origin": ORIGIN_ONE_OFF,
+            "target_type": group.target_type,
+            "run_type": group.run_type,
+            "runs": group.runs,
+            "last_run": group.last_run,
+        }
+        self._reveal(1)
+        self._runs_reload = partial(self._load_ephemeral_runs, group, str(self.selected_project["id"]))
+        self.run_worker(
+            self._load_ephemeral_runs(group, str(self.selected_project["id"])),
+            name="runs",
+            group="tui",
+            exclusive=True,
+        )
+
+    async def _load_ephemeral_runs(self, group: EphemeralGroup, project_id: str, announce: bool = True) -> None:
+        try:
+            runs = await asyncio.to_thread(self.data.load_ephemeral_runs, group.name, group.target_type, project_id)
+        except Exception as exc:
+            self._set_error(exc, announce=announce)
+            return
+        with self._preserve_view() if not announce else nullcontext():
+            self._render_runs(runs)
+
+    async def _load_run_detail(self, run_id: str, *, preserve: bool = False, announce: bool = True) -> None:
         target_type = (self._run_rows.get(run_id) or {}).get("target_type")
         try:
             detail = await asyncio.to_thread(self.data.load_run_detail, run_id, target_type=target_type)
         except Exception as exc:
-            self._set_error(exc)
+            self._set_error(exc, announce=announce)
             return
+        self._refresh_failures = 0
         self._run_detail = detail
-        self._expanded_timeline.clear()
+        if not preserve:
+            # Opening a different run starts folded. Re-reading the one already open must
+            # not fold the rows the reader expanded to look at.
+            self._expanded_timeline.clear()
         self._run_logs[run_id] = detail.logs
-        self._render_timeline()
+        with self._preserve_view() if preserve else nullcontext():
+            self._render_timeline()
 
     @property
     def _reading_logs(self) -> bool:
@@ -2451,42 +2955,87 @@ class RebaseTuiApp(App[None]):
                 key=profile_name,
             )
 
-    def _render_project_targets(self, targets: ProjectTargetsData) -> None:
+    def _render_project_targets(self, targets: ProjectTargetsData, *, preserve: bool = False) -> None:
+        """Draw both target tables. With *preserve*, keep where the reader already was.
+
+        A repaint rebuilds the rows, which drops the cursor back to the top and would
+        otherwise clear the runs box below. Under *preserve* the reader's place is put back
+        by `_preserve_view` — cursor by key, marked rows, and scroll — and anything already
+        open is left alone.
+        """
+        self._last_runs = targets.last_runs
         self._steps_by_function = targets.steps_by_function()
         self._function_rows = self._ordered_functions(targets)
         self._workflow_rows = {str(item["id"]): item for item in targets.workflows if item.get("id") is not None}
         self._endpoints_by_target = endpoints_by_target(targets.endpoints)
+        self._ephemeral_rows = {group.row_key: group for group in targets.ephemeral}
 
         functions = self._fill_table("functions-table")
         for function_id, function in self._function_rows.items():
             steps = self._steps_by_function.get(function_id, [])
             functions.add_row(
                 str(function.get("name", "-")),
+                ORIGIN_DEPLOYED,
                 format_step_workflows(steps),
                 format_step_keys(steps),
                 str(function.get("run_type") or "-"),
                 format_bool(function.get("enabled")),
                 format_endpoint(self._target_endpoints("function", function_id)),
+                self._time(self._last_runs.get(function_id)),
                 compact_id(function.get("current_version_id")),
                 self._time(function.get("updated_at")),
                 key=function_id,
+            )
+        for group in targets.ephemeral_by_type("function"):
+            functions.add_row(
+                group.name,
+                ORIGIN_ONE_OFF,
+                "-",
+                "-",
+                group.run_type,
+                "-",
+                "-",
+                self._time(group.last_run),
+                "-",
+                "-",
+                key=group.row_key,
             )
 
         workflows = self._fill_table("workflows-table")
         for workflow_id, workflow in self._workflow_rows.items():
             workflows.add_row(
                 str(workflow.get("name", "-")),
+                ORIGIN_DEPLOYED,
                 str(workflow.get("run_type") or "-"),
                 format_bool(workflow.get("enabled")),
                 format_endpoint(self._target_endpoints("workflow", workflow_id)),
                 format_schedule(workflow.get("schedule")),
                 self._time(workflow.get("next_run_at")),
+                self._time(self._last_runs.get(workflow_id)),
                 compact_id(workflow.get("current_version_id")),
                 self._time(workflow.get("updated_at")),
                 key=workflow_id,
             )
+        for group in targets.ephemeral_by_type("workflow"):
+            # State, endpoint, schedule, next run, version, updated: all deployment-time
+            # facts, and a one-off has none of them. Dashes rather than blanks, so each
+            # reads as "does not have one" rather than "failed to load".
+            workflows.add_row(
+                group.name,
+                ORIGIN_ONE_OFF,
+                group.run_type,
+                "-",
+                "-",
+                "-",
+                "-",
+                self._time(group.last_run),
+                "-",
+                "-",
+                key=group.row_key,
+            )
 
-        self._clear_target_detail(clear_project=False)
+        if not preserve:
+            self._clear_target_detail(clear_project=False)
 
     @staticmethod
     def _ordered_functions(targets: ProjectTargetsData) -> dict[str, dict[str, Any]]:
@@ -2845,6 +3394,11 @@ class RebaseTuiApp(App[None]):
             return
         if event.data_table.id == "projects-table":
             self._select_project(row_id)
+        # Ahead of the two target branches, not after them: a one-off row lives in those
+        # same tables, and either branch would look its synthetic key up among the real
+        # targets, find nothing, and silently return.
+        elif str(row_id).startswith(EPHEMERAL_ROW_PREFIX):
+            self._select_ephemeral(str(row_id))
         elif event.data_table.id == "functions-table":
             target = self._function_rows.get(row_id)
             if target is None:
@@ -2852,6 +3406,7 @@ class RebaseTuiApp(App[None]):
             self.selected_target_type = "function"
             self.selected_target = target
             self._reveal(1)
+            self._runs_reload = partial(self._load_runs, "function", row_id)
             self.run_worker(self._load_runs("function", row_id), name="runs", group="tui", exclusive=True)
         elif event.data_table.id == "workflows-table":
             target = self._workflow_rows.get(row_id)
@@ -2860,6 +3415,7 @@ class RebaseTuiApp(App[None]):
             self.selected_target_type = "workflow"
             self.selected_target = target
             self._reveal(1)
+            self._runs_reload = partial(self._load_runs, "workflow", row_id)
             self.run_worker(self._load_runs("workflow", row_id), name="runs", group="tui", exclusive=True)
         elif event.data_table.id == "timeline-table":
             # Enter, or a click, opens the row out to its full text and closes it again.
@@ -2918,11 +3474,29 @@ class RebaseTuiApp(App[None]):
             title = f"{title} - select text (mouse off, s to resume)"
         self.title = title
 
-    def _set_error(self, error: Exception) -> None:
+    def _set_error(self, error: Exception, *, announce: bool = True) -> None:
+        """Report a failed load. Quiet on a timer until it stops looking like a blip.
+
+        A refresh the reader asked for should say what went wrong. One the timer asked for
+        should not switch their view or raise a toast over a single dropped request — it
+        keeps the last good data and counts. Three in a row is no longer a blip, and gets
+        the loud treatment.
+        """
+        if not announce:
+            self._refresh_failures += 1
+            if self._refresh_failures < AUTO_REFRESH_FAILURE_LIMIT:
+                return
+        self._refresh_failures = 0
         self._show_project_view()
         self._set_project_error(f"The Rebase API request failed. Press r to retry.\nError: {error}")
         self.notify(f"Rebase API request failed: {error}", severity="error")
 
 
-def run_tui(*, project: str | None = None, limit: int = 100, client: Client | None = None) -> None:
-    RebaseTuiApp(client=client, project=project, limit=limit).run()
+def run_tui(
+    *,
+    project: str | None = None,
+    limit: int = 100,
+    client: Client | None = None,
+    refresh_interval: float = AUTO_REFRESH_SECONDS,
+) -> None:
+    RebaseTuiApp(client=client, project=project, limit=limit, refresh_interval=refresh_interval).run()

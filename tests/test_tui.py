@@ -26,6 +26,7 @@ from rebase.brand import BRAND_MEDIUM_GRAY
 from rebase.client import Client, RebaseWorkflowError
 from rebase.editor import EditorCommand
 from rebase.tui import (
+    AUTO_REFRESH_FAILURE_LIMIT,
     MARK_STYLE,
     DeleteConfirmScreen,
     DetailDrawer,
@@ -44,6 +45,7 @@ from rebase.tui import (
     format_step_keys,
     format_step_workflows,
     format_timestamp,
+    group_ephemeral_runs,
     status_style,
 )
 
@@ -60,6 +62,7 @@ class FakeClient:
     def __init__(self) -> None:
         self.api_url = "https://api.example.com"
         self.run_calls: list[dict[str, Any]] = []
+        self.run_detail_calls = 0
         self.deleted: list[tuple[str, str, bool]] = []
         self.delete_lock = threading.Lock()
         self.batch_calls: list[list[str]] = []
@@ -228,6 +231,7 @@ class FakeClient:
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         assert run_id == "run-id"
+        self.run_detail_calls += 1
         return self.runs[0]
 
     def list_run_events(self, run_id: str) -> list[dict[str, Any]]:
@@ -502,8 +506,13 @@ def test_tui_data_tolerates_a_missing_endpoint_route() -> None:
     assert [item["name"] for item in targets.workflows] == ["forecast"]
 
 
-def test_tui_overview_reads_all_workflows_and_endpoints_in_one_call_each() -> None:
-    """Per-project requests for these were the bulk of the TUI's startup wait."""
+def test_tui_overview_reads_every_count_in_one_call_each() -> None:
+    """Per-project requests for these were the bulk of the TUI's startup wait.
+
+    Functions were the last column still asked for project by project, which made
+    opening the workspace view scale with the number of projects. All three are now a
+    single workspace-wide read, so the overview costs the same for 3 projects as for 30.
+    """
     client = FakeClient()
     client.projects.append({"id": "third-project-id", "name": "storage"})
 
@@ -511,11 +520,7 @@ def test_tui_overview_reads_all_workflows_and_endpoints_in_one_call_each() -> No
 
     assert client.workflow_calls == [None]
     assert client.endpoint_calls == [None]
-    assert sorted(call or "" for call in client.function_calls) == [
-        "other-project-id",
-        "project-id",
-        "third-project-id",
-    ]
+    assert client.function_calls == [None]
     assert [
         (summary.function_count, summary.workflow_count, summary.endpoint_count, summary.cron_count)
         for summary in overview.project_summaries
@@ -634,8 +639,12 @@ def test_tui_app_mounts_and_renders_selected_workflow_run() -> None:
             assert app.query_one("#workflows-tab").show_vertical_scrollbar is False
             assert functions.row_count == 1
             assert workflows.row_count == 1
+            # Both target tables keep a horizontal scrollbar: nine columns each, and
+            # clipping would hide "Last run" entirely on a narrow terminal.
+            for table in (functions, workflows):
+                assert table.styles.scrollbar_size_horizontal == 1
+            assert app.query_one("#runs-table", DataTable).styles.scrollbar_size_horizontal == 0
             for table in (functions, workflows, app.query_one("#runs-table", DataTable)):
-                assert table.styles.scrollbar_size_horizontal == 0
                 assert table.styles.scrollbar_background.hex == "#101412"
             assert workflows.styles.scrollbar_color.hex == "#03C497"
             assert functions.styles.scrollbar_color.hex != "#03C497"
@@ -691,7 +700,7 @@ def test_tui_app_mounts_and_renders_selected_workflow_run() -> None:
     asyncio.run(scenario())
 
 
-def test_tui_app_shows_the_endpoint_column_and_the_two_target_chips() -> None:
+def test_tui_app_shows_the_endpoint_column_and_the_target_tabs() -> None:
     async def scenario() -> None:
         app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
 
@@ -705,10 +714,10 @@ def test_tui_app_shows_the_endpoint_column_and_the_two_target_chips() -> None:
 
             workflows = app.query_one("#workflows-table", DataTable)
             functions = app.query_one("#functions-table", DataTable)
-            # Endpoint is the 4th workflow column and the 6th function column, which
+            # Endpoint is the 5th workflow column and the 7th function column, which
             # carries two more up front for the step graph.
-            assert str(workflows.get_cell_at(Coordinate(0, 3))) == "POST /forecast"
-            assert str(functions.get_cell_at(Coordinate(0, 5))) == "-"
+            assert str(workflows.get_cell_at(Coordinate(0, 4))) == "POST /forecast"
+            assert str(functions.get_cell_at(Coordinate(0, 6))) == "-"
 
             # The workflow's endpoint, with the full URL the column has no room for.
             workflows.focus()
@@ -929,9 +938,15 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
                 assert app.query_one("#workspace-view").styles.display == "none"
                 assert app.query_one("#project-view").styles.display == "block"
 
-                # The step graph came off the workflow version and named the function's caller.
+                # The step graph came off the workflow version and named the function's
+                # caller. Columns are Name, Origin, Workflow, Step.
                 functions = app.query_one("#functions-table", DataTable)
-                assert [str(cell) for cell in functions.get_row_at(0)][:3] == ["normalize", "forecast", "normalize"]
+                assert [str(cell) for cell in functions.get_row_at(0)][:4] == [
+                    "normalize",
+                    tui_module.ORIGIN_DEPLOYED,
+                    "forecast",
+                    "normalize",
+                ]
 
                 workflows = app.query_one("#workflows-table", DataTable)
                 assert workflows.row_count == 1
@@ -973,7 +988,9 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
             assert ("/projects", {}, "Bearer rbw_test") in seen_requests
             assert any(path == "/projects/project-id/functions" for path, _, _ in seen_requests)
             assert any(path == "/projects/project-id/workflows" for path, _, _ in seen_requests)
-            assert not any(path == "/functions" for path, _, _ in seen_requests)
+            # The overview counts functions workspace-wide, in one request; only an opened
+            # project is fetched per project. This used to be one request per project.
+            assert any(path == "/functions" for path, _, _ in seen_requests)
             # The overview counts workflows workspace-wide; only an opened project is fetched per project.
             assert any(path == "/workflows" for path, _, _ in seen_requests)
             assert any(
@@ -2401,13 +2418,13 @@ def test_tui_functions_table_names_the_workflow_each_step_belongs_to() -> None:
                 "normalize",
                 "healthcheck",
             ]
-            # Name, Workflow, Step.
-            assert [str(functions.get_cell_at(Coordinate(row, 1))) for row in range(3)] == [
+            # Name, Origin, Workflow, Step.
+            assert [str(functions.get_cell_at(Coordinate(row, 2))) for row in range(3)] == [
                 "forecast",
                 "forecast",
                 "-",
             ]
-            assert [str(functions.get_cell_at(Coordinate(row, 2))) for row in range(3)] == [
+            assert [str(functions.get_cell_at(Coordinate(row, 3))) for row in range(3)] == [
                 "load_weather",
                 "normalize",
                 "-",
@@ -2452,9 +2469,10 @@ def test_tui_functions_table_leaves_the_step_columns_empty_for_a_plain_function(
             await pilot.press("enter")
             await pilot.pause(0.3)
 
+            # Workflow and Step, which follow Name and Origin.
             functions = app.query_one("#functions-table", DataTable)
-            assert str(functions.get_cell_at(Coordinate(0, 1))) == "-"
             assert str(functions.get_cell_at(Coordinate(0, 2))) == "-"
+            assert str(functions.get_cell_at(Coordinate(0, 3))) == "-"
 
             # And the drawer carries no step keys for either side of the pair.
             app.query_one("#target-tabs", TabbedContent).active = "functions-tab"
@@ -2969,5 +2987,618 @@ def test_tui_e_jumps_to_the_events_chip_and_back() -> None:
             await pilot.press("e")
             await pilot.pause(0.2)
             assert app._timeline_filter == "timeline-all"
+
+    asyncio.run(scenario())
+
+
+class LastRunClient:
+    """Enough client for `load_last_runs`: a function run, and a workflow with steps.
+
+    A standalone function gets its own run; a step never does, so its executions are
+    only visible in the step rows of a workflow run. Both paths have to land in the
+    same mapping.
+    """
+
+    def __init__(self) -> None:
+        self.api_url = "https://api.example.com"
+        self.step_calls: list[str] = []
+
+    def list_runs(self, **kwargs: Any) -> list[dict[str, Any]]:
+        # Newest first, the order the API returns.
+        return [
+            {
+                "id": "wf-run-new",
+                "target_type": "workflow",
+                "target_id": "workflow-id",
+                "created_at": "2026-08-09T18:15:00Z",
+                "started_at": "2026-08-09T18:15:05Z",
+            },
+            {
+                "id": "fn-run",
+                "target_type": "function",
+                "target_id": "standalone-fn",
+                "created_at": "2026-08-09T17:00:00Z",
+                "started_at": "2026-08-09T17:00:03Z",
+            },
+            {
+                # Ephemeral: no registered target, so it belongs to no row.
+                "id": "ephemeral-run",
+                "target_type": "function",
+                "target_id": None,
+                "is_ephemeral": True,
+                "created_at": "2026-08-09T19:00:00Z",
+                "started_at": "2026-08-09T19:00:01Z",
+            },
+            {
+                "id": "wf-run-old",
+                "target_type": "workflow",
+                "target_id": "workflow-id",
+                "created_at": "2026-08-09T18:00:00Z",
+                "started_at": "2026-08-09T18:00:05Z",
+            },
+        ]
+
+    def list_run_steps(self, run_id: str) -> list[dict[str, Any]]:
+        self.step_calls.append(run_id)
+        stamp = {"wf-run-new": "2026-08-09T18:15:20Z", "wf-run-old": "2026-08-09T18:00:20Z"}[run_id]
+        return [{"function_id": "step-fn", "started_at": stamp}]
+
+
+def test_last_runs_covers_both_standalone_functions_and_steps() -> None:
+    client = LastRunClient()
+    data = fake_tui_data(client)
+
+    last_runs = data.load_last_runs("project-id")
+
+    assert last_runs["standalone-fn"] == "2026-08-09T17:00:03Z"
+    # Workflows land in the same mapping, keyed the same way.
+    assert last_runs["workflow-id"] == "2026-08-09T18:15:05Z"
+    # The step's newest execution wins, not whichever run was read last.
+    assert last_runs["step-fn"] == "2026-08-09T18:15:20Z"
+    # An ephemeral run has no target to attribute, so it adds nothing.
+    assert None not in last_runs and len(last_runs) == 3
+    # Only workflow runs carry steps, and only the newest few are opened.
+    assert sorted(client.step_calls) == ["wf-run-new", "wf-run-old"]
+
+
+def test_last_runs_bounds_how_many_runs_it_opens() -> None:
+    """The scan is capped: a step's history is per-run, so it must not be unbounded."""
+
+    class ManyRuns(LastRunClient):
+        def list_runs(self, **kwargs: Any) -> list[dict[str, Any]]:
+            return [
+                {
+                    "id": f"wf-{index}",
+                    "target_type": "workflow",
+                    "target_id": "workflow-id",
+                    "created_at": f"2026-08-09T18:{index:02d}:00Z",
+                }
+                for index in range(20)
+            ]
+
+        def list_run_steps(self, run_id: str) -> list[dict[str, Any]]:
+            self.step_calls.append(run_id)
+            return []
+
+    client = ManyRuns()
+    fake_tui_data(client).load_last_runs("project-id")
+
+    assert len(client.step_calls) == tui_module.LAST_RUN_STEP_SCAN
+
+
+def test_functions_table_shows_when_each_function_last_ran() -> None:
+    async def scenario() -> None:
+        client = FakeClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
+
+        async with app.run_test(size=(200, 42)) as pilot:
+            await pilot.pause(0.3)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+
+            functions = app.query_one("#functions-table", SelectableDataTable)
+            labels = [str(column.label) for column in functions.columns.values()]
+            assert "Last run" in labels
+            # Ahead of Version and Updated, so the useful column is the reachable one.
+            assert labels.index("Last run") < labels.index("Version")
+
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            wf_labels = [str(column.label) for column in workflows.columns.values()]
+            # Next to Next run: the schedule's two ends belong side by side.
+            assert wf_labels.index("Last run") == wf_labels.index("Next run") + 1
+
+    asyncio.run(scenario())
+
+
+def test_overview_counts_functions_with_one_workspace_wide_call() -> None:
+    """Opening the workspace view must not scale with the number of projects."""
+
+    async def scenario() -> None:
+        client = FakeClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.4)
+            assert app.query_one("#projects-table", SelectableDataTable).row_count == 2
+            # One unfiltered call, not one per project — `None` is the workspace-wide read.
+            assert client.function_calls == [None]
+            assert app.workspace_overview is not None
+            counts = {s.project["name"]: s.function_count for s in app.workspace_overview.project_summaries}
+            assert counts == {"energy": 1, "trading": 0}
+
+    asyncio.run(scenario())
+
+
+def _ephemeral_run(
+    run_id: str,
+    name: str,
+    *,
+    target_type: str = "workflow",
+    started: str = "2026-08-09T18:00:00Z",
+) -> dict[str, Any]:
+    return {
+        "id": run_id,
+        "target_type": target_type,
+        "target_id": None,
+        "is_ephemeral": True,
+        "ephemeral_target": {"name": name, "project": "pypi-stats", "entrypoint": name},
+        "run_type": "quick",
+        "status": "succeeded",
+        "created_at": started,
+        "started_at": started,
+    }
+
+
+def test_ephemeral_runs_group_into_one_row_per_name_they_ran_as() -> None:
+    groups = group_ephemeral_runs(
+        [
+            _ephemeral_run("r1", "collect", started="2026-08-09T18:52:48Z"),
+            _ephemeral_run("r2", "collect", started="2026-08-09T18:44:02Z"),
+            _ephemeral_run("r3", "backfill", target_type="function", started="2026-08-09T19:10:00Z"),
+            # A registered run is not one of these and must not be swept in.
+            {"id": "r4", "target_type": "workflow", "target_id": "workflow-id"},
+        ]
+    )
+
+    # Most recently run first, not alphabetical: the useful question here is what you ran last.
+    assert [(g.name, g.target_type, g.runs) for g in groups] == [
+        ("backfill", "function", 1),
+        ("collect", "workflow", 2),
+    ]
+    # The newest of the group's runs, not whichever was read last.
+    assert groups[1].last_run == "2026-08-09T18:52:48Z"
+    assert groups[1].row_key == "ephemeral:workflow:collect"
+
+
+def test_ephemeral_grouping_skips_a_run_that_declared_no_name() -> None:
+    """A row has to be labelled something. Absence is not a name to group under."""
+    groups = group_ephemeral_runs(
+        [
+            {"id": "r1", "target_type": "workflow", "target_id": None, "is_ephemeral": True},
+            {**_ephemeral_run("r2", "collect"), "ephemeral_target": {"name": ""}},
+        ]
+    )
+
+    assert groups == ()
+
+
+def test_ephemeral_groups_are_split_by_kind_not_just_by_name() -> None:
+    """Same name, two kinds: they belong to different tables and must not merge."""
+    groups = group_ephemeral_runs(
+        [
+            _ephemeral_run("r1", "collect", target_type="workflow"),
+            _ephemeral_run("r2", "collect", target_type="function"),
+        ]
+    )
+
+    assert {(g.target_type, g.runs) for g in groups} == {("workflow", 1), ("function", 1)}
+
+
+class EphemeralClient(FakeClient):
+    """A project holding one deployed workflow and two one-off runs of `collect`."""
+
+    def list_runs(self, **kwargs: Any) -> list[dict[str, Any]]:
+        super().list_runs(**kwargs)
+        if kwargs.get("workflow_id") is not None:
+            return self.runs[: kwargs.get("limit", 100)]
+        return [
+            _ephemeral_run("eph-1", "collect", started="2026-08-09T18:52:48Z"),
+            _ephemeral_run("eph-2", "collect", started="2026-08-09T18:44:02Z"),
+            # A registered run alongside them, so the Last run column has something to
+            # fill with. Its id is what `FakeClient.list_run_steps` expects to be asked for.
+            {
+                "id": "run-id",
+                "target_type": "workflow",
+                "target_id": "workflow-id",
+                "status": "succeeded",
+                "created_at": "2026-08-09T17:00:00Z",
+                "started_at": "2026-08-09T17:00:05Z",
+            },
+        ]
+
+
+def test_ephemeral_runs_filter_to_the_name_they_ran_as() -> None:
+    """`/runs` cannot select on this, so the filtering has to happen here."""
+    data = fake_tui_data(EphemeralClient())
+
+    assert [run["id"] for run in data.load_ephemeral_runs("collect", "workflow", "project-id")] == [
+        "eph-1",
+        "eph-2",
+    ]
+    assert data.load_ephemeral_runs("collect", "function", "project-id") == []
+    assert data.load_ephemeral_runs("nope", "workflow", "project-id") == []
+
+
+def test_tui_one_off_runs_get_a_row_and_open_like_any_target() -> None:
+    """The whole point: a run that registered nothing is still reachable from the table."""
+
+    async def scenario() -> None:
+        client = EphemeralClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            rows = [[str(cell) for cell in workflows.get_row_at(index)] for index in range(workflows.row_count)]
+            # The deployed workflow keeps its place; the one-off is appended below it, and
+            # the Origin column is what tells them apart — no filter needed to see both.
+            assert [(row[0], row[1]) for row in rows] == [
+                ("forecast", tui_module.ORIGIN_DEPLOYED),
+                ("collect", tui_module.ORIGIN_ONE_OFF),
+            ]
+            # Everything after Run type is a deployment-time fact a one-off has none of.
+            one_off = rows[1]
+            assert one_off[3:7] == ["-", "-", "-", "-"]
+            assert (one_off[8], one_off[9]) == ("-", "-")
+
+            workflows.focus()
+            workflows.move_cursor(row=1)
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+
+            runs = app.query_one("#runs-table", DataTable)
+            assert runs.row_count == 2
+            assert [str(runs.get_row_at(index)[0]) for index in range(2)] == [
+                compact_id("eph-1"),
+                compact_id("eph-2"),
+            ]
+
+    asyncio.run(scenario())
+
+
+def test_tui_delete_on_a_one_off_row_says_why_rather_than_nothing_selected() -> None:
+    """It registered no target, so there is nothing for `d` to address."""
+
+    async def scenario() -> None:
+        client = EphemeralClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            workflows.focus()
+            workflows.move_cursor(row=1)
+            await pilot.press("d")
+            await pilot.pause(0.2)
+
+            # No confirm screen, and nothing was asked of the API.
+            assert not isinstance(app.screen, DeleteConfirmScreen)
+            assert client.deleted == []
+            # `run_test` suppresses the toast widget, so read the notifications directly,
+            # as the rest of this file does.
+            notices = [notification.message for notification in app._notifications]
+            assert any("one-off run registers no target" in notice for notice in notices)
+
+    asyncio.run(scenario())
+
+
+class SlowDetailClient(EphemeralClient):
+    """Fast target reads, slow step/last-run reads: the shape progressive paint is for."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.detail_started = threading.Event()
+        self.release_detail = threading.Event()
+
+    def _stall(self) -> None:
+        self.detail_started.set()
+        self.release_detail.wait(timeout=5)
+
+    def get_workflow_version(self, workflow_id: str, version_id: str) -> dict[str, Any]:
+        self._stall()
+        return super().get_workflow_version(workflow_id, version_id)
+
+    def list_run_steps(self, run_id: str) -> list[dict[str, Any]]:
+        self._stall()
+        return super().list_run_steps(run_id)
+
+
+def test_project_base_holds_back_only_what_needs_a_second_round_trip() -> None:
+    base, runs = fake_tui_data(EphemeralClient()).load_project_base({"id": "project-id", "name": "energy"})
+
+    # Everything the first paint draws is here already, one-off rows included.
+    assert [w["name"] for w in base.workflows] == ["forecast"]
+    assert [g.name for g in base.ephemeral] == ["collect"]
+    assert len(runs) == 3
+    # And the two things that cost another round trip are not.
+    assert base.steps == ()
+    assert base.last_runs == {}
+
+
+def test_project_detail_fills_in_what_the_base_left_empty() -> None:
+    client = EphemeralClient()
+    client.step_graph = {
+        "schema_version": 1,
+        "engine": "prefect",
+        "nodes": [{"node_key": "collect", "name": "collect", "function_id": "function-id", "upstream_node_keys": []}],
+    }
+    data = fake_tui_data(client)
+    base, runs = data.load_project_base({"id": "project-id", "name": "energy"})
+
+    full = data.load_project_detail(base, runs)
+
+    assert [step.node_key for step in full.steps] == ["collect"]
+    assert full.last_runs == {"workflow-id": "2026-08-09T17:00:05Z"}
+    # The base's own reads are carried through untouched rather than fetched again.
+    assert full.workflows == base.workflows
+    assert full.ephemeral == base.ephemeral
+
+
+def test_tui_paints_the_targets_before_the_slower_detail_arrives() -> None:
+    async def scenario() -> None:
+        client = SlowDetailClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+
+            # Wait for the detail phase to be in flight, then look: the names are already
+            # drawn even though the second round trip has not come back.
+            for _ in range(50):
+                await pilot.pause(0.05)
+                if client.detail_started.is_set():
+                    break
+            assert client.detail_started.is_set()
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            assert [str(workflows.get_row_at(i)[0]) for i in range(workflows.row_count)] == [
+                "forecast",
+                "collect",
+            ]
+            # The Last run column is what it is still waiting on.
+            assert str(workflows.get_row_at(0)[7]) == "-"
+
+            client.release_detail.set()
+            for _ in range(50):
+                await pilot.pause(0.05)
+                if str(workflows.get_row_at(0)[7]) != "-":
+                    break
+            assert str(workflows.get_row_at(0)[7]) != "-"
+
+    asyncio.run(scenario())
+
+
+def test_tui_second_paint_keeps_the_row_you_already_opened() -> None:
+    """The detail arrives unasked; it must not close what the reader opened meanwhile."""
+
+    async def scenario() -> None:
+        client = SlowDetailClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            for _ in range(50):
+                await pilot.pause(0.05)
+                if client.detail_started.is_set():
+                    break
+
+            # Open the one-off row while the detail phase is still out.
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            workflows.focus()
+            workflows.move_cursor(row=1)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            runs = app.query_one("#runs-table", DataTable)
+            assert runs.row_count == 2
+
+            client.release_detail.set()
+            for _ in range(50):
+                await pilot.pause(0.05)
+                if str(workflows.get_row_at(0)[7]) != "-":
+                    break
+
+            # Still on the same row, and its runs are still on screen.
+            assert workflows.cursor_key == "ephemeral:workflow:collect"
+            assert app.query_one("#runs-table", DataTable).row_count == 2
+
+    asyncio.run(scenario())
+
+
+async def _open_project(pilot, app) -> None:
+    """Drill into the fake client's first project and wait for both paints."""
+    await pilot.pause(0.3)
+    projects = app.query_one("#projects-table", SelectableDataTable)
+    projects.focus()
+    projects.move_cursor(row=0)
+    await pilot.press("enter")
+    await pilot.pause(0.4)
+
+
+def test_auto_refresh_keeps_the_cursor_and_the_marks() -> None:
+    """A repaint the reader did not ask for must not take their place away."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5), refresh_interval=0)
+
+        async with app.run_test(size=(200, 42)) as pilot:
+            await pilot.pause(0.3)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=1)
+            await pilot.press("shift+down")
+            await pilot.pause(0.1)
+            marked_before = list(projects.marked_keys)
+            cursor_before = projects.cursor_key
+            assert marked_before and cursor_before is not None
+
+            app._last_key_at = 0.0
+            app._refresh_tick()
+            await pilot.pause(0.5)
+
+            assert projects.cursor_key == cursor_before
+            assert projects.marked_keys == marked_before
+
+    asyncio.run(scenario())
+
+
+def test_auto_refresh_stands_down_while_the_reader_is_busy() -> None:
+    """Each pause is a case where repainting would take something away."""
+
+    async def scenario() -> None:
+        client = FakeClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, limit=5), refresh_interval=0)
+
+        async with app.run_test(size=(200, 42)) as pilot:
+            await pilot.pause(0.3)
+            app._last_key_at = 0.0
+            assert app._refresh_tick_paused() is False
+
+            # Mid-keystroke: the cursor is still being driven.
+            app.note_interaction()
+            assert app._refresh_tick_paused() is True
+            app._last_key_at = 0.0
+
+            # A dialog whose row list is what the reader is about to act on.
+            app.push_screen(DeleteConfirmScreen(kind="project", names=["energy"]))
+            await pilot.pause(0.2)
+            assert app._refresh_tick_paused() is True
+            app.pop_screen()
+            await pilot.pause(0.2)
+            app._last_key_at = 0.0
+
+            # The terminal owns the mouse; a repaint erases its native selection.
+            app._terminal_select = True
+            assert app._refresh_tick_paused() is True
+            app._terminal_select = False
+
+            # A half-made copy.
+            app.screen.selections = {app.query_one("#projects-table"): Selection(Offset(0, 0), Offset(4, 0))}
+            assert app._refresh_tick_paused() is True
+
+    asyncio.run(scenario())
+
+
+def test_auto_refresh_leaves_a_finished_run_alone() -> None:
+    """A finished run cannot change, and its timeline is where reading happens."""
+
+    async def scenario() -> None:
+        client = FakeClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5), refresh_interval=0)
+
+        async with app.run_test(size=(200, 42)) as pilot:
+            await _open_project(pilot, app)
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            workflows.focus()
+            workflows.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+            runs = app.query_one("#runs-table", DataTable)
+            runs.focus()
+            runs.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+
+            assert app._reveal_level == 2
+            # The fake's run is "succeeded", so there is nothing left to poll.
+            assert app._live_run_id is None
+
+            app._last_key_at = 0.0
+            before = len(client.run_calls)
+            app._refresh_tick()
+            await pilot.pause(0.6)
+
+            # The runs box is re-read — a new run can appear — but the timeline is not.
+            assert len(client.run_calls) > before
+            assert client.run_detail_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_a_failing_tick_is_quiet_until_it_stops_looking_like_a_blip() -> None:
+    """One dropped request on a timer is not worth yanking the view for."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5), refresh_interval=0)
+
+        async with app.run_test(size=(200, 42)) as pilot:
+            await pilot.pause(0.3)
+            shown: list[str] = []
+            app._set_project_error = lambda message: shown.append(message)  # type: ignore[method-assign]
+
+            for _ in range(AUTO_REFRESH_FAILURE_LIMIT - 1):
+                app._set_error(RebaseWorkflowError("boom"), announce=False)
+            assert shown == []
+
+            app._set_error(RebaseWorkflowError("boom"), announce=False)
+            assert len(shown) == 1
+            # The counter resets, so a later blip is a blip again rather than the last straw.
+            assert app._refresh_failures == 0
+
+            # A refresh the reader asked for says so immediately.
+            app._set_error(RebaseWorkflowError("boom"))
+            assert len(shown) == 2
+
+    asyncio.run(scenario())
+
+
+def test_refresh_interval_zero_arms_no_timer() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5), refresh_interval=0)
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            assert app._refresh_interval == 0
+            assert not any("_refresh_tick" in str(timer) for timer in app._timers)
+
+    asyncio.run(scenario())
+
+
+def test_the_timer_actually_fires() -> None:
+    """Every other test drives the tick by hand; this one checks it is wired at all."""
+
+    async def scenario() -> None:
+        client = FakeClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, limit=5), refresh_interval=0.2)
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            app._last_key_at = 0.0
+            before = len(client.function_calls)
+            # Long enough for several intervals; `exclusive=True` collapses any overlap.
+            await pilot.pause(1.0)
+
+            assert len(client.function_calls) > before
 
     asyncio.run(scenario())
