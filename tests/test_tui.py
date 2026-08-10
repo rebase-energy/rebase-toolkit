@@ -292,6 +292,7 @@ class SteppedClient(FakeClient):
         self.tasks = [
             {
                 "id": "task-0",
+                "name": "Capture NO1",
                 "batch_id": "batch-id",
                 "item_index": 0,
                 "parameters": {"area": "NO1"},
@@ -304,6 +305,7 @@ class SteppedClient(FakeClient):
             },
             {
                 "id": "task-1",
+                "name": "Capture SE3",
                 "batch_id": "batch-id",
                 "item_index": 1,
                 "parameters": {"area": "SE3"},
@@ -2780,6 +2782,18 @@ def test_tui_run_detail_issues_its_reads_together() -> None:
     assert [step["name"] for step in detail.steps] == ["load_weather"]
 
 
+def test_tui_loads_named_tasks_for_function_runs() -> None:
+    client = FakeClient()
+    client.runs[0]["target_type"] = "function"
+    client.tasks = [{"id": "task-id", "name": "Capture SE3", "status": "succeeded"}]
+
+    detail = fake_tui_data(client).load_run_detail("run-id", target_type="function")
+
+    assert detail.steps == []
+    assert detail.tasks == client.tasks
+    assert client.task_calls == ["run-id"]
+
+
 def _open_run(app, pilot):
     """Drill workspace -> project -> workflow -> run, leaving the timeline focused."""
 
@@ -2852,8 +2866,8 @@ def test_tui_timeline_chips_filter_the_run_by_kind() -> None:
             await pilot.pause(0.2)
             assert app._timeline_filter == "timeline-tasks"
             assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(timeline.row_count)] == [
-                "task 0",
-                "task 1",
+                "Capture NO1",
+                "Capture SE3",
             ]
 
             await pilot.press("right")
