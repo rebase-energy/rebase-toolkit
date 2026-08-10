@@ -64,8 +64,11 @@ from rebase.config import (
     add_search_path,
     config_path,
     editor_settings,
+    find_local_config,
     list_profiles,
     load_profile,
+    local_workspace_id,
+    local_workspace_mismatch,
     remove_search_path,
     search_paths,
     selected_profile_name,
@@ -359,7 +362,7 @@ def _print_run_help() -> None:
     commands = Table(title="Inspection Commands", box=box.SIMPLE)
     commands.add_column("Command", style="rebase.value")
     commands.add_column("Description")
-    commands.add_row("cancel", "Cancellation placeholder. Exits with an unsupported error.")
+    commands.add_row("cancel", "Cancel a submitted or running run.")
     commands.add_row("get", "Show run metadata.")
     commands.add_row("list", "List submitted runs in the active workspace.")
     commands.add_row("logs", "Show persisted run events and workflow step state.")
@@ -1345,11 +1348,15 @@ def _profile_show_data(profile: str | None = None) -> dict[str, Any]:
         active_profile=active_profile,
         has_auth_session=auth["exists"],
     )
+    local_config = find_local_config()
     return {
         **summary,
         "exists": profile_exists,
         "active_profile": active_profile,
         "config_file": str(config_path()),
+        "local_config_file": str(local_config) if local_config else None,
+        "local_workspace": local_workspace_id(),
+        "local_workspace_unreachable": local_workspace_mismatch(),
         "auth": auth,
     }
 
@@ -1381,6 +1388,15 @@ def _profile_show_table(data: dict[str, Any]) -> Table:
         table.add_row("Auth error", _format_value(auth.get("error")))
     table.add_row("Config file", _format_value(data.get("config_file")))
     table.add_row("Auth file", _format_value(auth.get("auth_file")))
+    if data.get("local_config_file"):
+        table.add_row("Repo workspace", _format_value(data.get("local_workspace")))
+        table.add_row("Repo marker", _format_value(data.get("local_config_file")))
+    unreachable = data.get("local_workspace_unreachable")
+    if unreachable:
+        table.add_row(
+            "Repo warning",
+            f"no local profile has credentials for {unreachable} — using {data.get('active_profile')}",
+        )
     return table
 
 
@@ -2005,6 +2021,32 @@ def setup_command(
     console.print(f"[rebase.muted]{path}[/rebase.muted]")
 
 
+@app.command("init")
+def init_command(
+    workspace: Annotated[
+        str | None,
+        typer.Argument(help="Workspace to connect this repository to. Omit to choose from your workspaces."),
+    ] = None,
+    directory: Annotated[
+        str | None,
+        typer.Option("--directory", "-d", help="Directory to mark. Defaults to the current git root."),
+    ] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", "-f", help="Replace a marker that names a different workspace."),
+    ] = False,
+) -> None:
+    """Connect this repository to a workspace you already belong to.
+
+    Writes the committed `.rebase/config.json` marker and nothing else — no sign-in,
+    no new workspace, and the machine's active workspace is left alone. Use
+    `rebase setup` to authenticate or to create a workspace.
+    """
+    from rebase.init import init_repository
+
+    init_repository(workspace=workspace, directory=directory, force=force)
+
+
 @app.command("tui")
 def tui_command(
     project: Annotated[
@@ -2015,11 +2057,28 @@ def tui_command(
         int,
         typer.Option("--limit", "-l", min=1, max=500, help="Maximum latest runs to load per selected target."),
     ] = 100,
+    refresh_interval: Annotated[
+        float | None,
+        typer.Option(
+            "--refresh-interval",
+            "-i",
+            min=0,
+            max=3600,
+            help="Seconds between automatic refreshes of what is on screen. 0 turns it off.",
+        ),
+    ] = None,
 ) -> None:
     """Open the Rebase terminal UI."""
-    from rebase.tui import run_tui
+    # Imported here, not at module scope: pulling in textual costs every other command
+    # startup time. Which is also why the default lives in tui rather than being repeated
+    # in this signature.
+    from rebase.tui import AUTO_REFRESH_SECONDS, run_tui
 
-    run_tui(project=project, limit=limit)
+    run_tui(
+        project=project,
+        limit=limit,
+        refresh_interval=AUTO_REFRESH_SECONDS if refresh_interval is None else refresh_interval,
+    )
 
 
 def _profile_list_data() -> dict[str, Any]:
@@ -5681,6 +5740,55 @@ def _parse_budget_seconds(value: str) -> int:
     return int(match.group(1)) * {"h": 3600, "m": 60, "s": 1, "": 1}[match.group(2)]
 
 
+@hillclimb_app.command("init")
+def hillclimb_init_command(
+    directory: Annotated[
+        str,
+        typer.Argument(help="Directory to initialize as a local Hillclimb workspace."),
+    ] = ".",
+    force: Annotated[
+        bool,
+        typer.Option("--force", "-f", help="Initialize even when already inside a Hillclimb workspace."),
+    ] = False,
+) -> None:
+    """Prepare this repository for local Hillclimb searches."""
+    module = _hillclimb()
+    try:
+        root = module.init_local_workspace(Path(directory), force=force)
+    except RuntimeError as exc:
+        raise RebaseWorkflowError(str(exc)) from exc
+    console.print(f"Initialized Hillclimb workspace at [bold]{root}[/bold]")
+    console.print("  config: hillclimb/config.yaml")
+    console.print("  runs:   hillclimb/runs/ (gitignored)")
+    console.print("Next: rebase hillclimb problems gefcom2014")
+
+
+@hillclimb_app.command("problems")
+def hillclimb_problems_command(
+    family: Annotated[
+        str | None,
+        typer.Argument(help="Optional emflow family, e.g. gefcom2014."),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j")] = False,
+) -> None:
+    """Discover forecast problems available to Hillclimb."""
+    problems = _hillclimb().discover_emflow_problems(family)
+    if json_output:
+        _print_json(problems)
+        return
+    if not problems:
+        suffix = f" in family {family!r}" if family else ""
+        console.print(f"no installed emflow problems{suffix}")
+        return
+    table = Table(title="Hillclimb Problems", box=box.SIMPLE)
+    table.add_column("Target", style=f"bold {BRAND_BRIGHT_GREEN}")
+    table.add_column("Family")
+    table.add_column("Track")
+    for problem in problems:
+        table.add_row(problem["target"], problem["family"], problem["track"])
+    console.print(table)
+
+
 @hillclimb_app.command("start")
 def hillclimb_start_command(
     target: Annotated[str, typer.Argument(help="Problem target, e.g. emflow://gefcom2014:solar.")],
@@ -5691,6 +5799,13 @@ def hillclimb_start_command(
         str | None,
         typer.Option("--backend", help="Operator backend: claude-code (default) | dummy (smoke tests)."),
     ] = None,
+    holdout: Annotated[
+        bool,
+        typer.Option(
+            "--holdout/--no-holdout",
+            help="Use the hidden holdout for final selection; disable it only for smoke tests.",
+        ),
+    ] = True,
     project: Annotated[str, typer.Option("--project", "-p", help="Project for the platform run.")] = "hillclimb",
     local: Annotated[bool, typer.Option("--local", "-l", help="Run on this machine instead of the platform.")] = False,
 ) -> None:
@@ -5699,7 +5814,13 @@ def hillclimb_start_command(
     budget_s = _parse_budget_seconds(budget)
     if local:
         outcome = module.run_local_search(
-            target, budget_s=budget_s, name=name, model=model, backend=backend, log=console.print
+            target,
+            budget_s=budget_s,
+            name=name,
+            model=model,
+            backend=backend,
+            holdout=holdout,
+            log=console.print,
         )
         console.print(f"[bold]{outcome.state}[/bold] {outcome.ref}")
         if outcome.selected is not None:
@@ -5713,6 +5834,7 @@ def hillclimb_start_command(
         project=project,
         model=model,
         backend=backend,
+        holdout=holdout,
     )
     console.print(f"Submitted hosted search run [bold]{run.id}[/bold]")
     console.print(f"  status: rebase hillclimb status {run.id}")

@@ -4,6 +4,41 @@
 
 ### Added
 
+- **`rebase setup` lets you sign in as someone else.** A stored session used to be reused in
+  silence, which put the provider picker out of reach for as long as the token lived: someone
+  who signed in with GitHub, and whose invite had gone to a work address GitHub never reports,
+  hit "you were not invited", quit, ran setup again, and hit the same wall with no way back to
+  the Google button. Setup now opens on a choice — *Continue as `<who>`* or *Sign in with a
+  different account* — and the second clears the session and re-asks for the provider, since a
+  `--provider` from the failed attempt would otherwise pin the retry to the login that just
+  failed. The offer repeats wherever setup runs out of workspaces to give you: alongside an
+  invite list, on the join-or-create menu, and after a handle you have no access to, which now
+  re-asks instead of ending the run. Switching re-enters the workspace step against the new
+  identity rather than making you start over. The question is skipped when stdin is not a
+  terminal, so scripted runs are unaffected.
+- **Permission failures name the account you are signed in as.** "You do not have access to
+  workspace 'acme'" and the beta-enrollment error are only actionable next to the address
+  behind them — the two differ exactly when those messages appear. The session now records the
+  login provider from the token's `app_metadata`, so setup reports
+  `1234+bob@users.noreply.github.com (via github)` and the mismatch is visible rather than
+  inferred.
+- **The TUI refreshes itself every 10 seconds**, so a screen left open is current rather
+  than quietly stale. `rebase tui --refresh-interval 0` turns it off, or any number of
+  seconds up to an hour. Only what is on screen is re-read — the workspace view, or a
+  project's targets plus whichever boxes below them are open — and a run's timeline is left
+  alone once the run has finished, since it cannot change and is the one place a reader is
+  likely to be scrolling through output. The tick stands down whenever repainting would
+  take something away rather than give something: a dialog is open, a text selection is
+  half made, `s` has handed the mouse to the terminal, a delete is in flight, or a key was
+  pressed in the last two seconds. It also fails quietly — a dropped request keeps the last
+  good data and counts, rather than switching the view and raising a toast; three in a row
+  still speaks up. A refresh you asked for with `r` stays loud.
+- **A refresh keeps your place.** Cursor, marked rows and horizontal scroll used to reset on
+  every repaint, because a repaint rebuilds every row — merely annoying when you pressed
+  `r`, unusable on a timer. `_preserve_view` puts all three back, by row key rather than
+  index since a repaint is also what reorders and removes rows, and an expanded timeline row
+  stays expanded when the run it belongs to is re-read.
+
 - **`rebase hillclimb init` and `rebase hillclimb problems` make local search
   setup and problem discovery Rebase-native.** A fresh repository can now create
   its versionable Hillclimb workspace and browse installed emflow targets without
@@ -224,6 +259,15 @@
   three tables that show something different on every line.
 
 ### Fixed
+
+- **Clicking the header of an empty table no longer crashes the TUI.** Textual's
+  header-click handler reads `ordered_columns[column_index]` without checking the list is
+  populated, so a click there raised `IndexError` and took the whole app down — reported
+  from the timeline pane, reachable in every table. Every table here can be in that state
+  by design: columns arrive with the rows, so an unloaded or cleared table has none while
+  still drawing a header row. A shared `HeaderSafeDataTable` base swallows the click, using
+  `prevent_default` rather than `stop` because Textual invokes `_on_click` for every class
+  in the MRO — stopping the bubble to parents does not stop the base handler that indexes.
 
 - **Opening a run took about 1.3 seconds.** The run, its events, its steps and its tasks were
   four sequential round trips behind one keypress — measured at 266ms, 330ms, 314ms and 353ms

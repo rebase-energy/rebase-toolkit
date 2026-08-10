@@ -1536,10 +1536,21 @@ def _binding_node_keys(binding: dict[str, Any]) -> set[str]:
 
 
 class _WorkflowTrace:
+    """Compiles a workflow body into a chain of step nodes.
+
+    Steps are sequential by contract: each one runs after the one before it, whether or
+    not it consumes its output. The graph could express parallel roots — dependencies are
+    derived from data bindings, so two steps that ignore each other would have none — but
+    a chain is what makes a workflow legible: a straight line to draw, and one unambiguous
+    answer to "which step failed, and what never ran because of it". Independent work that
+    wants to run side by side belongs to tasks inside a step, not to steps.
+    """
+
     def __init__(self, *, ephemeral: bool = False) -> None:
         self.ephemeral = ephemeral
         self.nodes: list[dict[str, Any]] = []
         self._node_keys: set[str] = set()
+        self._previous_node_key: str | None = None
 
     def record_step(self, step: Step, args: tuple[Any, ...], kwargs: dict[str, Any]) -> StepPromise:
         step_name = str(step.name)
@@ -1561,6 +1572,11 @@ class _WorkflowTrace:
         upstream_node_keys: set[str] = set()
         for binding in input_bindings.values():
             upstream_node_keys.update(_binding_node_keys(binding))
+        # The ordering edge, on top of whatever the data bindings imply. Kept separate from
+        # `input_bindings`, so the graph still shows which dependency carries a value and
+        # which is only sequence.
+        if self._previous_node_key is not None:
+            upstream_node_keys.add(self._previous_node_key)
 
         node_key = _node_key_for(step_name, self._node_keys)
         self._node_keys.add(node_key)
@@ -1587,6 +1603,7 @@ class _WorkflowTrace:
                 }
             )
         self.nodes.append(node)
+        self._previous_node_key = node_key
         return StepPromise(node_key)
 
 
@@ -2676,12 +2693,30 @@ class Client:
                 return []
             resolved_project_id = resolved_project["id"]
         if resolved_project_id is None:
-            projects = self.list_projects()
+            return self._list_workspace_functions()
+        response = self.request("GET", f"/projects/{resolved_project_id}/functions")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected function list response")
+        return response
+
+    def _list_workspace_functions(self) -> list[dict[str, Any]]:
+        """Every function in the workspace, in one request where the API allows it.
+
+        This used to walk the projects and ask for each one's functions in turn, so an
+        unfiltered `list_functions()` cost a request per project — serially, which is what
+        made the TUI's workspace view slow in proportion to the size of the workspace. The
+        fallback keeps that behaviour for a platform without `GET /functions`, so a toolkit
+        ahead of its API loses the speed rather than the answer.
+        """
+        try:
+            response = self.request("GET", "/functions")
+        except RebaseWorkflowError as exc:
+            if exc.status_code != 404:
+                raise
             functions: list[dict[str, Any]] = []
-            for item in projects:
+            for item in self.list_projects():
                 functions.extend(self.list_functions(project_id=item["id"]))
             return functions
-        response = self.request("GET", f"/projects/{resolved_project_id}/functions")
         if not isinstance(response, list):
             raise RebaseWorkflowError("expected function list response")
         return response
@@ -3587,26 +3622,39 @@ class Client:
         required_parameters: list[str] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
+        env: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
     ) -> Run:
-        response = self.request(
-            "POST",
-            "/runs/ephemeral",
-            json={
-                "target_type": target_type,
-                "project": project,
-                "name": name,
-                "source_code": source_code,
-                "entrypoint": entrypoint,
-                "default_parameters": default_parameters or {},
-                "parameters": parameters or {},
-                "run_type": _validate_run_type(run_type, target_type=target_type),
-                "image_spec": image_spec,
-                "step_graph": step_graph,
-                "required_parameters": required_parameters or [],
-                "cloud_run_min_instances": cloud_run_min_instances,
-                "cloud_run_concurrency": cloud_run_concurrency,
-            },
-        )
+        payload: dict[str, Any] = {
+            "target_type": target_type,
+            "project": project,
+            "name": name,
+            "source_code": source_code,
+            "entrypoint": entrypoint,
+            "default_parameters": default_parameters or {},
+            "parameters": parameters or {},
+            "run_type": _validate_run_type(run_type, target_type=target_type),
+            "image_spec": image_spec,
+            "step_graph": step_graph,
+            "required_parameters": required_parameters or [],
+            "cloud_run_min_instances": cloud_run_min_instances,
+            "cloud_run_concurrency": cloud_run_concurrency,
+        }
+        # Ephemeral runs carry env and secret references just like deployed ones.
+        # Without them the run starts with an empty environment, so a step reading
+        # os.environ["..."] raises KeyError even though the identical code works
+        # once deployed.
+        #
+        # Sent only when non-empty: the API rejects unknown fields, so an older
+        # deployment would 422 on every ephemeral run. Omitting the empty case
+        # keeps this client working against both, and callers that actually use
+        # secrets get a loud error instead of a container with no environment.
+        if env:
+            payload["env"] = dict(env)
+        if secrets:
+            payload["secrets"] = dict(secrets)
+
+        response = self.request("POST", "/runs/ephemeral", json=payload)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected run response")
         return Run(response["id"], client=self, data=response)
@@ -4457,6 +4505,8 @@ class Function:
             image_spec=self.image_spec,
             cloud_run_min_instances=self.cloud_run_min_instances,
             cloud_run_concurrency=self.cloud_run_concurrency,
+            env=self.env,
+            secrets=_resolve_secrets_payload(self.secrets, self._client),
         )
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
@@ -5061,6 +5111,8 @@ class Model(_EmflowModel):
             image_spec=function.image_spec,
             cloud_run_min_instances=function.cloud_run_min_instances,
             cloud_run_concurrency=function.cloud_run_concurrency,
+            env=function.env,
+            secrets=_resolve_secrets_payload(function.secrets, self._client),
         )
 
 
@@ -5493,6 +5545,11 @@ class Workflow:
             run_type=self.run_type,
             step_graph=self._build_step_graph(ephemeral=True),
             required_parameters=self.required_parameters,
+            # image_spec too: without it an ephemeral workflow runs on the default
+            # image and any uv_pip_install() the author declared is silently dropped.
+            image_spec=self.image_spec,
+            env=self.env,
+            secrets=_resolve_secrets_payload(self.secrets, self._client),
         )
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:

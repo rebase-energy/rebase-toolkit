@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import re
 import select
@@ -19,6 +20,7 @@ import requests
 from rebase.auth import (
     AuthError,
     build_supabase_authorize_url,
+    clear_session,
     exchange_pkce_code,
     generate_pkce_verifier,
     load_access_token,
@@ -28,10 +30,12 @@ from rebase.auth import (
 )
 from rebase.brand import BRAND_BRIGHT_GREEN, BRAND_MEDIUM_GRAY
 from rebase.client import Client, RebaseWorkflowError, _parse_github_remote
-from rebase.config import selected_profile_name, write_profile
+from rebase.config import selected_profile_name, write_local_config, write_profile
 
 JOIN_WORKSPACE = "Join an existing workspace"
 CREATE_WORKSPACE = "Create a new workspace"
+SWITCH_ACCOUNT = "Sign in with a different account"
+TRY_ANOTHER_HANDLE = "Enter a different workspace handle"
 BETA_ENROLLMENT_ERROR = "your account is not enrolled in the beta program. Contact hello@rebase.energy to get enrolled."
 WORKSPACE_CREATION_QUOTA_ERROR = (
     "You've reached your quota for creating new workspaces, please contact us to increase it: hello@rebase.energy"
@@ -42,6 +46,17 @@ HUGGINGFACE_DEVICE_URL = "https://huggingface.co/oauth/device"
 HUGGINGFACE_TOKEN_URL = "https://huggingface.co/oauth/token"
 HUGGINGFACE_DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
 HUGGINGFACE_DEFAULT_SCOPES = ("openid", "profile", "email", "write-repos")
+
+
+class _SwitchAccountRequested(Exception):
+    """Raised when someone picks `SWITCH_ACCOUNT` deeper in the flow.
+
+    Signing in again cannot happen where the choice is made — it invalidates the
+    client every caller below is holding — so the request travels up to `run_setup`,
+    which re-authenticates and re-runs the step. Deliberately not a
+    `RebaseWorkflowError`: it is a control signal, and must never be mistaken for a
+    failure worth reporting.
+    """
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
@@ -144,6 +159,28 @@ def _failure(message: str) -> None:
 
 def _hint(message: str) -> None:
     print(_paint(message, DIM, MUTED))
+
+
+def _can_prompt() -> bool:
+    """Whether there is someone at the keyboard to answer a question.
+
+    Piped and scripted runs must not be stopped by a menu, so a question that is
+    only ever an offer — not something the flow needs an answer to — is skipped
+    when stdin is not a terminal.
+    """
+    try:
+        return sys.stdin.isatty()
+    except ValueError:
+        return False
+
+
+def _session_description(session: Any | None) -> str:
+    """Who a stored session belongs to, named the way an invite would name them."""
+    if session is None:
+        return "an unknown account"
+    who = getattr(session, "email", None) or getattr(session, "user_id", None) or "Supabase user"
+    provider = getattr(session, "provider", None)
+    return f"{who} (via {provider})" if provider else str(who)
 
 
 def _terminal_fd() -> tuple[int | None, bool]:
@@ -325,9 +362,15 @@ def _choose_tty(title: str, values: list[str], *, default: str) -> str | None:
 
 
 def _prompt(value: str | None, message: str, *, default: str | None = None) -> str:
+    """Ask for `message`, spelling out what pressing enter will do.
+
+    A bare `[value]` suffix leaves people guessing whether it is a placeholder, an
+    example, or something that will actually be used, so the default is stated as
+    the action it performs.
+    """
     if value:
         return value
-    suffix = f" [{default}]" if default else ""
+    suffix = f' (enter to use "{default}")' if default else ""
     entered = _read_input(f"{message}{suffix}: ").strip()
     if entered:
         return entered
@@ -343,6 +386,24 @@ def _normalize_handle(value: str, *, label: str) -> str:
             f"{label} must be 3-39 characters and contain only letters, numbers, hyphens, or underscores"
         )
     return handle
+
+
+def _directory_handle_suggestion(directory: str | Path | None = None) -> str | None:
+    """The current directory's name as a workspace handle, when it can be one.
+
+    A workspace is 1:1 with a repo, so the folder you run `rebase setup` in is a far
+    better guess than the user handle — which is only ever right for the first
+    workspace someone creates. Returns None when the name cannot be normalized into
+    a valid handle, leaving the caller's fallback in place.
+    """
+    try:
+        name = Path(directory).expanduser().resolve().name if directory else Path.cwd().resolve().name
+    except OSError:
+        return None
+    suggestion = re.sub(r"[^a-z0-9_-]+", "-", name.lower()).strip("-_")
+    if HANDLE_RE.fullmatch(suggestion):
+        return suggestion
+    return None
 
 
 def _handle_suggestion(session: Any | None) -> str | None:
@@ -447,6 +508,31 @@ def _current_git_root() -> Path | None:
     return Path(root).resolve() if root else None
 
 
+def _mark_local_workspace(workspace: dict[str, Any]) -> Path | None:
+    """Write the `.rebase/config.json` marker pinning this repo to `workspace`.
+
+    Anchored at the git root rather than the cwd, so running setup from a
+    subdirectory still marks the repo once and every subdirectory resolves to it.
+    Failure to write is a hint, not an error: the global profile was already saved,
+    so the workspace is usable either way.
+    """
+    directory = _current_git_root() or Path.cwd()
+    workspace_id = str(workspace["id"])
+    name = workspace.get("name")
+    try:
+        marker = write_local_config(
+            directory,
+            workspace_id=workspace_id,
+            workspace_name=name if isinstance(name, str) and name else None,
+        )
+    except OSError as exc:
+        _hint(f"Could not write the workspace marker in {directory}: {exc}")
+        return None
+    _success(f"Marked {directory.name} as workspace {workspace_id}")
+    _hint(f"Wrote {marker} — commit it so the repo always resolves to this workspace")
+    return marker
+
+
 def _validate_github_repo_full_name(value: str) -> str:
     repo_full_name = value.strip()
     owner, repo = _parse_github_remote(f"https://github.com/{repo_full_name}")
@@ -513,6 +599,35 @@ def _oauth_session(args: Any, config: dict[str, Any]) -> str:
     return session.access_token
 
 
+def _reauth_args(args: Any) -> Any:
+    """`args` as they should be for signing in *again*.
+
+    The provider is cleared so the picker comes back: someone switching accounts is
+    usually switching provider too, and a `--provider` from the first attempt would
+    silently pin the retry to the login that just failed them.
+    """
+    reauth = copy.copy(args)
+    reauth.provider = None
+    reauth.force_auth = True
+    return reauth
+
+
+def _switch_account(args: Any, config: dict[str, Any]) -> str:
+    """Drop the stored session and authenticate from scratch."""
+    try:
+        clear_session()
+    except OSError as exc:
+        raise RebaseWorkflowError(f"could not clear the stored session: {exc}") from exc
+    return _oauth_session(_reauth_args(args), config)
+
+
+def _stored_session() -> Any | None:
+    try:
+        return load_session()
+    except AuthError:
+        return None
+
+
 def _access_token(args: Any, config: dict[str, Any]) -> str:
     if not args.force_auth:
         try:
@@ -520,18 +635,68 @@ def _access_token(args: Any, config: dict[str, Any]) -> str:
         except AuthError as exc:
             raise RebaseWorkflowError(str(exc)) from exc
         if token:
-            return token
+            return _confirm_stored_account(args, config, token)
     return _oauth_session(args, config)
+
+
+def _confirm_stored_account(args: Any, config: dict[str, Any], token: str) -> str:
+    """Offer the stored session as a choice rather than assuming it.
+
+    A rerun of `rebase setup` is nearly always a rerun because something went wrong,
+    and the most common something is being signed in as the wrong identity — a
+    GitHub login whose email is not the address the invite went to. The stored token
+    used to be returned in silence, which put the provider picker out of reach for
+    good and made every rerun fail the same way.
+    """
+    if not _can_prompt():
+        return token
+    who = _session_description(_stored_session())
+    keep = f"Continue as {who}"
+    selected = _choose(
+        "account",
+        [keep, SWITCH_ACCOUNT],
+        default=keep,
+        title="You are already signed in on this computer.",
+    )
+    if selected == keep:
+        return token
+    return _switch_account(args, config)
 
 
 def _workspace_by_id(workspaces: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {str(workspace["id"]): workspace for workspace in workspaces}
 
 
-def _select_joined_workspace(workspace_id: str, workspaces_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _signed_in_as_suffix(session: Any | None) -> str:
+    """The identity behind a permission failure, spelled out.
+
+    An invite is granted to an address, so "you were not invited" is only actionable
+    next to the address you are actually signed in as — the two differ exactly when
+    this message appears.
+    """
+    if session is None:
+        return ""
+    return f" You are signed in as {_session_description(session)}."
+
+
+def _no_workspace_access_message(workspace_id: str, *, session: Any | None) -> str:
+    return (
+        f"You do not have access to workspace {workspace_id!r}."
+        f"{_signed_in_as_suffix(session)}"
+        " Ask an owner to invite you, or — if the invite went to a different address — "
+        "sign in with a different account (`rebase setup --force-auth`)."
+    )
+
+
+def _select_joined_workspace(
+    workspace_id: str,
+    workspaces_by_id: dict[str, dict[str, Any]],
+    *,
+    session: Any | None = None,
+) -> dict[str, Any]:
     workspace = workspaces_by_id.get(workspace_id)
     if workspace is None:
-        raise RebaseWorkflowError(f"You do not have access to workspace {workspace_id!r}. Ask an owner to invite you.")
+        raise RebaseWorkflowError(_no_workspace_access_message(workspace_id, session=session))
     return workspace
 
 
@@ -553,18 +718,19 @@ def _is_workspace_creation_permission_error(error: RebaseWorkflowError) -> bool:
     )
 
 
-def _workspace_creation_error(error: RebaseWorkflowError) -> RebaseWorkflowError:
+def _workspace_creation_error(error: RebaseWorkflowError, *, session: Any | None = None) -> RebaseWorkflowError:
     if "workspace creation limit reached" in str(error) or "You've reached your quota" in str(error):
         return RebaseWorkflowError(WORKSPACE_CREATION_QUOTA_ERROR)
     if _is_workspace_creation_permission_error(error):
-        return RebaseWorkflowError(BETA_ENROLLMENT_ERROR)
+        return RebaseWorkflowError(f"{BETA_ENROLLMENT_ERROR}{_signed_in_as_suffix(session)}")
     return error
 
 
 def _create_workspace(args: Any, client: Client, *, session: Any | None) -> dict[str, Any]:
     profile = _ensure_profile_handle(args, client, session=session)
     profile_handle = profile.get("handle")
-    default_workspace = profile_handle if isinstance(profile_handle, str) and profile_handle else None
+    fallback_workspace = profile_handle if isinstance(profile_handle, str) and profile_handle else None
+    default_workspace = _directory_handle_suggestion() or fallback_workspace
     requested_workspace = getattr(args, "workspace", None)
     workspace_id = _normalize_handle(
         _prompt(requested_workspace, "Workspace handle to create", default=default_workspace),
@@ -573,7 +739,7 @@ def _create_workspace(args: Any, client: Client, *, session: Any | None) -> dict
     try:
         return client.create_workspace(workspace_id, name=args.workspace_name)
     except RebaseWorkflowError as exc:
-        raise _workspace_creation_error(exc) from exc
+        raise _workspace_creation_error(exc, session=session) from exc
 
 
 def _select_invited_workspace(workspaces: list[dict[str, Any]]) -> dict[str, Any] | str | None:
@@ -583,14 +749,50 @@ def _select_invited_workspace(workspaces: list[dict[str, Any]]) -> dict[str, Any
     workspace_options = [f"Join workspace ({_workspace_display_name(workspace)})" for workspace in invited_workspaces]
     selected = _choose(
         "workspace setup",
-        [*workspace_options, CREATE_WORKSPACE],
+        [*workspace_options, CREATE_WORKSPACE, SWITCH_ACCOUNT],
         default=workspace_options[0],
         title="You were invited to a workspace. What do you want to do?",
     )
+    if selected == SWITCH_ACCOUNT:
+        raise _SwitchAccountRequested
     if selected == CREATE_WORKSPACE:
         return CREATE_WORKSPACE
     selected_index = workspace_options.index(selected)
     return invited_workspaces[selected_index]
+
+
+def _join_workspace(
+    args: Any,
+    client: Client,
+    workspaces_by_id: dict[str, dict[str, Any]],
+    *,
+    session: Any | None,
+) -> dict[str, Any]:
+    """Ask which workspace to join, and keep the flow alive when there is no access.
+
+    A handle you were not invited to used to end the run, which is the worst moment
+    to end it: the fix is nearly always signing in as the address the invite was sent
+    to, and quitting is what made that unreachable on the next run.
+    """
+    while True:
+        workspace_id = _normalize_handle(_prompt(None, "Workspace handle to join"), label="Workspace handle")
+        workspace = workspaces_by_id.get(workspace_id)
+        if workspace is not None:
+            return workspace
+        if not _can_prompt():
+            return _select_joined_workspace(workspace_id, workspaces_by_id, session=session)
+        _failure(f"You do not have access to workspace {workspace_id!r}.{_signed_in_as_suffix(session)}")
+        _hint("An invite is granted to one address. If yours went elsewhere, sign in with that account.")
+        selected = _choose(
+            "next step",
+            [TRY_ANOTHER_HANDLE, SWITCH_ACCOUNT, CREATE_WORKSPACE],
+            default=TRY_ANOTHER_HANDLE,
+            title="What do you want to do?",
+        )
+        if selected == SWITCH_ACCOUNT:
+            raise _SwitchAccountRequested
+        if selected == CREATE_WORKSPACE:
+            return _create_workspace(args, client, session=session)
 
 
 def _select_workspace(args: Any, client: Client, *, session: Any | None) -> dict[str, Any]:
@@ -603,7 +805,7 @@ def _select_workspace(args: Any, client: Client, *, session: Any | None) -> dict
             try:
                 return client.create_workspace(workspace_id, name=args.workspace_name or workspace_id)
             except RebaseWorkflowError as exc:
-                raise _workspace_creation_error(exc) from exc
+                raise _workspace_creation_error(exc, session=session) from exc
         return workspaces_by_id[workspace_id]
     invited_workspace = _select_invited_workspace(workspaces)
     if invited_workspace == CREATE_WORKSPACE:
@@ -612,13 +814,14 @@ def _select_workspace(args: Any, client: Client, *, session: Any | None) -> dict
         return invited_workspace
     action = _choose(
         "workspace setup",
-        [JOIN_WORKSPACE, CREATE_WORKSPACE],
+        [JOIN_WORKSPACE, CREATE_WORKSPACE, SWITCH_ACCOUNT],
         default=JOIN_WORKSPACE if workspaces else CREATE_WORKSPACE,
         title="Do you want to join an existing workspace or create a new one?",
     )
+    if action == SWITCH_ACCOUNT:
+        raise _SwitchAccountRequested
     if action == JOIN_WORKSPACE:
-        workspace_id = _normalize_handle(_prompt(None, "Workspace handle to join"), label="Workspace handle")
-        return _select_joined_workspace(workspace_id, workspaces_by_id)
+        return _join_workspace(args, client, workspaces_by_id, session=session)
     return _create_workspace(args, client, session=session)
 
 
@@ -1278,16 +1481,23 @@ def run_setup(args: Any) -> int:
     total_steps = len(SETUP_STEPS)
     _section("Authenticate", step=1, total=total_steps)
     token = _access_token(args, config)
-    authed_client = Client(api_url=client.api_url, access_token=token, profile=args.profile)
-    session = load_session()
-    if session is not None:
-        _success(f"Authenticated as {session.email or session.user_id or 'Supabase user'}")
-    _section("Workspace", step=2, total=total_steps)
-    workspace = _select_workspace(args, authed_client, session=session)
+    while True:
+        authed_client = Client(api_url=client.api_url, access_token=token, profile=args.profile)
+        session = load_session()
+        if session is not None:
+            _success(f"Authenticated as {_session_description(session)}")
+        _section("Workspace", step=2, total=total_steps)
+        try:
+            workspace = _select_workspace(args, authed_client, session=session)
+            break
+        except _SwitchAccountRequested:
+            _section("Authenticate", step=1, total=total_steps)
+            token = _switch_account(args, config)
     workspace_id = str(workspace["id"])
     path = write_profile(profile=args.profile, api_url=authed_client.api_url, workspace=workspace)
     _success(f"Using workspace {workspace_id}")
     _hint(f"Saved Rebase profile '{args.profile}' to {path}")
+    _mark_local_workspace(workspace)
     _hint("Run `rebase connect github` when you are ready to add source backing.")
     _success("Setup complete")
     return 0
@@ -1301,13 +1511,14 @@ def run_workspace_create(args: Any) -> int:
     authed_client = Client(api_url=client.api_url, access_token=token, profile=args.profile)
     session = load_session()
     if session is not None:
-        _success(f"Authenticated as {session.email or session.user_id or 'Supabase user'}")
+        _success(f"Authenticated as {_session_description(session)}")
 
     workspace = _create_workspace(args, authed_client, session=session)
     workspace_id = str(workspace["id"])
     path = write_profile(profile=args.profile, api_url=authed_client.api_url, workspace=workspace)
     _success(f"Created workspace {workspace_id}")
     _hint(f"Saved Rebase profile '{args.profile}' to {path}")
+    _mark_local_workspace(workspace)
     _hint("Run `rebase connect github` when you are ready to add source backing.")
     _success("Workspace create complete")
     return 0

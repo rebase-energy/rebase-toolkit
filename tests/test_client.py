@@ -2956,3 +2956,341 @@ def test_on_update_only_valid_serialization() -> None:
 
     with pytest.raises(TypeError, match="only_valid"):
         rb.OnUpdate(["nordpool/prices"], only_valid="yes")
+
+
+def _mark(directory, workspace_id: str) -> None:
+    from rebase.config import write_local_config
+
+    write_local_config(directory, workspace_id=workspace_id)
+
+
+def test_directory_marker_overrides_the_active_workspace(tmp_path, monkeypatch) -> None:
+    """A repo's workspace beats the globally active one, on the active credentials.
+
+    The workspace travels as one header and an API key reaches every workspace the user
+    belongs to, so pinning a directory needs neither a second profile nor another
+    sign-in — which is the whole point of the marker.
+    """
+    config = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config))
+    write_profile(api_key="rbw_key", workspace={"id": "agent-work"}, path=config)
+
+    repo = tmp_path / "repo"
+    (repo / "deploy").mkdir(parents=True)
+    monkeypatch.chdir(repo)
+    assert rb.Client().workspace_id == "agent-work"
+
+    _mark(repo, "rebase-grid")
+    client = rb.Client()
+    assert client.workspace_id == "rebase-grid"
+    assert client.api_key == "rbw_key"
+    assert client._request_headers(auth=True)["X-Rebase-Workspace"] == "rebase-grid"
+
+    # Still the repo's workspace from a subdirectory, the way git resolves config.
+    monkeypatch.chdir(repo / "deploy")
+    assert rb.Client().workspace_id == "rebase-grid"
+
+
+def test_explicit_workspace_beats_the_directory_marker(tmp_path, monkeypatch) -> None:
+    """Switching workspace by hand has to survive being inside a marked repo."""
+    config = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config))
+    write_profile(api_key="rbw_key", workspace={"id": "agent-work"}, path=config)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.chdir(repo)
+    _mark(repo, "rebase-grid")
+
+    assert rb.Client(workspace_id="forecast-dev").workspace_id == "forecast-dev"
+
+
+def test_unmarked_directory_keeps_the_profile_workspace(tmp_path, monkeypatch) -> None:
+    config = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config))
+    write_profile(api_key="rbw_key", workspace={"id": "agent-work"}, path=config)
+
+    monkeypatch.chdir(tmp_path)
+    assert rb.Client().workspace_id == "agent-work"
+
+
+def _compiled_graph(monkeypatch, build) -> dict[str, Any]:
+    """Deploy a project against a fake API and return the workflow's compiled step graph."""
+    observed: dict[str, Any] = {}
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
+    monkeypatch.setattr(client, "find_function", lambda name, *, project: None)
+    monkeypatch.setattr(client, "find_workflow", lambda name, *, project=None: None)
+    monkeypatch.setattr(
+        client,
+        "register_function",
+        lambda **kwargs: {
+            "id": f"{kwargs['name']}-id",
+            "name": kwargs["name"],
+            "current_version_id": f"{kwargs['name']}-version-id",
+        },
+    )
+    monkeypatch.setattr(
+        client,
+        "register_workflow",
+        lambda **kwargs: observed.update(kwargs) or {"id": "workflow-id", "current_version_id": "v"},
+    )
+
+    project = rb.Project("energy-forecasting", client=client)
+    build(project)
+    project.deploy()
+    return observed["step_graph"]
+
+
+def test_steps_that_ignore_each_other_still_compile_to_a_chain(monkeypatch) -> None:
+    """Steps are sequential by contract, so the graph is a line even without data flow.
+
+    Two steps that pass nothing between them would otherwise be independent roots, and
+    "which step failed" stops having one answer the moment the graph forks.
+    """
+
+    def build(project: Any) -> None:
+        @project.step(name="capture-dk")
+        def capture_dk() -> dict:
+            return {"area": "DK"}
+
+        @project.step(name="capture-se")
+        def capture_se() -> dict:
+            return {"area": "SE"}
+
+        @project.workflow(name="capture-all")
+        def capture_all() -> dict:
+            return {"dk": capture_dk(), "se": capture_se()}
+
+    nodes = {node["node_key"]: node for node in _compiled_graph(monkeypatch, build)["nodes"]}
+
+    assert nodes["capture_dk"]["upstream_node_keys"] == []
+    assert nodes["capture_se"]["upstream_node_keys"] == ["capture_dk"]
+    # Sequence only: nothing is passed between them, so no binding claims a value is.
+    assert nodes["capture_se"]["input_bindings"] == {}
+
+
+def test_the_ordering_edge_is_added_to_the_data_edges_not_instead_of_them(monkeypatch) -> None:
+    """A step reaching back past its predecessor keeps both edges, and stays ordered."""
+
+    def build(project: Any) -> None:
+        @project.step(name="first")
+        def first() -> dict:
+            return {}
+
+        @project.step(name="second")
+        def second() -> dict:
+            return {}
+
+        @project.step(name="third")
+        def third(from_first: dict) -> dict:
+            return from_first
+
+        @project.workflow(name="reaches-back")
+        def reaches_back() -> dict:
+            one = first()
+            second()
+            return {"third": third(one)}
+
+    nodes = {node["node_key"]: node for node in _compiled_graph(monkeypatch, build)["nodes"]}
+
+    # "first" carries the value, "second" only the sequence — both are upstream.
+    assert nodes["third"]["upstream_node_keys"] == ["first", "second"]
+    assert nodes["third"]["input_bindings"] == {"from_first": {"type": "node_output", "node_key": "first"}}
+
+
+def test_graph_node_order_follows_the_body(monkeypatch) -> None:
+    def build(project: Any) -> None:
+        @project.step(name="a")
+        def step_a() -> dict:
+            return {}
+
+        @project.step(name="b")
+        def step_b() -> dict:
+            return {}
+
+        @project.step(name="c")
+        def step_c() -> dict:
+            return {}
+
+        @project.workflow(name="ordered")
+        def ordered() -> dict:
+            step_a()
+            step_b()
+            step_c()
+            return {}
+
+    graph = _compiled_graph(monkeypatch, build)
+    # The node key comes from the step's name, not the Python function's.
+    assert [node["node_key"] for node in graph["nodes"]] == ["a", "b", "c"]
+    assert [node["upstream_node_keys"] for node in graph["nodes"]] == [[], ["a"], ["b"]]
+
+
+def test_function_ephemeral_run_forwards_env_and_secrets(monkeypatch) -> None:
+    """An ephemeral run must carry the same env/secrets a deployed one gets.
+
+    Regression: these were dropped entirely, so user code that read
+    os.environ["..."] died with KeyError on every ephemeral run while the
+    identical deployed function worked.
+    """
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    observed: dict[str, Any] = {}
+
+    def fake_run_ephemeral(**kwargs: Any) -> rb.Run:
+        observed.update(kwargs)
+        return rb.Run("run-id", client=client, data={"id": "run-id", "status": "submitted"})
+
+    monkeypatch.setattr(client, "run_ephemeral", fake_run_ephemeral)
+
+    def add(a: int, b: int) -> dict:
+        return {"sum": a + b}
+
+    function = rb.Function(
+        add,
+        project="math",
+        name="add",
+        client=client,
+        env={"PLAIN": "value"},
+        secrets={"API_KEY": "rbw-ws-bundle--API_KEY"},
+    )
+    function.ephemeral_run(a=1, b=2)
+
+    assert observed["env"] == {"PLAIN": "value"}
+    assert observed["secrets"] == {"API_KEY": "rbw-ws-bundle--API_KEY"}
+
+
+def test_workflow_ephemeral_run_forwards_image_env_and_secrets(monkeypatch) -> None:
+    """Workflows additionally dropped image_spec, silently ignoring uv_pip_install()."""
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    observed: dict[str, Any] = {}
+
+    def fake_run_ephemeral(**kwargs: Any) -> rb.Run:
+        observed.update(kwargs)
+        return rb.Run("run-id", client=client, data={"id": "run-id", "status": "submitted"})
+
+    monkeypatch.setattr(client, "run_ephemeral", fake_run_ephemeral)
+
+    def flow() -> str:
+        return "done"
+
+    workflow = rb.Workflow(
+        flow,
+        project="etl",
+        name="flow",
+        client=client,
+        env={"PLAIN": "value"},
+        secrets={"API_KEY": "rbw-ws-bundle--API_KEY"},
+        image=rb.Image.python("3.12").uv_pip_install("httpx"),
+    )
+    workflow.ephemeral_run()
+
+    assert observed["env"] == {"PLAIN": "value"}
+    assert observed["secrets"] == {"API_KEY": "rbw-ws-bundle--API_KEY"}
+    assert observed["image_spec"] is not None
+    assert "httpx" in str(observed["image_spec"])
+
+
+def test_run_ephemeral_posts_env_and_secrets(monkeypatch) -> None:
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    sent: dict[str, Any] = {}
+
+    def fake_request(method: str, path: str, **kwargs: Any) -> dict:
+        sent["json"] = kwargs.get("json")
+        return {"id": "run-id", "status": "submitted"}
+
+    monkeypatch.setattr(client, "request", fake_request)
+
+    client.run_ephemeral(
+        target_type="function",
+        project="math",
+        name="add",
+        source_code="def add():\n    return 1\n",
+        entrypoint="add",
+        run_type="quick",
+        env={"PLAIN": "value"},
+        secrets={"API_KEY": "rbw-ws-bundle--API_KEY"},
+    )
+
+    assert sent["json"]["env"] == {"PLAIN": "value"}
+    assert sent["json"]["secrets"] == {"API_KEY": "rbw-ws-bundle--API_KEY"}
+
+
+def test_run_ephemeral_omits_empty_env_and_secrets(monkeypatch) -> None:
+    """Empty dicts are left out so an older API, which forbids unknown fields,
+    still accepts ordinary ephemeral runs."""
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    sent: dict[str, Any] = {}
+
+    def fake_request(method: str, path: str, **kwargs: Any) -> dict:
+        sent["json"] = kwargs.get("json")
+        return {"id": "run-id", "status": "submitted"}
+
+    monkeypatch.setattr(client, "request", fake_request)
+
+    client.run_ephemeral(
+        target_type="function",
+        project="math",
+        name="add",
+        source_code="def add():\n    return 1\n",
+        entrypoint="add",
+        run_type="quick",
+    )
+
+    assert "env" not in sent["json"]
+    assert "secrets" not in sent["json"]
+
+
+class FakeMissingRouteResponse:
+    """A 404 from a platform that predates the route being asked for."""
+
+    text = '{"detail":"Not Found"}'
+    status_code = 404
+
+    def raise_for_status(self) -> None:
+        raise requests.HTTPError("404")
+
+    def json(self) -> dict[str, Any]:
+        return {"detail": "Not Found"}
+
+
+def test_unfiltered_list_functions_makes_one_request(monkeypatch) -> None:
+    """It used to walk the projects and ask for each one's functions in turn.
+
+    That serial request-per-project is what made the TUI's workspace view slow in
+    proportion to the size of the workspace, and every other caller inherited it.
+    """
+    paths: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        paths.append(url.split("workflows.example.com")[-1])
+        return FakeResponse([{"id": "fn-1", "project_id": "p1"}, {"id": "fn-2", "project_id": "p2"}])
+
+    monkeypatch.setattr(requests, "request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    functions = client.list_functions()
+
+    assert [item["id"] for item in functions] == ["fn-1", "fn-2"]
+    assert paths == ["/functions"]
+
+
+def test_unfiltered_list_functions_falls_back_when_the_route_is_missing(monkeypatch) -> None:
+    """A toolkit ahead of its platform should lose the speed, not the answer."""
+    paths: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        path = url.split("workflows.example.com")[-1]
+        paths.append(path)
+        if path == "/functions":
+            return FakeMissingRouteResponse()
+        if path == "/projects":
+            return FakeResponse([{"id": "p1", "name": "one"}, {"id": "p2", "name": "two"}])
+        return FakeResponse([{"id": f"fn-{path[-11]}", "project_id": path.split("/")[2]}])
+
+    monkeypatch.setattr(requests, "request", fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    functions = client.list_functions()
+
+    assert len(functions) == 2
+    assert paths == ["/functions", "/projects", "/projects/p1/functions", "/projects/p2/functions"]

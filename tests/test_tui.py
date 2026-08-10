@@ -3602,3 +3602,43 @@ def test_the_timer_actually_fires() -> None:
             assert len(client.function_calls) > before
 
     asyncio.run(scenario())
+
+
+def test_clicking_the_header_of_an_empty_table_does_not_crash() -> None:
+    """Textual indexes `ordered_columns` on a header click without checking it is filled.
+
+    Columns arrive with the rows, so every table here spends time with none while still
+    drawing a header row. Clicking that band used to raise IndexError out of Textual and
+    take the whole app down — reported from the timeline pane, reachable in all of them.
+    """
+
+    async def scenario() -> None:
+        client = FakeClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5), refresh_interval=0)
+
+        async with app.run_test(size=(200, 42)) as pilot:
+            await _open_project(pilot, app)
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            workflows.focus()
+            workflows.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+            runs = app.query_one("#runs-table", DataTable)
+            runs.focus()
+            runs.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+
+            timeline = app.query_one("#timeline-table", DataTable)
+            assert timeline.row_count  # it filled, so the click below lands on a real widget
+            timeline.clear(columns=True)
+            assert list(timeline.columns) == []
+
+            # Row 0 of a table is its header. Before the guard this raised IndexError.
+            await pilot.click("#timeline-table", offset=(5, 0))
+            await pilot.pause(0.2)
+
+            # Still alive, and the header click changed nothing.
+            assert app.query_one("#timeline-table", DataTable).row_count == 0
+
+    asyncio.run(scenario())

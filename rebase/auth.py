@@ -29,6 +29,7 @@ class AuthSession:
     supabase_anon_key: str | None = None
     email: str | None = None
     user_id: str | None = None
+    provider: str | None = None
 
     @property
     def expires_at_datetime(self) -> datetime | None:
@@ -50,6 +51,7 @@ class AuthSession:
             "supabase_anon_key": self.supabase_anon_key,
             "email": self.email,
             "user_id": self.user_id,
+            "provider": self.provider,
         }
 
 
@@ -75,6 +77,18 @@ def _decode_jwt_payload(token: str) -> dict[str, Any]:
     except (ValueError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _provider_from_payload(payload: dict[str, Any]) -> str | None:
+    """Which social login issued this token, per Supabase's `app_metadata`.
+
+    Worth keeping because the account someone is signed in as is otherwise invisible:
+    an invite sent to a work address and a GitHub login that reports a private
+    noreply address look identical until the provider is named.
+    """
+    app_metadata = payload.get("app_metadata")
+    provider = app_metadata.get("provider") if isinstance(app_metadata, dict) else None
+    return provider if isinstance(provider, str) and provider else None
 
 
 def _supabase_url_from_issuer(issuer: str | None) -> str | None:
@@ -116,6 +130,7 @@ def parse_callback_url(callback_url: str) -> AuthSession:
         supabase_url=_supabase_url_from_issuer(issuer),
         email=email,
         user_id=user_id,
+        provider=_provider_from_payload(payload),
     )
 
 
@@ -174,6 +189,7 @@ def _session_from_token_payload(
         supabase_anon_key=supabase_anon_key,
         email=email,
         user_id=user_id,
+        provider=_provider_from_payload(jwt_payload),
     )
 
 
@@ -276,6 +292,7 @@ def load_session(*, path: Path | None = None) -> AuthSession | None:
         supabase_anon_key=data.get("supabase_anon_key") if isinstance(data.get("supabase_anon_key"), str) else None,
         email=data.get("email") if isinstance(data.get("email"), str) else None,
         user_id=data.get("user_id") if isinstance(data.get("user_id"), str) else None,
+        provider=data.get("provider") if isinstance(data.get("provider"), str) else None,
     )
 
 

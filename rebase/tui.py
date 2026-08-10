@@ -990,7 +990,32 @@ class RebaseHeader(Header):
         return None
 
 
-class DragHeaderTable(DataTable):
+class HeaderSafeDataTable(DataTable):
+    """A DataTable that survives a click on the header of an empty table.
+
+    Textual's header-click handler reads `self.ordered_columns[column_index]` without
+    checking the list is not empty, so clicking the header of a table with no columns
+    raises IndexError and takes the app down. It even records the click as
+    `out_of_bounds` in its own metadata first, then indexes anyway.
+
+    Every table here can legitimately be in that state: columns arrive with the rows (see
+    `_fill_table`), so an unfilled table has none while still drawing a header row — the
+    empty band above a box that has not loaded yet, or one that was cleared on the way out
+    of a project. Clicking there is an ordinary thing to do, and it should do nothing.
+    """
+
+    def _on_click(self, event: events.Click) -> None:
+        if self.ordered_columns:
+            return
+        # `prevent_default` rather than `stop`: Textual invokes `_on_click` for every class
+        # in the MRO, so the base handler — the one that indexes — runs after this unless it
+        # is suppressed. `stop` only ends the bubble to parent widgets, which is not where
+        # the crash is. No `super()` call for the same reason: Textual makes it itself.
+        event.prevent_default()
+        event.stop()
+
+
+class DragHeaderTable(HeaderSafeDataTable):
     """A table whose column header doubles as the splitter for the box above it.
 
     Textual has no splitter widget, so the usual answer — the one the hillclimb TUI uses —
@@ -1044,7 +1069,7 @@ class TimelineTable(DragHeaderTable):
     ]
 
 
-class SelectableDataTable(DataTable):
+class SelectableDataTable(HeaderSafeDataTable):
     """A DataTable whose rows can be *marked* in bulk, on top of the single-row cursor.
 
     Textual's DataTable has a cursor but no notion of a selection, so the marks live
@@ -1868,7 +1893,7 @@ class RebaseTuiApp(App[None]):
             yield SelectableDataTable(id="projects-table")
             yield Static("", id="workspace-empty")
         with Vertical(id="workspace-switcher-view"):
-            yield DataTable(id="workspace-profiles-table")
+            yield HeaderSafeDataTable(id="workspace-profiles-table")
         with Vertical(id="project-view"):
             yield Static("", id="project-error", classes="panel")
             with TabbedContent(initial="workflows-tab", id="target-tabs"):

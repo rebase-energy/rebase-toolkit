@@ -80,6 +80,14 @@ rebase setup
 
 The setup command asks for a Rebase API key and stores it in `~/.rebase/config.json`. The hosted Rebase API URL is built into the SDK, so normal user code does not need an API URL or API key argument.
 
+Setup remembers who you signed in as, so a later run opens with a choice —
+continue as that account, or sign in with a different one. Take the second when a
+workspace says you were not invited: an invite is granted to one address, and a
+GitHub login often reports a private `users.noreply.github.com` address rather than
+the one the invite was sent to. Signing in again is also offered at every point
+where setup finds no workspace for you, so a mismatch does not mean starting over.
+`rebase setup --force-auth` skips straight to a fresh login.
+
 You can select a named local profile when needed:
 
 ```bash
@@ -226,6 +234,14 @@ agents draft, debug, improve, and ensemble
 candidate is backtested leakage-safe on the problem's validation split and the
 winner is selected on a hidden holdout. Requires the `hillclimb` extra.
 
+Prepare a repository for local search state and discover installed problem
+targets without switching to the standalone Hillclimb CLI:
+
+```bash
+rebase hillclimb init
+rebase hillclimb problems gefcom2014
+```
+
 Start a search — hosted on the platform by default (a long-running Cloud Run
 job), or on your own machine with `--local`:
 
@@ -233,6 +249,10 @@ job), or on your own machine with `--local`:
 rebase hillclimb start emflow://gefcom2014:solar --budget 2h
 rebase hillclimb start emflow://gefcom2014:solar --budget 2h --local
 ```
+
+Hidden holdout selection is enabled by default. For public-data plumbing checks
+where private holdout credentials are intentionally unavailable, pass
+`--no-holdout`; do not use that mode to select a model for promotion.
 
 Any problem in emflow's registry is a valid target (`emflow://<name>`), as are
 plain hillclimb problem folders. `--backend dummy` runs the search loop

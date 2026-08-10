@@ -1,3 +1,4 @@
+import base64
 import json
 import subprocess
 from pathlib import Path
@@ -159,7 +160,15 @@ def test_options_expose_first_letter_short_flags() -> None:
 def test_tui_command_invokes_textual_app(monkeypatch) -> None:
     observed: dict[str, Any] = {}
 
-    def fake_run_tui(*, project: str | None = None, limit: int = 25, client: Client | None = None) -> None:
+    def fake_run_tui(
+        *,
+        project: str | None = None,
+        limit: int = 25,
+        client: Client | None = None,
+        # Accepted and ignored: the command forwards the auto-refresh interval too, and
+        # this test is about the project and limit it passes on, not the timer.
+        refresh_interval: float = 0.0,
+    ) -> None:
         observed["project"] = project
         observed["limit"] = limit
         observed["client"] = client
@@ -511,6 +520,10 @@ def add(a: int, b: int) -> dict:
         "source_code": observed["source_code"],
         "cloud_run_min_instances": None,
         "cloud_run_concurrency": None,
+        # Forwarded as kwargs even when empty; run_ephemeral drops empty dicts
+        # from the request body so an older API still accepts it.
+        "env": {},
+        "secrets": {},
     }
     assert "def add(a: int, b: int) -> dict:" in observed["source_code"]
     assert '"sum": 3' in capsys.readouterr().out
@@ -1166,6 +1179,9 @@ def test_setup_can_skip_verification(monkeypatch, tmp_path: Path) -> None:
 def test_setup_wizard_stores_supabase_profile(monkeypatch, tmp_path: Path, capsys) -> None:
     config_path = tmp_path / "config.json"
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
 
     class FakeClient:
         def __init__(
@@ -1361,11 +1377,205 @@ def test_setup_workspace_invite_offers_join_and_create(monkeypatch) -> None:
     assert choices == [
         {
             "label": "workspace setup",
-            "values": ["Join workspace (Team)", setup_module.CREATE_WORKSPACE],
+            "values": [
+                "Join workspace (Team)",
+                setup_module.CREATE_WORKSPACE,
+                setup_module.SWITCH_ACCOUNT,
+            ],
             "default": "Join workspace (Team)",
             "title": "You were invited to a workspace. What do you want to do?",
         }
     ]
+
+
+def _github_session(email: str = "1234+bob@users.noreply.github.com") -> AuthSession:
+    return AuthSession(
+        access_token="stored-token",
+        refresh_token="refresh-token",
+        expires_at=2_000_000_000,
+        token_type="bearer",
+        email=email,
+        provider="github",
+    )
+
+
+def _auth_args(**overrides: Any) -> SimpleNamespace:
+    args = SimpleNamespace(
+        profile="default",
+        api_url=None,
+        provider="github",
+        force_auth=False,
+        callback_port=17658,
+        auth_timeout=300,
+        no_browser=False,
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def test_setup_offers_to_switch_account_when_a_session_is_stored(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[str] = []
+    observed: dict[str, Any] = {}
+
+    monkeypatch.setattr(setup_module, "_can_prompt", lambda: True)
+    monkeypatch.setattr(setup_module, "load_access_token", lambda: "stored-token")
+    monkeypatch.setattr(setup_module, "load_session", _github_session)
+
+    def fake_choose(label: str, values: list[str], *, default: str | None = None, title: str | None = None) -> str:
+        observed.update({"label": label, "values": values, "default": default, "title": title})
+        return setup_module.SWITCH_ACCOUNT
+
+    monkeypatch.setattr(setup_module, "_choose", fake_choose)
+    monkeypatch.setattr(setup_module, "clear_session", lambda: calls.append("clear_session") or True)
+    monkeypatch.setattr(
+        setup_module,
+        "_oauth_session",
+        lambda args, config: calls.append(f"oauth:provider={args.provider}:force={args.force_auth}") or "new-token",
+    )
+
+    assert setup_module._access_token(_auth_args(), {}) == "new-token"
+    assert calls == ["clear_session", "oauth:provider=None:force=True"]
+    assert observed["values"] == [
+        "Continue as 1234+bob@users.noreply.github.com (via github)",
+        setup_module.SWITCH_ACCOUNT,
+    ]
+    assert observed["default"] == "Continue as 1234+bob@users.noreply.github.com (via github)"
+
+
+def test_setup_keeps_the_stored_session_when_you_continue(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    monkeypatch.setattr(setup_module, "_can_prompt", lambda: True)
+    monkeypatch.setattr(setup_module, "load_access_token", lambda: "stored-token")
+    monkeypatch.setattr(setup_module, "load_session", _github_session)
+    monkeypatch.setattr(setup_module, "_choose", lambda label, values, **kwargs: values[0])
+    monkeypatch.setattr(setup_module, "_oauth_session", lambda args, config: pytest.fail("should not re-authenticate"))
+
+    assert setup_module._access_token(_auth_args(), {}) == "stored-token"
+
+
+def test_setup_does_not_ask_about_the_account_without_a_terminal(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    monkeypatch.setattr(setup_module, "_can_prompt", lambda: False)
+    monkeypatch.setattr(setup_module, "load_access_token", lambda: "stored-token")
+    monkeypatch.setattr(setup_module, "load_session", _github_session)
+    monkeypatch.setattr(setup_module, "_choose", lambda *args, **kwargs: pytest.fail("should not prompt"))
+
+    assert setup_module._access_token(_auth_args(), {}) == "stored-token"
+
+
+def test_setup_workspace_join_without_access_offers_to_switch_account(monkeypatch, capsys) -> None:
+    from rebase import setup as setup_module
+
+    class FakeClient:
+        def list_my_workspaces(self) -> list[dict[str, Any]]:
+            return []
+
+    monkeypatch.setattr(setup_module, "_can_prompt", lambda: True)
+    monkeypatch.setattr(setup_module, "_prompt", lambda *args, **kwargs: "acme")
+
+    def fake_choose(label: str, values: list[str], *, default: str | None = None, title: str | None = None) -> str:
+        return setup_module.JOIN_WORKSPACE if label == "workspace setup" else setup_module.SWITCH_ACCOUNT
+
+    monkeypatch.setattr(setup_module, "_choose", fake_choose)
+
+    with pytest.raises(setup_module._SwitchAccountRequested):
+        setup_module._select_workspace(
+            SimpleNamespace(workspace=None, workspace_name=None, handle=None),
+            FakeClient(),
+            session=_github_session(),
+        )
+
+    output = capsys.readouterr().out
+    assert "You do not have access to workspace 'acme'." in output
+    assert "signed in as 1234+bob@users.noreply.github.com (via github)" in output
+
+
+def test_setup_workspace_join_without_access_names_the_account_when_scripted(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    class FakeClient:
+        def list_my_workspaces(self) -> list[dict[str, Any]]:
+            return []
+
+    monkeypatch.setattr(setup_module, "_can_prompt", lambda: False)
+    monkeypatch.setattr(setup_module, "_prompt", lambda *args, **kwargs: "acme")
+    monkeypatch.setattr(setup_module, "_choose", lambda *args, **kwargs: setup_module.JOIN_WORKSPACE)
+
+    with pytest.raises(setup_module.RebaseWorkflowError) as excinfo:
+        setup_module._select_workspace(
+            SimpleNamespace(workspace=None, workspace_name=None, handle=None),
+            FakeClient(),
+            session=_github_session(),
+        )
+
+    message = str(excinfo.value)
+    assert "1234+bob@users.noreply.github.com (via github)" in message
+    assert "--force-auth" in message
+
+
+def test_setup_beta_enrollment_error_names_the_account() -> None:
+    from rebase import setup as setup_module
+
+    error = setup_module._workspace_creation_error(
+        setup_module.RebaseWorkflowError("creating a workspace requires a platform beta invite"),
+        session=_github_session(),
+    )
+
+    assert "not enrolled in the beta program" in str(error)
+    assert "1234+bob@users.noreply.github.com (via github)" in str(error)
+
+
+def test_setup_retries_the_workspace_step_after_switching_account(monkeypatch, tmp_path) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[str] = []
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(tmp_path / "config.json"))
+    monkeypatch.chdir(tmp_path)
+
+    class FakeClient:
+        def __init__(
+            self,
+            *,
+            api_url: str | None = None,
+            access_token: str | None = None,
+            profile: str | None = None,
+        ) -> None:
+            self.api_url = api_url or "https://api.example.test"
+            self.access_token = access_token
+
+        def setup_config(self) -> dict[str, Any]:
+            return {"supabase_url": "https://project.supabase.co", "supabase_anon_key": "anon"}
+
+    def fake_select_workspace(args: Any, client: Any, *, session: Any) -> dict[str, Any]:
+        calls.append(f"select_workspace:{client.access_token}")
+        if client.access_token == "stored-token":
+            raise setup_module._SwitchAccountRequested
+        return {"id": "acme", "name": "Acme"}
+
+    monkeypatch.setattr(setup_module, "Client", FakeClient)
+    monkeypatch.setattr(setup_module, "_access_token", lambda args, config: "stored-token")
+    monkeypatch.setattr(setup_module, "load_session", lambda: None)
+    monkeypatch.setattr(setup_module, "_select_workspace", fake_select_workspace)
+    monkeypatch.setattr(
+        setup_module,
+        "_switch_account",
+        lambda args, config: calls.append("switch_account") or "google-token",
+    )
+
+    assert setup_module.run_setup(_auth_args(handle=None, workspace=None, workspace_name=None)) == 0
+    assert calls == [
+        "select_workspace:stored-token",
+        "switch_account",
+        "select_workspace:google-token",
+    ]
+
+    data = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert data["profiles"]["default"]["workspace_id"] == "acme"
 
 
 def test_setup_workspace_invite_create_without_beta_enrollment_errors(monkeypatch) -> None:
@@ -1425,11 +1635,7 @@ def test_setup_workspace_invite_create_with_beta_enrollment_continues(monkeypatc
     assert calls == [("get_profile", None), ("create_workspace", "sebaheg")]
 
 
-def test_setup_workspace_create_claims_profile_handle_first(monkeypatch) -> None:
-    from rebase import setup as setup_module
-
-    calls: list[tuple[str, str | None]] = []
-
+def _workspace_create_fake_client(calls: list[tuple[str, str | None]]) -> Any:
     class FakeClient:
         def list_my_workspaces(self) -> list[dict[str, Any]]:
             return []
@@ -1447,6 +1653,17 @@ def test_setup_workspace_create_claims_profile_handle_first(monkeypatch) -> None
             calls.append(("create_workspace", workspace_id))
             return {"id": workspace_id, "name": name}
 
+    return FakeClient()
+
+
+def test_setup_workspace_create_claims_profile_handle_first(monkeypatch, tmp_path: Path) -> None:
+    from rebase import setup as setup_module
+
+    calls: list[tuple[str, str | None]] = []
+    repo = tmp_path / "agent-work"
+    repo.mkdir()
+    monkeypatch.chdir(repo)
+
     monkeypatch.setattr(setup_module, "_choose", lambda *args, **kwargs: setup_module.CREATE_WORKSPACE)
 
     def fake_prompt(value: str | None, message: str, *, default: str | None = None) -> str:
@@ -1454,6 +1671,40 @@ def test_setup_workspace_create_claims_profile_handle_first(monkeypatch) -> None
             assert default == "sebastian"
             return "SebaHeg"
         assert message == "Workspace handle to create"
+        # The directory, not the user handle: a workspace is 1:1 with a repo.
+        assert default == "agent-work"
+        return default or "fallback"
+
+    monkeypatch.setattr(setup_module, "_prompt", fake_prompt)
+
+    workspace = setup_module._select_workspace(
+        SimpleNamespace(workspace=None, workspace_name=None, handle=None),
+        _workspace_create_fake_client(calls),
+        session=SimpleNamespace(email="sebastian@rebase.energy"),
+    )
+
+    assert workspace["id"] == "agent-work"
+    assert calls == [
+        ("get_profile", None),
+        ("update_profile", "sebaheg"),
+        ("create_workspace", "agent-work"),
+    ]
+
+
+def test_setup_workspace_create_falls_back_to_handle_for_unusable_dir(monkeypatch, tmp_path: Path) -> None:
+    """A directory name too short to be a handle leaves the old default in place."""
+    from rebase import setup as setup_module
+
+    calls: list[tuple[str, str | None]] = []
+    repo = tmp_path / "ab"
+    repo.mkdir()
+    monkeypatch.chdir(repo)
+
+    monkeypatch.setattr(setup_module, "_choose", lambda *args, **kwargs: setup_module.CREATE_WORKSPACE)
+
+    def fake_prompt(value: str | None, message: str, *, default: str | None = None) -> str:
+        if message == "Choose your Rebase handle":
+            return "SebaHeg"
         assert default == "sebaheg"
         return default or "fallback"
 
@@ -1461,16 +1712,11 @@ def test_setup_workspace_create_claims_profile_handle_first(monkeypatch) -> None
 
     workspace = setup_module._select_workspace(
         SimpleNamespace(workspace=None, workspace_name=None, handle=None),
-        FakeClient(),
+        _workspace_create_fake_client(calls),
         session=SimpleNamespace(email="sebastian@rebase.energy"),
     )
 
     assert workspace["id"] == "sebaheg"
-    assert calls == [
-        ("get_profile", None),
-        ("update_profile", "sebaheg"),
-        ("create_workspace", "sebaheg"),
-    ]
 
 
 def test_workspace_create_helper_creates_workspace_without_github_prompt(monkeypatch, tmp_path: Path) -> None:
@@ -1479,6 +1725,9 @@ def test_workspace_create_helper_creates_workspace_without_github_prompt(monkeyp
     calls: list[str] = []
     config_path = tmp_path / "config.json"
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
+    workdir = tmp_path / "energy-team"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
 
     class FakeClient:
         def __init__(
@@ -1529,6 +1778,11 @@ def test_workspace_create_helper_creates_workspace_without_github_prompt(monkeyp
         "get_profile",
         "create_workspace:energy-team:Energy Team",
     ]
+    marker = workdir / ".rebase" / "config.json"
+    assert json.loads(marker.read_text(encoding="utf-8")) == {
+        "workspace": "energy-team",
+        "workspace_name": "Energy Team",
+    }
     data = json.loads(config_path.read_text(encoding="utf-8"))
     assert data["default_profile"] == "new"
     assert data["profiles"]["new"]["workspace_id"] == "energy-team"
@@ -2843,6 +3097,27 @@ def test_profile_logout_clears_auth_session_only(monkeypatch, tmp_path: Path, ca
     assert config_path.exists()
     assert not auth_path.exists()
     assert f"Cleared Rebase auth session at {auth_path}" in capsys.readouterr().out
+
+
+def test_auth_session_records_the_login_provider(monkeypatch, tmp_path: Path) -> None:
+    from rebase.auth import load_session, parse_callback_url, save_session
+
+    monkeypatch.setenv("REBASE_AUTH_FILE", str(tmp_path / "auth.json"))
+    claims = {
+        "email": "1234+bob@users.noreply.github.com",
+        "sub": "user-id",
+        "app_metadata": {"provider": "github"},
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    token = f"header.{encoded}.signature"
+
+    session = parse_callback_url(f"http://127.0.0.1/auth/callback#access_token={token}&token_type=bearer")
+
+    assert session.provider == "github"
+    save_session(session)
+    stored = load_session()
+    assert stored is not None
+    assert stored.provider == "github"
 
 
 def test_profile_show_unknown_profile_errors(monkeypatch, tmp_path: Path) -> None:

@@ -36,6 +36,26 @@ SYNC_INTERVAL_S = 30
 SYNCED_FILES = ("run.yaml", "search.yaml", "status.json", "journal.jsonl", "knowledge_card.yaml")
 SYNCED_DIRS = ("best",)
 
+LOCAL_CONFIG_TEMPLATE = """\
+# Hillclimb workspace settings used by `rebase hillclimb`.
+# CLI flags override these defaults.
+
+model: sonnet
+
+# search:
+#   parallel_agents: 1
+#   n_trials: 1
+
+# holdout:
+#   enabled: true
+#   top_k: 5
+
+# learning:
+#   enabled: true
+#   max_cards: 3
+#   live: true
+"""
+
 
 def _require_hillclimb():
     try:
@@ -45,6 +65,61 @@ def _require_hillclimb():
             "hillclimb commands need the hillclimb extra: pip install 'rebase-toolkit[hillclimb]'"
         ) from exc
     return hillclimb
+
+
+def init_local_workspace(directory: Path, *, force: bool = False) -> Path:
+    """Initialize the on-disk state used by local ``rebase hillclimb`` runs."""
+    root = directory.resolve()
+    marker_dir = "hillclimb"
+    marker_file = "config.yaml"
+    existing = next(
+        (candidate for candidate in (root, *root.parents) if (candidate / marker_dir / marker_file).exists()),
+        None,
+    )
+    if existing is not None and not force:
+        marker = existing / marker_dir / marker_file
+        raise RuntimeError(f"already inside the Hillclimb workspace at {existing} ({marker} exists)")
+
+    folder = root / marker_dir
+    for subdirectory in ("knowledge", "problems", "runs", "specs"):
+        path = folder / subdirectory
+        path.mkdir(parents=True, exist_ok=True)
+        (path / ".gitkeep").touch()
+    (folder / marker_file).write_text(LOCAL_CONFIG_TEMPLATE)
+
+    gitignore = root / ".gitignore"
+    ignore_line = f"{marker_dir}/runs/"
+    existing_ignore = gitignore.read_text() if gitignore.exists() else ""
+    if ignore_line not in existing_ignore.splitlines():
+        separator = "\n" if existing_ignore and not existing_ignore.endswith("\n") else ""
+        gitignore.write_text(f"{existing_ignore}{separator}{ignore_line}\n")
+    return root
+
+
+def discover_emflow_problems(family: str | None = None) -> list[dict[str, str]]:
+    """Return installed emflow registry targets without loading their datasets."""
+    _require_hillclimb()
+    try:
+        import emflow as ef
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "problem discovery needs the hillclimb extra: pip install 'rebase-toolkit[hillclimb]'"
+        ) from exc
+
+    normalized_family = family.removeprefix("emflow://").rstrip(":") if family else None
+    problems = []
+    for name in sorted(ef.list_problems()):
+        problem_family, separator, track = name.partition(":")
+        if normalized_family and problem_family != normalized_family:
+            continue
+        problems.append(
+            {
+                "target": f"emflow://{name}",
+                "family": problem_family,
+                "track": track if separator else "—",
+            }
+        )
+    return problems
 
 
 def _bucket_name(explicit: str | None = None) -> str:
@@ -143,6 +218,7 @@ def hosted_search(
     sync_id: str | None = None,
     model: str | None = None,
     backend: str | None = None,
+    holdout: bool = True,
     seed_solution_code: str | None = None,
     knowledge_context: str | None = None,
 ) -> dict[str, Any]:
@@ -194,6 +270,7 @@ def hosted_search(
             budget_s=budget_s,
             name=name,
             config=config,
+            holdout=holdout,
             log=print,
             seed_from=seed_path,
             knowledge_context=knowledge_context or None,
@@ -240,12 +317,14 @@ _STUB_TEMPLATE = '''\
 
 
 def run(target: str, budget_s: int, name: str, sync_id: str, model: str = "",
-        backend: str = "", seed_solution_code: str = "", knowledge_context: str = ""):
+        backend: str = "", holdout: bool = True, seed_solution_code: str = "",
+        knowledge_context: str = ""):
     from rebase.hillclimb import hosted_search
 
     return hosted_search(target, budget_s=budget_s, name=name,
                          sync_id=sync_id, model=model or None,
                          backend=backend or None,
+                         holdout=holdout,
                          seed_solution_code=seed_solution_code or None,
                          knowledge_context=knowledge_context or None)
 '''
@@ -263,6 +342,7 @@ def start_hosted_search(
     project: str = "hillclimb",
     model: str | None = None,
     backend: str | None = None,
+    holdout: bool = True,
     seed_solution_code: str | None = None,
     knowledge_context: str | None = None,
 ):
@@ -283,6 +363,7 @@ def start_hosted_search(
             "sync_id": sync_id,
             "model": model or "",
             "backend": backend or "",
+            "holdout": holdout,
             "seed_solution_code": seed_solution_code or "",
             "knowledge_context": knowledge_context or "",
         },
@@ -298,12 +379,21 @@ def run_local_search(
     name: str | None = None,
     model: str | None = None,
     backend: str | None = None,
+    holdout: bool = True,
     log=print,
 ):
     """`--local` mode: same command surface, search runs on this machine with
     the user's own hillclimb config (subscription agent auth, local runs/)."""
     hillclimb = _require_hillclimb()
-    return hillclimb.run_search(target, budget_s=budget_s, name=name, model=model, backend=backend, log=log)
+    return hillclimb.run_search(
+        target,
+        budget_s=budget_s,
+        name=name,
+        model=model,
+        backend=backend,
+        holdout=holdout,
+        log=log,
+    )
 
 
 def read_hosted_state(sync_id: str, bucket: str | None = None) -> dict[str, Any]:
