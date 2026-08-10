@@ -203,7 +203,7 @@ TIMELINE_FILTERS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 TIMELINE_EMPTY: dict[str, str] = {
     "timeline-steps": "No steps — this workflow's body does the work itself.",
     "timeline-events": "No lifecycle events recorded for this run.",
-    "timeline-tasks": "No tasks — no step of this run fanned work out.",
+    "timeline-tasks": "No tasks reported for this run.",
     "timeline-logs": "No log output recorded for this run.",
     "timeline-all": "Nothing recorded for this run yet.",
 }
@@ -660,16 +660,20 @@ class RebaseTuiData:
             logs = executor.submit(_optional_entries, lambda: self.load_run_logs(run_id))
             # Supplementary, like the endpoint list: an API without the route costs the
             # rows and not the run view.
-            wanted = target_type in (None, "workflow")
-            steps = executor.submit(_optional_list, lambda: self.client.list_run_steps(run_id)) if wanted else None
-            tasks = executor.submit(_optional_list, lambda: self.client.list_run_tasks(run_id)) if wanted else None
+            wanted_steps = target_type in (None, "workflow")
+            steps = (
+                executor.submit(_optional_list, lambda: self.client.list_run_steps(run_id))
+                if wanted_steps
+                else None
+            )
+            tasks = executor.submit(_optional_list, lambda: self.client.list_run_tasks(run_id))
             resolved = run.result()
             is_workflow = resolved.get("target_type") == "workflow"
             return RunDetailData(
                 run=resolved,
                 events=events.result(),
                 steps=steps.result() if steps is not None and is_workflow else [],
-                tasks=tasks.result() if tasks is not None and is_workflow else [],
+                tasks=tasks.result(),
                 logs=logs.result(),
             )
 
@@ -765,7 +769,7 @@ def build_timeline(
                 # A queued task has not started, and sorting it by `created_at` keeps it
                 # with its batch instead of at the top of the run.
                 at=_parse_timestamp(task.get("started_at") or task.get("created_at")),
-                stage=f"task {task.get('item_index', '-')}",
+                stage=str(task.get("name") or f"task {task.get('item_index', '-')}"),
                 status=str(task.get("status", "-")),
                 message=f"{format_json_summary(task.get('parameters'), max_length=90)} -> {detail}",
                 kind="task",
