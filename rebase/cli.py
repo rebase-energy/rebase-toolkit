@@ -39,6 +39,7 @@ from rebase.client import (
     DEFAULT_API_KEY_PERMISSIONS,
     Agent,
     ASGIApp,
+    Bucket,
     Client,
     Cron,
     Function,
@@ -79,6 +80,8 @@ from rebase.config import (
 from rebase.contract import Freshness, validate_frame
 from rebase.editor import NO_EDITOR_HINT, build_argv, resolve_editor, run_foreground, spawn_detached
 from rebase.locate import describe_failure, find_project_declarations, is_risky_root, project_folder
+from rebase.shell import close_message as _shell_close_message
+from rebase.shell import run_bridge as _run_shell_bridge
 
 _BANNER_LINES = [
     "██████╗  ███████╗ ██████╗   █████╗  ███████╗ ███████╗",
@@ -3020,6 +3023,231 @@ def volume_delete_command(
     console.print(f"[rebase.success]Deleted volume {name}.[/rebase.success]")
 
 
+bucket_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Object storage buckets, addressed by key. Attach to functions with buckets=[...].",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+BUCKET_DETAIL_KEYS = ["name", "provider", "bucket", "uri", "location", "workspace_id", "created_at"]
+
+
+@bucket_app.command("create")
+def bucket_create_command(
+    name: Annotated[str, typer.Argument(help="Bucket name (lowercase letters, digits, '.', '_', '-').")],
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Create a bucket (idempotent: returns the existing one if present)."""
+    bucket = Client().create_bucket(name)
+    if json_output:
+        _print_json(bucket)
+        return
+    console.print(_detail_table("Bucket", bucket, preferred_keys=BUCKET_DETAIL_KEYS))
+
+
+@bucket_app.command("list")
+def bucket_list_command(
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List buckets in the active workspace."""
+    buckets = Client().list_buckets()
+    if json_output:
+        _print_json(buckets)
+        return
+    if not buckets:
+        console.print("[rebase.muted]No buckets yet.[/rebase.muted]")
+        return
+    table = Table(
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Name", style="rebase.value")
+    table.add_column("URI", style="rebase.muted")
+    table.add_column("Location", style="rebase.muted")
+    table.add_column("Created", style="rebase.muted")
+    for bucket in buckets:
+        table.add_row(
+            str(bucket.get("name", "-")),
+            _format_value(bucket.get("uri")),
+            _format_value(bucket.get("location")),
+            _format_value(bucket.get("created_at")),
+        )
+    console.print(table)
+
+
+@bucket_app.command("get")
+def bucket_get_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show bucket metadata."""
+    bucket = Client().get_bucket(name)
+    if json_output:
+        _print_json(bucket)
+        return
+    console.print(_detail_table("Bucket", bucket, preferred_keys=BUCKET_DETAIL_KEYS))
+
+
+@bucket_app.command("uri")
+def bucket_uri_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+) -> None:
+    """Print the gs:// URI, for piping into other tools."""
+    console.print(Bucket(name, client=Client()).uri)
+
+
+@bucket_app.command("ls")
+def bucket_ls_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+    prefix: Annotated[str, typer.Argument(help="Key prefix to list under.")] = "",
+    delimiter: Annotated[
+        str | None, typer.Option("--delimiter", "-d", help="Group keys by this separator, e.g. '/'.")
+    ] = None,
+    all_pages: Annotated[bool, typer.Option("--all", "-a", help="Follow pagination and list every object.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List objects in a bucket."""
+    bucket = Bucket(name, client=Client())
+    if all_pages:
+        objects = list(bucket.iter_all(prefix))
+        prefixes: list[str] = []
+        truncated = False
+    else:
+        page = bucket.list(prefix, delimiter=delimiter)
+        objects = page["objects"]
+        prefixes = page["prefixes"]
+        truncated = bool(page["next_page_token"])
+    if json_output:
+        _print_json(
+            {
+                "objects": [
+                    {"key": obj.key, "size": obj.size, "updated": obj.updated, "content_type": obj.content_type}
+                    for obj in objects
+                ],
+                "prefixes": prefixes,
+                "truncated": truncated,
+            }
+        )
+        return
+    if not objects and not prefixes:
+        console.print("[rebase.muted]No objects.[/rebase.muted]")
+        return
+    table = Table(
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Key", style="rebase.value")
+    table.add_column("Size", style="rebase.muted")
+    table.add_column("Updated", style="rebase.muted")
+    for common in prefixes:
+        table.add_row(common, "-", "-")
+    for obj in objects:
+        table.add_row(obj.key, _format_bytes(obj.size), _format_value(obj.updated))
+    console.print(table)
+    if truncated:
+        console.print("[rebase.muted]More objects remain; pass --all to list them.[/rebase.muted]")
+
+
+@bucket_app.command("stat")
+def bucket_stat_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+    key: Annotated[str, typer.Argument(help="Object key.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show metadata for one object."""
+    stat = Client().stat_bucket_object(name, key.lstrip("/"))
+    if json_output:
+        _print_json(stat)
+        return
+    console.print(_detail_table("Object", stat))
+
+
+@bucket_app.command("put")
+def bucket_put_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+    source: Annotated[str, typer.Argument(help="Local file or directory to upload.")],
+    key: Annotated[str | None, typer.Argument(help="Destination key. Defaults to the local name.")] = None,
+) -> None:
+    """Upload a file or directory into a bucket."""
+    bucket = Bucket(name, client=Client())
+    path = Path(source)
+    if path.is_dir():
+        written = bucket.put_directory(source, key or "")
+        console.print(f"[rebase.success]Uploaded {len(written)} objects to bucket {name}.[/rebase.success]")
+        return
+    written_key = bucket.put_file(source, key)
+    console.print(f"[rebase.success]Uploaded {source} to {name}/{written_key}.[/rebase.success]")
+
+
+@bucket_app.command("download")
+def bucket_download_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+    key: Annotated[str, typer.Argument(help="Object key.")],
+    local_path: Annotated[
+        str | None, typer.Argument(help="Local destination. Defaults to the key's file name.")
+    ] = None,
+) -> None:
+    """Download one object from a bucket."""
+    bucket = Bucket(name, client=Client())
+    destination = Path(local_path) if local_path else Path(Path(key).name)
+    bucket.download(key, destination)
+    console.print(f"[rebase.success]Downloaded {name}/{key.lstrip('/')} to {destination}.[/rebase.success]")
+
+
+@bucket_app.command("rm")
+def bucket_rm_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+    # Optional so `rm <name> --recursive` empties the whole bucket, which is what
+    # the "bucket is not empty" error from `bucket delete` tells people to run.
+    key: Annotated[
+        str | None, typer.Argument(help="Object key, or prefix with --recursive. Omit to mean the whole bucket.")
+    ] = None,
+    recursive: Annotated[
+        bool, typer.Option("--recursive", "-r", help="Delete every object under the key as a prefix.")
+    ] = False,
+    force: Annotated[bool, typer.Option("--force", "-f", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Delete one object, or everything under a prefix."""
+    bucket = Bucket(name, client=Client())
+    if not recursive:
+        if key is None:
+            raise RebaseWorkflowError("KEY is required unless --recursive is passed")
+        bucket.delete(key)
+        console.print(f"[rebase.success]Deleted {name}/{key.lstrip('/')}.[/rebase.success]")
+        return
+    prefix = (key or "").lstrip("/")
+    target = f"{name}/{prefix}" if prefix else f"bucket {name}"
+    if not force and not typer.confirm(f"Delete ALL objects in {target}?"):
+        raise typer.Abort()
+    # Paged from the client: emptying a large bucket in one API call would time
+    # out, and the retry would resume against a half-emptied bucket.
+    deleted = bucket.delete_prefix(prefix)
+    console.print(f"[rebase.success]Deleted {deleted} objects from bucket {name}.[/rebase.success]")
+
+
+@bucket_app.command("delete")
+def bucket_delete_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+    force: Annotated[bool, typer.Option("--force", "-f", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Delete an empty bucket.
+
+    Refuses while objects remain; empty it first with `rebase bucket rm <name> <prefix> --recursive`.
+    """
+    if not force and not typer.confirm(f"Delete bucket {name}?"):
+        raise typer.Abort()
+    Client().delete_bucket(name)
+    console.print(f"[rebase.success]Deleted bucket {name}.[/rebase.success]")
+
+
 dataset_app = typer.Typer(
     add_completion=False,
     cls=AlphabeticalTyperGroup,
@@ -3511,6 +3739,7 @@ dataset_app.add_typer(contract_app, name="contract")
 
 app.add_typer(secret_app, name="secret")
 app.add_typer(volume_app, name="volume")
+app.add_typer(bucket_app, name="bucket")
 app.add_typer(dataset_app, name="dataset")
 
 
@@ -5087,6 +5316,79 @@ async def _await_value(value: Any) -> Any:
 
 
 RUN_INSPECTION_COMMANDS = {"list", "get", "logs", "cancel", "replay"}
+
+
+@app.command("shell")
+def shell_command(
+    name: Annotated[
+        str | None,
+        typer.Argument(help="Function (default) or workflow name. Omit when using --id."),
+    ] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    target_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact function or workflow ID.")] = None,
+    workflow: Annotated[
+        bool,
+        typer.Option("--workflow", "-w", help="Open a shell in a workflow's environment instead of a function's."),
+    ] = False,
+    version_id: Annotated[
+        str | None,
+        typer.Option("--version-id", "-v", help="Shell into a specific version instead of the current one."),
+    ] = None,
+    idle_timeout: Annotated[
+        int | None,
+        typer.Option("--idle-timeout", help="Close the session after this many seconds without activity."),
+    ] = None,
+    ttl: Annotated[
+        int | None,
+        typer.Option("--ttl", "-t", help="Hard session limit in seconds (capped by the server)."),
+    ] = None,
+) -> None:
+    """Open an interactive shell in a cloud container with the target's
+    image, environment variables, secrets and volume mounts."""
+    client = Client()
+    if workflow:
+        target = _resolve_workflow_selector(client, name, workflow_id=target_id, project_name=project)
+        payload: dict[str, Any] = {"workflow_id": str(target["id"])}
+    else:
+        target = _resolve_function_selector(client, name, function_id=target_id, project_name=project)
+        payload = {"function_id": str(target["id"])}
+    if version_id is not None:
+        payload["version_id"] = version_id
+    if idle_timeout is not None:
+        payload["idle_timeout_seconds"] = idle_timeout
+    if ttl is not None:
+        payload["ttl_seconds"] = ttl
+
+    console.print(f"Starting shell container for [bold]{target.get('name', target['id'])}[/bold]…")
+    session = client.create_shell_session(payload)
+    session_id = str(session["id"])
+    relay_ws_url = session.get("relay_ws_url")
+    client_token = session.get("client_token")
+    if not relay_ws_url or not client_token:
+        raise RebaseWorkflowError("the server did not return shell connection details")
+
+    result = None
+    try:
+        result = _run_shell_bridge(
+            relay_ws_url,
+            session_id,
+            client_token,
+            on_waiting=lambda: console.print(
+                "Waiting for the container to dial in (first run installs dependencies; may take a minute)…"
+            ),
+            on_ready=lambda: console.print("Connected. Press Ctrl-D or type 'exit' to end the session.\n"),
+        )
+    except KeyboardInterrupt:
+        console.print("\nCancelled.")
+    finally:
+        with contextlib.suppress(Exception):
+            client.delete_shell_session(session_id)
+    if result is not None:
+        message = _shell_close_message(result)
+        if message is not None:
+            error_console.print(f"[{BRAND_CORAL_RED}]{message}[/]")
+            raise typer.Exit(code=1)
+        console.print("Session ended.")
 
 
 @app.command("run")

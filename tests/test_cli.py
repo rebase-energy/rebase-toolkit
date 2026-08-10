@@ -9,7 +9,17 @@ import pytest
 
 from rebase.auth import AuthSession
 from rebase.cli import _format_duration, deploy_file, main
-from rebase.client import ASGIApp, Client, Function, Model, Project, RebaseWorkflowError, Run, Workflow
+from rebase.client import (
+    ASGIApp,
+    Bucket,
+    Client,
+    Function,
+    Model,
+    Project,
+    RebaseWorkflowError,
+    Run,
+    Workflow,
+)
 
 
 def test_main_without_args_prints_help(capsys) -> None:
@@ -5165,3 +5175,50 @@ def test_workspace_notifications_set_on_stale(monkeypatch, capsys) -> None:
     observed.clear()
     assert main(["workspace", "notifications", "set", "--no-on-stale"]) == 0
     assert observed == {"notify_on_stale": False}
+
+
+def test_bucket_rm_recursive_without_key_empties_the_whole_bucket(monkeypatch, capsys) -> None:
+    """`bucket delete` tells users to run exactly this when a bucket is not empty."""
+    prefixes: list[str] = []
+
+    def fake_list(self, prefix="", *, delimiter=None, limit=1000, page_token=None):
+        prefixes.append(prefix)
+        return {"objects": [], "prefixes": [], "next_page_token": None}
+
+    monkeypatch.setattr(Client, "list_bucket_objects", lambda self, name, **kw: {"objects": []})
+    monkeypatch.setattr(Bucket, "list", fake_list)
+
+    assert main(["bucket", "rm", "forecasts", "--recursive", "--force"]) == 0
+    assert prefixes == [""], "no key must mean the whole bucket, not a literal 'None' prefix"
+    assert "Deleted 0 objects" in capsys.readouterr().out
+
+
+def test_bucket_rm_without_key_or_recursive_is_an_error(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(Client, "delete_bucket_object", lambda self, name, path: None)
+
+    assert main(["bucket", "rm", "forecasts"]) == 1
+    assert "KEY is required" in capsys.readouterr().err
+
+
+def test_bucket_create_and_ls_commands(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "create_bucket",
+        lambda self, name: {"name": name, "provider": "gcs", "bucket": f"rb-{name}-abc", "uri": f"gs://rb-{name}-abc"},
+    )
+    assert main(["bucket", "create", "forecasts"]) == 0
+    assert "gs://rb-forecasts-abc" in capsys.readouterr().out
+
+    monkeypatch.setattr(
+        Client,
+        "list_bucket_objects",
+        lambda self, name, **kw: {
+            "objects": [{"path": "2026/a.parquet", "size": 2048, "updated": None}],
+            "prefixes": ["2026/"],
+            "next_page_token": None,
+        },
+    )
+    assert main(["bucket", "ls", "forecasts", "--delimiter", "/"]) == 0
+    output = capsys.readouterr().out
+    assert "2026/" in output
+    assert "2.0 KiB" in output

@@ -39,6 +39,20 @@
   index since a repaint is also what reorders and removes rows, and an expanded timeline row
   stays expanded when the run it belongs to is re-read.
 
+- **`rb.Bucket` is object storage that admits what it is.** A bucket maps one-to-one to a
+  real cloud bucket and is addressed by key: `put`, `get`, `list`, `stat`, `delete`, and a
+  `gs://` URI you can hand straight to pandas, polars or duckdb. `rb.Volume` already stored
+  objects, but presented them as a mounted directory, and the mount makes expensive things
+  look cheap — editing one byte of a large file rewrites the whole object, rename is not
+  atomic, and there is no locking. None of that is visible from a path. Buckets attach with
+  `@rb.function(buckets=["forecasts"])`, which injects the URI as `REBASE_BUCKET_FORECASTS`
+  and grants the runtime service account access, so code inside a run reads `gs://` at full
+  speed without signed URLs. Volumes stay for the case they are actually good at: a library
+  that demands a real filesystem path for read-mostly data. Listing is paginated and says so,
+  deletion refuses a non-empty bucket rather than timing out halfway through draining it, and
+  `buckets:read`/`buckets:write` are granted to Developers, who could already deploy code that
+  uses a bucket. Note attachments apply to deployed code only: an ephemeral `rebase run
+  ./file.py::fn` carries no buckets, secrets, env or volumes, as it always has.
 - **`rebase hillclimb init` and `rebase hillclimb problems` make local search
   setup and problem discovery Rebase-native.** A fresh repository can now create
   its versionable Hillclimb workspace and browse installed emflow targets without
