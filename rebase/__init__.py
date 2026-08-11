@@ -1,4 +1,5 @@
 from rebase import data, modeling, sources
+from rebase.artifacts import Artifact, ArtifactReportingError, artifact
 from rebase.client import (
     DEFAULT_RUN_TYPE,
     RUN_TYPES,
@@ -89,6 +90,8 @@ __all__ = [
     "DEFAULT_SERVER_URL",
     "Agent",
     "AgentHandle",
+    "Artifact",
+    "ArtifactReportingError",
     "ASGIApp",
     "Function",
     "HuggingFacePublishConfig",
@@ -117,6 +120,7 @@ __all__ = [
     "Workflow",
     "__version__",
     "asgi_app",
+    "artifact",
     "configure",
     "current_run",
     "data",

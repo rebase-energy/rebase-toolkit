@@ -211,6 +211,25 @@ JSON-object domain result; lifecycle status stays `succeeded` for outcomes such
 as skipped or pending. Outside a hosted Rebase run the same context manager is a
 transparent in-memory no-op, which keeps local execution ordinary Python.
 
+## Artifacts
+
+Use `rb.artifact` after writing a durable output to register its URI on the
+current run. Rebase records the pointer and metadata; it does not upload or copy
+the object.
+
+```python
+artifact = rb.artifact(
+    "Day-ahead curve SE3",
+    uri="gs://curves/day-ahead/SE3.json",
+    key="day-ahead/SE3",
+    media_type="application/json",
+)
+```
+
+Artifacts created inside `rb.task` are attributed to that task automatically.
+The TUI lists them under `[ Artifacts ]`; select one and press `a` to open its
+location. GCS pointers open the exact object in Google Cloud Storage.
+
 Deploy a file from the command line:
 
 ```bash

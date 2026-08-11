@@ -36,6 +36,7 @@ from rebase.tui import (
     RebaseTuiData,
     SelectableDataTable,
     TimezoneChoiceScreen,
+    artifact_browser_url,
     compact_id,
     detail_payload,
     endpoints_by_target,
@@ -76,9 +77,11 @@ class FakeClient:
         self.version_calls: list[tuple[str, str]] = []
         self.log_calls: list[str] = []
         self.task_calls: list[str] = []
+        self.artifact_calls: list[str] = []
         # Empty by default: a workflow whose steps fan out into nothing has no tasks,
         # which is most of them. `SteppedClient` is the other kind.
         self.tasks: list[dict[str, Any]] = []
+        self.artifacts: list[dict[str, Any]] = []
         # One line between the run's only event and its only step, so the timeline has to
         # interleave the three routes rather than concatenate them.
         self.log_entries: list[dict[str, Any]] = [
@@ -153,6 +156,12 @@ class FakeClient:
     def list_run_tasks(self, run_id: str, *, step_run_id: str | None = None) -> list[dict[str, Any]]:
         self.task_calls.append(run_id)
         return self.tasks
+
+    def list_run_artifacts(
+        self, run_id: str, *, step_run_id: str | None = None, task_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        self.artifact_calls.append(run_id)
+        return self.artifacts
 
     def get_run_logs(self, run_id: str, *, since: str | None = None, limit: int | None = None) -> dict[str, Any]:
         self.log_calls.append(run_id)
@@ -317,6 +326,19 @@ class SteppedClient(FakeClient):
                 "finished_at": "2026-06-16T14:00:09Z",
             },
         ]
+        self.artifacts = [
+            {
+                "id": "artifact-id",
+                "name": "NO1 day-ahead curves",
+                "key": "nordpool/2026-06-16/NO1.json",
+                "uri": "gs://nordpool-curves/2026-06-16/NO1.json",
+                "disposition": "created",
+                "media_type": "application/json",
+                "size_bytes": 4096,
+                "task_id": "task-0",
+                "created_at": "2026-06-16T14:00:08Z",
+            }
+        ]
         self.step_graph = {
             "schema_version": 1,
             "engine": "prefect",
@@ -356,6 +378,14 @@ def test_tui_format_helpers() -> None:
     assert format_timestamp("2026-06-16T12:00:00Z") == "2026-06-16 12:00:00"
     assert format_json_summary({"b": 2, "a": 1}) == '{"a": 1, "b": 2}'
     assert status_style("failed") == "#E46962"
+
+
+def test_artifact_browser_url_targets_the_exact_gcs_object() -> None:
+    assert artifact_browser_url("gs://power-system-data/raw/nordpool/curve 1.json") == (
+        "https://console.cloud.google.com/storage/browser/_details/power-system-data/raw/nordpool/curve%201.json"
+    )
+    assert artifact_browser_url("https://example.com/result.json") == "https://example.com/result.json"
+    assert artifact_browser_url("s3://bucket/result.json") is None
 
 
 def test_tui_data_loads_project_filtered_overview_and_runs() -> None:
@@ -2714,8 +2744,9 @@ def test_tui_footer_shows_only_the_keys_you_move_around_with() -> None:
                 for _, binding, _, _ in app.screen.active_bindings.values()
                 if not binding.show
             }
-            for key in ("d", "o", "s", "p", "l", "m"):
+            for key in ("a", "d", "o", "s", "p", "l", "m"):
                 assert key in hidden, key
+            assert hidden["a"] == "Open artifact"
             assert hidden["m"] == "Maximise pane"
 
             tab = next(b for _, b, _, _ in app.screen.active_bindings.values() if b.key == "tab")
@@ -2827,13 +2858,14 @@ def test_tui_timeline_chips_filter_the_run_by_kind() -> None:
                 "[ Events ]",
                 "[ Logs ]",
                 "[ Tasks ]",
+                "[ Artifacts ]",
             ]
 
             def kinds() -> list[str]:
                 return [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(timeline.row_count)]
 
             # All: the Type column says which each row is, and everything is present.
-            assert set(kinds()) == {"event", "log", "step", "task"}
+            assert set(kinds()) == {"artifact", "event", "log", "step", "task"}
 
             # left/right steps the chips, the same gesture as the target pane's.
             await pilot.press("right")
@@ -2872,6 +2904,14 @@ def test_tui_timeline_chips_filter_the_run_by_kind() -> None:
 
             await pilot.press("right")
             await pilot.pause(0.2)
+            assert app._timeline_filter == "timeline-artifacts"
+            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(timeline.row_count)] == [
+                "NO1 day-ahead curves"
+            ]
+            assert "gs://nordpool-curves/2026-06-16/NO1.json" in str(timeline.get_cell_at(Coordinate(0, 3)))
+
+            await pilot.press("right")
+            await pilot.pause(0.2)
             assert app._timeline_filter == "timeline-all"
 
     asyncio.run(scenario())
@@ -2892,7 +2932,33 @@ def test_tui_timeline_says_why_a_filter_is_empty() -> None:
             assert timeline.row_count == 1
             assert "No tasks" in str(timeline.get_cell_at(Coordinate(0, 2)))
 
+            app._select_timeline_filter("timeline-artifacts")
+            await pilot.pause(0.2)
+            assert timeline.row_count == 1
+            assert "No artifacts" in str(timeline.get_cell_at(Coordinate(0, 2)))
+
     asyncio.run(scenario())
+
+
+def test_tui_a_opens_the_selected_gcs_artifact(monkeypatch) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr("rebase.tui.webbrowser.open", lambda url: opened.append(url) or True)
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(SteppedClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(160, 40)) as pilot:
+            await _open_run(app, pilot)
+            app._select_timeline_filter("timeline-artifacts")
+            await pilot.pause(0.2)
+            timeline = app.query_one("#timeline-table", DataTable)
+            timeline.focus()
+            timeline.move_cursor(row=0)
+            await pilot.press("a")
+            await pilot.pause(0.3)
+
+    asyncio.run(scenario())
+    assert opened == ["https://console.cloud.google.com/storage/browser/_details/nordpool-curves/2026-06-16/NO1.json"]
 
 
 def test_tui_l_jumps_to_the_logs_chip_and_back() -> None:

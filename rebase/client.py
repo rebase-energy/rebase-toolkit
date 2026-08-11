@@ -3819,6 +3819,33 @@ class Client:
             raise RebaseWorkflowError("expected run task response")
         return response
 
+    def list_run_artifacts(
+        self,
+        run_id: str,
+        *,
+        step_run_id: str | None = None,
+        task_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """The durable output pointers registered for a run."""
+        params = {
+            key: value for key, value in {"step_run_id": step_run_id, "task_id": task_id}.items() if value is not None
+        }
+        try:
+            response = self.request("GET", f"/runs/{run_id}/artifacts", params=params or None)
+        except RebaseWorkflowError as exc:
+            if exc.status_code in ROUTE_ABSENT_STATUSES:
+                return []
+            raise
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected run artifact list response")
+        return response
+
+    def create_run_artifact(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self.request("POST", f"/runs/{run_id}/artifacts", json=payload)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected run artifact response")
+        return response
+
     def list_run_events(self, run_id: str) -> list[dict[str, Any]]:
         response = self.request("GET", f"/runs/{run_id}/events")
         if not isinstance(response, list):
@@ -5583,6 +5610,9 @@ class Run:
 
     def tasks(self) -> list[dict[str, Any]]:
         return self.client.list_run_tasks(self.id)
+
+    def artifacts(self) -> list[dict[str, Any]]:
+        return self.client.list_run_artifacts(self.id)
 
     def events(self) -> list[dict[str, Any]]:
         return self.client.list_run_events(self.id)

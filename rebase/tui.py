@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import textwrap
+import webbrowser
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +14,7 @@ from functools import partial
 from pathlib import Path
 from time import monotonic
 from typing import Any, Literal
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo, available_timezones
 
 from rich.json import JSON
@@ -102,7 +104,7 @@ LAST_RUN_STEP_SCAN = 5
 STEP_GRAPH_FANOUT_WORKERS = 8
 #: The run, its events, its steps and its tasks: four independent reads behind one
 #: keypress, so they go together rather than one after another.
-RUN_DETAIL_FANOUT_WORKERS = 5
+RUN_DETAIL_FANOUT_WORKERS = 6
 #: What each level of the project view adds, outermost first. Level 0 is the target
 #: table alone; selecting a target reveals level 1, selecting a run reveals level 2.
 REVEAL_LEVELS: tuple[tuple[str, ...], ...] = (
@@ -191,19 +193,21 @@ EPHEMERAL_SCAN_LIMIT = 200
 #: What the timeline's chips filter down to. `logs` carries the platform's own
 #: lifecycle events as well: both are the run talking, one in stages and one in output.
 TIMELINE_FILTERS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("timeline-all", "[ All ]", ("event", "step", "task", "log")),
+    ("timeline-all", "[ All ]", ("event", "step", "task", "artifact", "log")),
     ("timeline-steps", "[ Steps ]", ("step",)),
     # Events and Logs deliberately overlap: the stages are the run's own account of
     # itself and belong in both "what happened" and "everything it said".
     ("timeline-events", "[ Events ]", ("event",)),
     ("timeline-logs", "[ Logs ]", ("event", "log")),
     ("timeline-tasks", "[ Tasks ]", ("task",)),
+    ("timeline-artifacts", "[ Artifacts ]", ("artifact",)),
 )
 #: What to say when a filter has nothing to show, rather than leaving a blank table.
 TIMELINE_EMPTY: dict[str, str] = {
     "timeline-steps": "No steps — this workflow's body does the work itself.",
     "timeline-events": "No lifecycle events recorded for this run.",
     "timeline-tasks": "No tasks reported for this run.",
+    "timeline-artifacts": "No artifacts registered for this run.",
     "timeline-logs": "No log output recorded for this run.",
     "timeline-all": "Nothing recorded for this run yet.",
 }
@@ -336,6 +340,8 @@ class RunDetailData:
     steps: list[dict[str, Any]]
     #: The fan-out inside those steps, one row per unit of work.
     tasks: list[dict[str, Any]] = field(default_factory=list)
+    #: Durable output pointers emitted by the run and its tasks.
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
     #: The runtime's own output, which the Logs chip shows alongside the events.
     logs: list[dict[str, Any]] = field(default_factory=list)
 
@@ -348,7 +354,10 @@ class TimelineRow:
     stage: str
     status: str
     message: str
-    kind: Literal["event", "step", "task", "log"]
+    kind: Literal["event", "step", "task", "artifact", "log"]
+    #: Original pointer plus its browser-safe destination, for artifact rows only.
+    artifact_uri: str | None = None
+    url: str | None = None
 
 
 def _optional_entries(load: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -662,11 +671,10 @@ class RebaseTuiData:
             # rows and not the run view.
             wanted_steps = target_type in (None, "workflow")
             steps = (
-                executor.submit(_optional_list, lambda: self.client.list_run_steps(run_id))
-                if wanted_steps
-                else None
+                executor.submit(_optional_list, lambda: self.client.list_run_steps(run_id)) if wanted_steps else None
             )
             tasks = executor.submit(_optional_list, lambda: self.client.list_run_tasks(run_id))
+            artifacts = executor.submit(_optional_list, lambda: self.load_run_artifacts(run_id))
             resolved = run.result()
             is_workflow = resolved.get("target_type") == "workflow"
             return RunDetailData(
@@ -674,12 +682,18 @@ class RebaseTuiData:
                 events=events.result(),
                 steps=steps.result() if steps is not None and is_workflow else [],
                 tasks=tasks.result(),
+                artifacts=artifacts.result(),
                 logs=logs.result(),
             )
 
     def load_run_logs(self, run_id: str) -> list[dict[str, Any]]:
         entries = self.client.get_run_logs(run_id, limit=RUN_LOG_LIMIT).get("entries")
         return entries if isinstance(entries, list) else []
+
+    def load_run_artifacts(self, run_id: str) -> list[dict[str, Any]]:
+        """Compatibility seam for TUI test clients and pre-artifact client builds."""
+        load = getattr(self.client, "list_run_artifacts", None)
+        return load(run_id) if callable(load) else []
 
 
 def workflow_steps(workflow_id: str, workflow_name: str, step_graph: Any) -> tuple[WorkflowStep, ...]:
@@ -712,15 +726,29 @@ def workflow_steps(workflow_id: str, workflow_name: str, step_graph: Any) -> tup
     return tuple(steps)
 
 
+def artifact_browser_url(uri: str) -> str | None:
+    """Turn a durable artifact URI into a safe destination for the user's browser."""
+    value = uri.strip()
+    parsed = urlsplit(value)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return value
+    if parsed.scheme != "gs" or not parsed.netloc or not parsed.path.lstrip("/"):
+        return None
+    bucket = quote(parsed.netloc, safe="")
+    object_name = quote(parsed.path.lstrip("/"), safe="/")
+    return f"https://console.cloud.google.com/storage/browser/_details/{bucket}/{object_name}"
+
+
 def build_timeline(
     events: Sequence[dict[str, Any]],
     steps: Sequence[dict[str, Any]],
     logs: Sequence[dict[str, Any]] | None,
     tasks: Sequence[dict[str, Any]] = (),
+    artifacts: Sequence[dict[str, Any]] = (),
 ) -> list[TimelineRow]:
     """Everything that happened during a run, in the order it happened.
 
-    Events, steps, tasks and log lines are four separate routes. Tasks say which step
+    Events, steps, tasks, artifacts and log lines arrive from separate routes. Tasks say which step
     fanned them out, so they could be nested properly — but a log entry carries a
     timestamp, a severity and a message and nothing else, so the grouping here is
     chronological rather than declared: a row sits under the last step or stage that
@@ -773,6 +801,20 @@ def build_timeline(
                 status=str(task.get("status", "-")),
                 message=f"{format_json_summary(task.get('parameters'), max_length=90)} -> {detail}",
                 kind="task",
+            )
+        )
+    for artifact in artifacts:
+        media_type = str(artifact.get("media_type") or "-")
+        uri = str(artifact.get("uri") or "-")
+        rows.append(
+            TimelineRow(
+                at=_parse_timestamp(artifact.get("created_at")),
+                stage=str(artifact.get("name") or "artifact"),
+                status=str(artifact.get("disposition") or "created"),
+                message=f"{media_type} · {uri}",
+                kind="artifact",
+                artifact_uri=uri,
+                url=artifact_browser_url(uri),
             )
         )
     for entry in logs or []:
@@ -1601,6 +1643,7 @@ class RebaseTuiApp(App[None]):
         # you move around with kept their places and the rest went one keystroke away.
         Binding("d", "delete_selection", "Delete", show=False),
         Binding("o", "open_source", "Open source", show=False),
+        Binding("a", "open_artifact", "Open artifact", show=False),
         Binding("s", "toggle_terminal_select", "Select text", show=False),
         Binding("p", "show_details", "Details", show=False),
         Binding("l", "toggle_logs", "Logs", show=False),
@@ -1878,6 +1921,8 @@ class RebaseTuiApp(App[None]):
         #: Position, not identity: changing filter or run reshuffles the list, and both
         #: clear this rather than leaving an expansion attached to some other line.
         self._expanded_timeline: set[int] = set()
+        #: Visible timeline rows by table key, so actions operate on the row under the cursor.
+        self._timeline_rows: dict[str, TimelineRow] = {}
         #: Log entries per run id, kept so toggling `l` back on costs no request.
         self._run_logs: dict[str, list[dict[str, Any]]] = {}
         self._marked_count = 0
@@ -2612,6 +2657,36 @@ class RebaseTuiApp(App[None]):
             return
         self.notify(describe_failure(result), severity="warning")
 
+    def action_open_artifact(self) -> None:
+        """Open the artifact under the timeline cursor at its durable location."""
+        focused = self.focused
+        key = self._cursor_key(focused) if getattr(focused, "id", None) == "timeline-table" else None
+        row = self._timeline_rows.get(key or "")
+        if row is None or row.kind != "artifact":
+            self.notify("Select an artifact in the timeline first — a opens its location.", severity="warning")
+            return
+        if row.url is None:
+            self.notify(f"No browser destination is available for {row.artifact_uri or row.stage}.", severity="warning")
+            return
+        self.run_worker(
+            self._open_artifact(row.stage, row.url),
+            name="open-artifact",
+            group="tui-open",
+            exclusive=True,
+        )
+
+    async def _open_artifact(self, name: str, url: str) -> None:
+        try:
+            opened = await asyncio.to_thread(webbrowser.open, url)
+        except Exception as exc:
+            self.notify(f"Could not open artifact: {exc}", severity="error")
+            return
+        if not opened:
+            self.notify(f"Could not open a browser for {url}", severity="error")
+            return
+        destination = "Google Cloud Storage" if "console.cloud.google.com/storage/" in url else "the browser"
+        self.notify(f"Opened {name} in {destination}.")
+
     def _on_source_chosen(self, chosen: ProjectDeclaration | None) -> None:
         if chosen is not None:
             self._launch_editor(chosen)
@@ -3125,7 +3200,8 @@ class RebaseTuiApp(App[None]):
         message_width = self._timeline_message_width()
         table = self._fill_table("timeline-table-all" if showing_all else "timeline-table", widget="timeline-table")
         shown = 0
-        for row in build_timeline(detail.events, detail.steps, logs, detail.tasks):
+        self._timeline_rows = {}
+        for row in build_timeline(detail.events, detail.steps, logs, detail.tasks, detail.artifacts):
             if row.kind not in kinds:
                 continue
             shown += 1
@@ -3133,7 +3209,7 @@ class RebaseTuiApp(App[None]):
             # which is the order they nest in even though the timeline sorts by time.
             # Indent only under All, where the nesting is what tells the kinds apart;
             # a filtered view is one kind throughout and reads better flush left.
-            indent = {"task": "  ", "log": "    "}.get(row.kind, "") if showing_all else ""
+            indent = {"task": "  ", "artifact": "    ", "log": "    "}.get(row.kind, "") if showing_all else ""
             cells: list[Any] = [self._time(row.at)]
             if showing_all:
                 cells.append(Text(row.kind, style=BRAND_MEDIUM_GRAY))
@@ -3147,10 +3223,15 @@ class RebaseTuiApp(App[None]):
                 (
                     Text(f"{indent}{row.stage}", style=MARK_STYLE if row.kind == "step" else ""),
                     status_text(row.status),
-                    Text(message, style=BRAND_MEDIUM_GRAY if row.kind == "log" else ""),
+                    Text(
+                        message,
+                        style=(BRAND_MEDIUM_GRAY if row.kind == "log" else f"link {row.url}" if row.url else ""),
+                    ),
                 )
             )
-            table.add_row(*cells, height=message.count("\n") + 1 if expanded else 1, key=str(shown - 1))
+            row_key = str(shown - 1)
+            self._timeline_rows[row_key] = row
+            table.add_row(*cells, height=message.count("\n") + 1 if expanded else 1, key=row_key)
         # An empty table looks broken; saying why it is empty is the whole point of
         # having asked for Steps on a workflow that has none.
         if not shown:
@@ -3193,6 +3274,7 @@ class RebaseTuiApp(App[None]):
         self.query_one("#runs-table", DataTable).clear(columns=True)
         self.query_one("#timeline-table", DataTable).clear(columns=True)
         self._run_rows = {}
+        self._timeline_rows = {}
         self._run_detail = None
         self._reveal(0)
 

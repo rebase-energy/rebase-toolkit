@@ -4,6 +4,12 @@
 
 ### Added
 
+- **`rb.artifact(...)` registers durable output URIs on the current run.** Artifacts
+  inherit the active step and task automatically, are exposed through
+  `Run.artifacts()` and `Client.list_run_artifacts(...)`, and appear in the TUI's
+  `[ Artifacts ]` timeline filter. Select an artifact and press `a` to open HTTP(S)
+  output directly or a `gs://` object at its exact Google Cloud Storage location.
+
 - **`rebase setup` lets you sign in as someone else.** A stored session used to be reused in
   silence, which put the provider picker out of reach for as long as the token lived: someone
   who signed in with GitHub, and whose invite had gone to a work address GitHub never reports,

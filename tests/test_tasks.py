@@ -57,11 +57,16 @@ def test_task_is_a_local_noop_with_normal_python_failure_semantics() -> None:
 
 
 def test_hosted_task_reports_success_with_run_and_step_identity() -> None:
+    from rebase.tasks import _current_task_id
+
     with (
         _activate_run_context("run-1", "step-1", api_url="https://api.example", api_key="rb_run"),
         rb.task("capture", key="2026-08-11/SE", parameters={"cluster": "SE"}) as task,
     ):
+        assert _current_task_id() == task.id
         task.set_result({"outcome": "captured"})
+
+    assert _current_task_id() is None
 
     client = RecordingClient.instances[0]
     assert client.started[0][0] == "run-1"
@@ -72,9 +77,7 @@ def test_hosted_task_reports_success_with_run_and_step_identity() -> None:
         "client_token": task.client_token,
         "step_run_id": "step-1",
     }
-    assert client.finished == [
-        ("run-1", "task-1", {"status": "succeeded", "result": {"outcome": "captured"}})
-    ]
+    assert client.finished == [("run-1", "task-1", {"status": "succeeded", "result": {"outcome": "captured"}})]
 
 
 def test_hosted_task_reports_failure_and_reraises() -> None:
