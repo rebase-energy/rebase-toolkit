@@ -233,6 +233,38 @@ def test_client_list_run_tasks_tolerates_an_api_without_the_route(monkeypatch) -
         client.list_run_tasks("run-1")
 
 
+def test_client_lists_and_creates_run_artifacts(monkeypatch) -> None:
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    def fake_request(method: str, path: str, **kwargs: Any) -> Any:
+        calls.append((method, path, kwargs))
+        return [{"id": "artifact-1"}] if method == "GET" else {"id": "artifact-1"}
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "request", fake_request)
+
+    assert client.list_run_artifacts("run-1", step_run_id="step-1", task_id="task-1") == [{"id": "artifact-1"}]
+    assert client.create_run_artifact("run-1", {"uri": "gs://bucket/a.json"}) == {"id": "artifact-1"}
+    assert calls == [
+        (
+            "GET",
+            "/runs/run-1/artifacts",
+            {"params": {"step_run_id": "step-1", "task_id": "task-1"}},
+        ),
+        ("POST", "/runs/run-1/artifacts", {"json": {"uri": "gs://bucket/a.json"}}),
+    ]
+
+
+def test_client_list_run_artifacts_tolerates_an_api_without_the_route(monkeypatch) -> None:
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    def absent(method: str, path: str, params: Any = None) -> Any:
+        raise _http_error("Not Found", 404)
+
+    monkeypatch.setattr(client, "request", absent)
+    assert client.list_run_artifacts("run-1") == []
+
+
 def test_client_list_runs_filters_on_target_id_not_workflow_id(monkeypatch) -> None:
     """`/runs` has no `workflow_id` parameter, and FastAPI drops unknown ones in silence.
 

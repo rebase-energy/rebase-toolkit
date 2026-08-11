@@ -21,6 +21,7 @@ from dataclasses import dataclass
 #: Set by the runner around a whole run, and around each step of it.
 RUN_ID_ENV = "REBASE_RUN_ID"
 STEP_RUN_ID_ENV = "REBASE_STEP_RUN_ID"
+TASK_ID_ENV = "REBASE_TASK_ID"
 API_URL_ENV = "REBASE_WORKFLOWS_API_URL"
 API_KEY_ENV = "REBASE_API_KEY"
 
@@ -31,6 +32,7 @@ class RunContext:
 
     run_id: str
     step_run_id: str | None = None
+    task_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +49,7 @@ _reporting_context: ContextVar[_ReportingContext | None] = ContextVar("rebase_re
 def _activate_run_context(
     run_id: str,
     step_run_id: str | None = None,
+    task_id: str | None = None,
     *,
     api_url: str | None = None,
     api_key: str | None = None,
@@ -57,7 +60,9 @@ def _activate_run_context(
     identity must not be stored in process-global environment variables. Jobs keep
     using the environment fallback because one process belongs to one run there.
     """
-    run_token = _run_context.set(RunContext(run_id=str(run_id), step_run_id=step_run_id or None))
+    run_token = _run_context.set(
+        RunContext(run_id=str(run_id), step_run_id=step_run_id or None, task_id=task_id or None)
+    )
     reporting_token = None
     if api_url and api_key:
         reporting_token = _reporting_context.set(_ReportingContext(api_url=api_url, api_key=api_key))
@@ -82,7 +87,8 @@ def current_run() -> RunContext | None:
     if not run_id:
         return None
     step_run_id = os.environ.get(STEP_RUN_ID_ENV)
-    return RunContext(run_id=run_id, step_run_id=step_run_id or None)
+    task_id = os.environ.get(TASK_ID_ENV)
+    return RunContext(run_id=run_id, step_run_id=step_run_id or None, task_id=task_id or None)
 
 
 def _current_reporting_context() -> _ReportingContext | None:

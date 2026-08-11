@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextvars import ContextVar, Token
 from types import TracebackType
 from typing import Any, Self
 from uuid import uuid4
@@ -14,6 +15,14 @@ from rebase.runtime import _current_reporting_context, current_run
 
 class TaskReportingError(RebaseWorkflowError):
     """The platform could not create or finalize a requested task report."""
+
+
+_active_task_id: ContextVar[str | None] = ContextVar("rebase_active_task_id", default=None)
+
+
+def _current_task_id() -> str | None:
+    """The innermost active inline task, when one has a platform identity."""
+    return _active_task_id.get()
 
 
 class Task:
@@ -48,6 +57,7 @@ class Task:
         self._finished = False
         self._client: Client | None = None
         self._run_id: str | None = None
+        self._task_context_token: Token[str | None] | None = None
 
     @staticmethod
     def _validate_json_object(value: dict[str, Any], *, field: str) -> None:
@@ -123,6 +133,7 @@ class Task:
 
     def __enter__(self) -> Self:
         self._start()
+        self._task_context_token = _active_task_id.set(self.id)
         return self
 
     def __exit__(
@@ -132,11 +143,17 @@ class Task:
         traceback: TracebackType | None,
     ) -> bool:
         del traceback
-        self._finish(exc_type, exc)
+        try:
+            self._finish(exc_type, exc)
+        finally:
+            if self._task_context_token is not None:
+                _active_task_id.reset(self._task_context_token)
+                self._task_context_token = None
         return False
 
     async def __aenter__(self) -> Self:
         await asyncio.to_thread(self._start)
+        self._task_context_token = _active_task_id.set(self.id)
         return self
 
     async def __aexit__(
@@ -146,7 +163,12 @@ class Task:
         traceback: TracebackType | None,
     ) -> bool:
         del traceback
-        await asyncio.to_thread(self._finish, exc_type, exc)
+        try:
+            await asyncio.to_thread(self._finish, exc_type, exc)
+        finally:
+            if self._task_context_token is not None:
+                _active_task_id.reset(self._task_context_token)
+                self._task_context_token = None
         return False
 
 
