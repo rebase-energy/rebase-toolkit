@@ -357,6 +357,8 @@ class TimelineRow:
     kind: Literal["event", "step", "task", "artifact", "log"]
     #: Original pointer plus its browser-safe destination, for artifact rows only.
     artifact_uri: str | None = None
+    artifact_id: str | None = None
+    artifact_run_id: str | None = None
     url: str | None = None
 
 
@@ -805,7 +807,13 @@ def build_timeline(
         )
     for artifact in artifacts:
         media_type = str(artifact.get("media_type") or "-")
-        uri = str(artifact.get("uri") or "-")
+        bucket = artifact.get("bucket")
+        object_key = artifact.get("object_key")
+        uri = (
+            f"rb://bucket/{bucket}/{str(object_key).lstrip('/')}"
+            if bucket and object_key
+            else str(artifact.get("uri") or "-")
+        )
         rows.append(
             TimelineRow(
                 at=_parse_timestamp(artifact.get("created_at")),
@@ -814,6 +822,8 @@ def build_timeline(
                 message=f"{media_type} · {uri}",
                 kind="artifact",
                 artifact_uri=uri,
+                artifact_id=str(artifact.get("id")) if artifact.get("id") else None,
+                artifact_run_id=str(artifact.get("workflow_run_id")) if artifact.get("workflow_run_id") else None,
                 url=artifact_browser_url(uri),
             )
         )
@@ -2665,18 +2675,27 @@ class RebaseTuiApp(App[None]):
         if row is None or row.kind != "artifact":
             self.notify("Select an artifact in the timeline first — a opens its location.", severity="warning")
             return
-        if row.url is None:
+        if row.url is None and (row.artifact_id is None or row.artifact_run_id is None):
             self.notify(f"No browser destination is available for {row.artifact_uri or row.stage}.", severity="warning")
             return
         self.run_worker(
-            self._open_artifact(row.stage, row.url),
+            self._open_artifact(row),
             name="open-artifact",
             group="tui-open",
             exclusive=True,
         )
 
-    async def _open_artifact(self, name: str, url: str) -> None:
+    async def _open_artifact(self, row: TimelineRow) -> None:
         try:
+            url = row.url
+            if row.artifact_id is not None and row.artifact_run_id is not None:
+                url = await asyncio.to_thread(
+                    self.data.client.open_run_artifact,
+                    row.artifact_run_id,
+                    row.artifact_id,
+                )
+            if url is None:
+                raise RebaseWorkflowError("artifact has no browser destination")
             opened = await asyncio.to_thread(webbrowser.open, url)
         except Exception as exc:
             self.notify(f"Could not open artifact: {exc}", severity="error")
@@ -2684,8 +2703,7 @@ class RebaseTuiApp(App[None]):
         if not opened:
             self.notify(f"Could not open a browser for {url}", severity="error")
             return
-        destination = "Google Cloud Storage" if "console.cloud.google.com/storage/" in url else "the browser"
-        self.notify(f"Opened {name} in {destination}.")
+        self.notify(f"Opened {row.stage} in the browser.")
 
     def _on_source_chosen(self, chosen: ProjectDeclaration | None) -> None:
         if chosen is not None:

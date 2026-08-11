@@ -78,6 +78,7 @@ class FakeClient:
         self.log_calls: list[str] = []
         self.task_calls: list[str] = []
         self.artifact_calls: list[str] = []
+        self.artifact_open_calls: list[tuple[str, str]] = []
         # Empty by default: a workflow whose steps fan out into nothing has no tasks,
         # which is most of them. `SteppedClient` is the other kind.
         self.tasks: list[dict[str, Any]] = []
@@ -162,6 +163,10 @@ class FakeClient:
     ) -> list[dict[str, Any]]:
         self.artifact_calls.append(run_id)
         return self.artifacts
+
+    def open_run_artifact(self, run_id: str, artifact_id: str) -> str:
+        self.artifact_open_calls.append((run_id, artifact_id))
+        return "https://storage.example/signed-object"
 
     def get_run_logs(self, run_id: str, *, since: str | None = None, limit: int | None = None) -> dict[str, Any]:
         self.log_calls.append(run_id)
@@ -329,9 +334,12 @@ class SteppedClient(FakeClient):
         self.artifacts = [
             {
                 "id": "artifact-id",
+                "workflow_run_id": "run-id",
                 "name": "NO1 day-ahead curves",
                 "key": "nordpool/2026-06-16/NO1.json",
-                "uri": "gs://nordpool-curves/2026-06-16/NO1.json",
+                "uri": None,
+                "bucket": "power-system-data",
+                "object_key": "raw/nordpool/2026-06-16/NO1.json",
                 "disposition": "created",
                 "media_type": "application/json",
                 "size_bytes": 4096,
@@ -2908,7 +2916,9 @@ def test_tui_timeline_chips_filter_the_run_by_kind() -> None:
             assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(timeline.row_count)] == [
                 "NO1 day-ahead curves"
             ]
-            assert "gs://nordpool-curves/2026-06-16/NO1.json" in str(timeline.get_cell_at(Coordinate(0, 3)))
+            assert "rb://bucket/power-system-data/raw/nordpool/2026-06-16/NO1.json" in str(
+                timeline.get_cell_at(Coordinate(0, 3))
+            )
 
             await pilot.press("right")
             await pilot.pause(0.2)
@@ -2940,7 +2950,7 @@ def test_tui_timeline_says_why_a_filter_is_empty() -> None:
     asyncio.run(scenario())
 
 
-def test_tui_a_opens_the_selected_gcs_artifact(monkeypatch) -> None:
+def test_tui_a_resolves_and_opens_the_selected_bucket_artifact(monkeypatch) -> None:
     opened: list[str] = []
     monkeypatch.setattr("rebase.tui.webbrowser.open", lambda url: opened.append(url) or True)
 
@@ -2958,7 +2968,7 @@ def test_tui_a_opens_the_selected_gcs_artifact(monkeypatch) -> None:
             await pilot.pause(0.3)
 
     asyncio.run(scenario())
-    assert opened == ["https://console.cloud.google.com/storage/browser/_details/nordpool-curves/2026-06-16/NO1.json"]
+    assert opened == ["https://storage.example/signed-object"]
 
 
 def test_tui_l_jumps_to_the_logs_chip_and_back() -> None:

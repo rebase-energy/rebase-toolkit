@@ -4,11 +4,17 @@
 
 ### Added
 
-- **`rb.artifact(...)` registers durable output URIs on the current run.** Artifacts
+- **`rb.Bucket` is a provider-neutral object store.** Workflows attach logical
+  bucket names and read or write objects through short-lived Rebase capabilities;
+  cloud credentials, provider names and physical bucket identifiers stay inside
+  the platform. Artifacts can point to a bucket object, and the TUI resolves that
+  pointer only when the user presses `a`.
+
+- **`rb.artifact(...)` registers durable outputs on the current run.** Artifacts
   inherit the active step and task automatically, are exposed through
   `Run.artifacts()` and `Client.list_run_artifacts(...)`, and appear in the TUI's
-  `[ Artifacts ]` timeline filter. Select an artifact and press `a` to open HTTP(S)
-  output directly or a `gs://` object at its exact Google Cloud Storage location.
+  `[ Artifacts ]` timeline filter. Select an artifact and press `a` to resolve and
+  open its current destination.
 
 - **`rebase setup` lets you sign in as someone else.** A stored session used to be reused in
   silence, which put the provider picker out of reach for as long as the token lived: someone
