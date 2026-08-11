@@ -287,6 +287,27 @@ def workspace_settings(workspace_id: str, *, path: Path | None = None) -> dict[s
     return settings
 
 
+def active_environment(workspace_id: str, *, path: Path | None = None) -> str | None:
+    value = workspace_settings(workspace_id, path=path).get("environment")
+    return value if isinstance(value, str) and value else None
+
+
+def set_active_environment(workspace_id: str, environment: str, *, path: Path | None = None) -> None:
+    """Persist a personal environment selection in the global user config."""
+    resolved_path = path or config_path()
+    data = read_config(resolved_path)
+    workspaces = data.get("workspaces")
+    if not isinstance(workspaces, dict):
+        workspaces = {}
+    settings = workspaces.get(workspace_id)
+    if not isinstance(settings, dict):
+        settings = {}
+    settings["environment"] = environment
+    workspaces[workspace_id] = settings
+    data["workspaces"] = workspaces
+    _write_config(data, resolved_path)
+
+
 def search_paths(workspace_id: str, *, path: Path | None = None) -> list[str]:
     """Local directories to search for the files declaring this workspace's projects."""
     configured = workspace_settings(workspace_id, path=path).get("search_paths")

@@ -192,6 +192,7 @@ rebase run list / get <id> / logs <id> / cancel <id> / replay <id>
 rebase dataset list / validate / check / sync
 rebase workflow schedule show|set|clear|pause|resume
 rebase volume ls|put|download|rm
+rebase bucket ls|put|download|rm|uri
 rebase secret create NAME KEY=value
 rebase tui                        # interactive dashboard
 ```

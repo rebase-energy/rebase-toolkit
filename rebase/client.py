@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import contextvars
+import dis
 import hashlib
 import inspect
 import json
@@ -15,6 +17,7 @@ import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from functools import wraps
 from pathlib import Path
 from types import FunctionType
 from typing import Any, Self
@@ -22,8 +25,10 @@ from typing import Any, Self
 import requests
 
 from rebase.auth import AuthError, load_access_token
-from rebase.config import DEFAULT_SERVER_URL, load_profile, local_workspace_id
+from rebase.config import DEFAULT_SERVER_URL, active_environment, load_profile, local_workspace_id
+from rebase.image import DEFAULT_PYTHON_VERSION, Image
 from rebase.runtime import current_run
+from rebase.source_bundle import SourceBundle, build_source_bundle
 
 try:
     from emflow.models import Agent as _ImportedEmflowAgent
@@ -58,6 +63,30 @@ _EmflowSimulator: Any = _ImportedEmflowSimulator
 
 
 _default_client: Client | None = None
+_environment_context: contextvars.ContextVar[str | None] = contextvars.ContextVar("rebase_environment", default=None)
+
+
+def _resolve_environment(client: Client, environment: str | None) -> str:
+    """Resolve an explicit override, then ambient context, then client default."""
+    return environment or _environment_context.get() or getattr(client, "environment_name", "dev")
+
+
+def _environment_scoped_deploy(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Keep every lookup and write in a deploy under one environment."""
+
+    @wraps(method)
+    def scoped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        environment = _resolve_environment(self._client, kwargs.get("environment"))
+        kwargs["environment"] = environment
+        token = _environment_context.set(environment)
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            _environment_context.reset(token)
+
+    return scoped
+
+
 _trace_stack: list[_WorkflowTrace] = []
 _UNSET = object()
 DEFAULT_PROJECT_NAME = "default"
@@ -72,6 +101,12 @@ DEFAULT_API_KEY_PERMISSIONS = [
     "runs:read",
 ]
 DEPLOY_REQUEST_TIMEOUT_SECONDS = 300
+# (connect, read) for POST /runs/ephemeral: the server executes quick runs inside
+# the request and enforces a 300 s run cap, so the read timeout is that plus
+# headroom. The old default of 30 s failed any run longer than half a minute.
+EPHEMERAL_RUN_REQUEST_TIMEOUT_SECONDS = (10, 330)
+IMAGE_BUILD_POLL_SECONDS = 1.0
+IMAGE_BUILD_TIMEOUT_SECONDS = 30 * 60
 
 
 class RebaseWorkflowError(RuntimeError):
@@ -383,28 +418,70 @@ class OnUpdate:
 Schedule = Cron | dict[str, Any]
 Trigger = OnWorkflow | OnUpdate | dict[str, Any]
 _RESERVED_WORKFLOW_PARAMETERS = frozenset({"ctx"})
+ExecutionMode = str
+Isolation = str
+EXECUTION_MODES = ("interactive", "job")
+ISOLATIONS = ("shared", "dedicated")
+DEFAULT_MODE: ExecutionMode = "interactive"
+DEFAULT_ISOLATION: Isolation = "shared"
+
+# Deprecated compatibility names. New code should use mode/isolation.
 RunType = str
 RUN_TYPES = ("quick", "quick_shared", "long")
-DEFAULT_RUN_TYPE: RunType = "quick"
+DEFAULT_RUN_TYPE: RunType = "quick_shared"
 WORKFLOW_RUN_TYPES = ("quick", "long")
 DeploySource = str
 DEFAULT_DEPLOY_SOURCE: DeploySource = "rebase"
-DEFAULT_PYTHON_VERSION = "3.13"
 DEFAULT_MODEL_DEPENDENCY = (
     "emflow @ git+https://github.com/rebase-energy/emflow.git@2d0205e1b479d439df72e50c6865735d0b26de8d"
 )
 LEGACY_BACKEND_REMOVED_ERROR = (
-    "the 'backend' parameter was removed; use run_type='quick' | 'quick_shared' | 'long' "
-    "('interactive' → 'quick', 'batch' → 'long')"
+    "the 'backend' parameter was removed; use mode='interactive' | 'job' and isolation='shared' | 'dedicated'"
 )
+
+
+def _validate_execution(
+    mode: ExecutionMode | None = None,
+    isolation: Isolation | None = None,
+    *,
+    target_type: str = "function",
+    run_type: RunType | None = None,
+) -> tuple[ExecutionMode, Isolation]:
+    """Validate execution settings and translate deprecated run_type values."""
+    if run_type is not None:
+        _validate_run_type(run_type, target_type=target_type)
+        if mode is not None or isolation is not None:
+            raise ValueError("use either mode/isolation or the deprecated run_type, not both")
+        if run_type == "long":
+            return "job", DEFAULT_ISOLATION
+        if run_type == "quick_shared":
+            return "interactive", "shared"
+        return ("interactive", "shared") if target_type == "workflow" else ("interactive", "dedicated")
+
+    resolved_mode = mode or DEFAULT_MODE
+    resolved_isolation = isolation or DEFAULT_ISOLATION
+    if resolved_mode not in EXECUTION_MODES:
+        raise ValueError("mode must be 'interactive' or 'job'")
+    if resolved_isolation not in ISOLATIONS:
+        raise ValueError("isolation must be 'shared' or 'dedicated'")
+    if target_type == "workflow" and resolved_mode == "interactive" and resolved_isolation == "dedicated":
+        raise ValueError("workflows support mode='interactive' only with isolation='shared'")
+    return resolved_mode, resolved_isolation
+
+
+def _legacy_run_type(mode: ExecutionMode, isolation: Isolation, *, target_type: str = "function") -> RunType:
+    if mode == "job":
+        return "long"
+    if target_type == "workflow":
+        return "quick"
+    return "quick_shared" if isolation == "shared" else "quick"
 
 
 def _validate_run_type(run_type: RunType, target_type: str = "function") -> RunType:
     if run_type not in RUN_TYPES or (target_type == "workflow" and run_type not in WORKFLOW_RUN_TYPES):
         raise ValueError(
             "run_type must be 'quick', 'quick_shared', or 'long' (workflows: 'quick' or 'long'). "
-            "Legacy backends were removed: 'interactive' is now 'quick', 'batch' is now 'long'; "
-            "'modal', 'prefect', 'prefect_cloud', 'cloud_run*' are no longer selectable."
+            "run_type is deprecated; use mode='interactive' | 'job' and isolation='shared' | 'dedicated'."
         )
     return run_type
 
@@ -479,41 +556,142 @@ def _warn_unpinned_dependencies(packages: list[str]) -> None:
         )
 
 
-class Image:
-    def __init__(
+class _EnvironmentObjects:
+    def create(
         self,
+        name: str,
         *,
-        kind: str = "python",
-        python_version: str = DEFAULT_PYTHON_VERSION,
-        uv_pip_packages: list[str] | None = None,
-        uv_version: str | None = None,
-    ) -> None:
-        if kind != "python":
-            raise ValueError("only python images are supported")
-        self.kind = kind
-        self.python_version = python_version
-        self.uv_pip_packages = list(uv_pip_packages or [])
-        self.uv_version = uv_version
+        deploy_mode: str = "direct",
+        protected: bool = False,
+        require_pr: bool = False,
+        allowed_branches: list[str] | None = None,
+        client: Client | None = None,
+    ) -> Environment:
+        resolved = client or default_client()
+        resolved.create_environment(
+            name,
+            deploy_mode=deploy_mode,
+            protected=protected,
+            require_pr=require_pr,
+            allowed_branches=allowed_branches,
+        )
+        return Environment(name, client=resolved)
+
+
+class _EnvironmentProjects:
+    def __init__(self, environment: Environment) -> None:
+        self.environment = environment
+
+    def track(
+        self,
+        name: str,
+        *,
+        github_connection_id: str,
+        ref: str,
+        entrypoint: str,
+        repo_path: str | None = None,
+    ) -> dict[str, Any]:
+        client = self.environment._resolved_client()
+        project = client.ensure_project(name, environment_name=self.environment.name)
+        return client.track_project(
+            str(project["id"]),
+            github_connection_id=github_connection_id,
+            tracked_ref=ref,
+            entrypoint=entrypoint,
+            repo_path=repo_path,
+        )
+
+
+class Environment:
+    """A workspace namespace for projects, storage, secrets, runs and policies."""
+
+    objects = _EnvironmentObjects()
+
+    def __init__(self, name: str, *, client: Client | None = None) -> None:
+        if not name or not name.strip():
+            raise ValueError("Environment requires a non-empty name")
+        self.name = name.strip().lower()
+        self._client = client
+        self._context_tokens: list[contextvars.Token[str | None]] = []
+        self.projects = _EnvironmentProjects(self)
 
     @classmethod
-    def python(cls, version: str = DEFAULT_PYTHON_VERSION) -> Image:
-        return cls(python_version=version)
+    def from_name(
+        cls,
+        name: str,
+        *,
+        create_if_missing: bool = False,
+        client: Client | None = None,
+    ) -> Environment:
+        environment = cls(name, client=client)
+        if create_if_missing:
+            try:
+                environment._resolved_client().get_environment(environment.name)
+            except RebaseWorkflowError as exc:
+                if exc.status_code != 404:
+                    raise
+                environment._resolved_client().create_environment(environment.name)
+        return environment
 
-    def uv_pip_install(self, *packages: str, uv_version: str | None = None) -> Image:
-        self.uv_pip_packages.extend(packages)
-        if uv_version is not None:
-            self.uv_version = uv_version
+    @classmethod
+    def from_context(cls, *, client: Client | None = None) -> Environment:
+        resolved = client or default_client()
+        return cls(_environment_context.get() or resolved.environment_name, client=resolved)
+
+    def _resolved_client(self) -> Client:
+        if self._client is None:
+            self._client = default_client()
+        return self._client
+
+    def hydrate(self) -> dict[str, Any]:
+        return self._resolved_client().get_environment(self.name)
+
+    def configure(
+        self,
+        *,
+        deploy_mode: str | None = None,
+        protected: bool | None = None,
+        require_pr: bool | None = None,
+        allowed_branches: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return self._resolved_client().update_environment_policy(
+            self.name,
+            deploy_mode=deploy_mode,
+            protected=protected,
+            require_pr=require_pr,
+            allowed_branches=allowed_branches,
+        )
+
+    def grants(self) -> list[dict[str, Any]]:
+        """List explicit profile/API-key access grants for this environment."""
+        return self._resolved_client().list_environment_grants(self.name)
+
+    def grant(
+        self,
+        *,
+        profile_id: str | None = None,
+        api_key_id: str | None = None,
+        access: str = "read",
+    ) -> dict[str, Any]:
+        """Grant read, write, or admin access to exactly one principal."""
+        return self._resolved_client().grant_environment_access(
+            self.name,
+            profile_id=profile_id,
+            api_key_id=api_key_id,
+            access=access,
+        )
+
+    def revoke(self, grant_id: str) -> None:
+        """Remove one explicit access grant."""
+        self._resolved_client().revoke_environment_access(self.name, grant_id)
+
+    def __enter__(self) -> Environment:
+        self._context_tokens.append(_environment_context.set(self.name))
         return self
 
-    def to_dict(self) -> dict[str, Any]:
-        packages = [package.strip() for package in self.uv_pip_packages if package.strip()]
-        _warn_unpinned_dependencies(packages)
-        return {
-            "kind": self.kind,
-            "python_version": self.python_version,
-            "uv_pip_packages": packages,
-            "uv_version": self.uv_version,
-        }
+    def __exit__(self, *_exc: object) -> None:
+        if self._context_tokens:
+            _environment_context.reset(self._context_tokens.pop())
 
 
 class Secret:
@@ -530,21 +708,34 @@ class Secret:
     payload or source snapshot.
     """
 
-    def __init__(self, *, name: str | None = None, env_dict: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        name: str | None = None,
+        env_dict: dict[str, str] | None = None,
+        environment_name: str | None = None,
+    ) -> None:
         if name is None and env_dict is None:
             raise ValueError("Secret requires a name (from_name) or values (from_dict)")
         self.name = name
         self.env_dict = dict(env_dict) if env_dict is not None else None
+        self.environment_name = environment_name
 
     @classmethod
-    def from_name(cls, name: str) -> Secret:
+    def from_name(cls, name: str, *, environment_name: str | None = None) -> Secret:
         """Reference an existing workspace secret bundle by name."""
         if not name or not name.strip():
             raise ValueError("Secret.from_name requires a non-empty name")
-        return cls(name=name.strip())
+        return cls(name=name.strip(), environment_name=environment_name)
 
     @classmethod
-    def from_dict(cls, env_dict: dict[str, str], *, name: str | None = None) -> Secret:
+    def from_dict(
+        cls,
+        env_dict: dict[str, str],
+        *,
+        name: str | None = None,
+        environment_name: str | None = None,
+    ) -> Secret:
         """Create (or update) a bundle from a dict at deploy time, then attach it.
 
         Without ``name``, a stable content-derived name (``inline-<hash>``) is used.
@@ -552,7 +743,7 @@ class Secret:
         """
         if not env_dict:
             raise ValueError("Secret.from_dict requires at least one KEY: value entry")
-        return cls(name=name, env_dict=env_dict)
+        return cls(name=name, env_dict=env_dict, environment_name=environment_name)
 
     @classmethod
     def from_dotenv(cls, path: str | Path = ".env", *, name: str | None = None) -> Secret:
@@ -576,6 +767,8 @@ class Secret:
 
     def resolve(self, client: Client) -> dict[str, str]:
         """Materialize this secret into the env-name -> secret-ref map deploys send."""
+        if self.environment_name is not None:
+            client = client.with_environment(self.environment_name)
         if self.env_dict is not None:
             created = client.set_secret(self._resolved_name(), self.env_dict)
             refs = created.get("secret_refs")
@@ -636,6 +829,7 @@ class Volume:
         create_if_missing: bool = False,
         read_only: bool = False,
         client: Client | None = None,
+        environment_name: str | None = None,
     ) -> None:
         if not name or not name.strip():
             raise ValueError("Volume requires a non-empty name")
@@ -643,16 +837,31 @@ class Volume:
         self.create_if_missing = create_if_missing
         self.read_only = read_only
         self._client = client
+        self.environment_name = environment_name
         self._ensured = False
 
     @classmethod
-    def from_name(cls, name: str, *, create_if_missing: bool = False, read_only: bool = False) -> Volume:
+    def from_name(
+        cls,
+        name: str,
+        *,
+        create_if_missing: bool = False,
+        read_only: bool = False,
+        environment_name: str | None = None,
+    ) -> Volume:
         """Reference a workspace volume by name, optionally creating it lazily."""
-        return cls(name, create_if_missing=create_if_missing, read_only=read_only)
+        return cls(
+            name,
+            create_if_missing=create_if_missing,
+            read_only=read_only,
+            environment_name=environment_name,
+        )
 
     def _resolved_client(self) -> Client:
         if self._client is None:
             self._client = default_client()
+        if self.environment_name is not None and self._client.environment_name != self.environment_name:
+            self._client = self._client.with_environment(self.environment_name)
         return self._client
 
     def ensure(self, client: Client | None = None) -> dict[str, Any]:
@@ -748,9 +957,14 @@ def _resolve_volumes_payload(
     return attachments
 
 
+def bucket_env_var(name: str) -> str:
+    """The env var an attached bucket is injected as, matching the API's mapping."""
+    return "REBASE_BUCKET_" + re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_")
+
+
 @dataclass(frozen=True)
 class BucketObject:
-    """One object in a provider-neutral :class:`Bucket`."""
+    """One object in a bucket."""
 
     key: str
     size: int
@@ -762,11 +976,30 @@ class BucketObject:
 
 
 class Bucket:
-    """A named object store managed through Rebase.
+    """A named object store, backed one-to-one by a real cloud bucket.
 
-    The backing provider is deliberately not part of this API. Reads and writes
-    use short-lived capability URLs issued by Rebase, so hosted code does not
-    receive cloud credentials and callers do not need provider SDKs.
+    Keys and objects, not files and directories::
+
+        b = rb.Bucket.from_name("forecasts", create_if_missing=True)
+        b.put("2026/08/10.parquet", data)
+        b.get("2026/08/10.parquet")
+        for obj in b.iter_all(prefix="2026/"):
+            ...
+
+    Attach one to deployed code to read it at full speed, without signed URLs::
+
+        @rb.function(buckets=["forecasts"])
+        def train():
+            pd.read_parquet(rb.Bucket.from_name("forecasts").uri + "/2026/08/10.parquet")
+
+    Unlike :class:`Volume` this is never mounted, so nothing here pretends an
+    object store is a filesystem: there is no ``commit``/``reload`` pair, and a
+    write costs one request rather than a silent read-modify-write of the whole
+    object.
+
+    The backing provider is deliberately not part of this API: reads and writes
+    use short-lived capability URLs issued by Rebase, so hosted code never
+    receives cloud credentials and callers need no provider SDKs.
     """
 
     def __init__(
@@ -775,17 +1008,31 @@ class Bucket:
         *,
         create_if_missing: bool = False,
         client: Client | None = None,
+        environment_name: str | None = None,
     ) -> None:
         if not isinstance(name, str) or not name.strip():
             raise ValueError("Bucket requires a non-empty name")
         self.name = name.strip()
         self.create_if_missing = create_if_missing
         self._client = client
+        self.environment_name = environment_name
         self._ensured = False
+        self._uri: str | None = None
 
     @classmethod
-    def from_name(cls, name: str, *, create_if_missing: bool = False) -> Bucket:
-        return cls(name, create_if_missing=create_if_missing)
+    def from_name(
+        cls,
+        name: str,
+        *,
+        create_if_missing: bool = False,
+        environment_name: str | None = None,
+    ) -> Bucket:
+        """Reference a workspace bucket by name, optionally creating it lazily."""
+        return cls(
+            name,
+            create_if_missing=create_if_missing,
+            environment_name=environment_name,
+        )
 
     def __repr__(self) -> str:
         return f"Bucket({self.name!r})"
@@ -793,22 +1040,37 @@ class Bucket:
     def _resolved_client(self) -> Client:
         if self._client is None:
             self._client = default_client()
+        if self.environment_name is not None and self._client.environment_name != self.environment_name:
+            self._client = self._client.with_environment(self.environment_name)
         return self._client
 
-    def ensure(self) -> dict[str, Any]:
-        """Resolve this logical bucket, creating it when requested."""
-        client = self._resolved_client()
-        value = client.create_bucket(self.name) if self.create_if_missing else client.get_bucket(self.name)
+    def ensure(self, client: Client | None = None) -> dict[str, Any]:
+        """Make sure the bucket exists (creates it when ``create_if_missing``)."""
+        resolved = client or self._resolved_client()
+        data = resolved.create_bucket(self.name) if self.create_if_missing else resolved.get_bucket(self.name)
         self._ensured = True
-        return value
+        self._uri = str(data.get("uri") or "") or None
+        return data
 
-    def _ensure_for_write(self) -> None:
+    def _ensure_once(self) -> None:
         if self.create_if_missing and not self._ensured:
             self.ensure()
 
+    @property
+    def uri(self) -> str:
+        """The ``gs://`` URI, for handing to pandas, polars, duckdb or fsspec.
+
+        Inside a deployed run this comes from the injected environment, so it
+        costs nothing; elsewhere it is fetched once and cached.
+        """
+        if self._uri is None:
+            injected = os.environ.get(bucket_env_var(self.name))
+            self._uri = injected if injected else str(self.ensure().get("uri") or "")
+        return self._uri
+
     def put(self, key: str, data: bytes | str | Path, *, content_type: str | None = None) -> str:
-        """Write one object from bytes, text, or a local path."""
-        self._ensure_for_write()
+        """Write one object. Accepts bytes, text, or a path to upload."""
+        self._ensure_once()
         if isinstance(data, Path):
             return self.put_file(data, key, content_type=content_type)
         payload = data.encode("utf-8") if isinstance(data, str) else data
@@ -826,10 +1088,10 @@ class Bucket:
         *,
         content_type: str | None = None,
     ) -> str:
-        """Stream one local file into the bucket."""
+        """Upload one local file. Streams, so object size is not bounded by memory."""
         local = Path(local_path)
         target = (key or local.name).lstrip("/")
-        self._ensure_for_write()
+        self._ensure_once()
         signed = self._signed_url(target, method="PUT", content_type=content_type)
         headers = {"Content-Type": content_type} if content_type else None
         with local.open("rb") as handle:
@@ -838,18 +1100,41 @@ class Bucket:
             raise RebaseWorkflowError(f"bucket upload failed: {response.status_code} {response.text[:200]}")
         return target
 
+    def put_directory(self, local_dir: str | Path, prefix: str = "") -> Sequence[str]:
+        """Recursively upload a local directory. Returns the keys written."""
+        base = Path(local_dir)
+        if not base.is_dir():
+            raise RebaseWorkflowError(f"not a directory: {local_dir}")
+        files = [path for path in sorted(base.rglob("*")) if path.is_file()]
+        if not files:
+            return []
+        self._ensure_once()
+        clean = prefix.strip("/")
+        relatives = [path.relative_to(base).as_posix() for path in files]
+        keys = [f"{clean}/{relative}" if clean else relative for relative in relatives]
+        # One signing round trip for the whole tree rather than one per file.
+        signed = self._signed_urls(keys, method="PUT")
+        for path, key in zip(files, keys, strict=True):
+            with path.open("rb") as handle:
+                response = requests.put(signed[key], data=handle, timeout=600)
+            if response.status_code >= 400:
+                raise RebaseWorkflowError(f"bucket upload failed for {key}: {response.status_code}")
+        return keys
+
     def get(self, key: str) -> bytes:
         """Read one object into memory."""
-        response = requests.get(self._signed_url(key, method="GET"), timeout=600)
+        signed = self._signed_url(key, method="GET")
+        response = requests.get(signed, timeout=600)
         if response.status_code >= 400:
             raise RebaseWorkflowError(f"bucket download failed: {response.status_code} {response.text[:200]}")
         return response.content
 
     def download(self, key: str, local_path: str | Path) -> Path:
-        """Stream one object to a local path."""
+        """Download one object to disk, streaming it rather than buffering."""
         local = Path(local_path)
         local.parent.mkdir(parents=True, exist_ok=True)
-        with requests.get(self._signed_url(key, method="GET"), timeout=600, stream=True) as response:
+        signed = self._signed_url(key, method="GET")
+        with requests.get(signed, timeout=600, stream=True) as response:
             if response.status_code >= 400:
                 raise RebaseWorkflowError(f"bucket download failed: {response.status_code} {response.text[:200]}")
             with local.open("wb") as handle:
@@ -865,13 +1150,16 @@ class Bucket:
         limit: int = 1000,
         page_token: str | None = None,
     ) -> dict[str, Any]:
-        """Return one page of objects and logical prefixes."""
+        """One page of objects. Pass ``delimiter="/"`` to browse folder-style.
+
+        Returns ``{"objects": [...], "prefixes": [...], "next_page_token": ...}``.
+        Use :meth:`iter_all` when you want every object rather than one page.
+
+        Note this name shadows the ``list`` builtin inside the class body, so
+        annotations below here use ``Sequence`` rather than ``list[...]``.
+        """
         data = self._resolved_client().list_bucket_objects(
-            self.name,
-            prefix=prefix,
-            delimiter=delimiter,
-            limit=limit,
-            page_token=page_token,
+            self.name, prefix=prefix, delimiter=delimiter, limit=limit, page_token=page_token
         )
         return {
             "objects": [_bucket_object(item) for item in data.get("objects", [])],
@@ -880,7 +1168,7 @@ class Bucket:
         }
 
     def iter_all(self, prefix: str = "") -> Iterator[BucketObject]:
-        """Iterate every object under a prefix."""
+        """Every object under a prefix, following pagination transparently."""
         page_token: str | None = None
         while True:
             page = self.list(prefix, page_token=page_token)
@@ -890,6 +1178,7 @@ class Bucket:
                 return
 
     def stat(self, key: str) -> dict[str, Any]:
+        """Metadata for one object, including checksums and generation."""
         return self._resolved_client().stat_bucket_object(self.name, key)
 
     def exists(self, key: str) -> bool:
@@ -902,24 +1191,59 @@ class Bucket:
         return True
 
     def delete(self, key: str) -> None:
+        """Delete one object."""
         self._resolved_client().delete_bucket_object(self.name, key.lstrip("/"))
 
+    def delete_prefix(self, prefix: str = "") -> int:
+        """Delete every object under a prefix. Returns the number deleted.
+
+        Paged from here rather than server-side: emptying a large bucket inside
+        one API request would time out long before it finished, and the retry
+        would restart against a half-emptied bucket.
+        """
+        deleted = 0
+        while True:
+            page = self.list(prefix, limit=1000)
+            if not page["objects"]:
+                return deleted
+            for obj in page["objects"]:
+                self.delete(obj.key)
+                deleted += 1
+
     def signed_url(self, key: str, *, method: str = "GET", content_type: str | None = None) -> str:
-        """Return a short-lived object capability URL."""
+        """A short-lived capability URL for one object."""
         return self._signed_url(key, method=method, content_type=content_type)
+
+    def signed_urls(self, keys: Sequence[str], *, method: str = "GET") -> dict[str, str]:
+        """Presigned URLs for many objects in one round trip."""
+        return self._signed_urls(list(keys), method=method)
 
     def _signed_url(self, key: str, *, method: str, content_type: str | None = None) -> str:
         cleaned = key.lstrip("/")
-        data = self._resolved_client().create_bucket_signed_urls(
-            self.name,
-            [cleaned],
-            method=method,
-            content_type=content_type,
-        )
-        urls = data.get("urls", [])
-        if len(urls) != 1 or urls[0].get("path") != cleaned:
-            raise RebaseWorkflowError(f"no signed URL returned for {cleaned!r}")
-        return str(urls[0]["url"])
+        return self._signed_urls([cleaned], method=method, content_type=content_type)[cleaned]
+
+    def _signed_urls(
+        self,
+        keys: Sequence[str],
+        *,
+        method: str,
+        content_type: str | None = None,
+    ) -> dict[str, str]:
+        cleaned = [key.lstrip("/") for key in keys]
+        urls: dict[str, str] = {}
+        client = self._resolved_client()
+        # The API caps a batch; chunk so a big directory upload still works.
+        for start in range(0, len(cleaned), _SIGNED_URL_BATCH):
+            chunk = cleaned[start : start + _SIGNED_URL_BATCH]
+            data = client.create_bucket_signed_urls(self.name, chunk, method=method, content_type=content_type)
+            urls.update({item["path"]: item["url"] for item in data.get("urls", [])})
+        missing = [key for key in cleaned if key not in urls]
+        if missing:
+            raise RebaseWorkflowError(f"no signed URL returned for: {missing[:5]}")
+        return urls
+
+
+_SIGNED_URL_BATCH = 100
 
 
 def _bucket_object(item: dict[str, Any]) -> BucketObject:
@@ -934,27 +1258,35 @@ def _bucket_object(item: dict[str, Any]) -> BucketObject:
     )
 
 
-def _resolve_buckets_payload(buckets: list[Any] | None) -> list[dict[str, str]]:
-    """Normalize a deployment's logical bucket attachments."""
+def _resolve_buckets_payload(
+    buckets: list[Any] | None,
+    client: Client | None,
+) -> list[dict[str, Any]]:
+    """Normalize ``buckets=`` into the attachment list the API stores.
+
+    Accepts bare names or :class:`Bucket` handles. Sorted by name so the same
+    set in a different order does not churn the deployed version.
+    """
     if buckets is None:
         return []
-    attachments: list[dict[str, str]] = []
+    attachments: list[dict[str, Any]] = []
     for item in buckets:
-        if isinstance(item, Bucket) and item.create_if_missing:
-            item.ensure()
+        # A pre-built attachment list round-trips unchanged.
         if isinstance(item, dict):
-            name = item.get("bucket")
-        elif isinstance(item, Bucket):
-            name = item.name
-        else:
-            name = item if isinstance(item, str) else None
-        if not isinstance(name, str) or not name.strip():
-            raise RebaseWorkflowError("buckets entries must be rebase.Bucket or bucket names")
-        attachments.append({"bucket": name.strip()})
-    names = [item["bucket"] for item in attachments]
+            attachments.append(item)
+            continue
+        bucket = Bucket.from_name(item) if isinstance(item, str) else item
+        if not isinstance(bucket, Bucket):
+            raise RebaseWorkflowError(f"buckets entries must be rebase.Bucket or bucket names, got {type(item)!r}")
+        if bucket.create_if_missing:
+            if client is None:
+                raise RebaseWorkflowError("resolving buckets requires an authenticated client")
+            bucket.ensure(client)
+        attachments.append({"bucket": bucket.name})
+    names = [str(entry.get("bucket", "")) for entry in attachments]
     if len(names) != len(set(names)):
         raise RebaseWorkflowError("bucket attachments must be unique")
-    return sorted(attachments, key=lambda item: item["bucket"])
+    return sorted(attachments, key=lambda entry: str(entry.get("bucket", "")))
 
 
 def _coerce_config_dict(value: Any, *, field_name: str) -> dict[str, Any] | None:
@@ -1355,7 +1687,7 @@ def _image_spec_for(
     if image is not None and dependencies:
         raise ValueError("provide either image or dependencies, not both")
     if isinstance(image, Image):
-        return image.to_dict()
+        return image.legacy_spec()
     if isinstance(image, dict):
         return image
     if dependencies is not None:
@@ -1392,13 +1724,11 @@ def _model_image_spec_for(
     if image is None:
         return _image_spec_for(dependencies=_model_dependencies(dependencies))
     if isinstance(image, Image):
+        if image.build_enabled:
+            raise ValueError("models do not support uv_sync or add_local_* image operations yet")
         packages = _model_dependencies(image.uv_pip_packages)
-        return Image(
-            kind=image.kind,
-            python_version=image.python_version,
-            uv_pip_packages=packages,
-            uv_version=image.uv_version,
-        ).to_dict()
+        built = Image.python(image.python_version).uv_pip_install(*packages, uv_version=image.uv_version)
+        return built.legacy_spec()
     if isinstance(image, dict):
         if image.get("kind", "python") != "python":
             raise ValueError("only python images are supported")
@@ -1418,9 +1748,16 @@ def configure(
     api_url: str | None = None,
     profile: str | None = None,
     access_token: str | None = None,
+    environment_name: str | None = None,
 ) -> None:
     global _default_client
-    _default_client = Client(api_key=api_key, api_url=api_url, profile=profile, access_token=access_token)
+    _default_client = Client(
+        api_key=api_key,
+        api_url=api_url,
+        profile=profile,
+        access_token=access_token,
+        environment_name=environment_name,
+    )
 
 
 def default_client() -> Client:
@@ -1807,7 +2144,8 @@ class _WorkflowTrace:
                 {
                     "source_code": step.source_code,
                     "default_parameters": step.default_parameters,
-                    "run_type": step.run_type,
+                    "mode": step.mode,
+                    "isolation": step.isolation,
                     "image_spec": step.image_spec,
                 }
             )
@@ -1901,6 +2239,23 @@ def _git_metadata_for(fn: Callable[..., Any]) -> dict[str, Any]:
         return {}
 
     source_path = Path(source_file).resolve()
+    reconciler_root = os.getenv("REBASE_GITOPS_REPO_ROOT")
+    reconciler_sha = os.getenv("REBASE_GITOPS_COMMIT_SHA")
+    if reconciler_root and reconciler_sha:
+        try:
+            relative_source_path = source_path.relative_to(Path(reconciler_root).resolve())
+        except ValueError:
+            pass
+        else:
+            return {
+                "repo_owner": os.getenv("REBASE_GITOPS_REPO_OWNER"),
+                "repo_name": os.getenv("REBASE_GITOPS_REPO_NAME"),
+                "source_path": str(relative_source_path),
+                "git_commit_sha": reconciler_sha,
+                "git_branch": os.getenv("REBASE_GITOPS_BRANCH"),
+                "git_tag": os.getenv("REBASE_GITOPS_TAG"),
+                "git_dirty": False,
+            }
     root = _git(["rev-parse", "--show-toplevel"], cwd=source_path.parent)
     if root is None:
         return {}
@@ -1994,6 +2349,7 @@ class Client:
         profile: str | None = None,
         access_token: str | None = None,
         workspace_id: str | None = None,
+        environment_name: str | None = None,
     ) -> None:
         env_api_key = os.getenv("REBASE_API_KEY") or os.getenv("REBASE_WORKFLOWS_API_KEY")
         env_access_token = os.getenv("REBASE_ACCESS_TOKEN") or os.getenv("REBASE_WORKFLOWS_ACCESS_TOKEN")
@@ -2019,31 +2375,90 @@ class Client:
             or (configured_workspace_id if isinstance(configured_workspace_id, str) else None)
         )
         self.workspace_id = resolved_workspace_id or None
+        configured_environment = active_environment(self.workspace_id) if self.workspace_id else None
+        self.environment_name = environment_name or os.getenv("REBASE_ENVIRONMENT") or configured_environment or "dev"
         profile_api_url = configured_api_url if isinstance(configured_api_url, str) else None
         selected_api_url = api_url or os.getenv("REBASE_WORKFLOWS_API_URL") or profile_api_url or DEFAULT_SERVER_URL
         self.api_url = selected_api_url.rstrip("/")
+        # Lazily-created keep-alive session plus the pid that owns it: reusing one
+        # connection avoids a fresh TCP+TLS handshake per request (the bulk of
+        # per-call latency), and the pid check rebuilds it after a fork, where an
+        # inherited socket would be shared with the parent.
+        self._session: requests.Session | None = None
+        self._session_pid: int | None = None
+        # Cache for tokens read from disk by load_access_token(); explicit
+        # credentials (api_key/access_token) never go through this.
+        self._cached_disk_token: str | None = None
+
+    def _http_session(self) -> requests.Session:
+        pid = os.getpid()
+        if self._session is None or self._session_pid != pid:
+            # No retry adapter on purpose: a retried POST /runs/ephemeral would
+            # execute the run twice.
+            self._session = requests.Session()
+            self._session_pid = pid
+        return self._session
+
+    def with_environment(self, environment_name: str) -> Client:
+        clone = Client(
+            api_key=self.api_key,
+            api_url=self.api_url,
+            access_token=self.access_token,
+            workspace_id=self.workspace_id,
+            environment_name=environment_name,
+        )
+        clone._cached_disk_token = self._cached_disk_token
+        return clone
+
+    def _http_request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        """Single seam for all HTTP traffic; tests patch this instead of `requests`."""
+        return self._http_session().request(method, f"{self.api_url}{path}", **kwargs)
+
+    def _bearer_token(self) -> str | None:
+        token = self.api_key or self.access_token
+        if token is not None:
+            return token
+        if self._cached_disk_token is None:
+            try:
+                self._cached_disk_token = load_access_token()
+            except AuthError as exc:
+                raise RebaseWorkflowError(str(exc)) from exc
+        return self._cached_disk_token
+
+    def _invalidate_cached_token(self) -> bool:
+        """Drop the disk-token cache after a 401. Returns whether a retry makes sense:
+        only when the rejected token actually came from the cache (not an explicit
+        api_key/access_token, which a retry would resend unchanged)."""
+        if self.api_key or self.access_token or self._cached_disk_token is None:
+            return False
+        self._cached_disk_token = None
+        return True
 
     def _request_headers(self, *, auth: bool, headers: dict[str, str] | None = None) -> dict[str, str]:
         resolved_headers = dict(headers or {})
         if auth:
-            bearer_token = self.api_key or self.access_token
-            if bearer_token is None:
-                try:
-                    bearer_token = load_access_token()
-                except AuthError as exc:
-                    raise RebaseWorkflowError(str(exc)) from exc
+            bearer_token = self._bearer_token()
             if bearer_token:
                 resolved_headers["Authorization"] = f"Bearer {bearer_token}"
         if self.workspace_id and "X-Rebase-Workspace" not in resolved_headers:
             resolved_headers["X-Rebase-Workspace"] = self.workspace_id
+        if "X-Rebase-Environment" not in resolved_headers:
+            resolved_headers["X-Rebase-Environment"] = _environment_context.get() or self.environment_name
+        release_id = os.getenv("REBASE_GITOPS_RELEASE_ID")
+        if release_id and "X-Rebase-GitOps-Release" not in resolved_headers:
+            resolved_headers["X-Rebase-GitOps-Release"] = release_id
         return resolved_headers
 
     def request(
         self, method: str, path: str, *, auth: bool = True, **kwargs: Any
     ) -> dict[str, Any] | list[dict[str, Any]]:
-        headers = self._request_headers(auth=auth, headers=kwargs.pop("headers", {}))
+        caller_headers = kwargs.pop("headers", {})
+        headers = self._request_headers(auth=auth, headers=caller_headers)
         timeout = kwargs.pop("timeout", 30)
-        response = requests.request(method, f"{self.api_url}{path}", headers=headers, timeout=timeout, **kwargs)
+        response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
+        if getattr(response, "status_code", None) == 401 and auth and self._invalidate_cached_token():
+            headers = self._request_headers(auth=auth, headers=caller_headers)
+            response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
@@ -2057,9 +2472,13 @@ class Client:
 
         ``request`` always parses the response as JSON, which a 204 has none of.
         """
-        headers = self._request_headers(auth=auth, headers=kwargs.pop("headers", {}))
+        caller_headers = kwargs.pop("headers", {})
+        headers = self._request_headers(auth=auth, headers=caller_headers)
         timeout = kwargs.pop("timeout", 30)
-        response = requests.request(method, f"{self.api_url}{path}", headers=headers, timeout=timeout, **kwargs)
+        response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
+        if getattr(response, "status_code", None) == 401 and auth and self._invalidate_cached_token():
+            headers = self._request_headers(auth=auth, headers=caller_headers)
+            response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
@@ -2070,9 +2489,9 @@ class Client:
     def stream_request(self, method: str, path: str, *, auth: bool = True, **kwargs: Any) -> Iterator[dict[str, Any]]:
         headers = self._request_headers(auth=auth, headers=kwargs.pop("headers", {}))
         timeout = kwargs.pop("timeout", None)
-        response = requests.request(
+        response = self._http_request(
             method,
-            f"{self.api_url}{path}",
+            path,
             headers=headers,
             timeout=timeout,
             stream=True,
@@ -2317,16 +2736,16 @@ class Client:
     def delete_volume_object(self, name: str, path: str) -> None:
         self.request("DELETE", f"/volumes/{name}/objects", params={"path": path})
 
-    def list_buckets(self) -> list[dict[str, Any]]:
-        response = self.request("GET", "/buckets")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected bucket list response")
-        return response
-
     def create_bucket(self, name: str) -> dict[str, Any]:
         response = self.request("POST", "/buckets", json={"name": name})
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected bucket response")
+        return response
+
+    def list_buckets(self) -> list[dict[str, Any]]:
+        response = self.request("GET", "/buckets")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected bucket list response")
         return response
 
     def get_bucket(self, name: str) -> dict[str, Any]:
@@ -2334,6 +2753,9 @@ class Client:
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected bucket response")
         return response
+
+    def delete_bucket(self, name: str) -> None:
+        self.request("DELETE", f"/buckets/{name}")
 
     def list_bucket_objects(
         self,
@@ -2344,16 +2766,15 @@ class Client:
         limit: int | None = None,
         page_token: str | None = None,
     ) -> dict[str, Any]:
-        params = {
-            key: value
-            for key, value in {
-                "prefix": prefix or None,
-                "delimiter": delimiter,
-                "limit": limit,
-                "page_token": page_token,
-            }.items()
-            if value is not None
-        }
+        params: dict[str, Any] = {}
+        if prefix:
+            params["prefix"] = prefix
+        if delimiter:
+            params["delimiter"] = delimiter
+        if limit is not None:
+            params["limit"] = limit
+        if page_token:
+            params["page_token"] = page_token
         response = self.request("GET", f"/buckets/{name}/objects", params=params or None)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected bucket object list response")
@@ -2518,6 +2939,76 @@ class Client:
         if not isinstance(response, list):
             raise RebaseWorkflowError("expected workspace environment policy list response")
         return response
+
+    def list_environments(self) -> list[dict[str, Any]]:
+        return self.list_environment_policies()
+
+    def get_environment(self, name: str) -> dict[str, Any]:
+        response = self.request("GET", f"/environments/{name}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected environment response")
+        return response
+
+    def list_environment_grants(self, name: str) -> list[dict[str, Any]]:
+        response = self.request("GET", f"/environments/{name}/grants")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected environment grant list response")
+        return response
+
+    def grant_environment_access(
+        self,
+        name: str,
+        *,
+        profile_id: str | None = None,
+        api_key_id: str | None = None,
+        access: str = "read",
+    ) -> dict[str, Any]:
+        if (profile_id is None) == (api_key_id is None):
+            raise ValueError("provide exactly one of profile_id or api_key_id")
+        if access not in {"read", "write", "admin"}:
+            raise ValueError("access must be read, write, or admin")
+        response = self.request(
+            "PUT",
+            f"/environments/{name}/grants",
+            json={
+                "profile_id": profile_id,
+                "api_key_id": api_key_id,
+                "access": access,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected environment grant response")
+        return response
+
+    def revoke_environment_access(self, name: str, grant_id: str) -> None:
+        self.request_no_content("DELETE", f"/environments/{name}/grants/{grant_id}")
+
+    def create_environment(
+        self,
+        name: str,
+        *,
+        deploy_mode: str = "direct",
+        protected: bool = False,
+        require_pr: bool = False,
+        allowed_branches: list[str] | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            "/environments",
+            json={
+                "name": name,
+                "deploy_mode": deploy_mode,
+                "protected": protected,
+                "require_pr": require_pr,
+                "allowed_branches": allowed_branches or [],
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected environment response")
+        return response
+
+    def delete_environment(self, name: str) -> None:
+        self.request_no_content("DELETE", f"/environments/{name}")
 
     def update_environment_policy(
         self,
@@ -2773,8 +3264,9 @@ class Client:
             raise RebaseWorkflowError("expected GitHub promotion PR response")
         return response
 
-    def list_projects(self) -> list[dict[str, Any]]:
-        response = self.request("GET", "/projects")
+    def list_projects(self, *, environment_name: str | None = None) -> list[dict[str, Any]]:
+        headers = {"X-Rebase-Environment": environment_name} if environment_name else None
+        response = self.request("GET", "/projects", headers=headers)
         if not isinstance(response, list):
             raise RebaseWorkflowError("expected project list response")
         return response
@@ -2825,6 +3317,7 @@ class Client:
         repo_owner: str | None = None,
         repo_name: str | None = None,
         repo_path: str | None = None,
+        environment_name: str | None = None,
     ) -> dict[str, Any]:
         response = self.request(
             "POST",
@@ -2837,6 +3330,7 @@ class Client:
                 "repo_name": repo_name,
                 "repo_path": repo_path,
             },
+            headers={"X-Rebase-Environment": environment_name} if environment_name else None,
         )
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected project response")
@@ -2868,6 +3362,41 @@ class Client:
         response = self.request("PATCH", f"/projects/{project_id}", json=payload)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected project response")
+        return response
+
+    def track_project(
+        self,
+        project_id: str,
+        *,
+        github_connection_id: str,
+        tracked_ref: str,
+        entrypoint: str,
+        repo_path: str | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "PUT",
+            f"/projects/{project_id}/git-track",
+            json={
+                "github_connection_id": github_connection_id,
+                "tracked_ref": tracked_ref,
+                "entrypoint": entrypoint,
+                "repo_path": repo_path,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected project Git track response")
+        return response
+
+    def get_project_git_track(self, project_id: str) -> dict[str, Any]:
+        response = self.request("GET", f"/projects/{project_id}/git-track")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected project Git track response")
+        return response
+
+    def list_project_releases(self, project_id: str) -> list[dict[str, Any]]:
+        response = self.request("GET", f"/projects/{project_id}/releases")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected project release list response")
         return response
 
     def delete_project(self, project_id: str, *, force: bool = False) -> None:
@@ -2923,8 +3452,9 @@ class Client:
     def delete_workflow(self, workflow_id: str, *, force: bool = False) -> None:
         self.request_no_content("DELETE", f"/workflows/{workflow_id}", params={"force": str(force).lower()})
 
-    def find_project(self, name: str) -> dict[str, Any] | None:
-        for project in self.list_projects():
+    def find_project(self, name: str, *, environment_name: str | None = None) -> dict[str, Any] | None:
+        projects = self.list_projects(environment_name=environment_name) if environment_name else self.list_projects()
+        for project in projects:
             if project["name"] == name:
                 return project
         return None
@@ -2938,8 +3468,9 @@ class Client:
         repo_owner: str | None = None,
         repo_name: str | None = None,
         repo_path: str | None = None,
+        environment_name: str | None = None,
     ) -> dict[str, Any]:
-        existing = self.find_project(name)
+        existing = self.find_project(name, environment_name=environment_name)
         desired = {
             key: value
             for key, value in {
@@ -2962,7 +3493,15 @@ class Client:
             repo_owner=repo_owner,
             repo_name=repo_name,
             repo_path=repo_path,
+            environment_name=environment_name,
         )
+
+    def _ensure_project_in_environment(self, name: str, environment: str) -> dict[str, Any]:
+        token = _environment_context.set(environment)
+        try:
+            return self.ensure_project(name)
+        finally:
+            _environment_context.reset(token)
 
     def list_functions(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
         resolved_project_id = project_id
@@ -3041,6 +3580,7 @@ class Client:
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
         volumes: list[dict[str, Any]] | None = None,
+        buckets: list[dict[str, Any]] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_max_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
@@ -3048,7 +3588,7 @@ class Client:
         cloud_run_cpu: str | None = None,
         cloud_run_memory: str | None = None,
         enabled: bool = True,
-        environment: str = "dev",
+        environment: str | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -3058,40 +3598,49 @@ class Client:
         git_branch: str | None = None,
         git_tag: str | None = None,
         git_dirty: bool | None = None,
+        build: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        project_id = self.ensure_project(project)["id"]
+        environment = _resolve_environment(self, environment)
+        project_id = self._ensure_project_in_environment(project, environment)["id"]
+        payload: dict[str, Any] = {
+            "name": name,
+            "description": description,
+            "source_code": source_code,
+            "entrypoint": entrypoint,
+            "base_path": base_path,
+            "auth": auth,
+            "image_spec": image_spec,
+            "env": env or {},
+            "secrets": secrets or {},
+            "volumes": volumes or [],
+            "cloud_run_min_instances": cloud_run_min_instances,
+            "cloud_run_max_instances": cloud_run_max_instances,
+            "cloud_run_concurrency": cloud_run_concurrency,
+            "cloud_run_timeout_seconds": cloud_run_timeout_seconds,
+            "cloud_run_cpu": cloud_run_cpu,
+            "cloud_run_memory": cloud_run_memory,
+            "enabled": enabled,
+            "source_mode": source_mode,
+            "repo_owner": repo_owner,
+            "repo_name": repo_name,
+            "repo_path": repo_path,
+            "source_path": source_path,
+            "git_commit_sha": git_commit_sha,
+            "git_branch": git_branch,
+            "git_tag": git_tag,
+            "git_dirty": git_dirty or False,
+        }
+        # Sent only when non-empty: an API predating this field forbids extras,
+        # so an unconditional "buckets" would 422 every deploy from this client.
+        if buckets:
+            payload["buckets"] = buckets
+        if build:
+            payload["build"] = build
         response = self.request(
             "POST",
             f"/projects/{project_id}/asgi-apps",
             timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
-            json={
-                "name": name,
-                "description": description,
-                "source_code": source_code,
-                "entrypoint": entrypoint,
-                "base_path": base_path,
-                "auth": auth,
-                "image_spec": image_spec,
-                "env": env or {},
-                "secrets": secrets or {},
-                "volumes": volumes or [],
-                "cloud_run_min_instances": cloud_run_min_instances,
-                "cloud_run_max_instances": cloud_run_max_instances,
-                "cloud_run_concurrency": cloud_run_concurrency,
-                "cloud_run_timeout_seconds": cloud_run_timeout_seconds,
-                "cloud_run_cpu": cloud_run_cpu,
-                "cloud_run_memory": cloud_run_memory,
-                "enabled": enabled,
-                "source_mode": source_mode,
-                "repo_owner": repo_owner,
-                "repo_name": repo_name,
-                "repo_path": repo_path,
-                "source_path": source_path,
-                "git_commit_sha": git_commit_sha,
-                "git_branch": git_branch,
-                "git_tag": git_tag,
-                "git_dirty": git_dirty or False,
-            },
+            json=payload,
         )
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected ASGI app response")
@@ -3111,6 +3660,7 @@ class Client:
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
         volumes: list[dict[str, Any]] | None = None,
+        buckets: list[dict[str, Any]] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_max_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
@@ -3128,6 +3678,7 @@ class Client:
         git_branch: str | None = None,
         git_tag: str | None = None,
         git_dirty: bool | None = None,
+        build: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = {
             key: value
@@ -3142,6 +3693,11 @@ class Client:
                 "env": env,
                 "secrets": secrets,
                 "volumes": volumes,
+                # `or None` so an empty list is dropped by the filter below, the
+                # same rule the create path applies: an API predating this field
+                # forbids extras, and an unconditional "buckets" 422s every
+                # update-deploy from this client.
+                "buckets": buckets or None,
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_max_instances": cloud_run_max_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
@@ -3161,6 +3717,8 @@ class Client:
             }.items()
             if value is not None
         }
+        if build:
+            payload["build"] = build
         response = self.request(
             "PATCH",
             f"/asgi-apps/{asgi_app_id}",
@@ -3180,18 +3738,21 @@ class Client:
         entrypoint: str,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        run_type: RunType = DEFAULT_RUN_TYPE,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         image_spec: dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
         volumes: list[dict[str, Any]] | None = None,
+        buckets: list[dict[str, Any]] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
         cloud_run_cpu: str | None = None,
         cloud_run_memory: str | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
-        environment: str = "dev",
+        environment: str | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -3201,39 +3762,50 @@ class Client:
         git_branch: str | None = None,
         git_tag: str | None = None,
         git_dirty: bool | None = None,
+        build: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        project_id = self.ensure_project(project)["id"]
+        environment = _resolve_environment(self, environment)
+        project_id = self._ensure_project_in_environment(project, environment)["id"]
+        resolved_mode, resolved_isolation = _validate_execution(mode, isolation, run_type=run_type)
+        payload: dict[str, Any] = {
+            "name": name,
+            "description": description,
+            "source_code": source_code,
+            "entrypoint": entrypoint,
+            "default_parameters": default_parameters or {},
+            "mode": resolved_mode,
+            "isolation": resolved_isolation,
+            "image_spec": image_spec,
+            "env": env or {},
+            "secrets": secrets or {},
+            "volumes": volumes or [],
+            "cloud_run_min_instances": cloud_run_min_instances,
+            "cloud_run_concurrency": cloud_run_concurrency,
+            "cloud_run_cpu": cloud_run_cpu,
+            "cloud_run_memory": cloud_run_memory,
+            "enabled": enabled,
+            "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
+            "environment": environment,
+            "source_mode": source_mode,
+            "repo_owner": repo_owner,
+            "repo_name": repo_name,
+            "repo_path": repo_path,
+            "source_path": source_path,
+            "git_commit_sha": git_commit_sha,
+            "git_branch": git_branch,
+            "git_tag": git_tag,
+            "git_dirty": git_dirty or False,
+        }
+        # Sent only when non-empty: an API predating this field forbids extras,
+        # so an unconditional "buckets" would 422 every deploy from this client.
+        if buckets:
+            payload["buckets"] = buckets
+        if build:
+            payload["build"] = build
         response = self.request(
             "POST",
             f"/projects/{project_id}/functions",
-            json={
-                "name": name,
-                "description": description,
-                "source_code": source_code,
-                "entrypoint": entrypoint,
-                "default_parameters": default_parameters or {},
-                "run_type": _validate_run_type(run_type),
-                "image_spec": image_spec,
-                "env": env or {},
-                "secrets": secrets or {},
-                "volumes": volumes or [],
-                "cloud_run_min_instances": cloud_run_min_instances,
-                "cloud_run_concurrency": cloud_run_concurrency,
-                "cloud_run_cpu": cloud_run_cpu,
-                "cloud_run_memory": cloud_run_memory,
-                "enabled": enabled,
-                "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
-                "environment": environment,
-                "source_mode": source_mode,
-                "repo_owner": repo_owner,
-                "repo_name": repo_name,
-                "repo_path": repo_path,
-                "source_path": source_path,
-                "git_commit_sha": git_commit_sha,
-                "git_branch": git_branch,
-                "git_tag": git_tag,
-                "git_dirty": git_dirty or False,
-            },
+            json=payload,
         )
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected function response")
@@ -3248,11 +3820,14 @@ class Client:
         entrypoint: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
         run_type: RunType | None = None,
         image_spec: dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
         volumes: list[dict[str, Any]] | None = None,
+        buckets: list[dict[str, Any]] | None = None,
         cloud_run_min_instances: int | None = None,
         cloud_run_concurrency: int | None = None,
         cloud_run_cpu: str | None = None,
@@ -3269,7 +3844,12 @@ class Client:
         git_branch: str | None = None,
         git_tag: str | None = None,
         git_dirty: bool | None = None,
+        build: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        execution_payload: dict[str, Any] = {}
+        if mode is not None or isolation is not None or run_type is not None:
+            resolved_mode, resolved_isolation = _validate_execution(mode, isolation, run_type=run_type)
+            execution_payload = {"mode": resolved_mode, "isolation": resolved_isolation}
         payload = {
             key: value
             for key, value in {
@@ -3278,11 +3858,12 @@ class Client:
                 "source_code": source_code,
                 "entrypoint": entrypoint,
                 "default_parameters": default_parameters,
-                "run_type": _validate_run_type(run_type) if run_type else None,
                 "image_spec": image_spec,
                 "env": env,
                 "secrets": secrets,
                 "volumes": volumes,
+                # See the note on update_asgi_app: empty must be omitted, not sent.
+                "buckets": buckets or None,
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
                 "cloud_run_cpu": cloud_run_cpu,
@@ -3302,6 +3883,9 @@ class Client:
             }.items()
             if value is not None
         }
+        payload.update(execution_payload)
+        if build:
+            payload["build"] = build
         response = self.request("PATCH", f"/functions/{function_id}", json=payload)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected function response")
@@ -3381,7 +3965,9 @@ class Client:
         source_code: str,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        run_type: RunType = DEFAULT_RUN_TYPE,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         image_spec: dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
@@ -3391,7 +3977,7 @@ class Client:
         cloud_run_memory: str | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
-        environment: str | None = "dev",
+        environment: str | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -3402,7 +3988,9 @@ class Client:
         git_tag: str | None = None,
         git_dirty: bool | None = None,
     ) -> dict[str, Any]:
-        project_id = self.ensure_project(project)["id"]
+        environment = _resolve_environment(self, environment)
+        project_id = self._ensure_project_in_environment(project, environment)["id"]
+        resolved_mode, resolved_isolation = _validate_execution(mode, isolation, run_type=run_type)
         response = self.request(
             "POST",
             f"/projects/{project_id}/models",
@@ -3413,7 +4001,8 @@ class Client:
                 "description": description,
                 "source_code": source_code,
                 "default_parameters": default_parameters or {},
-                "run_type": _validate_run_type(run_type),
+                "mode": resolved_mode,
+                "isolation": resolved_isolation,
                 "image_spec": image_spec,
                 "env": env or {},
                 "secrets": secrets or {},
@@ -3449,6 +4038,8 @@ class Client:
         source_code: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
         run_type: RunType | None = None,
         image_spec: dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
@@ -3470,6 +4061,10 @@ class Client:
         git_tag: str | None = None,
         git_dirty: bool | None = None,
     ) -> dict[str, Any]:
+        execution_payload: dict[str, Any] = {}
+        if mode is not None or isolation is not None or run_type is not None:
+            resolved_mode, resolved_isolation = _validate_execution(mode, isolation, run_type=run_type)
+            execution_payload = {"mode": resolved_mode, "isolation": resolved_isolation}
         payload = {
             key: value
             for key, value in {
@@ -3479,7 +4074,6 @@ class Client:
                 "description": description,
                 "source_code": source_code,
                 "default_parameters": default_parameters,
-                "run_type": _validate_run_type(run_type) if run_type else None,
                 "image_spec": image_spec,
                 "env": env,
                 "secrets": secrets,
@@ -3502,6 +4096,7 @@ class Client:
             }.items()
             if value is not None
         }
+        payload.update(execution_payload)
         response = self.request("PATCH", f"/models/{model_id}", json=payload)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected model response")
@@ -3512,8 +4107,9 @@ class Client:
         model_id: str,
         parameters: dict[str, Any] | None = None,
         *,
-        environment: str = "dev",
+        environment: str | None = None,
     ) -> Run:
+        environment = _resolve_environment(self, environment)
         response = self.request(
             "POST",
             f"/models/{model_id}/runs",
@@ -3729,14 +4325,16 @@ class Client:
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
         required_parameters: list[str] | None = None,
-        run_type: RunType = DEFAULT_RUN_TYPE,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
         buckets: list[dict[str, str]] | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         project: str | None = None,
-        environment: str = "dev",
+        environment: str | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -3746,42 +4344,54 @@ class Client:
         git_branch: str | None = None,
         git_tag: str | None = None,
         git_dirty: bool | None = None,
+        build: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        environment = _resolve_environment(self, environment)
         path = "/workflows"
         if project is not None:
-            project_id = self.ensure_project(project)["id"]
+            project_id = self._ensure_project_in_environment(project, environment)["id"]
             path = f"/projects/{project_id}/workflows"
+        resolved_mode, resolved_isolation = _validate_execution(
+            mode,
+            isolation,
+            target_type="workflow",
+            run_type=run_type,
+        )
+        payload = {
+            "name": name,
+            "description": description,
+            "flow_ref": flow_ref,
+            "source_code": source_code,
+            "entrypoint": entrypoint,
+            "step_graph": step_graph,
+            "schedule": schedule,
+            "trigger": trigger,
+            "default_parameters": default_parameters or {},
+            "required_parameters": required_parameters or [],
+            "mode": resolved_mode,
+            "isolation": resolved_isolation,
+            "env": env or {},
+            "secrets": secrets or {},
+            "buckets": buckets or [],
+            "enabled": enabled,
+            "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
+            "environment": environment,
+            "source_mode": source_mode,
+            "repo_owner": repo_owner,
+            "repo_name": repo_name,
+            "repo_path": repo_path,
+            "source_path": source_path,
+            "git_commit_sha": git_commit_sha,
+            "git_branch": git_branch,
+            "git_tag": git_tag,
+            "git_dirty": git_dirty or False,
+        }
+        if build:
+            payload["build"] = build
         response = self.request(
             "POST",
             path,
-            json={
-                "name": name,
-                "description": description,
-                "flow_ref": flow_ref,
-                "source_code": source_code,
-                "entrypoint": entrypoint,
-                "step_graph": step_graph,
-                "schedule": schedule,
-                "trigger": trigger,
-                "default_parameters": default_parameters or {},
-                "required_parameters": required_parameters or [],
-                "run_type": _validate_run_type(run_type, target_type="workflow"),
-                "env": env or {},
-                "secrets": secrets or {},
-                "buckets": buckets or [],
-                "enabled": enabled,
-                "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
-                "environment": environment,
-                "source_mode": source_mode,
-                "repo_owner": repo_owner,
-                "repo_name": repo_name,
-                "repo_path": repo_path,
-                "source_path": source_path,
-                "git_commit_sha": git_commit_sha,
-                "git_branch": git_branch,
-                "git_tag": git_tag,
-                "git_dirty": git_dirty or False,
-            },
+            json=payload,
         )
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected workflow response")
@@ -3801,6 +4411,8 @@ class Client:
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
         required_parameters: list[str] | None = None,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
         run_type: RunType | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
@@ -3817,7 +4429,17 @@ class Client:
         git_branch: str | None = None,
         git_tag: str | None = None,
         git_dirty: bool | None = None,
+        build: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        execution_payload: dict[str, Any] = {}
+        if mode is not None or isolation is not None or run_type is not None:
+            resolved_mode, resolved_isolation = _validate_execution(
+                mode,
+                isolation,
+                target_type="workflow",
+                run_type=run_type,
+            )
+            execution_payload = {"mode": resolved_mode, "isolation": resolved_isolation}
         payload: dict[str, Any] = {
             key: value
             for key, value in {
@@ -3828,7 +4450,6 @@ class Client:
                 "entrypoint": entrypoint,
                 "default_parameters": default_parameters,
                 "required_parameters": required_parameters,
-                "run_type": _validate_run_type(run_type, target_type="workflow") if run_type else None,
                 "env": env,
                 "secrets": secrets,
                 "enabled": enabled,
@@ -3846,6 +4467,7 @@ class Client:
             }.items()
             if value is not None
         }
+        payload.update(execution_payload)
         if step_graph is not _UNSET:
             payload["step_graph"] = step_graph
         if schedule is not _UNSET:
@@ -3854,6 +4476,8 @@ class Client:
             payload["trigger"] = trigger
         if buckets is not _UNSET:
             payload["buckets"] = buckets
+        if build:
+            payload["build"] = build
         response = self.request("PATCH", f"/workflows/{workflow_id}", json=payload)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected workflow response")
@@ -3900,7 +4524,9 @@ class Client:
         entrypoint: str,
         default_parameters: dict[str, Any] | None = None,
         parameters: dict[str, Any] | None = None,
-        run_type: RunType,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         image_spec: dict[str, Any] | None = None,
         step_graph: dict[str, Any] | None = None,
         required_parameters: list[str] | None = None,
@@ -3909,6 +4535,12 @@ class Client:
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
     ) -> Run:
+        resolved_mode, resolved_isolation = _validate_execution(
+            mode,
+            isolation,
+            target_type=target_type,
+            run_type=run_type,
+        )
         payload: dict[str, Any] = {
             "target_type": target_type,
             "project": project,
@@ -3917,7 +4549,8 @@ class Client:
             "entrypoint": entrypoint,
             "default_parameters": default_parameters or {},
             "parameters": parameters or {},
-            "run_type": _validate_run_type(run_type, target_type=target_type),
+            "mode": resolved_mode,
+            "isolation": resolved_isolation,
             "image_spec": image_spec,
             "step_graph": step_graph,
             "required_parameters": required_parameters or [],
@@ -3938,7 +4571,12 @@ class Client:
         if secrets:
             payload["secrets"] = dict(secrets)
 
-        response = self.request("POST", "/runs/ephemeral", json=payload)
+        response = self.request(
+            "POST",
+            "/runs/ephemeral",
+            json=payload,
+            timeout=EPHEMERAL_RUN_REQUEST_TIMEOUT_SECONDS,
+        )
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected run response")
         return Run(response["id"], client=self, data=response)
@@ -4068,6 +4706,36 @@ class Client:
             raise RebaseWorkflowError("expected run list response")
         return response
 
+    def list_latest_runs_by_project(self) -> list[dict[str, Any]]:
+        """The newest run of each project, one row per project.
+
+        `list_runs` cannot answer this: it returns runs newest-first across the
+        whole workspace, so one project running every fifteen minutes fills any
+        page size and the quiet projects fall off the end — and those are exactly
+        the ones where "when did this last run" is worth asking.
+
+        Empty against an API without the route, so a toolkit ahead of its
+        platform loses the column rather than the view.
+
+        Such an API does not answer 404. `/runs/{run_id}` is declared there and
+        matches first, so FastAPI takes "latest-by-project" for a run id and
+        rejects it as an invalid UUID — a 422. Only that shape is treated as an
+        absent route: a real call to this path carries no run id, so a
+        `uuid_parsing` complaint about one cannot be a genuine error, and 422
+        stays meaningful everywhere else.
+        """
+        try:
+            response = self.request("GET", "/runs/latest-by-project")
+        except RebaseWorkflowError as exc:
+            if exc.status_code in ROUTE_ABSENT_STATUSES:
+                return []
+            if exc.status_code == 422 and "uuid_parsing" in str(exc) and "run_id" in str(exc):
+                return []
+            raise
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected run list response")
+        return response
+
     def list_run_steps(self, run_id: str) -> list[dict[str, Any]]:
         response = self.request("GET", f"/runs/{run_id}/steps")
         if not isinstance(response, list):
@@ -4142,6 +4810,104 @@ class Client:
             raise RebaseWorkflowError("expected run event list response")
         return response
 
+    def create_shell_session(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # Creating a session deploys and starts the shell container's Cloud Run
+        # job synchronously, which can take a couple of minutes on first use.
+        response = self.request("POST", "/shell-sessions", json=payload, timeout=300)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected shell session response")
+        return response
+
+    def prepare_source_bundle(self, bundle: SourceBundle) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            "/source-bundles/prepare",
+            json={
+                "digest": bundle.digest,
+                "archive_size": len(bundle.archive),
+                "expanded_size": bundle.expanded_size,
+                "file_count": bundle.file_count,
+                "manifest": bundle.manifest,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected source bundle preparation response")
+        upload_url = response.get("upload_url")
+        if isinstance(upload_url, str):
+            upload = requests.put(
+                upload_url,
+                data=bundle.archive,
+                headers={"Content-Type": "application/gzip"},
+                timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
+            )
+            if upload.status_code >= 400:
+                raise RebaseWorkflowError(f"source bundle upload failed: {upload.status_code} {upload.text[:200]}")
+            bundle_id = response.get("id")
+            response = self.request(
+                "POST",
+                f"/source-bundles/{bundle_id}/finalize",
+                timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
+            )
+            if not isinstance(response, dict):
+                raise RebaseWorkflowError("expected finalized source bundle response")
+        if response.get("status") != "ready":
+            raise RebaseWorkflowError(str(response.get("error") or "source bundle did not become ready"))
+        return response
+
+    def build_image(self, *, source_bundle_id: str, recipe: dict[str, Any]) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            "/image-builds",
+            json={"source_bundle_id": source_bundle_id, "recipe": recipe},
+            timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected image build response")
+        build_id = response.get("id")
+        deadline = time.monotonic() + IMAGE_BUILD_TIMEOUT_SECONDS
+        while response.get("status") in {"queued", "building"}:
+            if not isinstance(build_id, str):
+                raise RebaseWorkflowError("image build response is missing an id")
+            if time.monotonic() >= deadline:
+                logs_url = response.get("logs_url")
+                suffix = f" Logs: {logs_url}" if logs_url else ""
+                raise RebaseWorkflowError(f"image build did not finish within 30 minutes.{suffix}")
+            time.sleep(IMAGE_BUILD_POLL_SECONDS)
+            response = self.request("GET", f"/image-builds/{build_id}")
+            if not isinstance(response, dict):
+                raise RebaseWorkflowError("expected image build status response")
+        if response.get("status") != "succeeded" or not response.get("image_digest"):
+            logs_url = response.get("logs_url")
+            suffix = f" Logs: {logs_url}" if logs_url else ""
+            raise RebaseWorkflowError(str(response.get("error") or "image build failed") + suffix)
+        return response
+
+    def prepare_built_image(self, fn: FunctionType, image: Image) -> dict[str, Any]:
+        bundle = build_source_bundle(fn, image)
+        source = self.prepare_source_bundle(bundle)
+        build = self.build_image(
+            source_bundle_id=str(source["id"]),
+            recipe=bundle.manifest["image_recipe"],
+        )
+        return {
+            "image_build_id": build["id"],
+            "image_digest": build["image_digest"],
+            "image_recipe": bundle.manifest["image_recipe"],
+            "source_bundle_id": source["id"],
+            "source_bundle_digest": bundle.digest,
+            "entrypoint_module": bundle.entrypoint_module,
+            "entrypoint_qualname": bundle.entrypoint_qualname,
+        }
+
+    def get_shell_session(self, session_id: str) -> dict[str, Any]:
+        response = self.request("GET", f"/shell-sessions/{session_id}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected shell session response")
+        return response
+
+    def delete_shell_session(self, session_id: str) -> None:
+        self.request_no_content("DELETE", f"/shell-sessions/{session_id}")
+
 
 class Project:
     def __init__(
@@ -4174,7 +4940,11 @@ class Project:
     def _client(self) -> Client:
         return self.client or default_client()
 
-    def deploy(self, *, replace: bool = False, deploy_source: str | None = None, environment: str = "dev") -> Self:
+    @_environment_scoped_deploy
+    def deploy(
+        self, *, replace: bool = False, deploy_source: str | None = None, environment: str | None = None
+    ) -> Self:
+        environment = _resolve_environment(self._client, environment)
         for workflow in self._workflows:
             workflow._validate_schedule_defaults()
         resolved_deploy_source = _validate_deploy_source(deploy_source)
@@ -4186,6 +4956,7 @@ class Project:
             repo_owner=self.repo_owner,
             repo_name=self.repo_name,
             repo_path=self.repo_path,
+            environment_name=environment,
         )
         self.id = project["id"]
         for function in self._functions:
@@ -4209,12 +4980,15 @@ class Project:
         name: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        run_type: RunType = DEFAULT_RUN_TYPE,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | list[Secret | str] | None = None,
         volumes: dict[str, Volume | str] | list[dict[str, Any]] | None = None,
+        buckets: list[Bucket | str] | list[dict[str, Any]] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
         cpu: float | int | str | None = None,
@@ -4233,12 +5007,15 @@ class Project:
                 project=self.name,
                 description=description,
                 default_parameters=default_parameters,
+                mode=mode,
+                isolation=isolation,
                 run_type=run_type,
                 dependencies=dependencies,
                 image=image,
                 env=env,
                 secrets=secrets,
                 volumes=volumes,
+                buckets=buckets,
                 min_instances=min_instances,
                 concurrency=concurrency,
                 cpu=cpu,
@@ -4266,6 +5043,7 @@ class Project:
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | list[Secret | str] | None = None,
         volumes: dict[str, Volume | str] | list[dict[str, Any]] | None = None,
+        buckets: list[Bucket | str] | list[dict[str, Any]] | None = None,
         min_instances: int | None = None,
         max_instances: int | None = None,
         concurrency: int | None = None,
@@ -4288,6 +5066,7 @@ class Project:
                 env=env,
                 secrets=secrets,
                 volumes=volumes,
+                buckets=buckets,
                 min_instances=min_instances,
                 max_instances=max_instances,
                 concurrency=concurrency,
@@ -4345,7 +5124,9 @@ class Project:
         schedule: Schedule | None = None,
         trigger: Trigger | None = None,
         default_parameters: dict[str, Any] | None = None,
-        run_type: RunType = DEFAULT_RUN_TYPE,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
@@ -4370,6 +5151,8 @@ class Project:
                 schedule=schedule,
                 trigger=trigger,
                 default_parameters=default_parameters,
+                mode=mode,
+                isolation=isolation,
                 run_type=run_type,
                 enabled=enabled,
                 endpoint=endpoint,
@@ -4406,6 +5189,7 @@ class ASGIApp:
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | list[Secret | str] | None = None,
         volumes: dict[str, Volume | str] | list[dict[str, Any]] | None = None,
+        buckets: list[Bucket | str] | list[dict[str, Any]] | None = None,
         min_instances: int | None = None,
         max_instances: int | None = None,
         concurrency: int | None = None,
@@ -4431,6 +5215,8 @@ class ASGIApp:
         self.secrets = secrets if secrets is not None else {}
         # Kept unresolved (Volume handles or an attachment list) until deploy needs a client.
         self.volumes = volumes if volumes is not None else list((data.get("volumes") if data else None) or [])
+        # Kept unresolved (Bucket handles or an attachment list) until deploy needs a client.
+        self.buckets = buckets if buckets is not None else list((data.get("buckets") if data else None) or [])
         self.enabled = enabled
         self.deploy_source = _validate_deploy_source(deploy_source)
         self.project_source_mode = project_source_mode
@@ -4441,6 +5227,7 @@ class ASGIApp:
         self.source_code: str | None = None
         self.entrypoint: str | None = None
         self.image_spec: dict[str, Any] | None = data.get("image_spec") if data else None
+        self.image: Image | None = image if isinstance(image, Image) else None
         self.image_fingerprint: str | None = data.get("image_fingerprint") if data else None
         self.cloud_run_min_instances: int | None = data.get("cloud_run_min_instances") if data else None
         self.cloud_run_max_instances: int | None = data.get("cloud_run_max_instances") if data else None
@@ -4504,7 +5291,11 @@ class ASGIApp:
             project_source_mode=project_source_mode,
         )
 
-    def deploy(self, *, replace: bool = False, deploy_source: str | None = None, environment: str = "dev") -> ASGIApp:
+    @_environment_scoped_deploy
+    def deploy(
+        self, *, replace: bool = False, deploy_source: str | None = None, environment: str | None = None
+    ) -> ASGIApp:
+        environment = _resolve_environment(self._client, environment)
         if self.source_code is None or self.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy an ASGI app handle without source_code and entrypoint")
         if self.name is None:
@@ -4512,6 +5303,12 @@ class ASGIApp:
         source_metadata = self._source_metadata_for_deploy(deploy_source)
         secrets_payload = _resolve_secrets_payload(self.secrets, self._client)
         volumes_payload = _resolve_volumes_payload(self.volumes, self._client)
+        buckets_payload = _resolve_buckets_payload(self.buckets, self._client)
+        build = (
+            self._client.prepare_built_image(self.fn, self.image)
+            if self.fn and self.image and self.image.build_enabled
+            else None
+        )
         existing = self._client.find_asgi_app(self.name, project=self.project)
         if existing is not None:
             asgi_app = self._client.update_asgi_app(
@@ -4525,6 +5322,7 @@ class ASGIApp:
                 env=self.env,
                 secrets=secrets_payload,
                 volumes=volumes_payload,
+                buckets=buckets_payload,
                 cloud_run_min_instances=self.cloud_run_min_instances,
                 cloud_run_max_instances=self.cloud_run_max_instances,
                 cloud_run_concurrency=self.cloud_run_concurrency,
@@ -4532,6 +5330,7 @@ class ASGIApp:
                 cloud_run_cpu=self.cloud_run_cpu,
                 cloud_run_memory=self.cloud_run_memory,
                 enabled=self.enabled,
+                build=build,
                 environment=environment,
                 **source_metadata,
             )
@@ -4551,6 +5350,7 @@ class ASGIApp:
             env=self.env,
             secrets=secrets_payload,
             volumes=volumes_payload,
+            buckets=buckets_payload,
             cloud_run_min_instances=self.cloud_run_min_instances,
             cloud_run_max_instances=self.cloud_run_max_instances,
             cloud_run_concurrency=self.cloud_run_concurrency,
@@ -4558,6 +5358,7 @@ class ASGIApp:
             cloud_run_cpu=self.cloud_run_cpu,
             cloud_run_memory=self.cloud_run_memory,
             enabled=self.enabled,
+            build=build,
             environment=environment,
             **source_metadata,
         )
@@ -4575,12 +5376,15 @@ class Function:
         project: str,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        run_type: RunType = DEFAULT_RUN_TYPE,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | list[Secret | str] | None = None,
         volumes: dict[str, Volume | str] | list[dict[str, Any]] | None = None,
+        buckets: list[Bucket | str] | list[dict[str, Any]] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
         cpu: float | int | str | None = None,
@@ -4604,6 +5408,8 @@ class Function:
         self.secrets = secrets if secrets is not None else dict((data.get("secrets") if data else None) or {})
         # Kept unresolved (Volume handles or an attachment list) until deploy needs a client.
         self.volumes = volumes if volumes is not None else list((data.get("volumes") if data else None) or [])
+        # Kept unresolved (Bucket handles or an attachment list) until deploy needs a client.
+        self.buckets = buckets if buckets is not None else list((data.get("buckets") if data else None) or [])
         self.endpoint = _coerce_endpoint(endpoint) or _endpoint_for_callable(fn)
         self.client = client
         self.id: str | None = function_id
@@ -4614,8 +5420,17 @@ class Function:
         self.source_code: str | None = None
         self.entrypoint: str | None = None
         self.default_parameters = default_parameters or {}
-        self.run_type: RunType = (data.get("run_type") or DEFAULT_RUN_TYPE) if data else DEFAULT_RUN_TYPE
+        data_mode = data.get("mode") if data else None
+        data_isolation = data.get("isolation") if data else None
+        data_run_type = data.get("run_type") if data and data_mode is None and data_isolation is None else None
+        self.mode, self.isolation = _validate_execution(
+            data_mode if data else mode,
+            data_isolation if data else isolation,
+            run_type=data_run_type if data else run_type,
+        )
+        self.run_type: RunType = _legacy_run_type(self.mode, self.isolation)
         self.image_spec: dict[str, Any] | None = data.get("image_spec") if data else None
+        self.image: Image | None = image if isinstance(image, Image) else None
         self.image_fingerprint: str | None = data.get("image_fingerprint") if data else None
         self.cloud_run_min_instances: int | None = data.get("cloud_run_min_instances") if data else None
         self.cloud_run_concurrency: int | None = data.get("cloud_run_concurrency") if data else None
@@ -4631,7 +5446,8 @@ class Function:
             self.name = _target_name(fn, name)
             inferred_defaults = _defaults_for(fn, target="Function")
             self.default_parameters = {**inferred_defaults, **(default_parameters or {})}
-            self.run_type = _validate_run_type(run_type)
+            self.mode, self.isolation = _validate_execution(mode, isolation, run_type=run_type)
+            self.run_type = _legacy_run_type(self.mode, self.isolation)
             self.image_spec = _image_spec_for(image=image, dependencies=dependencies)
             if min_instances is not None and min_instances < 0:
                 raise ValueError("min_instances must be greater than or equal to 0")
@@ -4674,7 +5490,11 @@ class Function:
             project_source_mode=project_source_mode,
         )
 
-    def deploy(self, *, replace: bool = False, deploy_source: str | None = None, environment: str = "dev") -> Function:
+    @_environment_scoped_deploy
+    def deploy(
+        self, *, replace: bool = False, deploy_source: str | None = None, environment: str | None = None
+    ) -> Function:
+        environment = _resolve_environment(self._client, environment)
         if self.source_code is None or self.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy a function handle without source_code and entrypoint")
         if self.name is None:
@@ -4683,6 +5503,15 @@ class Function:
         source_metadata = self._source_metadata_for_deploy(deploy_source)
         secrets_payload = _resolve_secrets_payload(self.secrets, self._client)
         volumes_payload = _resolve_volumes_payload(self.volumes, self._client)
+        buckets_payload = _resolve_buckets_payload(self.buckets, self._client)
+        build = None
+        if self.fn and self.image and self.image.build_enabled:
+            if self.mode == "interactive" and self.isolation == "shared":
+                raise RebaseWorkflowError(
+                    "Images using uv_sync or add_local_* cannot run on the shared runner. "
+                    "Use isolation='dedicated' or mode='job'."
+                )
+            build = self._client.prepare_built_image(self.fn, self.image)
         existing = self._client.find_function(name, project=self.project)
         if existing is not None:
             function = self._client.update_function(
@@ -4691,17 +5520,20 @@ class Function:
                 source_code=self.source_code,
                 entrypoint=self.entrypoint,
                 default_parameters=self.default_parameters,
-                run_type=self.run_type,
+                mode=self.mode,
+                isolation=self.isolation,
                 image_spec=self.image_spec,
                 env=self.env,
                 secrets=secrets_payload,
                 volumes=volumes_payload,
+                buckets=buckets_payload,
                 cloud_run_min_instances=self.cloud_run_min_instances,
                 cloud_run_concurrency=self.cloud_run_concurrency,
                 cloud_run_cpu=self.cloud_run_cpu,
                 cloud_run_memory=self.cloud_run_memory,
                 enabled=self.enabled,
                 endpoint=self.endpoint,
+                build=build,
                 environment=environment,
                 **source_metadata,
             )
@@ -4716,17 +5548,20 @@ class Function:
             source_code=self.source_code,
             entrypoint=self.entrypoint,
             default_parameters=self.default_parameters,
-            run_type=self.run_type,
+            mode=self.mode,
+            isolation=self.isolation,
             image_spec=self.image_spec,
             env=self.env,
             secrets=secrets_payload,
             volumes=volumes_payload,
+            buckets=buckets_payload,
             cloud_run_min_instances=self.cloud_run_min_instances,
             cloud_run_concurrency=self.cloud_run_concurrency,
             cloud_run_cpu=self.cloud_run_cpu,
             cloud_run_memory=self.cloud_run_memory,
             enabled=self.enabled,
             endpoint=self.endpoint,
+            build=build,
             environment=environment,
             **source_metadata,
         )
@@ -4830,7 +5665,8 @@ class Function:
             entrypoint=self.entrypoint,
             default_parameters=self.default_parameters,
             parameters=parameters,
-            run_type=self.run_type,
+            mode=self.mode,
+            isolation=self.isolation,
             image_spec=self.image_spec,
             cloud_run_min_instances=self.cloud_run_min_instances,
             cloud_run_concurrency=self.cloud_run_concurrency,
@@ -4857,16 +5693,16 @@ class _RemoteModelOperation:
     def __init__(self, handle: ModelHandle) -> None:
         self._handle = handle
 
-    def spawn(self, *, environment: str = "dev", **parameters: Any) -> Run:
+    def spawn(self, *, environment: str | None = None, **parameters: Any) -> Run:
         return self._handle.spawn(environment=environment, **parameters)
 
-    def remote(self, *, environment: str = "dev", **parameters: Any) -> dict[str, Any]:
+    def remote(self, *, environment: str | None = None, **parameters: Any) -> dict[str, Any]:
         return self._handle.remote(environment=environment, **parameters)
 
-    def run(self, *, environment: str = "dev", **parameters: Any) -> Run:
+    def run(self, *, environment: str | None = None, **parameters: Any) -> Run:
         return self.spawn(environment=environment, **parameters)
 
-    def __call__(self, *, environment: str = "dev", **parameters: Any) -> dict[str, Any]:
+    def __call__(self, *, environment: str | None = None, **parameters: Any) -> dict[str, Any]:
         return self.remote(environment=environment, **parameters)
 
 
@@ -4908,15 +5744,15 @@ class ModelHandle:
             raise RebaseWorkflowError("model handle does not expose a known remote operation")
         return getattr(self, self.operation_name)
 
-    def spawn(self, *, environment: str = "dev", **parameters: Any) -> Run:
+    def spawn(self, *, environment: str | None = None, **parameters: Any) -> Run:
         if self.id is None:
             raise RebaseWorkflowError("model handle has no ID")
         return self._client.run_model(self.id, parameters, environment=environment)
 
-    def remote(self, *, environment: str = "dev", **parameters: Any) -> dict[str, Any]:
+    def remote(self, *, environment: str | None = None, **parameters: Any) -> dict[str, Any]:
         return self.spawn(environment=environment, **parameters).result()
 
-    def run(self, *, environment: str = "dev", **parameters: Any) -> Run:
+    def run(self, *, environment: str | None = None, **parameters: Any) -> Run:
         return self.spawn(environment=environment, **parameters)
 
 
@@ -5085,7 +5921,9 @@ class Model(_EmflowModel):
     project: str | None = "default"
     description: str | None = None
     default_parameters: dict[str, Any] | None = None
-    run_type: RunType = DEFAULT_RUN_TYPE
+    mode: ExecutionMode = DEFAULT_MODE
+    isolation: Isolation = DEFAULT_ISOLATION
+    run_type: RunType | None = None
     dependencies: list[str] | tuple[str, ...] | None = None
     image: Image | dict[str, Any] | None = None
     env: dict[str, str] | None = None
@@ -5105,6 +5943,8 @@ class Model(_EmflowModel):
         project: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
         run_type: RunType | None = None,
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
@@ -5131,7 +5971,23 @@ class Model(_EmflowModel):
         self.default_parameters: dict[str, Any] = (
             dict(default_parameters) if default_parameters is not None else dict(class_default_parameters or {})
         )
-        self.run_type = _validate_run_type(run_type or getattr(cls, "run_type", DEFAULT_RUN_TYPE))
+        class_run_type = (
+            cls.__dict__.get("run_type") if mode is None and isolation is None and run_type is None else None
+        )
+        resolved_mode = (
+            mode if mode is not None else (None if class_run_type is not None else getattr(cls, "mode", DEFAULT_MODE))
+        )
+        resolved_isolation = (
+            isolation
+            if isolation is not None
+            else (None if class_run_type is not None else getattr(cls, "isolation", DEFAULT_ISOLATION))
+        )
+        self.mode, self.isolation = _validate_execution(
+            resolved_mode,
+            resolved_isolation,
+            run_type=run_type if run_type is not None else class_run_type,
+        )
+        self.run_type = _legacy_run_type(self.mode, self.isolation)
         self.dependencies = dependencies if dependencies is not None else getattr(cls, "dependencies", None)
         self.image = image if image is not None else getattr(cls, "image", None)
         self.env = dict(env if env is not None else (getattr(cls, "env", None) or {}))
@@ -5200,13 +6056,14 @@ class Model(_EmflowModel):
                 name=str(self.name),
                 description=self.description,
                 default_parameters={**inferred_defaults, **default_parameters},
+                mode=self.mode,
+                isolation=self.isolation,
                 enabled=self.enabled,
                 deploy_source=self.deploy_source,
                 client=self._client,
             )
             function.source_code = _source_for_model(self, operation_name=operation_name)
             function.entrypoint = operation_name
-            function.run_type = self.run_type
             function.image_spec = _model_image_spec_for(image=self.image, dependencies=self.dependencies)
             function.cloud_run_min_instances = self.cloud_run_min_instances
             function.cloud_run_concurrency = self.cloud_run_concurrency
@@ -5343,14 +6200,16 @@ class Model(_EmflowModel):
             publication_metadata=publication_metadata,
         )
 
+    @_environment_scoped_deploy
     def deploy(
         self,
         *,
         replace: bool = False,
-        environment: str = "dev",
+        environment: str | None = None,
         huggingface: HuggingFacePublishConfig | None = None,
         deploy_source: str | None = None,
     ) -> Model:
+        environment = _resolve_environment(self._client, environment)
         function = self.as_function()
         if function.source_code is None or function.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy a model without source_code and operation entrypoint")
@@ -5365,7 +6224,8 @@ class Model(_EmflowModel):
                 description=self.description,
                 source_code=function.source_code,
                 default_parameters=function.default_parameters,
-                run_type=function.run_type,
+                mode=function.mode,
+                isolation=function.isolation,
                 image_spec=function.image_spec,
                 env=self.env,
                 secrets=secrets_payload,
@@ -5387,7 +6247,8 @@ class Model(_EmflowModel):
                 description=self.description,
                 source_code=function.source_code,
                 default_parameters=function.default_parameters,
-                run_type=function.run_type,
+                mode=function.mode,
+                isolation=function.isolation,
                 image_spec=function.image_spec,
                 env=self.env,
                 secrets=secrets_payload,
@@ -5411,17 +6272,18 @@ class Model(_EmflowModel):
             self.data["huggingface_publication"] = publication
         return self
 
-    def spawn(self, *, environment: str = "dev", **parameters: Any) -> Run:
+    def spawn(self, *, environment: str | None = None, **parameters: Any) -> Run:
+        environment = _resolve_environment(self._client, environment)
         if self.id is None:
             self.deploy(environment=environment)
         if self.id is None:
             raise RebaseWorkflowError("model has no ID after deployment")
         return self._client.run_model(self.id, parameters, environment=environment)
 
-    def remote(self, *, environment: str = "dev", **parameters: Any) -> dict[str, Any]:
+    def remote(self, *, environment: str | None = None, **parameters: Any) -> dict[str, Any]:
         return self.spawn(environment=environment, **parameters).result()
 
-    def run(self, *, environment: str = "dev", **parameters: Any) -> Run:
+    def run(self, *, environment: str | None = None, **parameters: Any) -> Run:
         return self.spawn(environment=environment, **parameters)
 
     def ephemeral_run(self, **parameters: Any) -> Run:
@@ -5436,7 +6298,8 @@ class Model(_EmflowModel):
             entrypoint=function.entrypoint,
             default_parameters=function.default_parameters,
             parameters=parameters,
-            run_type=function.run_type,
+            mode=function.mode,
+            isolation=function.isolation,
             image_spec=function.image_spec,
             cloud_run_min_instances=function.cloud_run_min_instances,
             cloud_run_concurrency=function.cloud_run_concurrency,
@@ -5515,8 +6378,9 @@ class Step(Function):
             description=description,
             default_parameters=default_parameters,
             # Steps execute in-flow inside their workflow's Prefect run; the
-            # stored run type is never used for dispatch, so use the default.
-            run_type=DEFAULT_RUN_TYPE,
+            # stored execution settings are never used for dispatch.
+            mode=DEFAULT_MODE,
+            isolation=DEFAULT_ISOLATION,
             dependencies=None,
             image=None,
             min_instances=None,
@@ -5594,7 +6458,9 @@ class Workflow:
         schedule: Schedule | None = None,
         trigger: Trigger | None = None,
         default_parameters: dict[str, Any] | None = None,
-        run_type: RunType = DEFAULT_RUN_TYPE,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
@@ -5636,10 +6502,20 @@ class Workflow:
         )
         self.trigger = _trigger_payload(trigger) if trigger is not None else (data.get("trigger") if data else None)
         self.default_parameters = default_parameters or {}
-        self.run_type: RunType = (data.get("run_type") or DEFAULT_RUN_TYPE) if data else DEFAULT_RUN_TYPE
+        data_mode = data.get("mode") if data else None
+        data_isolation = data.get("isolation") if data else None
+        data_run_type = data.get("run_type") if data and data_mode is None and data_isolation is None else None
+        self.mode, self.isolation = _validate_execution(
+            data_mode if data else mode,
+            data_isolation if data else isolation,
+            target_type="workflow",
+            run_type=data_run_type if data else run_type,
+        )
+        self.run_type: RunType = _legacy_run_type(self.mode, self.isolation, target_type="workflow")
         self.required_parameters: list[str] = list(data.get("required_parameters", [])) if data else []
         self.source_metadata: dict[str, Any] = {}
         self.image_spec: dict[str, Any] | None = None
+        self.image: Image | None = image if isinstance(image, Image) else None
         self.cloud_run_min_instances: int | None = None
         self.cloud_run_concurrency: int | None = None
         self.resource_policy: dict[str, Any] = {}
@@ -5653,7 +6529,13 @@ class Workflow:
                 fn, target="Workflow", reserved=_RESERVED_WORKFLOW_PARAMETERS
             )
             self.default_parameters = {**inferred_defaults, **(default_parameters or {})}
-            self.run_type = _validate_run_type(run_type, target_type="workflow")
+            self.mode, self.isolation = _validate_execution(
+                mode,
+                isolation,
+                target_type="workflow",
+                run_type=run_type,
+            )
+            self.run_type = _legacy_run_type(self.mode, self.isolation, target_type="workflow")
             self.source_code = _source_for(fn, target="workflow")
             self.entrypoint = fn.__name__
             self.source_metadata = _git_metadata_for(fn)
@@ -5704,7 +6586,22 @@ class Workflow:
             closure = inspect.getclosurevars(self.fn)
         except TypeError:
             return []
-        return [v for v in [*closure.nonlocals.values(), *closure.globals.values()] if isinstance(v, Step)]
+        referenced = {**closure.globals, **closure.nonlocals}
+        ordered: list[Step] = []
+        seen: set[int] = set()
+        # Closure mappings are not a source-order contract (and Python 3.14
+        # changed their observed order). Bytecode preserves first use, which is
+        # the deploy order users see in a straight-line workflow declaration.
+        for instruction in dis.get_instructions(self.fn):
+            value = referenced.get(str(instruction.argval))
+            if isinstance(value, Step) and id(value) not in seen:
+                seen.add(id(value))
+                ordered.append(value)
+        for value in referenced.values():
+            if isinstance(value, Step) and id(value) not in seen:
+                seen.add(id(value))
+                ordered.append(value)
+        return ordered
 
     def _references_step(self) -> bool:
         return bool(self._collect_steps())
@@ -5767,19 +6664,29 @@ class Workflow:
                 f"Triggered workflows require defaults for every workflow parameter. Missing defaults: {missing}"
             )
 
+    @_environment_scoped_deploy
     def deploy(
         self,
         *,
         replace: bool = False,
         deploy_source: str | None = None,
-        environment: str = "dev",
+        environment: str | None = None,
         _skip_dataset_preflight: bool = False,
     ) -> Workflow:
+        environment = _resolve_environment(self._client, environment)
         if self.source_code is None or self.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy a workflow handle without source_code and entrypoint")
         if self.name is None:
             raise RebaseWorkflowError("workflow name is required")
         self._validate_schedule_defaults()
+        build = None
+        if self.fn and self.image and self.image.build_enabled:
+            if self.mode != "job":
+                raise RebaseWorkflowError(
+                    "Workflows using uv_sync or add_local_* require mode='job'; "
+                    "interactive custom-image workflows are not supported yet."
+                )
+            build = self._client.prepare_built_image(self.fn, self.image)
         if not _skip_dataset_preflight:
             # Project.deploy runs the preflight once for all targets.
             preflight_datasets(self.client)
@@ -5798,7 +6705,7 @@ class Workflow:
         step_graph = self._build_step_graph()
         source_metadata = self._source_metadata_for_deploy(deploy_source)
         secrets_payload = _resolve_secrets_payload(self.secrets, self._client)
-        buckets_payload = _resolve_buckets_payload(self.buckets)
+        buckets_payload = _resolve_buckets_payload(self.buckets, self._client)
         existing = self._client.find_workflow(name, project=self.project)
         if existing is not None:
             workflow = self._client.update_workflow(
@@ -5812,12 +6719,14 @@ class Workflow:
                 trigger=self.trigger,
                 default_parameters=self.default_parameters,
                 required_parameters=self.required_parameters,
-                run_type=self.run_type,
+                mode=self.mode,
+                isolation=self.isolation,
                 env=self.env,
                 secrets=secrets_payload,
                 buckets=buckets_payload,
                 enabled=self.enabled,
                 endpoint=self.endpoint,
+                build=build,
                 environment=environment,
                 **source_metadata,
             )
@@ -5838,12 +6747,14 @@ class Workflow:
             trigger=self.trigger,
             default_parameters=self.default_parameters,
             required_parameters=self.required_parameters,
-            run_type=self.run_type,
+            mode=self.mode,
+            isolation=self.isolation,
             env=self.env,
             secrets=secrets_payload,
             buckets=buckets_payload,
             enabled=self.enabled,
             endpoint=self.endpoint,
+            build=build,
             environment=environment,
             **source_metadata,
         )
@@ -5876,7 +6787,8 @@ class Workflow:
             entrypoint=self.entrypoint,
             default_parameters=self.default_parameters,
             parameters=parameters,
-            run_type=self.run_type,
+            mode=self.mode,
+            isolation=self.isolation,
             step_graph=self._build_step_graph(ephemeral=True),
             required_parameters=self.required_parameters,
             # image_spec too: without it an ephemeral workflow runs on the default
@@ -5934,9 +6846,17 @@ class Run:
     def result(self, *, timeout: int = 600, poll_interval: float = 5.0) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
         terminal_statuses = {"succeeded", "failed", "cancelled"}
+        # The ephemeral submit response is already terminal on current servers, so
+        # the data in hand usually answers without a single GET. Non-terminal data
+        # (older servers, async run types) falls through to the poll loop.
+        first_iteration = True
 
         while True:
-            data = self.refresh()
+            if first_iteration and self.data and self.data.get("status") in terminal_statuses:
+                data = self.data
+            else:
+                data = self.refresh()
+            first_iteration = False
             status = data["status"]
             if status in terminal_statuses:
                 if status == "succeeded":

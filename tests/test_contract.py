@@ -443,23 +443,23 @@ def test_dataset_coerces_contract_and_freshness_to_dicts() -> None:
         rb.Dataset("d", contract="not-a-dict")
 
 
-# --- run_type server parity ------------------------------------------------------------
+# --- execution semantics server parity ------------------------------------------------
 
 
-def test_run_type_values_match_server_contract(monkeypatch) -> None:
-    """The SDK's accepted run_type values must match the workflows API server.
+def test_execution_values_match_server_contract(monkeypatch) -> None:
+    """The SDK's accepted execution values must match the API server.
 
-    Server contract: Create/Update/EphemeralRun schemas accept only
-    run_type in {"quick", "quick_shared", "long"} (workflows: no "quick_shared"),
-    and reject any "execution_backend" request field.
+    ``run_type`` constants remain exported only for older clients.
     """
-    from rebase.client import RUN_TYPES, WORKFLOW_RUN_TYPES
+    from rebase.client import EXECUTION_MODES, ISOLATIONS, RUN_TYPES, WORKFLOW_RUN_TYPES
 
+    assert EXECUTION_MODES == ("interactive", "job")
+    assert ISOLATIONS == ("shared", "dedicated")
     assert RUN_TYPES == ("quick", "quick_shared", "long")
     assert WORKFLOW_RUN_TYPES == ("quick", "long")
 
 
-def test_registration_payload_sends_run_type_not_execution_backend(monkeypatch) -> None:
+def test_registration_payload_sends_execution_semantics_not_backend(monkeypatch) -> None:
     observed: dict = {}
 
     def fake_request(method: str, path: str, **kwargs):
@@ -478,5 +478,7 @@ def test_registration_payload_sends_run_type_not_execution_backend(monkeypatch) 
     )
 
     payload = observed["json"]
-    assert payload["run_type"] == "quick"
+    assert payload["mode"] == "interactive"
+    assert payload["isolation"] == "shared"
+    assert "run_type" not in payload
     assert "execution_backend" not in payload

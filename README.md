@@ -133,6 +133,72 @@ rebase workspace list
 rebase workspace switch prod
 ```
 
+## Environments and GitOps
+
+Environments are workspace namespaces, not values baked into an app. Projects and
+their compute, runs, endpoints, schedules, models, secrets, volumes, and buckets all
+live in one environment. The same project name can therefore exist independently in
+`dev`, `staging`, a pull-request environment, or `prod`.
+
+Select a default for the current workspace:
+
+```bash
+rebase environment create preview
+rebase environment use preview
+```
+
+Or keep the choice in Python. An explicit environment wins over the ambient context,
+which wins over `REBASE_ENVIRONMENT` and the locally selected default:
+
+```python
+import rebase as rb
+
+preview = rb.Environment.from_name("preview", create_if_missing=True)
+
+with preview:
+    project = rb.project("forecasting")
+
+    @project.function(buckets=["forecasts"])
+    def build_forecast() -> dict:
+        return {"ok": True}
+
+    project.deploy()
+```
+
+Persistent resources use the same context and are isolated by environment:
+
+```python
+with rb.Environment.from_name("prod"):
+    forecasts = rb.Bucket.from_name("forecasts", create_if_missing=True)
+    cache = rb.Volume.from_name("model-cache", create_if_missing=True)
+    credentials = rb.Secret.from_name("weather-api")
+```
+
+Environment access is explicit when a workspace needs narrower boundaries:
+
+```python
+prod = rb.Environment.from_name("prod")
+prod.grant(profile_id="PROFILE_UUID", access="read")
+prod.grant(api_key_id="API_KEY_UUID", access="write")
+```
+
+Protect an environment and bind each of its projects to a Git ref and Python
+declaration file:
+
+```bash
+rebase environment protect prod --allowed-branch main
+rebase environment track-project prod forecasting \
+  --connection CONNECTION_ID \
+  --ref refs/heads/main \
+  --entrypoint deploy.py
+```
+
+A signed GitHub push then reconciles the exact merged commit in an isolated job. The
+Python file is the desired state—there is no deployment YAML. Objects removed from the
+file are pruned from compute after a successful apply; secrets, buckets, volumes, and
+their data are retained. Endpoint URLs include the environment, for example
+`/e/acme/prod/forecasting/predict`.
+
 ## Minimal Function
 
 ```python
@@ -151,6 +217,10 @@ project.deploy()
 run = add.spawn(a=2, b=3)
 print(run.result(timeout=120))
 ```
+
+Functions default to `mode="interactive", isolation="shared"` for the lowest-latency cloud
+loop. Use `@project.function(isolation="dedicated")` for a private warm Cloud Run service or
+`@project.function(mode="job")` for a fresh, cancellable Cloud Run Job execution.
 
 ## Minimal Workflow
 
@@ -218,17 +288,34 @@ current run. Rebase records the pointer and metadata; it does not upload or copy
 the object.
 
 ```python
-artifact = rb.artifact(
-    "Day-ahead curve SE3",
-    uri="gs://curves/day-ahead/SE3.json",
-    key="day-ahead/SE3",
-    media_type="application/json",
-)
+@project.workflow()
+def capture(dataset: str = "SE3") -> dict:
+    uri = write_curve_to_gcs(dataset)
+    artifact = rb.artifact(
+        f"Day-ahead curve {dataset}",
+        uri=uri,
+        key=f"day-ahead/{dataset}",
+        disposition="created",
+        media_type="application/json",
+        size_bytes=42_018,
+        version="1741632447112345",
+        digest="md5:8d777f385d3dfec8815d20f7496026dc",
+        metadata={"dataset": dataset, "points": 96},
+    )
+    return {"artifact_id": artifact.id, "uri": artifact.uri}
 ```
 
-Artifacts created inside `rb.task` are attributed to that task automatically.
-The TUI lists them under `[ Artifacts ]`; select one and press `a` to open its
-location. GCS pointers open the exact object in Google Cloud Storage.
+Use `disposition="reused"` when the workflow found an existing output instead
+of creating it. A `key` identifies the logical output within the run, making a
+retry with the same key and URI idempotent. Artifacts created inside `rb.task`
+or a `Function.map` item are attributed to that task automatically and are also
+listed on the parent workflow run. In a hosted run registration is strict: a
+reporting failure raises `ArtifactReportingError`, so a successful upload is not
+silently omitted from the run record. Local calls validate their arguments and
+otherwise remain in-memory no-ops.
+
+The TUI lists artifacts under `[ Artifacts ]`; select one and press `a` to
+resolve and open its current location.
 
 Deploy a file from the command line:
 
@@ -455,6 +542,41 @@ def add_with_boltons(a: int = 0, b: int = 0) -> dict:
 
     return {"sum": sum(flatten([[a], [b]]))}
 ```
+
+For a larger codebase, opt into a built image. Rebase automatically bundles the
+module or package that defines the decorated target; additional local packages
+and files are explicit, as in Modal:
+
+```python
+image = (
+    rb.Image.python("3.13")
+    .uv_sync(".", frozen=True)
+    .add_local_python_source("agent_work")
+    .add_local_dir("config", "/workspace/config")
+)
+
+
+@project.workflow(image=image, mode="job")
+def sync_accounting():
+    from agent_work.accounting.pipeline import run
+
+    return run()
+```
+
+`uv_sync()` requires both `pyproject.toml` and `uv.lock`. `add_local_file()`,
+`add_local_dir()`, and `add_local_python_source()` use a read-only,
+content-addressed source mount by default. Set `copy=True` to bake that input
+into the immutable OCI image instead. `.gitignore`, `.rebaseignore`, and an
+explicit `ignore=` list are applied when directories are bundled; symlinks are
+rejected.
+
+Built images support Python 3.12 and 3.13. They run in dedicated functions,
+function jobs, ASGI apps, and job-mode workflows; the shared function runner
+and interactive workflows cannot switch images per invocation. `deploy()`
+uploads the deterministic bundle, waits for the cached Cloud Build result, and
+pins the deployed version to both the OCI image digest and source-bundle
+digest. Legacy images that only use `uv_pip_install()` retain the existing
+runtime-install behavior.
 
 ## Data and Modeling Packages
 

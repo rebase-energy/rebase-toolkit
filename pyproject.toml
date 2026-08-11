@@ -18,6 +18,8 @@ dependencies = [
     "rich>=15.0.0",
     "textual>=8.2.7",
     "typer>=0.25.1",
+    # rebase shell: WebSocket bridge between the local terminal and the relay.
+    "websockets>=13",
 ]
 
 [project.urls]

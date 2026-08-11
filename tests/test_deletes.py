@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 import requests
+from http_stub import patch_client_http
 
 import rebase as rb
 from rebase.client import RebaseWorkflowError
@@ -80,7 +81,7 @@ def test_delete_issues_delete_and_tolerates_empty_body(monkeypatch, method_name:
         observed["params"] = kwargs.get("params")
         return FakeNoContentResponse()
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     assert getattr(_client(), method_name)("p1") is None
     assert observed["method"] == "DELETE"
@@ -95,7 +96,7 @@ def test_force_is_passed_through(monkeypatch) -> None:
         observed["params"] = kwargs.get("params")
         return FakeNoContentResponse()
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     _client().delete_project("p1", force=True)
     assert observed["params"] == {"force": "true"}
 
@@ -105,7 +106,7 @@ def test_conflict_reports_what_the_project_still_holds(monkeypatch) -> None:
         "message": "project is not empty; retry with force=true to delete it and its contents",
         "contents": {"functions": 2, "runs": 17},
     }
-    monkeypatch.setattr("requests.request", lambda *a, **k: FakeConflictResponse(detail))
+    patch_client_http(monkeypatch, lambda *a, **k: FakeConflictResponse(detail))
 
     with pytest.raises(RebaseWorkflowError) as excinfo:
         _client().delete_project("p1")
@@ -125,7 +126,7 @@ class TestBatchDeleteProjects:
             observed["json"] = kwargs.get("json")
             return FakeJsonResponse(payload)
 
-        monkeypatch.setattr("requests.request", fake_request)
+        patch_client_http(monkeypatch, fake_request)
 
     def test_one_request_carries_every_id(self, monkeypatch) -> None:
         observed: dict[str, Any] = {}
@@ -159,7 +160,7 @@ class TestBatchDeleteProjects:
         def explode(*_args: Any, **_kwargs: Any) -> None:
             raise AssertionError("no request should be made")
 
-        monkeypatch.setattr("requests.request", explode)
+        patch_client_http(monkeypatch, explode)
         assert _client().delete_projects([]) == []
 
     # 404 is the obvious way for an API to say "no such route". 405 is what it actually
@@ -176,7 +177,7 @@ class TestBatchDeleteProjects:
                 return FakeConflictResponse(detail, status_code=status)
             return FakeNoContentResponse()
 
-        monkeypatch.setattr("requests.request", fake_request)
+        patch_client_http(monkeypatch, fake_request)
 
         assert _client().delete_projects(["p1", "p2"], force=True) == []
         assert calls == [
@@ -193,7 +194,7 @@ class TestBatchDeleteProjects:
             sent.append(kwargs["json"]["project_ids"])
             return FakeJsonResponse({"deleted": kwargs["json"]["project_ids"], "failed": []})
 
-        monkeypatch.setattr("requests.request", fake_request)
+        patch_client_http(monkeypatch, fake_request)
         ids = [f"p{index}" for index in range(250)]
 
         assert _client().delete_projects(ids) == []
@@ -201,14 +202,14 @@ class TestBatchDeleteProjects:
         assert [project_id for chunk in sent for project_id in chunk] == ids
 
     def test_other_errors_are_not_swallowed_by_the_fallback(self, monkeypatch) -> None:
-        monkeypatch.setattr("requests.request", lambda *a, **k: FakeConflictResponse("nope", status_code=403))
+        patch_client_http(monkeypatch, lambda *a, **k: FakeConflictResponse("nope", status_code=403))
 
         with pytest.raises(RebaseWorkflowError, match="nope"):
             _client().delete_projects(["p1"])
 
 
 def test_plain_string_detail_still_surfaces(monkeypatch) -> None:
-    monkeypatch.setattr("requests.request", lambda *a, **k: FakeConflictResponse("workflow not found"))
+    patch_client_http(monkeypatch, lambda *a, **k: FakeConflictResponse("workflow not found"))
 
     with pytest.raises(RebaseWorkflowError, match="workflow not found"):
         _client().delete_workflow("w1")

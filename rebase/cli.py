@@ -5,6 +5,7 @@ import getpass
 import importlib
 import importlib.util
 import json
+import os
 import sys
 import time
 from collections.abc import Iterable, Sequence
@@ -39,8 +40,10 @@ from rebase.client import (
     DEFAULT_API_KEY_PERMISSIONS,
     Agent,
     ASGIApp,
+    Bucket,
     Client,
     Cron,
+    Environment,
     Function,
     Model,
     OnUpdate,
@@ -56,7 +59,7 @@ from rebase.client import (
     _flatten_config,
     _git,
     _parse_github_remote,
-    _validate_run_type,
+    _validate_execution,
 )
 from rebase.config import (
     DEFAULT_PROFILE,
@@ -72,6 +75,7 @@ from rebase.config import (
     remove_search_path,
     search_paths,
     selected_profile_name,
+    set_active_environment,
     set_default_profile,
     workspace_key,
     write_profile,
@@ -79,6 +83,8 @@ from rebase.config import (
 from rebase.contract import Freshness, validate_frame
 from rebase.editor import NO_EDITOR_HINT, build_argv, resolve_editor, run_foreground, spawn_detached
 from rebase.locate import describe_failure, find_project_declarations, is_risky_root, project_folder
+from rebase.shell import close_message as _shell_close_message
+from rebase.shell import run_bridge as _run_shell_bridge
 
 _BANNER_LINES = [
     "██████╗  ███████╗ ██████╗   █████╗  ███████╗ ███████╗",
@@ -347,10 +353,9 @@ def _print_run_help() -> None:
     options.add_column("Description")
     options.add_row("--param, -p", "Target parameter as name=json_value. Can be passed more than once.")
     options.add_row("--parameters-json", "JSON object with target parameters.")
-    options.add_row(
-        "--run-type, -r",
-        "Override the run type for this ephemeral run: quick, quick_shared (functions only), or long.",
-    )
+    options.add_row("--mode", "Execution mode: interactive (default) or job.")
+    options.add_row("--isolation, -i", "Interactive isolation: shared (default) or dedicated.")
+    options.add_row("--run-type, -r", "Deprecated alias: quick, quick_shared, or long.")
     options.add_row("--module, -m", "Interpret the target source as a Python module path instead of a file.")
     options.add_row("--wait / --no-wait, -w", "Wait for the function result before exiting. Defaults to --wait.")
     options.add_row("--timeout, -t", "Maximum seconds to wait for the result. Defaults to 600.")
@@ -519,12 +524,22 @@ def _parse_run_parameters(parameters_json: str | None, parameters: Iterable[str]
     return parsed
 
 
-def _validate_run_type_override(run_type: str | None, target: RunnableTarget) -> str | None:
-    if run_type is None:
+def _validate_execution_override(
+    mode: str | None,
+    isolation: str | None,
+    run_type: str | None,
+    target: RunnableTarget,
+) -> tuple[str, str] | None:
+    if mode is None and isolation is None and run_type is None:
         return None
     target_type = "workflow" if isinstance(target, Workflow) else "function"
     try:
-        return _validate_run_type(run_type, target_type=target_type)
+        return _validate_execution(
+            mode if mode is not None else (None if run_type is not None else target.mode),
+            isolation if isolation is not None else (None if run_type is not None else target.isolation),
+            target_type=target_type,
+            run_type=run_type,
+        )
     except ValueError as exc:
         raise RebaseWorkflowError(str(exc)) from exc
 
@@ -556,7 +571,7 @@ def _runs_table(runs: list[dict[str, Any]], *, project_names: dict[str, str]) ->
     table.add_column("ID", style="rebase.muted")
     table.add_column("Target")
     table.add_column("Status", style="rebase.value")
-    table.add_column("Run type")
+    table.add_column("Execution")
     table.add_column("Project")
     table.add_column("Created", style="rebase.muted")
     table.add_column("Finished", style="rebase.muted")
@@ -566,7 +581,7 @@ def _runs_table(runs: list[dict[str, Any]], *, project_names: dict[str, str]) ->
             str(run.get("id", "-")),
             _format_value(run.get("target_type")),
             _format_value(run.get("status")),
-            _format_value(run.get("run_type")),
+            _execution_label(run),
             project_names.get(project_id, project_id or "-"),
             _format_value(run.get("created_at")),
             _format_value(run.get("finished_at")),
@@ -590,6 +605,10 @@ def _emit_event_to_reporter(
         reporter.update(message)
     elif status == "failed":
         reporter.fail(message)
+    elif status == "info":
+        # An announcement introduces work rather than reporting on it, so it is neither a
+        # transient spinner line nor a tick. Ticking it would claim something finished.
+        reporter.announce(message)
     else:
         reporter.complete(message)
 
@@ -655,6 +674,10 @@ class _LineRunProgressReporter:
         prefix, style = _progress_prefix("running")
         console.print(f"{prefix} {message}", style=style)
 
+    def announce(self, message: str) -> None:
+        prefix, style = _progress_prefix("info")
+        console.print(f"{prefix} {message}", style=style)
+
     def complete(self, message: str) -> None:
         prefix, style = _progress_prefix("completed")
         console.print(f"{prefix} {message}", style=style)
@@ -708,6 +731,13 @@ class _TerminalRunProgressReporter:
             self._header.update(text=Text(message, style="rebase.info"))
         else:
             self._header = Spinner("dots", text=Text(message, style="rebase.info"))
+        self._refresh()
+
+    def announce(self, message: str) -> None:
+        # Kept in the tree rather than shown on the spinner: an announcement is a milestone
+        # worth still being able to read once the next stage has replaced the header, and it
+        # is not a tick — nothing completed.
+        self._tree.add(f"[dim]•[/dim] {message}")
         self._refresh()
 
     def complete(self, message: str) -> None:
@@ -807,28 +837,26 @@ def _stream_run_result(
     first_iteration = True
 
     while True:
-        if events_supported:
+        # The submit response already carries the terminal record for synchronous
+        # quick runs — in that case every per-iteration fetch below would be a
+        # wasted round trip: the run is over, so there is no progress to stream.
+        already_terminal = first_iteration and bool(run.data) and str(run.data.get("status") or "") in terminal_statuses
+
+        if events_supported and not already_terminal:
             try:
                 for event in run.events():
                     event_id = str(event.get("id", ""))
                     if not event_id or event_id in seen_event_ids:
                         continue
                     seen_event_ids.add(event_id)
-                    event_status = str(event.get("status") or "info")
-                    message = str(event.get("message") or "")
-                    if not message:
-                        continue
-                    if event_status == "running":
-                        reporter.update(message)
-                        continue
-                    if event_status == "failed":
-                        reporter.fail(message)
-                    else:
-                        reporter.complete(message)
+                    # Routed through the same helper the snapshot path uses. This loop used
+                    # to carry its own copy of the mapping, so a new status had to be taught
+                    # to both or the live view and the replayed one disagreed.
+                    _emit_event_to_reporter(reporter, event)
             except RebaseWorkflowError:
                 events_supported = False
 
-        if steps_supported:
+        if steps_supported and not already_terminal:
             try:
                 for step in run.steps():
                     step_key = str(step.get("id") or step.get("node_key") or step.get("name") or "")
@@ -844,7 +872,9 @@ def _stream_run_result(
             except RebaseWorkflowError:
                 steps_supported = False
 
-        if log_follower is not None:
+        if log_follower is not None and not already_terminal:
+            # Skipping here is safe: the terminal branch below does its own final
+            # log_follower.poll, which is the fetch that matters.
             log_follower.poll(reporter)
 
         data = run.data if first_iteration and run.data else run.refresh()
@@ -1163,6 +1193,29 @@ def _environment_policy_table(policies: list[dict[str, Any]]) -> Table:
             "yes" if policy.get("protected") else "no",
             "yes" if policy.get("require_pr") else "no",
             ", ".join(str(branch) for branch in branches) if branches else "-",
+        )
+    return table
+
+
+def _environment_grants_table(grants: list[dict[str, Any]]) -> Table:
+    table = Table(
+        title="Environment Grants",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+    )
+    table.add_column("Grant ID", style="rebase.muted")
+    table.add_column("Principal", style="rebase.value")
+    table.add_column("Kind")
+    table.add_column("Access")
+    for grant in grants:
+        profile_id = grant.get("profile_id")
+        api_key_id = grant.get("api_key_id")
+        table.add_row(
+            _format_value(grant.get("id")),
+            _format_value(profile_id or api_key_id),
+            "profile" if profile_id else "api key",
+            _format_value(grant.get("access")),
         )
     return table
 
@@ -1602,6 +1655,14 @@ def _format_value(value: Any) -> str:
     return str(value)
 
 
+def _execution_label(value: dict[str, Any]) -> str:
+    mode = value.get("mode")
+    isolation = value.get("isolation")
+    if mode is not None:
+        return f"{mode}/{isolation}" if isolation is not None else str(mode)
+    return _format_value(value.get("run_type"))
+
+
 def _print_json(data: Any) -> None:
     console.print_json(data=data)
 
@@ -1666,7 +1727,7 @@ def _function_table(functions: list[dict[str, Any]], *, project_names: dict[str,
     )
     table.add_column("Name", style="rebase.value")
     table.add_column("Project")
-    table.add_column("Run type")
+    table.add_column("Execution")
     table.add_column("Enabled")
     table.add_column("ID", style="rebase.muted")
     table.add_column("Updated", style="rebase.muted")
@@ -1675,7 +1736,7 @@ def _function_table(functions: list[dict[str, Any]], *, project_names: dict[str,
         table.add_row(
             str(function.get("name", "-")),
             project_names.get(project_id, project_id or "-"),
-            _format_value(function.get("run_type")),
+            _execution_label(function),
             _format_value(function.get("enabled")),
             str(function.get("id", "-")),
             _format_value(function.get("updated_at")),
@@ -1694,7 +1755,7 @@ def _workflow_table(workflows: list[dict[str, Any]], *, project_names: dict[str,
     )
     table.add_column("Name", style="rebase.value")
     table.add_column("Project")
-    table.add_column("Run type")
+    table.add_column("Execution")
     table.add_column("Enabled")
     table.add_column("Schedule")
     table.add_column("ID", style="rebase.muted")
@@ -1704,7 +1765,7 @@ def _workflow_table(workflows: list[dict[str, Any]], *, project_names: dict[str,
         table.add_row(
             str(workflow.get("name", "-")),
             project_names.get(project_id, project_id or "-"),
-            _format_value(workflow.get("run_type")),
+            _execution_label(workflow),
             _format_value(workflow.get("enabled")),
             _format_schedule(workflow.get("schedule")),
             str(workflow.get("id", "-")),
@@ -1749,7 +1810,7 @@ def _model_table(models: list[dict[str, Any]], *, project_names: dict[str, str])
     table.add_column("Project")
     table.add_column("Kind")
     table.add_column("Operation")
-    table.add_column("Run type")
+    table.add_column("Execution")
     table.add_column("ID", style="rebase.muted")
     table.add_column("Updated", style="rebase.muted")
     for model in models:
@@ -1759,7 +1820,7 @@ def _model_table(models: list[dict[str, Any]], *, project_names: dict[str, str])
             project_names.get(project_id, project_id or "-"),
             _format_value(model.get("kind")),
             _format_value(model.get("operation_name")),
-            _format_value(model.get("run_type")),
+            _execution_label(model),
             str(model.get("id", "-")),
             _format_value(model.get("updated_at")),
         )
@@ -1832,14 +1893,14 @@ def _version_table(title: str, versions: list[dict[str, Any]]) -> Table:
     table.add_column("Version", style="rebase.value")
     table.add_column("ID", style="rebase.muted")
     table.add_column("Fingerprint")
-    table.add_column("Run type")
+    table.add_column("Execution")
     table.add_column("Created", style="rebase.muted")
     for version in versions:
         table.add_row(
             _format_value(version.get("version_number")),
             str(version.get("id", "-")),
             _format_value(version.get("fingerprint")),
-            _format_value(version.get("run_type")),
+            _execution_label(version),
             _format_value(version.get("created_at")),
         )
     return table
@@ -2512,6 +2573,116 @@ def environment_list_command(
     console.print(_environment_policy_table(policies))
 
 
+@environment_app.command("create")
+def environment_create_command(
+    environment: Annotated[str, typer.Argument(help="Environment name.")],
+    protected: Annotated[
+        bool, typer.Option("--protected/--direct", "-p/-d", help="Create a GitOps-protected environment.")
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j")] = False,
+) -> None:
+    """Create an environment in the active workspace."""
+    created = Client().create_environment(
+        environment,
+        deploy_mode="gitops" if protected else "direct",
+        protected=protected,
+        require_pr=protected,
+        allowed_branches=["main", "master"] if protected else [],
+    )
+    _print_json(created) if json_output else console.print(_detail_table("Environment", created))
+
+
+@environment_app.command("show")
+def environment_show_command(
+    environment: Annotated[str, typer.Argument(help="Environment name.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j")] = False,
+) -> None:
+    """Show one environment."""
+    value = Client().get_environment(environment)
+    _print_json(value) if json_output else console.print(_detail_table("Environment", value))
+
+
+@environment_app.command("use")
+def environment_use_command(
+    environment: Annotated[str, typer.Argument(help="Environment name.")],
+) -> None:
+    """Select the environment for this workspace on this machine."""
+    client = Client()
+    client.get_environment(environment)
+    workspace_id = client.workspace_id or str(client.get_workspace()["id"])
+    set_active_environment(workspace_id, environment)
+    console.print(f"Active environment: [rebase.value]{environment}[/rebase.value]")
+
+
+@environment_app.command("grants")
+def environment_grants_command(
+    environment: Annotated[str, typer.Argument(help="Environment name.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j")] = False,
+) -> None:
+    """List explicit profile and API-key access grants."""
+    grants = Environment.from_name(environment).grants()
+    _print_json(grants) if json_output else console.print(_environment_grants_table(grants))
+
+
+@environment_app.command("grant")
+def environment_grant_command(
+    environment: Annotated[str, typer.Argument(help="Environment name.")],
+    profile_id: Annotated[str | None, typer.Option("--profile-id", "-p", help="Workspace profile UUID.")] = None,
+    api_key_id: Annotated[str | None, typer.Option("--api-key-id", help="Workspace API key UUID.")] = None,
+    access: Annotated[str, typer.Option("--access", "-a", help="read, write, or admin.")] = "read",
+    json_output: Annotated[bool, typer.Option("--json", "-j")] = False,
+) -> None:
+    """Grant one profile or API key access to an environment."""
+    grant = Environment.from_name(environment).grant(
+        profile_id=profile_id,
+        api_key_id=api_key_id,
+        access=access,
+    )
+    _print_json(grant) if json_output else console.print(_detail_table("Environment Grant", grant))
+
+
+@environment_app.command("revoke-grant")
+def environment_revoke_grant_command(
+    environment: Annotated[str, typer.Argument(help="Environment name.")],
+    grant_id: Annotated[str, typer.Argument(help="Environment grant UUID.")],
+) -> None:
+    """Remove one explicit environment access grant."""
+    Environment.from_name(environment).revoke(grant_id)
+    console.print(f"Revoked environment grant [rebase.value]{grant_id}[/rebase.value]")
+
+
+@environment_app.command("delete")
+def environment_delete_command(
+    environment: Annotated[str, typer.Argument(help="Empty, unprotected environment to delete.")],
+) -> None:
+    """Delete an empty, unprotected environment."""
+    Client().delete_environment(environment)
+    console.print(f"Deleted environment [rebase.value]{environment}[/rebase.value]")
+
+
+@environment_app.command("track-project")
+def environment_track_project_command(
+    environment: Annotated[str, typer.Argument(help="Environment name.")],
+    project: Annotated[str, typer.Argument(help="Project name in that environment.")],
+    connection_id: Annotated[str, typer.Option("--connection", "-c", help="GitHub repository connection ID.")],
+    ref: Annotated[str, typer.Option("--ref", "-r", help="Tracked branch or tag ref.")],
+    entrypoint: Annotated[str, typer.Option("--entrypoint", "-e", help="Python declaration file.")],
+    repo_path: Annotated[str | None, typer.Option("--repo-path")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j")] = False,
+) -> None:
+    """Bind an environment project to a GitHub ref and Python entrypoint."""
+    client = Client(environment_name=environment)
+    target = client.ensure_project(project, environment_name=environment)
+    track = client.track_project(
+        str(target["id"]),
+        github_connection_id=connection_id,
+        tracked_ref=ref,
+        entrypoint=entrypoint,
+        repo_path=repo_path,
+    )
+    _print_json(track) if json_output else console.print(_detail_table("Project Git Track", track))
+
+
 @environment_app.command("protect")
 def environment_protect_command(
     environment: Annotated[str, typer.Argument(help="Environment to protect, for example prod or staging.")],
@@ -2815,6 +2986,13 @@ def secret_create_command(
         return
     keys = ", ".join(sorted((secret.get("secret_refs") or {}).keys()))
     console.print(f"Created secret [rebase.value]{secret.get('name', name)}[/rebase.value] with keys: {keys}")
+    # Name the workspace explicitly. `rebase workspace list` marks one profile
+    # active, but a mutating command resolves its target separately, and when the
+    # two disagree the write lands somewhere else entirely -- silently, because
+    # nothing in the output says where it went. Secrets are the worst case: this
+    # put a service-account key and a bot token in an unrelated workspace.
+    if client.workspace_id:
+        console.print(f"Workspace:   [rebase.value]{client.workspace_id}[/rebase.value]")
     console.print(
         f'Use it with: [rebase.value]secrets=[rebase.Secret.from_name("{secret.get("name", name)}")][/rebase.value]'
     )
@@ -3018,6 +3196,231 @@ def volume_delete_command(
         raise typer.Abort()
     Client().delete_volume(name)
     console.print(f"[rebase.success]Deleted volume {name}.[/rebase.success]")
+
+
+bucket_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Object storage buckets, addressed by key. Attach to functions with buckets=[...].",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+BUCKET_DETAIL_KEYS = ["name", "provider", "bucket", "uri", "location", "workspace_id", "created_at"]
+
+
+@bucket_app.command("create")
+def bucket_create_command(
+    name: Annotated[str, typer.Argument(help="Bucket name (lowercase letters, digits, '.', '_', '-').")],
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Create a bucket (idempotent: returns the existing one if present)."""
+    bucket = Client().create_bucket(name)
+    if json_output:
+        _print_json(bucket)
+        return
+    console.print(_detail_table("Bucket", bucket, preferred_keys=BUCKET_DETAIL_KEYS))
+
+
+@bucket_app.command("list")
+def bucket_list_command(
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List buckets in the active workspace."""
+    buckets = Client().list_buckets()
+    if json_output:
+        _print_json(buckets)
+        return
+    if not buckets:
+        console.print("[rebase.muted]No buckets yet.[/rebase.muted]")
+        return
+    table = Table(
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Name", style="rebase.value")
+    table.add_column("URI", style="rebase.muted")
+    table.add_column("Location", style="rebase.muted")
+    table.add_column("Created", style="rebase.muted")
+    for bucket in buckets:
+        table.add_row(
+            str(bucket.get("name", "-")),
+            _format_value(bucket.get("uri")),
+            _format_value(bucket.get("location")),
+            _format_value(bucket.get("created_at")),
+        )
+    console.print(table)
+
+
+@bucket_app.command("get")
+def bucket_get_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show bucket metadata."""
+    bucket = Client().get_bucket(name)
+    if json_output:
+        _print_json(bucket)
+        return
+    console.print(_detail_table("Bucket", bucket, preferred_keys=BUCKET_DETAIL_KEYS))
+
+
+@bucket_app.command("uri")
+def bucket_uri_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+) -> None:
+    """Print the gs:// URI, for piping into other tools."""
+    console.print(Bucket(name, client=Client()).uri)
+
+
+@bucket_app.command("ls")
+def bucket_ls_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+    prefix: Annotated[str, typer.Argument(help="Key prefix to list under.")] = "",
+    delimiter: Annotated[
+        str | None, typer.Option("--delimiter", "-d", help="Group keys by this separator, e.g. '/'.")
+    ] = None,
+    all_pages: Annotated[bool, typer.Option("--all", "-a", help="Follow pagination and list every object.")] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List objects in a bucket."""
+    bucket = Bucket(name, client=Client())
+    if all_pages:
+        objects = list(bucket.iter_all(prefix))
+        prefixes: list[str] = []
+        truncated = False
+    else:
+        page = bucket.list(prefix, delimiter=delimiter)
+        objects = page["objects"]
+        prefixes = page["prefixes"]
+        truncated = bool(page["next_page_token"])
+    if json_output:
+        _print_json(
+            {
+                "objects": [
+                    {"key": obj.key, "size": obj.size, "updated": obj.updated, "content_type": obj.content_type}
+                    for obj in objects
+                ],
+                "prefixes": prefixes,
+                "truncated": truncated,
+            }
+        )
+        return
+    if not objects and not prefixes:
+        console.print("[rebase.muted]No objects.[/rebase.muted]")
+        return
+    table = Table(
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Key", style="rebase.value")
+    table.add_column("Size", style="rebase.muted")
+    table.add_column("Updated", style="rebase.muted")
+    for common in prefixes:
+        table.add_row(common, "-", "-")
+    for obj in objects:
+        table.add_row(obj.key, _format_bytes(obj.size), _format_value(obj.updated))
+    console.print(table)
+    if truncated:
+        console.print("[rebase.muted]More objects remain; pass --all to list them.[/rebase.muted]")
+
+
+@bucket_app.command("stat")
+def bucket_stat_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+    key: Annotated[str, typer.Argument(help="Object key.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show metadata for one object."""
+    stat = Client().stat_bucket_object(name, key.lstrip("/"))
+    if json_output:
+        _print_json(stat)
+        return
+    console.print(_detail_table("Object", stat))
+
+
+@bucket_app.command("put")
+def bucket_put_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+    source: Annotated[str, typer.Argument(help="Local file or directory to upload.")],
+    key: Annotated[str | None, typer.Argument(help="Destination key. Defaults to the local name.")] = None,
+) -> None:
+    """Upload a file or directory into a bucket."""
+    bucket = Bucket(name, client=Client())
+    path = Path(source)
+    if path.is_dir():
+        written = bucket.put_directory(source, key or "")
+        console.print(f"[rebase.success]Uploaded {len(written)} objects to bucket {name}.[/rebase.success]")
+        return
+    written_key = bucket.put_file(source, key)
+    console.print(f"[rebase.success]Uploaded {source} to {name}/{written_key}.[/rebase.success]")
+
+
+@bucket_app.command("download")
+def bucket_download_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+    key: Annotated[str, typer.Argument(help="Object key.")],
+    local_path: Annotated[
+        str | None, typer.Argument(help="Local destination. Defaults to the key's file name.")
+    ] = None,
+) -> None:
+    """Download one object from a bucket."""
+    bucket = Bucket(name, client=Client())
+    destination = Path(local_path) if local_path else Path(Path(key).name)
+    bucket.download(key, destination)
+    console.print(f"[rebase.success]Downloaded {name}/{key.lstrip('/')} to {destination}.[/rebase.success]")
+
+
+@bucket_app.command("rm")
+def bucket_rm_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+    # Optional so `rm <name> --recursive` empties the whole bucket, which is what
+    # the "bucket is not empty" error from `bucket delete` tells people to run.
+    key: Annotated[
+        str | None, typer.Argument(help="Object key, or prefix with --recursive. Omit to mean the whole bucket.")
+    ] = None,
+    recursive: Annotated[
+        bool, typer.Option("--recursive", "-r", help="Delete every object under the key as a prefix.")
+    ] = False,
+    force: Annotated[bool, typer.Option("--force", "-f", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Delete one object, or everything under a prefix."""
+    bucket = Bucket(name, client=Client())
+    if not recursive:
+        if key is None:
+            raise RebaseWorkflowError("KEY is required unless --recursive is passed")
+        bucket.delete(key)
+        console.print(f"[rebase.success]Deleted {name}/{key.lstrip('/')}.[/rebase.success]")
+        return
+    prefix = (key or "").lstrip("/")
+    target = f"{name}/{prefix}" if prefix else f"bucket {name}"
+    if not force and not typer.confirm(f"Delete ALL objects in {target}?"):
+        raise typer.Abort()
+    # Paged from the client: emptying a large bucket in one API call would time
+    # out, and the retry would resume against a half-emptied bucket.
+    deleted = bucket.delete_prefix(prefix)
+    console.print(f"[rebase.success]Deleted {deleted} objects from bucket {name}.[/rebase.success]")
+
+
+@bucket_app.command("delete")
+def bucket_delete_command(
+    name: Annotated[str, typer.Argument(help="Bucket name.")],
+    force: Annotated[bool, typer.Option("--force", "-f", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Delete an empty bucket.
+
+    Refuses while objects remain; empty it first with `rebase bucket rm <name> <prefix> --recursive`.
+    """
+    if not force and not typer.confirm(f"Delete bucket {name}?"):
+        raise typer.Abort()
+    Client().delete_bucket(name)
+    console.print(f"[rebase.success]Deleted bucket {name}.[/rebase.success]")
 
 
 dataset_app = typer.Typer(
@@ -3511,6 +3914,7 @@ dataset_app.add_typer(contract_app, name="contract")
 
 app.add_typer(secret_app, name="secret")
 app.add_typer(volume_app, name="volume")
+app.add_typer(bucket_app, name="bucket")
 app.add_typer(dataset_app, name="dataset")
 
 
@@ -3997,7 +4401,8 @@ def function_get_command(
                 "workspace_id",
                 "description",
                 "entrypoint",
-                "run_type",
+                "mode",
+                "isolation",
                 "enabled",
                 "default_parameters",
                 "image_spec",
@@ -4115,7 +4520,8 @@ def workflow_get_command(
                 "description",
                 "entrypoint",
                 "flow_ref",
-                "run_type",
+                "mode",
+                "isolation",
                 "enabled",
                 "default_parameters",
                 "current_version_id",
@@ -4326,7 +4732,7 @@ def workflow_schedule_trigger_command(
             _detail_table(
                 "Run Submitted",
                 run.data,
-                preferred_keys=["id", "status", "target_type", "run_type", "execution_backend", "created_at"],
+                preferred_keys=["id", "status", "target_type", "mode", "isolation", "execution_backend", "created_at"],
             )
         )
         return
@@ -4723,7 +5129,8 @@ def model_get_command(
                 "kind",
                 "operation_name",
                 "description",
-                "run_type",
+                "mode",
+                "isolation",
                 "enabled",
                 "default_parameters",
                 "image_spec",
@@ -4746,8 +5153,8 @@ def model_deploy_command(
         typer.Option("--name", "-n", help="Deploy only the top-level variable name or model name."),
     ] = None,
     environment: Annotated[
-        str, typer.Option("--env", "-e", help="Deployment environment: dev, staging, or prod.")
-    ] = "dev",
+        str | None, typer.Option("--env", "-e", help="Environment; defaults to the active environment.")
+    ] = None,
 ) -> None:
     """Deploy model objects from a Python file."""
     module = _load_module(file)
@@ -4993,19 +5400,29 @@ def deploy_command(
         typer.Option("--source", "-s", help="Override deploy source for this command: rebase or github."),
     ] = None,
     environment: Annotated[
-        str, typer.Option("--env", "-e", help="Deployment environment: dev, staging, or prod.")
-    ] = "dev",
+        str | None, typer.Option("--env", "-e", help="Environment; defaults to the active environment.")
+    ] = None,
     plan: Annotated[bool, typer.Option("--plan", "-p", help="Show the deployment path without applying it.")] = False,
-    sync: Annotated[bool, typer.Option("--sync", help="Reserved for reconciler-based GitOps sync.")] = False,
+    sync: Annotated[bool, typer.Option("--sync", help="Apply a platform-authorized GitOps reconciliation.")] = False,
 ) -> None:
     """Deploy Rebase objects from a Python file."""
     client = Client()
+    environment = environment or getattr(client, "environment_name", "dev")
     policy = _environment_policy(client, environment)
     if _policy_requires_gitops(policy):
         if source == "rebase":
             raise RebaseWorkflowError("protected environments require GitHub-backed source; remove `--source rebase`.")
         if sync:
-            raise RebaseWorkflowError("direct GitOps sync is not available yet; protected deploys create a PR request.")
+            if not os.getenv("REBASE_GITOPS_RELEASE_ID"):
+                raise RebaseWorkflowError("--sync is reserved for the platform GitOps reconciler.")
+            deployed = deploy_file(
+                file,
+                object_names=name,
+                deploy_source=source or "github",
+                environment=environment,
+            )
+            console.print(_deploy_table(deployed))
+            return
         if plan:
             metadata = _gitops_source_metadata(file)
             console.print(
@@ -5089,6 +5506,79 @@ async def _await_value(value: Any) -> Any:
 RUN_INSPECTION_COMMANDS = {"list", "get", "logs", "cancel", "replay"}
 
 
+@app.command("shell")
+def shell_command(
+    name: Annotated[
+        str | None,
+        typer.Argument(help="Function (default) or workflow name. Omit when using --id."),
+    ] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    target_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact function or workflow ID.")] = None,
+    workflow: Annotated[
+        bool,
+        typer.Option("--workflow", "-w", help="Open a shell in a workflow's environment instead of a function's."),
+    ] = False,
+    version_id: Annotated[
+        str | None,
+        typer.Option("--version-id", "-v", help="Shell into a specific version instead of the current one."),
+    ] = None,
+    idle_timeout: Annotated[
+        int | None,
+        typer.Option("--idle-timeout", help="Close the session after this many seconds without activity."),
+    ] = None,
+    ttl: Annotated[
+        int | None,
+        typer.Option("--ttl", "-t", help="Hard session limit in seconds (capped by the server)."),
+    ] = None,
+) -> None:
+    """Open an interactive shell in a cloud container with the target's
+    image, environment variables, secrets and volume mounts."""
+    client = Client()
+    if workflow:
+        target = _resolve_workflow_selector(client, name, workflow_id=target_id, project_name=project)
+        payload: dict[str, Any] = {"workflow_id": str(target["id"])}
+    else:
+        target = _resolve_function_selector(client, name, function_id=target_id, project_name=project)
+        payload = {"function_id": str(target["id"])}
+    if version_id is not None:
+        payload["version_id"] = version_id
+    if idle_timeout is not None:
+        payload["idle_timeout_seconds"] = idle_timeout
+    if ttl is not None:
+        payload["ttl_seconds"] = ttl
+
+    console.print(f"Starting shell container for [bold]{target.get('name', target['id'])}[/bold]…")
+    session = client.create_shell_session(payload)
+    session_id = str(session["id"])
+    relay_ws_url = session.get("relay_ws_url")
+    client_token = session.get("client_token")
+    if not relay_ws_url or not client_token:
+        raise RebaseWorkflowError("the server did not return shell connection details")
+
+    result = None
+    try:
+        result = _run_shell_bridge(
+            relay_ws_url,
+            session_id,
+            client_token,
+            on_waiting=lambda: console.print(
+                "Waiting for the container to dial in (first run installs dependencies; may take a minute)…"
+            ),
+            on_ready=lambda: console.print("Connected. Press Ctrl-D or type 'exit' to end the session.\n"),
+        )
+    except KeyboardInterrupt:
+        console.print("\nCancelled.")
+    finally:
+        with contextlib.suppress(Exception):
+            client.delete_shell_session(session_id)
+    if result is not None:
+        message = _shell_close_message(result)
+        if message is not None:
+            error_console.print(f"[{BRAND_CORAL_RED}]{message}[/]")
+            raise typer.Exit(code=1)
+        console.print("Session ended.")
+
+
 @app.command("run")
 def run_command(
     target_ref: Annotated[
@@ -5109,12 +5599,20 @@ def run_command(
         str | None,
         typer.Option("--parameters-json", help="JSON object with target parameters."),
     ] = None,
+    mode: Annotated[
+        str | None,
+        typer.Option("--mode", help="Execution mode: interactive (default) or job."),
+    ] = None,
+    isolation: Annotated[
+        str | None,
+        typer.Option("--isolation", "-i", help="Interactive isolation: shared (default) or dedicated."),
+    ] = None,
     run_type: Annotated[
         str | None,
         typer.Option(
             "--run-type",
             "-r",
-            help="Override the run type for this ephemeral run: quick, quick_shared (functions only), or long.",
+            help="Deprecated alias for execution mode/isolation: quick, quick_shared, or long.",
         ),
     ] = None,
     module: Annotated[
@@ -5137,8 +5635,8 @@ def run_command(
 ) -> None:
     """Run local Rebase targets and inspect submitted runs."""
     if local:
-        if run_type is not None:
-            raise RebaseWorkflowError("--local runs in-process; --run-type selects a cloud run type")
+        if mode is not None or isolation is not None or run_type is not None:
+            raise RebaseWorkflowError("--local runs in-process; execution options select cloud execution")
         if not wait:
             raise RebaseWorkflowError("--local always runs synchronously; drop --no-wait")
         _run_local_target(target_ref, as_module=module, parameters_json=parameters_json, parameter=parameter)
@@ -5153,9 +5651,9 @@ def run_command(
         target = _resolve_run_target(target_ref, as_module=module)
         reporter.complete("Loaded local Rebase target.")
 
-        run_type_override = _validate_run_type_override(run_type, target)
-        if run_type_override is not None:
-            target.run_type = run_type_override
+        execution_override = _validate_execution_override(mode, isolation, run_type, target)
+        if execution_override is not None:
+            target.mode, target.isolation = execution_override
 
         parameters = _parse_run_parameters(parameters_json, parameter)
         if isinstance(target, Workflow):
@@ -5247,7 +5745,8 @@ def run_get_command(
                 "id",
                 "target_type",
                 "status",
-                "run_type",
+                "mode",
+                "isolation",
                 "execution_backend",
                 "project_id",
                 "workflow_id",
@@ -5297,16 +5796,34 @@ def run_logs_command(
             _render_run_snapshot(run=run_data, events=events, steps=steps, reporter=reporter)
             _RunLogFollower(run).poll(reporter)
             return
-        _stream_run_result(
-            run,
-            target_type=str(run_data.get("target_type") or ""),
-            reporter=reporter,
-            started_at=time.monotonic(),
-            timeout=timeout,
-            poll_interval=poll_interval,
-            return_result=False,
-            log_follower=_RunLogFollower(run),
-        )
+        try:
+            _stream_run_result(
+                run,
+                target_type=str(run_data.get("target_type") or ""),
+                reporter=reporter,
+                started_at=time.monotonic(),
+                timeout=timeout,
+                poll_interval=poll_interval,
+                return_result=False,
+                log_follower=_RunLogFollower(run),
+            )
+        except TimeoutError:
+            # Following a run whose worker died means waiting the full timeout
+            # and then printing a stack trace, which reads like a bug in the CLI
+            # rather than what it is: the run stopped reporting. Say that, show
+            # what did arrive, and exit non-zero without the traceback.
+            reporter.fail(
+                f"Stopped following after {timeout}s; the run has not reached a terminal state. "
+                "If it is also producing no output, its worker may be gone -- "
+                "the platform settles such runs, or `rebase run cancel` ends it now."
+            )
+            _render_run_snapshot(
+                run=run.refresh(),
+                events=client.list_run_events(run_id),
+                steps=client.list_run_steps(run_id) if run_data.get("target_type") == "workflow" else [],
+                reporter=reporter,
+            )
+            raise typer.Exit(code=1) from None
 
 
 @run_app.command("cancel")
@@ -5324,7 +5841,16 @@ def run_cancel_command(
         _detail_table(
             "Cancelled Run",
             cancelled,
-            preferred_keys=["id", "status", "target_type", "run_type", "execution_backend", "error", "finished_at"],
+            preferred_keys=[
+                "id",
+                "status",
+                "target_type",
+                "mode",
+                "isolation",
+                "execution_backend",
+                "error",
+                "finished_at",
+            ],
         )
     )
 
