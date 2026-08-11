@@ -1710,6 +1710,45 @@ def test_project_function_serializes_image_builder(monkeypatch) -> None:
     }
 
 
+def test_built_function_deploy_sends_pinned_artifact_contract(monkeypatch, tmp_path) -> None:
+    observed: dict[str, Any] = {}
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    image = rb.Image.python("3.13").add_local_dir(tmp_path, "/workspace/source")
+    build = {
+        "image_build_id": "11111111-1111-1111-1111-111111111111",
+        "image_digest": "sha256:" + "a" * 64,
+        "image_recipe": image.to_dict(),
+        "source_bundle_id": "22222222-2222-2222-2222-222222222222",
+        "source_bundle_digest": "sha256:" + "b" * 64,
+        "entrypoint_module": "test_client",
+        "entrypoint_qualname": "run_built",
+    }
+    monkeypatch.setattr(client, "find_function", lambda name, *, project: None)
+    monkeypatch.setattr(client, "prepare_built_image", lambda fn, declared_image: build)
+    monkeypatch.setattr(client, "register_function", lambda **kwargs: observed.update(kwargs) or {"id": "fn"})
+
+    def run_built() -> dict[str, bool]:
+        return {"ok": True}
+
+    rb.Function(run_built, project="energy", image=image, mode="job", client=client).deploy()
+
+    assert observed["build"] == build
+    assert observed["mode"] == "job"
+    assert observed["image_spec"] == image.legacy_spec()
+
+
+def test_built_function_rejects_shared_interactive_runner(tmp_path) -> None:
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    image = rb.Image.python("3.13").add_local_dir(tmp_path, "/workspace/source")
+
+    def shared_built() -> None:
+        return None
+
+    function = rb.Function(shared_built, project="energy", image=image, client=client)
+    with pytest.raises(rb.RebaseWorkflowError, match="shared runner"):
+        function.deploy()
+
+
 def test_project_deploy_registers_step_workflow_graph(monkeypatch) -> None:
     observed_functions: list[dict[str, Any]] = []
     observed_workflow: dict[str, Any] = {}

@@ -26,7 +26,9 @@ import requests
 
 from rebase.auth import AuthError, load_access_token
 from rebase.config import DEFAULT_SERVER_URL, active_environment, load_profile, local_workspace_id
+from rebase.image import DEFAULT_PYTHON_VERSION, Image
 from rebase.runtime import current_run
+from rebase.source_bundle import SourceBundle, build_source_bundle
 
 try:
     from emflow.models import Agent as _ImportedEmflowAgent
@@ -103,6 +105,8 @@ DEPLOY_REQUEST_TIMEOUT_SECONDS = 300
 # the request and enforces a 300 s run cap, so the read timeout is that plus
 # headroom. The old default of 30 s failed any run longer than half a minute.
 EPHEMERAL_RUN_REQUEST_TIMEOUT_SECONDS = (10, 330)
+IMAGE_BUILD_POLL_SECONDS = 1.0
+IMAGE_BUILD_TIMEOUT_SECONDS = 30 * 60
 
 
 class RebaseWorkflowError(RuntimeError):
@@ -428,7 +432,6 @@ DEFAULT_RUN_TYPE: RunType = "quick_shared"
 WORKFLOW_RUN_TYPES = ("quick", "long")
 DeploySource = str
 DEFAULT_DEPLOY_SOURCE: DeploySource = "rebase"
-DEFAULT_PYTHON_VERSION = "3.13"
 DEFAULT_MODEL_DEPENDENCY = (
     "emflow @ git+https://github.com/rebase-energy/emflow.git@2d0205e1b479d439df72e50c6865735d0b26de8d"
 )
@@ -551,43 +554,6 @@ def _warn_unpinned_dependencies(packages: list[str]) -> None:
             f"Prefer exact pins for: {', '.join(unpinned)}",
             stacklevel=3,
         )
-
-
-class Image:
-    def __init__(
-        self,
-        *,
-        kind: str = "python",
-        python_version: str = DEFAULT_PYTHON_VERSION,
-        uv_pip_packages: list[str] | None = None,
-        uv_version: str | None = None,
-    ) -> None:
-        if kind != "python":
-            raise ValueError("only python images are supported")
-        self.kind = kind
-        self.python_version = python_version
-        self.uv_pip_packages = list(uv_pip_packages or [])
-        self.uv_version = uv_version
-
-    @classmethod
-    def python(cls, version: str = DEFAULT_PYTHON_VERSION) -> Image:
-        return cls(python_version=version)
-
-    def uv_pip_install(self, *packages: str, uv_version: str | None = None) -> Image:
-        self.uv_pip_packages.extend(packages)
-        if uv_version is not None:
-            self.uv_version = uv_version
-        return self
-
-    def to_dict(self) -> dict[str, Any]:
-        packages = [package.strip() for package in self.uv_pip_packages if package.strip()]
-        _warn_unpinned_dependencies(packages)
-        return {
-            "kind": self.kind,
-            "python_version": self.python_version,
-            "uv_pip_packages": packages,
-            "uv_version": self.uv_version,
-        }
 
 
 class _EnvironmentObjects:
@@ -1721,7 +1687,7 @@ def _image_spec_for(
     if image is not None and dependencies:
         raise ValueError("provide either image or dependencies, not both")
     if isinstance(image, Image):
-        return image.to_dict()
+        return image.legacy_spec()
     if isinstance(image, dict):
         return image
     if dependencies is not None:
@@ -1758,13 +1724,11 @@ def _model_image_spec_for(
     if image is None:
         return _image_spec_for(dependencies=_model_dependencies(dependencies))
     if isinstance(image, Image):
+        if image.build_enabled:
+            raise ValueError("models do not support uv_sync or add_local_* image operations yet")
         packages = _model_dependencies(image.uv_pip_packages)
-        return Image(
-            kind=image.kind,
-            python_version=image.python_version,
-            uv_pip_packages=packages,
-            uv_version=image.uv_version,
-        ).to_dict()
+        built = Image.python(image.python_version).uv_pip_install(*packages, uv_version=image.uv_version)
+        return built.legacy_spec()
     if isinstance(image, dict):
         if image.get("kind", "python") != "python":
             raise ValueError("only python images are supported")
@@ -3634,6 +3598,7 @@ class Client:
         git_branch: str | None = None,
         git_tag: str | None = None,
         git_dirty: bool | None = None,
+        build: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         environment = _resolve_environment(self, environment)
         project_id = self._ensure_project_in_environment(project, environment)["id"]
@@ -3669,6 +3634,8 @@ class Client:
         # so an unconditional "buckets" would 422 every deploy from this client.
         if buckets:
             payload["buckets"] = buckets
+        if build:
+            payload["build"] = build
         response = self.request(
             "POST",
             f"/projects/{project_id}/asgi-apps",
@@ -3711,6 +3678,7 @@ class Client:
         git_branch: str | None = None,
         git_tag: str | None = None,
         git_dirty: bool | None = None,
+        build: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload = {
             key: value
@@ -3749,6 +3717,8 @@ class Client:
             }.items()
             if value is not None
         }
+        if build:
+            payload["build"] = build
         response = self.request(
             "PATCH",
             f"/asgi-apps/{asgi_app_id}",
@@ -3792,6 +3762,7 @@ class Client:
         git_branch: str | None = None,
         git_tag: str | None = None,
         git_dirty: bool | None = None,
+        build: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         environment = _resolve_environment(self, environment)
         project_id = self._ensure_project_in_environment(project, environment)["id"]
@@ -3829,6 +3800,8 @@ class Client:
         # so an unconditional "buckets" would 422 every deploy from this client.
         if buckets:
             payload["buckets"] = buckets
+        if build:
+            payload["build"] = build
         response = self.request(
             "POST",
             f"/projects/{project_id}/functions",
@@ -3871,6 +3844,7 @@ class Client:
         git_branch: str | None = None,
         git_tag: str | None = None,
         git_dirty: bool | None = None,
+        build: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         execution_payload: dict[str, Any] = {}
         if mode is not None or isolation is not None or run_type is not None:
@@ -3910,6 +3884,8 @@ class Client:
             if value is not None
         }
         payload.update(execution_payload)
+        if build:
+            payload["build"] = build
         response = self.request("PATCH", f"/functions/{function_id}", json=payload)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected function response")
@@ -4368,6 +4344,7 @@ class Client:
         git_branch: str | None = None,
         git_tag: str | None = None,
         git_dirty: bool | None = None,
+        build: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         environment = _resolve_environment(self, environment)
         path = "/workflows"
@@ -4380,38 +4357,41 @@ class Client:
             target_type="workflow",
             run_type=run_type,
         )
+        payload = {
+            "name": name,
+            "description": description,
+            "flow_ref": flow_ref,
+            "source_code": source_code,
+            "entrypoint": entrypoint,
+            "step_graph": step_graph,
+            "schedule": schedule,
+            "trigger": trigger,
+            "default_parameters": default_parameters or {},
+            "required_parameters": required_parameters or [],
+            "mode": resolved_mode,
+            "isolation": resolved_isolation,
+            "env": env or {},
+            "secrets": secrets or {},
+            "buckets": buckets or [],
+            "enabled": enabled,
+            "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
+            "environment": environment,
+            "source_mode": source_mode,
+            "repo_owner": repo_owner,
+            "repo_name": repo_name,
+            "repo_path": repo_path,
+            "source_path": source_path,
+            "git_commit_sha": git_commit_sha,
+            "git_branch": git_branch,
+            "git_tag": git_tag,
+            "git_dirty": git_dirty or False,
+        }
+        if build:
+            payload["build"] = build
         response = self.request(
             "POST",
             path,
-            json={
-                "name": name,
-                "description": description,
-                "flow_ref": flow_ref,
-                "source_code": source_code,
-                "entrypoint": entrypoint,
-                "step_graph": step_graph,
-                "schedule": schedule,
-                "trigger": trigger,
-                "default_parameters": default_parameters or {},
-                "required_parameters": required_parameters or [],
-                "mode": resolved_mode,
-                "isolation": resolved_isolation,
-                "env": env or {},
-                "secrets": secrets or {},
-                "buckets": buckets or [],
-                "enabled": enabled,
-                "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
-                "environment": environment,
-                "source_mode": source_mode,
-                "repo_owner": repo_owner,
-                "repo_name": repo_name,
-                "repo_path": repo_path,
-                "source_path": source_path,
-                "git_commit_sha": git_commit_sha,
-                "git_branch": git_branch,
-                "git_tag": git_tag,
-                "git_dirty": git_dirty or False,
-            },
+            json=payload,
         )
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected workflow response")
@@ -4449,6 +4429,7 @@ class Client:
         git_branch: str | None = None,
         git_tag: str | None = None,
         git_dirty: bool | None = None,
+        build: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         execution_payload: dict[str, Any] = {}
         if mode is not None or isolation is not None or run_type is not None:
@@ -4495,6 +4476,8 @@ class Client:
             payload["trigger"] = trigger
         if buckets is not _UNSET:
             payload["buckets"] = buckets
+        if build:
+            payload["build"] = build
         response = self.request("PATCH", f"/workflows/{workflow_id}", json=payload)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected workflow response")
@@ -4835,6 +4818,87 @@ class Client:
             raise RebaseWorkflowError("expected shell session response")
         return response
 
+    def prepare_source_bundle(self, bundle: SourceBundle) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            "/source-bundles/prepare",
+            json={
+                "digest": bundle.digest,
+                "archive_size": len(bundle.archive),
+                "expanded_size": bundle.expanded_size,
+                "file_count": bundle.file_count,
+                "manifest": bundle.manifest,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected source bundle preparation response")
+        upload_url = response.get("upload_url")
+        if isinstance(upload_url, str):
+            upload = requests.put(
+                upload_url,
+                data=bundle.archive,
+                headers={"Content-Type": "application/gzip"},
+                timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
+            )
+            if upload.status_code >= 400:
+                raise RebaseWorkflowError(f"source bundle upload failed: {upload.status_code} {upload.text[:200]}")
+            bundle_id = response.get("id")
+            response = self.request(
+                "POST",
+                f"/source-bundles/{bundle_id}/finalize",
+                timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
+            )
+            if not isinstance(response, dict):
+                raise RebaseWorkflowError("expected finalized source bundle response")
+        if response.get("status") != "ready":
+            raise RebaseWorkflowError(str(response.get("error") or "source bundle did not become ready"))
+        return response
+
+    def build_image(self, *, source_bundle_id: str, recipe: dict[str, Any]) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            "/image-builds",
+            json={"source_bundle_id": source_bundle_id, "recipe": recipe},
+            timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected image build response")
+        build_id = response.get("id")
+        deadline = time.monotonic() + IMAGE_BUILD_TIMEOUT_SECONDS
+        while response.get("status") in {"queued", "building"}:
+            if not isinstance(build_id, str):
+                raise RebaseWorkflowError("image build response is missing an id")
+            if time.monotonic() >= deadline:
+                logs_url = response.get("logs_url")
+                suffix = f" Logs: {logs_url}" if logs_url else ""
+                raise RebaseWorkflowError(f"image build did not finish within 30 minutes.{suffix}")
+            time.sleep(IMAGE_BUILD_POLL_SECONDS)
+            response = self.request("GET", f"/image-builds/{build_id}")
+            if not isinstance(response, dict):
+                raise RebaseWorkflowError("expected image build status response")
+        if response.get("status") != "succeeded" or not response.get("image_digest"):
+            logs_url = response.get("logs_url")
+            suffix = f" Logs: {logs_url}" if logs_url else ""
+            raise RebaseWorkflowError(str(response.get("error") or "image build failed") + suffix)
+        return response
+
+    def prepare_built_image(self, fn: FunctionType, image: Image) -> dict[str, Any]:
+        bundle = build_source_bundle(fn, image)
+        source = self.prepare_source_bundle(bundle)
+        build = self.build_image(
+            source_bundle_id=str(source["id"]),
+            recipe=bundle.manifest["image_recipe"],
+        )
+        return {
+            "image_build_id": build["id"],
+            "image_digest": build["image_digest"],
+            "image_recipe": bundle.manifest["image_recipe"],
+            "source_bundle_id": source["id"],
+            "source_bundle_digest": bundle.digest,
+            "entrypoint_module": bundle.entrypoint_module,
+            "entrypoint_qualname": bundle.entrypoint_qualname,
+        }
+
     def get_shell_session(self, session_id: str) -> dict[str, Any]:
         response = self.request("GET", f"/shell-sessions/{session_id}")
         if not isinstance(response, dict):
@@ -5163,6 +5227,7 @@ class ASGIApp:
         self.source_code: str | None = None
         self.entrypoint: str | None = None
         self.image_spec: dict[str, Any] | None = data.get("image_spec") if data else None
+        self.image: Image | None = image if isinstance(image, Image) else None
         self.image_fingerprint: str | None = data.get("image_fingerprint") if data else None
         self.cloud_run_min_instances: int | None = data.get("cloud_run_min_instances") if data else None
         self.cloud_run_max_instances: int | None = data.get("cloud_run_max_instances") if data else None
@@ -5239,6 +5304,11 @@ class ASGIApp:
         secrets_payload = _resolve_secrets_payload(self.secrets, self._client)
         volumes_payload = _resolve_volumes_payload(self.volumes, self._client)
         buckets_payload = _resolve_buckets_payload(self.buckets, self._client)
+        build = (
+            self._client.prepare_built_image(self.fn, self.image)
+            if self.fn and self.image and self.image.build_enabled
+            else None
+        )
         existing = self._client.find_asgi_app(self.name, project=self.project)
         if existing is not None:
             asgi_app = self._client.update_asgi_app(
@@ -5260,6 +5330,7 @@ class ASGIApp:
                 cloud_run_cpu=self.cloud_run_cpu,
                 cloud_run_memory=self.cloud_run_memory,
                 enabled=self.enabled,
+                build=build,
                 environment=environment,
                 **source_metadata,
             )
@@ -5287,6 +5358,7 @@ class ASGIApp:
             cloud_run_cpu=self.cloud_run_cpu,
             cloud_run_memory=self.cloud_run_memory,
             enabled=self.enabled,
+            build=build,
             environment=environment,
             **source_metadata,
         )
@@ -5358,6 +5430,7 @@ class Function:
         )
         self.run_type: RunType = _legacy_run_type(self.mode, self.isolation)
         self.image_spec: dict[str, Any] | None = data.get("image_spec") if data else None
+        self.image: Image | None = image if isinstance(image, Image) else None
         self.image_fingerprint: str | None = data.get("image_fingerprint") if data else None
         self.cloud_run_min_instances: int | None = data.get("cloud_run_min_instances") if data else None
         self.cloud_run_concurrency: int | None = data.get("cloud_run_concurrency") if data else None
@@ -5431,6 +5504,14 @@ class Function:
         secrets_payload = _resolve_secrets_payload(self.secrets, self._client)
         volumes_payload = _resolve_volumes_payload(self.volumes, self._client)
         buckets_payload = _resolve_buckets_payload(self.buckets, self._client)
+        build = None
+        if self.fn and self.image and self.image.build_enabled:
+            if self.mode == "interactive" and self.isolation == "shared":
+                raise RebaseWorkflowError(
+                    "Images using uv_sync or add_local_* cannot run on the shared runner. "
+                    "Use isolation='dedicated' or mode='job'."
+                )
+            build = self._client.prepare_built_image(self.fn, self.image)
         existing = self._client.find_function(name, project=self.project)
         if existing is not None:
             function = self._client.update_function(
@@ -5452,6 +5533,7 @@ class Function:
                 cloud_run_memory=self.cloud_run_memory,
                 enabled=self.enabled,
                 endpoint=self.endpoint,
+                build=build,
                 environment=environment,
                 **source_metadata,
             )
@@ -5479,6 +5561,7 @@ class Function:
             cloud_run_memory=self.cloud_run_memory,
             enabled=self.enabled,
             endpoint=self.endpoint,
+            build=build,
             environment=environment,
             **source_metadata,
         )
@@ -6432,6 +6515,7 @@ class Workflow:
         self.required_parameters: list[str] = list(data.get("required_parameters", [])) if data else []
         self.source_metadata: dict[str, Any] = {}
         self.image_spec: dict[str, Any] | None = None
+        self.image: Image | None = image if isinstance(image, Image) else None
         self.cloud_run_min_instances: int | None = None
         self.cloud_run_concurrency: int | None = None
         self.resource_policy: dict[str, Any] = {}
@@ -6595,6 +6679,14 @@ class Workflow:
         if self.name is None:
             raise RebaseWorkflowError("workflow name is required")
         self._validate_schedule_defaults()
+        build = None
+        if self.fn and self.image and self.image.build_enabled:
+            if self.mode != "job":
+                raise RebaseWorkflowError(
+                    "Workflows using uv_sync or add_local_* require mode='job'; "
+                    "interactive custom-image workflows are not supported yet."
+                )
+            build = self._client.prepare_built_image(self.fn, self.image)
         if not _skip_dataset_preflight:
             # Project.deploy runs the preflight once for all targets.
             preflight_datasets(self.client)
@@ -6634,6 +6726,7 @@ class Workflow:
                 buckets=buckets_payload,
                 enabled=self.enabled,
                 endpoint=self.endpoint,
+                build=build,
                 environment=environment,
                 **source_metadata,
             )
@@ -6661,6 +6754,7 @@ class Workflow:
             buckets=buckets_payload,
             enabled=self.enabled,
             endpoint=self.endpoint,
+            build=build,
             environment=environment,
             **source_metadata,
         )

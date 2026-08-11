@@ -543,6 +543,41 @@ def add_with_boltons(a: int = 0, b: int = 0) -> dict:
     return {"sum": sum(flatten([[a], [b]]))}
 ```
 
+For a larger codebase, opt into a built image. Rebase automatically bundles the
+module or package that defines the decorated target; additional local packages
+and files are explicit, as in Modal:
+
+```python
+image = (
+    rb.Image.python("3.13")
+    .uv_sync(".", frozen=True)
+    .add_local_python_source("agent_work")
+    .add_local_dir("config", "/workspace/config")
+)
+
+
+@project.workflow(image=image, mode="job")
+def sync_accounting():
+    from agent_work.accounting.pipeline import run
+
+    return run()
+```
+
+`uv_sync()` requires both `pyproject.toml` and `uv.lock`. `add_local_file()`,
+`add_local_dir()`, and `add_local_python_source()` use a read-only,
+content-addressed source mount by default. Set `copy=True` to bake that input
+into the immutable OCI image instead. `.gitignore`, `.rebaseignore`, and an
+explicit `ignore=` list are applied when directories are bundled; symlinks are
+rejected.
+
+Built images support Python 3.12 and 3.13. They run in dedicated functions,
+function jobs, ASGI apps, and job-mode workflows; the shared function runner
+and interactive workflows cannot switch images per invocation. `deploy()`
+uploads the deterministic bundle, waits for the cached Cloud Build result, and
+pins the deployed version to both the OCI image digest and source-bundle
+digest. Legacy images that only use `uv_pip_install()` retain the existing
+runtime-install behavior.
+
 ## Data and Modeling Packages
 
 The toolkit can expose optional `emflow` and EnergyDataModel modules through:
