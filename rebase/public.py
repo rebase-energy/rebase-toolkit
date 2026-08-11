@@ -467,7 +467,7 @@ def deploy(
     *targets: DeployTarget,
     replace: bool = False,
     deploy_source: str | None = None,
-    environment: str = "dev",
+    environment: str | None = None,
 ) -> DeployTarget | list[Any]:
     if not targets:
         raise RebaseWorkflowError("deploy requires at least one Rebase project, function, workflow, ASGI app, or model")
@@ -481,7 +481,7 @@ def deploy(
     deploy_kwargs: dict[str, Any] = {"replace": replace}
     if deploy_source is not None:
         deploy_kwargs["deploy_source"] = deploy_source
-    if environment != "dev":
+    if environment is not None:
         deploy_kwargs["environment"] = environment
     deployed = [target.deploy(**deploy_kwargs) for target in targets]
     return deployed[0] if len(deployed) == 1 else deployed

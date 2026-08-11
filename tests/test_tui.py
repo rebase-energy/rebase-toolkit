@@ -159,7 +159,6 @@ class FakeClient:
                 "finished_at": "2026-06-16T14:01:00Z",
             }
         ]
-
     def get_workflow_version(self, workflow_id: str, version_id: str) -> dict[str, Any]:
         self.version_calls.append((workflow_id, version_id))
         return {
@@ -300,6 +299,33 @@ class FakeClient:
         ]
 
 
+class EnvironmentClient(FakeClient):
+    def __init__(self, environment_name: str = "dev") -> None:
+        super().__init__()
+        self.environment_name = environment_name
+        self.workspace_id = "workspace-id"
+        self.projects = [{"id": f"{environment_name}-project", "name": "energy"}]
+        self.functions = []
+        self.workflows = []
+        self.endpoints = []
+        self.runs = []
+
+    def with_environment(self, environment_name: str) -> EnvironmentClient:
+        return EnvironmentClient(environment_name)
+
+    def list_environments(self) -> list[dict[str, Any]]:
+        return [{"name": "dev"}, {"name": "staging"}, {"name": "prod"}]
+
+    def list_buckets(self) -> list[dict[str, Any]]:
+        return [{"name": f"{self.environment_name}-data"}]
+
+    def list_volumes(self) -> list[dict[str, Any]]:
+        return [{"name": f"{self.environment_name}-cache", "provider": "gcs"}]
+
+    def list_secrets(self) -> list[dict[str, Any]]:
+        return [{"name": f"{self.environment_name}-api", "keys": ["TOKEN"]}]
+
+
 class SteppedClient(FakeClient):
     """A project whose workflow is built out of steps, which are functions of its own."""
 
@@ -405,6 +431,32 @@ class EmptyWorkspaceClient(FakeClient):
 def fake_tui_data(client: Any, **kwargs: Any) -> RebaseTuiData:
     """FakeClient duck-types Client; the cast keeps the type checker honest at that seam."""
     return RebaseTuiData(cast(Client, client), **kwargs)
+
+
+def test_tui_environment_resources_and_switcher() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(EnvironmentClient()), refresh_interval=0)
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+
+            assert "Environment: dev" in str(app.query_one("#environment-context", Static).render())
+            assert str(app.query_one("#buckets-table", DataTable).get_cell_at(Coordinate(0, 0))) == "dev-data"
+            assert str(app.query_one("#volumes-table", DataTable).get_cell_at(Coordinate(0, 0))) == "dev-cache"
+            assert str(app.query_one("#secrets-table", DataTable).get_cell_at(Coordinate(0, 0))) == "dev-api"
+
+            await pilot.press("v")
+            await pilot.pause(0.1)
+            options = app.screen.query_one("#environment-options", OptionList)
+            options.highlighted = 2
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+
+            assert app.environment_name == "prod"
+            assert app.data.environment_name == "prod"
+            assert "Environment: prod" in str(app.query_one("#environment-context", Static).render())
+            assert str(app.query_one("#buckets-table", DataTable).get_cell_at(Coordinate(0, 0))) == "prod-data"
+
+    asyncio.run(scenario())
 
 
 def test_tui_format_helpers() -> None:
@@ -1436,6 +1488,47 @@ def test_tui_workspace_title_opens_switcher_and_changes_profile(monkeypatch, tmp
                 assert app.title == "Rebase TUI - Workspace: Development"
                 assert app.query_one("#workspace-view").styles.display == "block"
                 assert app.query_one("#projects-table", DataTable).row_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_tui_w_opens_switcher_and_changes_workspace(monkeypatch) -> None:
+    async def scenario() -> None:
+        config_module.write_profile(
+            api_key="rbw_dev",
+            profile="dev",
+            api_url="https://api.example.com",
+            workspace={"id": "workspace-dev", "name": "Development"},
+        )
+        config_module.write_profile(
+            api_key="rbw_prod",
+            profile="prod",
+            api_url="https://api.example.com",
+            workspace={"id": "workspace-prod", "name": "Production"},
+        )
+        monkeypatch.setattr(tui_module, "Client", lambda **_kwargs: FakeClient())
+
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            assert app.title == "Rebase TUI - Workspace: Production"
+
+            await pilot.press("w")
+            await pilot.pause(0.1)
+
+            profiles = app.query_one("#workspace-profiles-table", DataTable)
+            assert app.current_view == "workspace-switcher"
+            assert profiles.has_focus
+            assert profiles.row_count == 2
+
+            profiles.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+
+            assert config_module.selected_profile_name() == "dev"
+            assert app.title == "Rebase TUI - Workspace: Development"
+            assert app.current_view == "workspace"
 
     asyncio.run(scenario())
 
@@ -3153,9 +3246,10 @@ def test_tui_footer_shows_only_the_keys_you_move_around_with() -> None:
                 for _, binding, _, _ in app.screen.active_bindings.values()
                 if not binding.show
             }
-            for key in ("d", "o", "g", "s", "p", "l", "m"):
+            for key in ("d", "o", "g", "w", "s", "p", "l", "m"):
                 assert key in hidden, key
             assert hidden["g"] == "Open deployed code on GitHub"
+            assert hidden["w"] == "Switch workspace"
             assert hidden["m"] == "Maximise pane"
 
             tab = next(b for _, b, _, _ in app.screen.active_bindings.values() if b.key == "tab")

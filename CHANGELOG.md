@@ -4,6 +4,20 @@
 
 ### Added
 
+- **First-class environments now combine Modal-style Python ergonomics with GitOps.**
+  Workspaces seed `dev`, `staging`, and `prod` and can create arbitrary additional names.
+  Projects, compute, runs, routes, schedules, models, secrets, volumes, and buckets are
+  isolated by environment, while the SDK supplies `rb.Environment`, ambient context, and
+  explicit overrides without deployment YAML. Protected environments track a project to a
+  GitHub ref and Python entrypoint; signed pushes reconcile the exact commit in an isolated,
+  release-authorized job, prune compute removed from Python only after a successful apply,
+  and retain persistent resources. The TUI adds an environment switcher and sibling Projects,
+  Buckets, Volumes, and Secrets tabs.
+
+- **Pressing `w` in the TUI opens the workspace switcher.** Workspace switching
+  is now available from the keyboard and command panel as well as by clicking the
+  workspace title, from either the workspace overview or an open project.
+
 - **Execution is now configured with `mode` and `isolation`.** Functions, models, workflows,
   and `rebase run` default to `mode="interactive", isolation="shared"` for the lowest-latency
   cloud loop. Functions and models can select `isolation="dedicated"` for a private Cloud Run

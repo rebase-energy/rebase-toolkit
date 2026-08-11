@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import contextvars
+import dis
 import hashlib
 import inspect
 import json
@@ -15,6 +17,7 @@ import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from functools import wraps
 from pathlib import Path
 from types import FunctionType
 from typing import Any, Self
@@ -22,7 +25,7 @@ from typing import Any, Self
 import requests
 
 from rebase.auth import AuthError, load_access_token
-from rebase.config import DEFAULT_SERVER_URL, load_profile, local_workspace_id
+from rebase.config import DEFAULT_SERVER_URL, active_environment, load_profile, local_workspace_id
 from rebase.runtime import current_run
 
 try:
@@ -58,6 +61,32 @@ _EmflowSimulator: Any = _ImportedEmflowSimulator
 
 
 _default_client: Client | None = None
+_environment_context: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "rebase_environment", default=None
+)
+
+
+def _resolve_environment(client: Client, environment: str | None) -> str:
+    """Resolve an explicit override, then ambient context, then client default."""
+    return environment or _environment_context.get() or getattr(client, "environment_name", "dev")
+
+
+def _environment_scoped_deploy(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Keep every lookup and write in a deploy under one environment."""
+
+    @wraps(method)
+    def scoped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        environment = _resolve_environment(self._client, kwargs.get("environment"))
+        kwargs["environment"] = environment
+        token = _environment_context.set(environment)
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            _environment_context.reset(token)
+
+    return scoped
+
+
 _trace_stack: list[_WorkflowTrace] = []
 _UNSET = object()
 DEFAULT_PROJECT_NAME = "default"
@@ -564,6 +593,144 @@ class Image:
         }
 
 
+class _EnvironmentObjects:
+    def create(
+        self,
+        name: str,
+        *,
+        deploy_mode: str = "direct",
+        protected: bool = False,
+        require_pr: bool = False,
+        allowed_branches: list[str] | None = None,
+        client: Client | None = None,
+    ) -> Environment:
+        resolved = client or default_client()
+        resolved.create_environment(
+            name,
+            deploy_mode=deploy_mode,
+            protected=protected,
+            require_pr=require_pr,
+            allowed_branches=allowed_branches,
+        )
+        return Environment(name, client=resolved)
+
+
+class _EnvironmentProjects:
+    def __init__(self, environment: Environment) -> None:
+        self.environment = environment
+
+    def track(
+        self,
+        name: str,
+        *,
+        github_connection_id: str,
+        ref: str,
+        entrypoint: str,
+        repo_path: str | None = None,
+    ) -> dict[str, Any]:
+        client = self.environment._resolved_client()
+        project = client.ensure_project(name, environment_name=self.environment.name)
+        return client.track_project(
+            str(project["id"]),
+            github_connection_id=github_connection_id,
+            tracked_ref=ref,
+            entrypoint=entrypoint,
+            repo_path=repo_path,
+        )
+
+
+class Environment:
+    """A workspace namespace for projects, storage, secrets, runs and policies."""
+
+    objects = _EnvironmentObjects()
+
+    def __init__(self, name: str, *, client: Client | None = None) -> None:
+        if not name or not name.strip():
+            raise ValueError("Environment requires a non-empty name")
+        self.name = name.strip().lower()
+        self._client = client
+        self._context_tokens: list[contextvars.Token[str | None]] = []
+        self.projects = _EnvironmentProjects(self)
+
+    @classmethod
+    def from_name(
+        cls,
+        name: str,
+        *,
+        create_if_missing: bool = False,
+        client: Client | None = None,
+    ) -> Environment:
+        environment = cls(name, client=client)
+        if create_if_missing:
+            try:
+                environment._resolved_client().get_environment(environment.name)
+            except RebaseWorkflowError as exc:
+                if exc.status_code != 404:
+                    raise
+                environment._resolved_client().create_environment(environment.name)
+        return environment
+
+    @classmethod
+    def from_context(cls, *, client: Client | None = None) -> Environment:
+        resolved = client or default_client()
+        return cls(_environment_context.get() or resolved.environment_name, client=resolved)
+
+    def _resolved_client(self) -> Client:
+        if self._client is None:
+            self._client = default_client()
+        return self._client
+
+    def hydrate(self) -> dict[str, Any]:
+        return self._resolved_client().get_environment(self.name)
+
+    def configure(
+        self,
+        *,
+        deploy_mode: str | None = None,
+        protected: bool | None = None,
+        require_pr: bool | None = None,
+        allowed_branches: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return self._resolved_client().update_environment_policy(
+            self.name,
+            deploy_mode=deploy_mode,
+            protected=protected,
+            require_pr=require_pr,
+            allowed_branches=allowed_branches,
+        )
+
+    def grants(self) -> list[dict[str, Any]]:
+        """List explicit profile/API-key access grants for this environment."""
+        return self._resolved_client().list_environment_grants(self.name)
+
+    def grant(
+        self,
+        *,
+        profile_id: str | None = None,
+        api_key_id: str | None = None,
+        access: str = "read",
+    ) -> dict[str, Any]:
+        """Grant read, write, or admin access to exactly one principal."""
+        return self._resolved_client().grant_environment_access(
+            self.name,
+            profile_id=profile_id,
+            api_key_id=api_key_id,
+            access=access,
+        )
+
+    def revoke(self, grant_id: str) -> None:
+        """Remove one explicit access grant."""
+        self._resolved_client().revoke_environment_access(self.name, grant_id)
+
+    def __enter__(self) -> Environment:
+        self._context_tokens.append(_environment_context.set(self.name))
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self._context_tokens:
+            _environment_context.reset(self._context_tokens.pop())
+
+
 class Secret:
     """A named bundle of environment variables, injected into deployed code.
 
@@ -578,21 +745,34 @@ class Secret:
     payload or source snapshot.
     """
 
-    def __init__(self, *, name: str | None = None, env_dict: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        name: str | None = None,
+        env_dict: dict[str, str] | None = None,
+        environment_name: str | None = None,
+    ) -> None:
         if name is None and env_dict is None:
             raise ValueError("Secret requires a name (from_name) or values (from_dict)")
         self.name = name
         self.env_dict = dict(env_dict) if env_dict is not None else None
+        self.environment_name = environment_name
 
     @classmethod
-    def from_name(cls, name: str) -> Secret:
+    def from_name(cls, name: str, *, environment_name: str | None = None) -> Secret:
         """Reference an existing workspace secret bundle by name."""
         if not name or not name.strip():
             raise ValueError("Secret.from_name requires a non-empty name")
-        return cls(name=name.strip())
+        return cls(name=name.strip(), environment_name=environment_name)
 
     @classmethod
-    def from_dict(cls, env_dict: dict[str, str], *, name: str | None = None) -> Secret:
+    def from_dict(
+        cls,
+        env_dict: dict[str, str],
+        *,
+        name: str | None = None,
+        environment_name: str | None = None,
+    ) -> Secret:
         """Create (or update) a bundle from a dict at deploy time, then attach it.
 
         Without ``name``, a stable content-derived name (``inline-<hash>``) is used.
@@ -600,7 +780,7 @@ class Secret:
         """
         if not env_dict:
             raise ValueError("Secret.from_dict requires at least one KEY: value entry")
-        return cls(name=name, env_dict=env_dict)
+        return cls(name=name, env_dict=env_dict, environment_name=environment_name)
 
     @classmethod
     def from_dotenv(cls, path: str | Path = ".env", *, name: str | None = None) -> Secret:
@@ -624,6 +804,8 @@ class Secret:
 
     def resolve(self, client: Client) -> dict[str, str]:
         """Materialize this secret into the env-name -> secret-ref map deploys send."""
+        if self.environment_name is not None:
+            client = client.with_environment(self.environment_name)
         if self.env_dict is not None:
             created = client.set_secret(self._resolved_name(), self.env_dict)
             refs = created.get("secret_refs")
@@ -684,6 +866,7 @@ class Volume:
         create_if_missing: bool = False,
         read_only: bool = False,
         client: Client | None = None,
+        environment_name: str | None = None,
     ) -> None:
         if not name or not name.strip():
             raise ValueError("Volume requires a non-empty name")
@@ -691,16 +874,31 @@ class Volume:
         self.create_if_missing = create_if_missing
         self.read_only = read_only
         self._client = client
+        self.environment_name = environment_name
         self._ensured = False
 
     @classmethod
-    def from_name(cls, name: str, *, create_if_missing: bool = False, read_only: bool = False) -> Volume:
+    def from_name(
+        cls,
+        name: str,
+        *,
+        create_if_missing: bool = False,
+        read_only: bool = False,
+        environment_name: str | None = None,
+    ) -> Volume:
         """Reference a workspace volume by name, optionally creating it lazily."""
-        return cls(name, create_if_missing=create_if_missing, read_only=read_only)
+        return cls(
+            name,
+            create_if_missing=create_if_missing,
+            read_only=read_only,
+            environment_name=environment_name,
+        )
 
     def _resolved_client(self) -> Client:
         if self._client is None:
             self._client = default_client()
+        if self.environment_name is not None and self._client.environment_name != self.environment_name:
+            self._client = self._client.with_environment(self.environment_name)
         return self._client
 
     def ensure(self, client: Client | None = None) -> dict[str, Any]:
@@ -835,19 +1033,37 @@ class Bucket:
     object.
     """
 
-    def __init__(self, name: str, *, create_if_missing: bool = False, client: Client | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        create_if_missing: bool = False,
+        client: Client | None = None,
+        environment_name: str | None = None,
+    ) -> None:
         if not name or not name.strip():
             raise ValueError("Bucket requires a non-empty name")
         self.name = name.strip()
         self.create_if_missing = create_if_missing
         self._client = client
+        self.environment_name = environment_name
         self._ensured = False
         self._uri: str | None = None
 
     @classmethod
-    def from_name(cls, name: str, *, create_if_missing: bool = False) -> Bucket:
+    def from_name(
+        cls,
+        name: str,
+        *,
+        create_if_missing: bool = False,
+        environment_name: str | None = None,
+    ) -> Bucket:
         """Reference a workspace bucket by name, optionally creating it lazily."""
-        return cls(name, create_if_missing=create_if_missing)
+        return cls(
+            name,
+            create_if_missing=create_if_missing,
+            environment_name=environment_name,
+        )
 
     def __repr__(self) -> str:
         return f"Bucket({self.name!r})"
@@ -855,6 +1071,8 @@ class Bucket:
     def _resolved_client(self) -> Client:
         if self._client is None:
             self._client = default_client()
+        if self.environment_name is not None and self._client.environment_name != self.environment_name:
+            self._client = self._client.with_environment(self.environment_name)
         return self._client
 
     def ensure(self, client: Client | None = None) -> dict[str, Any]:
@@ -1539,9 +1757,16 @@ def configure(
     api_url: str | None = None,
     profile: str | None = None,
     access_token: str | None = None,
+    environment_name: str | None = None,
 ) -> None:
     global _default_client
-    _default_client = Client(api_key=api_key, api_url=api_url, profile=profile, access_token=access_token)
+    _default_client = Client(
+        api_key=api_key,
+        api_url=api_url,
+        profile=profile,
+        access_token=access_token,
+        environment_name=environment_name,
+    )
 
 
 def default_client() -> Client:
@@ -2023,6 +2248,23 @@ def _git_metadata_for(fn: Callable[..., Any]) -> dict[str, Any]:
         return {}
 
     source_path = Path(source_file).resolve()
+    reconciler_root = os.getenv("REBASE_GITOPS_REPO_ROOT")
+    reconciler_sha = os.getenv("REBASE_GITOPS_COMMIT_SHA")
+    if reconciler_root and reconciler_sha:
+        try:
+            relative_source_path = source_path.relative_to(Path(reconciler_root).resolve())
+        except ValueError:
+            pass
+        else:
+            return {
+                "repo_owner": os.getenv("REBASE_GITOPS_REPO_OWNER"),
+                "repo_name": os.getenv("REBASE_GITOPS_REPO_NAME"),
+                "source_path": str(relative_source_path),
+                "git_commit_sha": reconciler_sha,
+                "git_branch": os.getenv("REBASE_GITOPS_BRANCH"),
+                "git_tag": os.getenv("REBASE_GITOPS_TAG"),
+                "git_dirty": False,
+            }
     root = _git(["rev-parse", "--show-toplevel"], cwd=source_path.parent)
     if root is None:
         return {}
@@ -2116,6 +2358,7 @@ class Client:
         profile: str | None = None,
         access_token: str | None = None,
         workspace_id: str | None = None,
+        environment_name: str | None = None,
     ) -> None:
         env_api_key = os.getenv("REBASE_API_KEY") or os.getenv("REBASE_WORKFLOWS_API_KEY")
         env_access_token = os.getenv("REBASE_ACCESS_TOKEN") or os.getenv("REBASE_WORKFLOWS_ACCESS_TOKEN")
@@ -2141,6 +2384,13 @@ class Client:
             or (configured_workspace_id if isinstance(configured_workspace_id, str) else None)
         )
         self.workspace_id = resolved_workspace_id or None
+        configured_environment = active_environment(self.workspace_id) if self.workspace_id else None
+        self.environment_name = (
+            environment_name
+            or os.getenv("REBASE_ENVIRONMENT")
+            or configured_environment
+            or "dev"
+        )
         profile_api_url = configured_api_url if isinstance(configured_api_url, str) else None
         selected_api_url = api_url or os.getenv("REBASE_WORKFLOWS_API_URL") or profile_api_url or DEFAULT_SERVER_URL
         self.api_url = selected_api_url.rstrip("/")
@@ -2162,6 +2412,17 @@ class Client:
             self._session = requests.Session()
             self._session_pid = pid
         return self._session
+
+    def with_environment(self, environment_name: str) -> Client:
+        clone = Client(
+            api_key=self.api_key,
+            api_url=self.api_url,
+            access_token=self.access_token,
+            workspace_id=self.workspace_id,
+            environment_name=environment_name,
+        )
+        clone._cached_disk_token = self._cached_disk_token
+        return clone
 
     def _http_request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
         """Single seam for all HTTP traffic; tests patch this instead of `requests`."""
@@ -2195,6 +2456,13 @@ class Client:
                 resolved_headers["Authorization"] = f"Bearer {bearer_token}"
         if self.workspace_id and "X-Rebase-Workspace" not in resolved_headers:
             resolved_headers["X-Rebase-Workspace"] = self.workspace_id
+        if "X-Rebase-Environment" not in resolved_headers:
+            resolved_headers["X-Rebase-Environment"] = (
+                _environment_context.get() or self.environment_name
+            )
+        release_id = os.getenv("REBASE_GITOPS_RELEASE_ID")
+        if release_id and "X-Rebase-GitOps-Release" not in resolved_headers:
+            resolved_headers["X-Rebase-GitOps-Release"] = release_id
         return resolved_headers
 
     def request(
@@ -2685,6 +2953,76 @@ class Client:
             raise RebaseWorkflowError("expected workspace environment policy list response")
         return response
 
+    def list_environments(self) -> list[dict[str, Any]]:
+        return self.list_environment_policies()
+
+    def get_environment(self, name: str) -> dict[str, Any]:
+        response = self.request("GET", f"/environments/{name}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected environment response")
+        return response
+
+    def list_environment_grants(self, name: str) -> list[dict[str, Any]]:
+        response = self.request("GET", f"/environments/{name}/grants")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected environment grant list response")
+        return response
+
+    def grant_environment_access(
+        self,
+        name: str,
+        *,
+        profile_id: str | None = None,
+        api_key_id: str | None = None,
+        access: str = "read",
+    ) -> dict[str, Any]:
+        if (profile_id is None) == (api_key_id is None):
+            raise ValueError("provide exactly one of profile_id or api_key_id")
+        if access not in {"read", "write", "admin"}:
+            raise ValueError("access must be read, write, or admin")
+        response = self.request(
+            "PUT",
+            f"/environments/{name}/grants",
+            json={
+                "profile_id": profile_id,
+                "api_key_id": api_key_id,
+                "access": access,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected environment grant response")
+        return response
+
+    def revoke_environment_access(self, name: str, grant_id: str) -> None:
+        self.request_no_content("DELETE", f"/environments/{name}/grants/{grant_id}")
+
+    def create_environment(
+        self,
+        name: str,
+        *,
+        deploy_mode: str = "direct",
+        protected: bool = False,
+        require_pr: bool = False,
+        allowed_branches: list[str] | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "POST",
+            "/environments",
+            json={
+                "name": name,
+                "deploy_mode": deploy_mode,
+                "protected": protected,
+                "require_pr": require_pr,
+                "allowed_branches": allowed_branches or [],
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected environment response")
+        return response
+
+    def delete_environment(self, name: str) -> None:
+        self.request_no_content("DELETE", f"/environments/{name}")
+
     def update_environment_policy(
         self,
         environment: str,
@@ -2939,8 +3277,9 @@ class Client:
             raise RebaseWorkflowError("expected GitHub promotion PR response")
         return response
 
-    def list_projects(self) -> list[dict[str, Any]]:
-        response = self.request("GET", "/projects")
+    def list_projects(self, *, environment_name: str | None = None) -> list[dict[str, Any]]:
+        headers = {"X-Rebase-Environment": environment_name} if environment_name else None
+        response = self.request("GET", "/projects", headers=headers)
         if not isinstance(response, list):
             raise RebaseWorkflowError("expected project list response")
         return response
@@ -2991,6 +3330,7 @@ class Client:
         repo_owner: str | None = None,
         repo_name: str | None = None,
         repo_path: str | None = None,
+        environment_name: str | None = None,
     ) -> dict[str, Any]:
         response = self.request(
             "POST",
@@ -3003,6 +3343,7 @@ class Client:
                 "repo_name": repo_name,
                 "repo_path": repo_path,
             },
+            headers={"X-Rebase-Environment": environment_name} if environment_name else None,
         )
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected project response")
@@ -3034,6 +3375,41 @@ class Client:
         response = self.request("PATCH", f"/projects/{project_id}", json=payload)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected project response")
+        return response
+
+    def track_project(
+        self,
+        project_id: str,
+        *,
+        github_connection_id: str,
+        tracked_ref: str,
+        entrypoint: str,
+        repo_path: str | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "PUT",
+            f"/projects/{project_id}/git-track",
+            json={
+                "github_connection_id": github_connection_id,
+                "tracked_ref": tracked_ref,
+                "entrypoint": entrypoint,
+                "repo_path": repo_path,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected project Git track response")
+        return response
+
+    def get_project_git_track(self, project_id: str) -> dict[str, Any]:
+        response = self.request("GET", f"/projects/{project_id}/git-track")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected project Git track response")
+        return response
+
+    def list_project_releases(self, project_id: str) -> list[dict[str, Any]]:
+        response = self.request("GET", f"/projects/{project_id}/releases")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected project release list response")
         return response
 
     def delete_project(self, project_id: str, *, force: bool = False) -> None:
@@ -3089,8 +3465,9 @@ class Client:
     def delete_workflow(self, workflow_id: str, *, force: bool = False) -> None:
         self.request_no_content("DELETE", f"/workflows/{workflow_id}", params={"force": str(force).lower()})
 
-    def find_project(self, name: str) -> dict[str, Any] | None:
-        for project in self.list_projects():
+    def find_project(self, name: str, *, environment_name: str | None = None) -> dict[str, Any] | None:
+        projects = self.list_projects(environment_name=environment_name) if environment_name else self.list_projects()
+        for project in projects:
             if project["name"] == name:
                 return project
         return None
@@ -3104,8 +3481,9 @@ class Client:
         repo_owner: str | None = None,
         repo_name: str | None = None,
         repo_path: str | None = None,
+        environment_name: str | None = None,
     ) -> dict[str, Any]:
-        existing = self.find_project(name)
+        existing = self.find_project(name, environment_name=environment_name)
         desired = {
             key: value
             for key, value in {
@@ -3128,7 +3506,15 @@ class Client:
             repo_owner=repo_owner,
             repo_name=repo_name,
             repo_path=repo_path,
+            environment_name=environment_name,
         )
+
+    def _ensure_project_in_environment(self, name: str, environment: str) -> dict[str, Any]:
+        token = _environment_context.set(environment)
+        try:
+            return self.ensure_project(name)
+        finally:
+            _environment_context.reset(token)
 
     def list_functions(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
         resolved_project_id = project_id
@@ -3215,7 +3601,7 @@ class Client:
         cloud_run_cpu: str | None = None,
         cloud_run_memory: str | None = None,
         enabled: bool = True,
-        environment: str = "dev",
+        environment: str | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -3226,7 +3612,8 @@ class Client:
         git_tag: str | None = None,
         git_dirty: bool | None = None,
     ) -> dict[str, Any]:
-        project_id = self.ensure_project(project)["id"]
+        environment = _resolve_environment(self, environment)
+        project_id = self._ensure_project_in_environment(project, environment)["id"]
         payload: dict[str, Any] = {
             "name": name,
             "description": description,
@@ -3372,7 +3759,7 @@ class Client:
         cloud_run_memory: str | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
-        environment: str = "dev",
+        environment: str | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -3383,7 +3770,8 @@ class Client:
         git_tag: str | None = None,
         git_dirty: bool | None = None,
     ) -> dict[str, Any]:
-        project_id = self.ensure_project(project)["id"]
+        environment = _resolve_environment(self, environment)
+        project_id = self._ensure_project_in_environment(project, environment)["id"]
         resolved_mode, resolved_isolation = _validate_execution(mode, isolation, run_type=run_type)
         payload: dict[str, Any] = {
             "name": name,
@@ -3590,7 +3978,7 @@ class Client:
         cloud_run_memory: str | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
-        environment: str | None = "dev",
+        environment: str | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -3601,7 +3989,8 @@ class Client:
         git_tag: str | None = None,
         git_dirty: bool | None = None,
     ) -> dict[str, Any]:
-        project_id = self.ensure_project(project)["id"]
+        environment = _resolve_environment(self, environment)
+        project_id = self._ensure_project_in_environment(project, environment)["id"]
         resolved_mode, resolved_isolation = _validate_execution(mode, isolation, run_type=run_type)
         response = self.request(
             "POST",
@@ -3719,8 +4108,9 @@ class Client:
         model_id: str,
         parameters: dict[str, Any] | None = None,
         *,
-        environment: str = "dev",
+        environment: str | None = None,
     ) -> Run:
+        environment = _resolve_environment(self, environment)
         response = self.request(
             "POST",
             f"/models/{model_id}/runs",
@@ -3944,7 +4334,7 @@ class Client:
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         project: str | None = None,
-        environment: str = "dev",
+        environment: str | None = None,
         source_mode: str | None = None,
         repo_owner: str | None = None,
         repo_name: str | None = None,
@@ -3955,9 +4345,10 @@ class Client:
         git_tag: str | None = None,
         git_dirty: bool | None = None,
     ) -> dict[str, Any]:
+        environment = _resolve_environment(self, environment)
         path = "/workflows"
         if project is not None:
-            project_id = self.ensure_project(project)["id"]
+            project_id = self._ensure_project_in_environment(project, environment)["id"]
             path = f"/projects/{project_id}/workflows"
         resolved_mode, resolved_isolation = _validate_execution(
             mode,
@@ -4453,7 +4844,11 @@ class Project:
     def _client(self) -> Client:
         return self.client or default_client()
 
-    def deploy(self, *, replace: bool = False, deploy_source: str | None = None, environment: str = "dev") -> Self:
+    @_environment_scoped_deploy
+    def deploy(
+        self, *, replace: bool = False, deploy_source: str | None = None, environment: str | None = None
+    ) -> Self:
+        environment = _resolve_environment(self._client, environment)
         for workflow in self._workflows:
             workflow._validate_schedule_defaults()
         resolved_deploy_source = _validate_deploy_source(deploy_source)
@@ -4465,6 +4860,7 @@ class Project:
             repo_owner=self.repo_owner,
             repo_name=self.repo_name,
             repo_path=self.repo_path,
+            environment_name=environment,
         )
         self.id = project["id"]
         for function in self._functions:
@@ -4796,7 +5192,11 @@ class ASGIApp:
             project_source_mode=project_source_mode,
         )
 
-    def deploy(self, *, replace: bool = False, deploy_source: str | None = None, environment: str = "dev") -> ASGIApp:
+    @_environment_scoped_deploy
+    def deploy(
+        self, *, replace: bool = False, deploy_source: str | None = None, environment: str | None = None
+    ) -> ASGIApp:
+        environment = _resolve_environment(self._client, environment)
         if self.source_code is None or self.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy an ASGI app handle without source_code and entrypoint")
         if self.name is None:
@@ -4983,7 +5383,11 @@ class Function:
             project_source_mode=project_source_mode,
         )
 
-    def deploy(self, *, replace: bool = False, deploy_source: str | None = None, environment: str = "dev") -> Function:
+    @_environment_scoped_deploy
+    def deploy(
+        self, *, replace: bool = False, deploy_source: str | None = None, environment: str | None = None
+    ) -> Function:
+        environment = _resolve_environment(self._client, environment)
         if self.source_code is None or self.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy a function handle without source_code and entrypoint")
         if self.name is None:
@@ -5172,16 +5576,16 @@ class _RemoteModelOperation:
     def __init__(self, handle: ModelHandle) -> None:
         self._handle = handle
 
-    def spawn(self, *, environment: str = "dev", **parameters: Any) -> Run:
+    def spawn(self, *, environment: str | None = None, **parameters: Any) -> Run:
         return self._handle.spawn(environment=environment, **parameters)
 
-    def remote(self, *, environment: str = "dev", **parameters: Any) -> dict[str, Any]:
+    def remote(self, *, environment: str | None = None, **parameters: Any) -> dict[str, Any]:
         return self._handle.remote(environment=environment, **parameters)
 
-    def run(self, *, environment: str = "dev", **parameters: Any) -> Run:
+    def run(self, *, environment: str | None = None, **parameters: Any) -> Run:
         return self.spawn(environment=environment, **parameters)
 
-    def __call__(self, *, environment: str = "dev", **parameters: Any) -> dict[str, Any]:
+    def __call__(self, *, environment: str | None = None, **parameters: Any) -> dict[str, Any]:
         return self.remote(environment=environment, **parameters)
 
 
@@ -5223,15 +5627,15 @@ class ModelHandle:
             raise RebaseWorkflowError("model handle does not expose a known remote operation")
         return getattr(self, self.operation_name)
 
-    def spawn(self, *, environment: str = "dev", **parameters: Any) -> Run:
+    def spawn(self, *, environment: str | None = None, **parameters: Any) -> Run:
         if self.id is None:
             raise RebaseWorkflowError("model handle has no ID")
         return self._client.run_model(self.id, parameters, environment=environment)
 
-    def remote(self, *, environment: str = "dev", **parameters: Any) -> dict[str, Any]:
+    def remote(self, *, environment: str | None = None, **parameters: Any) -> dict[str, Any]:
         return self.spawn(environment=environment, **parameters).result()
 
-    def run(self, *, environment: str = "dev", **parameters: Any) -> Run:
+    def run(self, *, environment: str | None = None, **parameters: Any) -> Run:
         return self.spawn(environment=environment, **parameters)
 
 
@@ -5679,14 +6083,16 @@ class Model(_EmflowModel):
             publication_metadata=publication_metadata,
         )
 
+    @_environment_scoped_deploy
     def deploy(
         self,
         *,
         replace: bool = False,
-        environment: str = "dev",
+        environment: str | None = None,
         huggingface: HuggingFacePublishConfig | None = None,
         deploy_source: str | None = None,
     ) -> Model:
+        environment = _resolve_environment(self._client, environment)
         function = self.as_function()
         if function.source_code is None or function.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy a model without source_code and operation entrypoint")
@@ -5749,17 +6155,18 @@ class Model(_EmflowModel):
             self.data["huggingface_publication"] = publication
         return self
 
-    def spawn(self, *, environment: str = "dev", **parameters: Any) -> Run:
+    def spawn(self, *, environment: str | None = None, **parameters: Any) -> Run:
+        environment = _resolve_environment(self._client, environment)
         if self.id is None:
             self.deploy(environment=environment)
         if self.id is None:
             raise RebaseWorkflowError("model has no ID after deployment")
         return self._client.run_model(self.id, parameters, environment=environment)
 
-    def remote(self, *, environment: str = "dev", **parameters: Any) -> dict[str, Any]:
+    def remote(self, *, environment: str | None = None, **parameters: Any) -> dict[str, Any]:
         return self.spawn(environment=environment, **parameters).result()
 
-    def run(self, *, environment: str = "dev", **parameters: Any) -> Run:
+    def run(self, *, environment: str | None = None, **parameters: Any) -> Run:
         return self.spawn(environment=environment, **parameters)
 
     def ephemeral_run(self, **parameters: Any) -> Run:
@@ -6059,7 +6466,22 @@ class Workflow:
             closure = inspect.getclosurevars(self.fn)
         except TypeError:
             return []
-        return [v for v in [*closure.nonlocals.values(), *closure.globals.values()] if isinstance(v, Step)]
+        referenced = {**closure.globals, **closure.nonlocals}
+        ordered: list[Step] = []
+        seen: set[int] = set()
+        # Closure mappings are not a source-order contract (and Python 3.14
+        # changed their observed order). Bytecode preserves first use, which is
+        # the deploy order users see in a straight-line workflow declaration.
+        for instruction in dis.get_instructions(self.fn):
+            value = referenced.get(str(instruction.argval))
+            if isinstance(value, Step) and id(value) not in seen:
+                seen.add(id(value))
+                ordered.append(value)
+        for value in referenced.values():
+            if isinstance(value, Step) and id(value) not in seen:
+                seen.add(id(value))
+                ordered.append(value)
+        return ordered
 
     def _references_step(self) -> bool:
         return bool(self._collect_steps())
@@ -6122,14 +6544,16 @@ class Workflow:
                 f"Triggered workflows require defaults for every workflow parameter. Missing defaults: {missing}"
             )
 
+    @_environment_scoped_deploy
     def deploy(
         self,
         *,
         replace: bool = False,
         deploy_source: str | None = None,
-        environment: str = "dev",
+        environment: str | None = None,
         _skip_dataset_preflight: bool = False,
     ) -> Workflow:
+        environment = _resolve_environment(self._client, environment)
         if self.source_code is None or self.entrypoint is None:
             raise RebaseWorkflowError("cannot deploy a workflow handle without source_code and entrypoint")
         if self.name is None:

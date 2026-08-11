@@ -5,6 +5,7 @@ import getpass
 import importlib
 import importlib.util
 import json
+import os
 import sys
 import time
 from collections.abc import Iterable, Sequence
@@ -42,6 +43,7 @@ from rebase.client import (
     Bucket,
     Client,
     Cron,
+    Environment,
     Function,
     Model,
     OnUpdate,
@@ -73,6 +75,7 @@ from rebase.config import (
     remove_search_path,
     search_paths,
     selected_profile_name,
+    set_active_environment,
     set_default_profile,
     workspace_key,
     write_profile,
@@ -1192,6 +1195,29 @@ def _environment_policy_table(policies: list[dict[str, Any]]) -> Table:
             "yes" if policy.get("protected") else "no",
             "yes" if policy.get("require_pr") else "no",
             ", ".join(str(branch) for branch in branches) if branches else "-",
+        )
+    return table
+
+
+def _environment_grants_table(grants: list[dict[str, Any]]) -> Table:
+    table = Table(
+        title="Environment Grants",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+    )
+    table.add_column("Grant ID", style="rebase.muted")
+    table.add_column("Principal", style="rebase.value")
+    table.add_column("Kind")
+    table.add_column("Access")
+    for grant in grants:
+        profile_id = grant.get("profile_id")
+        api_key_id = grant.get("api_key_id")
+        table.add_row(
+            _format_value(grant.get("id")),
+            _format_value(profile_id or api_key_id),
+            "profile" if profile_id else "api key",
+            _format_value(grant.get("access")),
         )
     return table
 
@@ -2547,6 +2573,120 @@ def environment_list_command(
         _print_json(policies)
         return
     console.print(_environment_policy_table(policies))
+
+
+@environment_app.command("create")
+def environment_create_command(
+    environment: Annotated[str, typer.Argument(help="Environment name.")],
+    protected: Annotated[
+        bool, typer.Option("--protected/--direct", "-p/-d", help="Create a GitOps-protected environment.")
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", "-j")] = False,
+) -> None:
+    """Create an environment in the active workspace."""
+    created = Client().create_environment(
+        environment,
+        deploy_mode="gitops" if protected else "direct",
+        protected=protected,
+        require_pr=protected,
+        allowed_branches=["main", "master"] if protected else [],
+    )
+    _print_json(created) if json_output else console.print(_detail_table("Environment", created))
+
+
+@environment_app.command("show")
+def environment_show_command(
+    environment: Annotated[str, typer.Argument(help="Environment name.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j")] = False,
+) -> None:
+    """Show one environment."""
+    value = Client().get_environment(environment)
+    _print_json(value) if json_output else console.print(_detail_table("Environment", value))
+
+
+@environment_app.command("use")
+def environment_use_command(
+    environment: Annotated[str, typer.Argument(help="Environment name.")],
+) -> None:
+    """Select the environment for this workspace on this machine."""
+    client = Client()
+    client.get_environment(environment)
+    workspace_id = client.workspace_id or str(client.get_workspace()["id"])
+    set_active_environment(workspace_id, environment)
+    console.print(f"Active environment: [rebase.value]{environment}[/rebase.value]")
+
+
+@environment_app.command("grants")
+def environment_grants_command(
+    environment: Annotated[str, typer.Argument(help="Environment name.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j")] = False,
+) -> None:
+    """List explicit profile and API-key access grants."""
+    grants = Environment.from_name(environment).grants()
+    _print_json(grants) if json_output else console.print(_environment_grants_table(grants))
+
+
+@environment_app.command("grant")
+def environment_grant_command(
+    environment: Annotated[str, typer.Argument(help="Environment name.")],
+    profile_id: Annotated[
+        str | None, typer.Option("--profile-id", "-p", help="Workspace profile UUID.")
+    ] = None,
+    api_key_id: Annotated[str | None, typer.Option("--api-key-id", help="Workspace API key UUID.")] = None,
+    access: Annotated[str, typer.Option("--access", "-a", help="read, write, or admin.")] = "read",
+    json_output: Annotated[bool, typer.Option("--json", "-j")] = False,
+) -> None:
+    """Grant one profile or API key access to an environment."""
+    grant = Environment.from_name(environment).grant(
+        profile_id=profile_id,
+        api_key_id=api_key_id,
+        access=access,
+    )
+    _print_json(grant) if json_output else console.print(_detail_table("Environment Grant", grant))
+
+
+@environment_app.command("revoke-grant")
+def environment_revoke_grant_command(
+    environment: Annotated[str, typer.Argument(help="Environment name.")],
+    grant_id: Annotated[str, typer.Argument(help="Environment grant UUID.")],
+) -> None:
+    """Remove one explicit environment access grant."""
+    Environment.from_name(environment).revoke(grant_id)
+    console.print(f"Revoked environment grant [rebase.value]{grant_id}[/rebase.value]")
+
+
+@environment_app.command("delete")
+def environment_delete_command(
+    environment: Annotated[str, typer.Argument(help="Empty, unprotected environment to delete.")],
+) -> None:
+    """Delete an empty, unprotected environment."""
+    Client().delete_environment(environment)
+    console.print(f"Deleted environment [rebase.value]{environment}[/rebase.value]")
+
+
+@environment_app.command("track-project")
+def environment_track_project_command(
+    environment: Annotated[str, typer.Argument(help="Environment name.")],
+    project: Annotated[str, typer.Argument(help="Project name in that environment.")],
+    connection_id: Annotated[
+        str, typer.Option("--connection", "-c", help="GitHub repository connection ID.")
+    ],
+    ref: Annotated[str, typer.Option("--ref", "-r", help="Tracked branch or tag ref.")],
+    entrypoint: Annotated[str, typer.Option("--entrypoint", "-e", help="Python declaration file.")],
+    repo_path: Annotated[str | None, typer.Option("--repo-path")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j")] = False,
+) -> None:
+    """Bind an environment project to a GitHub ref and Python entrypoint."""
+    client = Client(environment_name=environment)
+    target = client.ensure_project(project, environment_name=environment)
+    track = client.track_project(
+        str(target["id"]),
+        github_connection_id=connection_id,
+        tracked_ref=ref,
+        entrypoint=entrypoint,
+        repo_path=repo_path,
+    )
+    _print_json(track) if json_output else console.print(_detail_table("Project Git Track", track))
 
 
 @environment_app.command("protect")
@@ -5019,8 +5159,8 @@ def model_deploy_command(
         typer.Option("--name", "-n", help="Deploy only the top-level variable name or model name."),
     ] = None,
     environment: Annotated[
-        str, typer.Option("--env", "-e", help="Deployment environment: dev, staging, or prod.")
-    ] = "dev",
+        str | None, typer.Option("--env", "-e", help="Environment; defaults to the active environment.")
+    ] = None,
 ) -> None:
     """Deploy model objects from a Python file."""
     module = _load_module(file)
@@ -5266,19 +5406,29 @@ def deploy_command(
         typer.Option("--source", "-s", help="Override deploy source for this command: rebase or github."),
     ] = None,
     environment: Annotated[
-        str, typer.Option("--env", "-e", help="Deployment environment: dev, staging, or prod.")
-    ] = "dev",
+        str | None, typer.Option("--env", "-e", help="Environment; defaults to the active environment.")
+    ] = None,
     plan: Annotated[bool, typer.Option("--plan", "-p", help="Show the deployment path without applying it.")] = False,
-    sync: Annotated[bool, typer.Option("--sync", help="Reserved for reconciler-based GitOps sync.")] = False,
+    sync: Annotated[bool, typer.Option("--sync", help="Apply a platform-authorized GitOps reconciliation.")] = False,
 ) -> None:
     """Deploy Rebase objects from a Python file."""
     client = Client()
+    environment = environment or getattr(client, "environment_name", "dev")
     policy = _environment_policy(client, environment)
     if _policy_requires_gitops(policy):
         if source == "rebase":
             raise RebaseWorkflowError("protected environments require GitHub-backed source; remove `--source rebase`.")
         if sync:
-            raise RebaseWorkflowError("direct GitOps sync is not available yet; protected deploys create a PR request.")
+            if not os.getenv("REBASE_GITOPS_RELEASE_ID"):
+                raise RebaseWorkflowError("--sync is reserved for the platform GitOps reconciler.")
+            deployed = deploy_file(
+                file,
+                object_names=name,
+                deploy_source=source or "github",
+                environment=environment,
+            )
+            console.print(_deploy_table(deployed))
+            return
         if plan:
             metadata = _gitops_source_metadata(file)
             console.print(

@@ -70,7 +70,7 @@ def test_client_sends_bearer_token(monkeypatch) -> None:
     assert observed == {
         "method": "GET",
         "url": "https://workflows.example.com/workflows",
-        "headers": {"Authorization": "Bearer rbw_test"},
+        "headers": {"Authorization": "Bearer rbw_test", "X-Rebase-Environment": "dev"},
     }
 
 
@@ -126,7 +126,7 @@ def test_stream_request_parses_ndjson(monkeypatch) -> None:
     assert observed == {
         "method": "POST",
         "url": "https://workflows.example.com/functions/fn/map",
-        "headers": {"Authorization": "Bearer rbw_test"},
+        "headers": {"Authorization": "Bearer rbw_test", "X-Rebase-Environment": "dev"},
         "stream": True,
         "timeout": None,
     }
@@ -754,7 +754,7 @@ def test_client_get_project_requests_project_endpoint(monkeypatch) -> None:
     assert observed == {
         "method": "GET",
         "url": "https://workflows.example.com/projects/project-id",
-        "headers": {"Authorization": "Bearer rbw_test"},
+        "headers": {"Authorization": "Bearer rbw_test", "X-Rebase-Environment": "dev"},
     }
 
 
@@ -775,7 +775,7 @@ def test_client_lists_run_events_from_events_endpoint(monkeypatch) -> None:
     assert observed == {
         "method": "GET",
         "url": "https://workflows.example.com/runs/run-id/events",
-        "headers": {"Authorization": "Bearer rbw_test"},
+        "headers": {"Authorization": "Bearer rbw_test", "X-Rebase-Environment": "dev"},
     }
 
 
@@ -799,7 +799,7 @@ def test_client_lists_runs_with_filters(monkeypatch) -> None:
     assert observed == {
         "method": "GET",
         "url": "https://workflows.example.com/runs",
-        "headers": {"Authorization": "Bearer rbw_test"},
+        "headers": {"Authorization": "Bearer rbw_test", "X-Rebase-Environment": "dev"},
         "params": {
             "project_id": "project-id",
             "target_type": "workflow",
@@ -982,6 +982,7 @@ def test_client_sends_workspace_header_from_local_profile(monkeypatch, tmp_path)
 
     assert observed["headers"] == {
         "Authorization": "Bearer rbw_profile",
+        "X-Rebase-Environment": "dev",
         "X-Rebase-Workspace": "workspace-id",
     }
 
@@ -1009,6 +1010,7 @@ def test_client_prefers_explicit_access_token_over_profile_api_key(monkeypatch, 
 
     assert observed["headers"] == {
         "Authorization": "Bearer supabase-token",
+        "X-Rebase-Environment": "dev",
         "X-Rebase-Workspace": "workspace-id",
     }
 
@@ -2111,9 +2113,10 @@ def test_project_deploy_sends_source_settings(monkeypatch) -> None:
         "description": None,
         "source_mode": "workspace_repo",
         "repo_owner": None,
-        "repo_name": None,
-        "repo_path": "projects/energy-forecasting",
-    }
+            "repo_name": None,
+            "repo_path": "projects/energy-forecasting",
+            "environment_name": "dev",
+        }
 
 
 def test_function_from_name_spawns_remote_run(monkeypatch) -> None:

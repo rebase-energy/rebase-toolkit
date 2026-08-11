@@ -69,6 +69,7 @@ from rebase.config import (
     local_workspace_id,
     search_paths,
     selected_profile_name,
+    set_active_environment,
     set_default_profile,
     workspace_key,
 )
@@ -126,6 +127,9 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "Created",
     ),
     "workspace-profiles-table": ("Active", "Profile", "Workspace", "Workspace ID", "API URL"),
+    "buckets-table": ("Bucket", "Created", "Updated"),
+    "volumes-table": ("Volume", "Provider", "Storage", "Prefix", "Created", "Updated"),
+    "secrets-table": ("Secret", "Keys"),
     # `Origin` sits second in both: you read what a thing is called, then what kind of
     # thing it is, and every column after it is one a one-off has no answer for.
     "functions-table": (
@@ -197,6 +201,9 @@ TERMINAL_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 #: through, mark rows in, or scroll sideways — see `RebaseTuiApp._preserve_view`.
 PRESERVED_TABLE_IDS: tuple[str, ...] = (
     "projects-table",
+    "buckets-table",
+    "volumes-table",
+    "secrets-table",
     *TARGET_TABLE_IDS,
     "runs-table",
     "timeline-table",
@@ -299,6 +306,10 @@ class WorkspaceOverviewData:
     projects: list[dict[str, Any]]
     project_summaries: list[ProjectSummary]
     project_names: dict[str, str]
+    environments: list[dict[str, Any]] = field(default_factory=list)
+    buckets: list[dict[str, Any]] = field(default_factory=list)
+    volumes: list[dict[str, Any]] = field(default_factory=list)
+    secrets: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -519,12 +530,41 @@ class RebaseTuiData:
         self.project = project
         self.limit = limit
 
+    @property
+    def environment_name(self) -> str:
+        value = getattr(self.client, "environment_name", None)
+        return value if isinstance(value, str) and value else "dev"
+
+    def use_environment(self, name: str) -> None:
+        """Move every subsequent TUI request into one environment."""
+        switch = getattr(self.client, "with_environment", None)
+        if callable(switch):
+            self.client = switch(name)
+
+    def _optional_resource_list(self, method: str) -> list[dict[str, Any]]:
+        load = getattr(self.client, method, None)
+        if not callable(load):
+            return []
+        try:
+            result = load()
+        except RebaseWorkflowError:
+            return []
+        return result if isinstance(result, list) else []
+
     def load_workspace_overview(self) -> WorkspaceOverviewData:
         projects = self.client.list_projects()
         if self.project is not None and not any(project.get("name") == self.project for project in projects):
             raise RebaseWorkflowError(f"project not found: {self.project}")
 
         counts = self._overview_counts(projects)
+        # These are environment siblings of Projects. Older servers and lightweight
+        # test clients may not expose all three routes yet, so each column degrades on
+        # its own instead of taking the project overview down with it.
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            environments = executor.submit(self._optional_resource_list, "list_environments")
+            buckets = executor.submit(self._optional_resource_list, "list_buckets")
+            volumes = executor.submit(self._optional_resource_list, "list_volumes")
+            secrets = executor.submit(self._optional_resource_list, "list_secrets")
         return WorkspaceOverviewData(
             projects=projects,
             project_summaries=[
@@ -540,6 +580,10 @@ class RebaseTuiData:
                 for project in projects
             ],
             project_names={str(project.get("id", "")): str(project.get("name", "-")) for project in projects},
+            environments=environments.result() or [{"name": self.environment_name}],
+            buckets=buckets.result(),
+            volumes=volumes.result(),
+            secrets=secrets.result(),
         )
 
     def _overview_counts(self, projects: list[dict[str, Any]]) -> OverviewCounts:
@@ -2000,6 +2044,67 @@ class TimezoneChoiceScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class EnvironmentChoiceScreen(ModalScreen[str | None]):
+    """Pick the environment whose isolated resources the workspace view shows."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    CSS = f"""
+    EnvironmentChoiceScreen {{
+        align: center middle;
+        background: #101412 70%;
+    }}
+
+    #environment-dialog {{
+        width: 54;
+        height: auto;
+        max-height: 20;
+        padding: 1 2;
+        background: #101412;
+        border: solid {BRAND_BRIGHT_GREEN};
+    }}
+
+    #environment-title {{
+        color: {BRAND_BRIGHT_GREEN};
+        text-style: bold;
+        margin-bottom: 1;
+    }}
+
+    #environment-options {{
+        height: auto;
+        max-height: 12;
+        background: #101412;
+        border: none;
+    }}
+
+    #environment-hint {{
+        color: {BRAND_MEDIUM_GRAY};
+        margin-top: 1;
+    }}
+    """
+
+    def __init__(self, environments: Sequence[str], *, current: str) -> None:
+        super().__init__()
+        self.environments = list(dict.fromkeys([current, *environments]))
+        self.current = current
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="environment-dialog"):
+            yield Static(f"Environment — currently {self.current}", id="environment-title")
+            yield OptionList(*self.environments, id="environment-options")
+            yield Static("Enter selects. Escape cancels.", id="environment-hint")
+
+    def on_mount(self) -> None:
+        options = self.query_one("#environment-options", OptionList)
+        options.highlighted = self.environments.index(self.current)
+        options.focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(str(event.option.prompt))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class RebaseTuiApp(App[None]):
     TITLE = "Rebase TUI"
     SUB_TITLE = ""
@@ -2013,6 +2118,8 @@ class RebaseTuiApp(App[None]):
         Binding("d", "delete_selection", "Delete", show=False),
         Binding("o", "open_source", "Open source", show=False),
         Binding("g", "open_github", "Open deployed code on GitHub", show=False),
+        Binding("w", "switch_workspace", "Switch workspace", show=False),
+        Binding("v", "choose_environment", "Switch environment", show=False),
         Binding("s", "toggle_terminal_select", "Select text", show=False),
         Binding("p", "show_details", "Details", show=False),
         Binding("l", "toggle_logs", "Logs", show=False),
@@ -2061,6 +2168,9 @@ class RebaseTuiApp(App[None]):
     }}
 
     #projects-table,
+    #buckets-table,
+    #volumes-table,
+    #secrets-table,
     #runs-table,
     #timeline-table {{
         overflow-x: hidden;
@@ -2088,13 +2198,26 @@ class RebaseTuiApp(App[None]):
         scrollbar-color-active: {BRAND_MAIN_GREEN};
     }}
 
-    #projects-table {{
+    #projects-table,
+    #buckets-table,
+    #volumes-table,
+    #secrets-table {{
+        height: 1fr;
+    }}
+
+    #environment-context {{
+        height: 1;
+        padding: 0 1;
+        color: {BRAND_BRIGHT_GREEN};
+    }}
+
+    #workspace-resource-tabs {{
         height: 1fr;
     }}
 
     #workspace-empty {{
         height: auto;
-        padding: 1;
+        padding: 0 1;
         color: {BRAND_MEDIUM_GRAY};
     }}
 
@@ -2110,16 +2233,19 @@ class RebaseTuiApp(App[None]):
     /* A pair of chips rather than Textual's underlined labels: the selected one is a
        filled rectangle, which reads as "this is the one" at a glance and, unlike a bar
        drawn under the text, costs no row of its own. */
+    #workspace-resource-tabs Tabs,
     #target-tabs Tabs,
     #timeline-tabs {{
         height: 1;
     }}
 
+    #workspace-resource-tabs Underline,
     #target-tabs Underline,
     #timeline-tabs Underline {{
         display: none;
     }}
 
+    #workspace-resource-tabs Tab,
     #target-tabs Tab,
     #timeline-tabs Tab {{
         padding: 0 1;
@@ -2127,6 +2253,7 @@ class RebaseTuiApp(App[None]):
         color: {BRAND_MEDIUM_GRAY};
     }}
 
+    #workspace-resource-tabs Tab:hover,
     #target-tabs Tab:hover,
     #timeline-tabs Tab:hover {{
         color: {BRAND_BRIGHT_GREEN};
@@ -2134,6 +2261,8 @@ class RebaseTuiApp(App[None]):
 
     /* The `:focus` rule repeats the unfocused one because Textual's own
        `Tabs:focus .-active` would otherwise repaint it in the block-cursor colours. */
+    #workspace-resource-tabs Tab.-active,
+    #workspace-resource-tabs Tabs:focus Tab.-active,
     #target-tabs Tab.-active,
     #target-tabs Tabs:focus Tab.-active,
     #timeline-tabs Tab.-active,
@@ -2267,6 +2396,7 @@ class RebaseTuiApp(App[None]):
         self.profile_name = selected_profile_name()
         self.profile_data = load_profile(self.profile_name)
         self.workspace_overview: WorkspaceOverviewData | None = None
+        self.environment_name = self.data.environment_name
         self.project_targets: ProjectTargetsData | None = None
         self.selected_project: dict[str, Any] | None = None
         self.selected_target_type: TargetType | None = None
@@ -2276,6 +2406,11 @@ class RebaseTuiApp(App[None]):
         self.current_view: ViewName = "workspace"
         self.view_before_switcher: ViewName = "workspace"
         self._project_rows: dict[str, ProjectSummary] = {}
+        self._workspace_resource_rows: dict[str, dict[str, dict[str, Any]]] = {
+            "buckets-table": {},
+            "volumes-table": {},
+            "secrets-table": {},
+        }
         self._profile_rows: dict[str, dict[str, Any]] = {}
         self._function_rows: dict[str, dict[str, Any]] = {}
         self._workflow_rows: dict[str, dict[str, Any]] = {}
@@ -2309,7 +2444,16 @@ class RebaseTuiApp(App[None]):
     def compose(self) -> ComposeResult:
         yield RebaseHeader(show_clock=True, icon="• Commands")
         with Vertical(id="workspace-view"):
-            yield SelectableDataTable(id="projects-table")
+            yield Static("", id="environment-context")
+            with TabbedContent(initial="projects-resource-tab", id="workspace-resource-tabs"):
+                with TabPane(Content("[ Projects ]"), id="projects-resource-tab"):
+                    yield SelectableDataTable(id="projects-table")
+                with TabPane(Content("[ Buckets ]"), id="buckets-resource-tab"):
+                    yield HeaderSafeDataTable(id="buckets-table")
+                with TabPane(Content("[ Volumes ]"), id="volumes-resource-tab"):
+                    yield HeaderSafeDataTable(id="volumes-table")
+                with TabPane(Content("[ Secrets ]"), id="secrets-resource-tab"):
+                    yield HeaderSafeDataTable(id="secrets-table")
             yield Static("", id="workspace-empty")
         with Vertical(id="workspace-switcher-view"):
             yield HeaderSafeDataTable(id="workspace-profiles-table")
@@ -2676,6 +2820,11 @@ class RebaseTuiApp(App[None]):
         projects.cursor_type = "row"
         projects.zebra_stripes = False
 
+        for table_id in ("buckets-table", "volumes-table", "secrets-table"):
+            resource = self.query_one(f"#{table_id}", DataTable)
+            resource.cursor_type = "row"
+            resource.zebra_stripes = True
+
         profiles = self.query_one("#workspace-profiles-table", DataTable)
         profiles.cursor_type = "row"
         profiles.zebra_stripes = True
@@ -2810,6 +2959,39 @@ class RebaseTuiApp(App[None]):
             self._clear_target_detail()
             self._show_workspace_view()
 
+    def action_switch_workspace(self) -> None:
+        """Open the workspace picker from anywhere in the TUI."""
+        if self.current_view != "workspace-switcher":
+            self._open_workspace_switcher()
+
+    def action_choose_environment(self) -> None:
+        """Open the environment picker without leaving the current workspace."""
+        environments = [
+            str(item["name"])
+            for item in (self.workspace_overview.environments if self.workspace_overview else [])
+            if item.get("name")
+        ]
+        self.push_screen(
+            EnvironmentChoiceScreen(environments or [self.environment_name], current=self.environment_name),
+            self._on_environment_chosen,
+        )
+
+    def _on_environment_chosen(self, environment: str | None) -> None:
+        if environment is None or environment == self.environment_name:
+            return
+        self.environment_name = environment
+        self.data.use_environment(environment)
+        workspace_id = getattr(self.data.client, "workspace_id", None)
+        if isinstance(workspace_id, str) and workspace_id:
+            set_active_environment(workspace_id, environment)
+        self.workspace_overview = None
+        self.selected_project = None
+        self.project_targets = None
+        self._clear_target_detail()
+        self._show_workspace_view()
+        self._update_workspace_title()
+        self.action_refresh()
+
     def on_click(self, event: events.Click) -> None:
         if event.widget.__class__.__name__ == "HeaderTitle":
             event.stop()
@@ -2821,7 +3003,14 @@ class RebaseTuiApp(App[None]):
     def _visible_boxes(self) -> list[DataTable]:
         """The tables `tab` moves between, top to bottom, as the screen currently stands."""
         if self.current_view == "workspace":
-            return [self.query_one("#projects-table", DataTable)]
+            active = self.query_one("#workspace-resource-tabs", TabbedContent).active
+            table = {
+                "projects-resource-tab": "#projects-table",
+                "buckets-resource-tab": "#buckets-table",
+                "volumes-resource-tab": "#volumes-table",
+                "secrets-resource-tab": "#secrets-table",
+            }.get(active, "#projects-table")
+            return [self.query_one(table, DataTable)]
         if self.current_view == "workspace-switcher":
             return [self.query_one("#workspace-profiles-table", DataTable)]
         active = self.query_one("#target-tabs", TabbedContent).active
@@ -3132,7 +3321,9 @@ class RebaseTuiApp(App[None]):
         not what `d` looks like it would do there.
         """
         if self.current_view == "workspace":
-            return self.query_one("#projects-table", SelectableDataTable)
+            if self.query_one("#workspace-resource-tabs", TabbedContent).active == "projects-resource-tab":
+                return self.query_one("#projects-table", SelectableDataTable)
+            return None
         if self.current_view != "project":
             return None
         focused = self.focused
@@ -3473,6 +3664,11 @@ class RebaseTuiApp(App[None]):
         self._select_timeline_filter(order[(current + delta) % len(order)])
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+        if event.tabs.parent is not None and event.tabs.parent.id == "workspace-resource-tabs":
+            boxes = self._visible_boxes()
+            if boxes:
+                boxes[0].focus()
+            return
         if (
             event.tabs.id == "timeline-tabs"
             and event.tab.id in self._available_timeline_filters()
@@ -3522,6 +3718,56 @@ class RebaseTuiApp(App[None]):
                 self._time(summary.next_run_at),
                 self._time(project.get("created_at")),
                 key=project_id,
+            )
+
+        self.query_one("#environment-context", Static).update(
+            Text.assemble(
+                ("Environment: ", BRAND_MEDIUM_GRAY),
+                (self.environment_name, f"bold {BRAND_BRIGHT_GREEN}"),
+                ("  ·  press v to switch", BRAND_MEDIUM_GRAY),
+            )
+        )
+        self._render_environment_resources(overview)
+
+    def _render_environment_resources(self, overview: WorkspaceOverviewData) -> None:
+        buckets = self._fill_table("buckets-table")
+        bucket_rows = {
+            str(item.get("id") or item.get("name")): item for item in overview.buckets if item.get("name")
+        }
+        self._workspace_resource_rows["buckets-table"] = bucket_rows
+        for key, item in bucket_rows.items():
+            buckets.add_row(
+                str(item.get("name", "-")),
+                self._time(item.get("created_at")),
+                self._time(item.get("updated_at")),
+                key=key,
+            )
+
+        volumes = self._fill_table("volumes-table")
+        volume_rows = {
+            str(item.get("id") or item.get("name")): item for item in overview.volumes if item.get("name")
+        }
+        self._workspace_resource_rows["volumes-table"] = volume_rows
+        for key, item in volume_rows.items():
+            volumes.add_row(
+                str(item.get("name", "-")),
+                str(item.get("provider", "-")),
+                str(item.get("bucket", "-")),
+                str(item.get("prefix", "-")),
+                self._time(item.get("created_at")),
+                self._time(item.get("updated_at")),
+                key=key,
+            )
+
+        secrets = self._fill_table("secrets-table")
+        secret_rows = {str(item.get("name")): item for item in overview.secrets if item.get("name")}
+        self._workspace_resource_rows["secrets-table"] = secret_rows
+        for key, item in secret_rows.items():
+            keys = item.get("keys")
+            secrets.add_row(
+                str(item.get("name", "-")),
+                ", ".join(str(value) for value in keys) if isinstance(keys, list) else "-",
+                key=key,
             )
 
     def _render_workspace_profiles(self) -> None:
@@ -3858,7 +4104,7 @@ class RebaseTuiApp(App[None]):
         self.query_one("#workspace-view", Vertical).styles.display = "block"
         self.query_one("#project-view", Vertical).styles.display = "none"
         self.query_one("#workspace-switcher-view", Vertical).styles.display = "none"
-        self.query_one("#projects-table", DataTable).focus()
+        self._visible_boxes()[0].focus()
 
     def _show_project_view(self) -> None:
         self.current_view = "project"
@@ -3909,6 +4155,7 @@ class RebaseTuiApp(App[None]):
             ),
             limit=self.limit,
         )
+        self.environment_name = self.data.environment_name
         self.workspace_overview = None
         self.project_targets = None
         self.selected_project = None
@@ -4026,6 +4273,15 @@ class RebaseTuiApp(App[None]):
                         endpoints=summary.endpoint_count,
                     ),
                 ],
+            )
+        if table_id in self._workspace_resource_rows:
+            item = self._workspace_resource_rows[table_id].get(key)
+            if item is None:
+                return None
+            kind = table_id.removesuffix("-table").removesuffix("s").title()
+            return DetailDrawer(
+                fields=[DetailField(kind, str(item.get("name", "-")))],
+                sections=[detail_payload(item, environment=self.environment_name)],
             )
         if table_id == "functions-table":
             item = self._function_rows.get(key)

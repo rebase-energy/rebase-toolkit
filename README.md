@@ -133,6 +133,72 @@ rebase workspace list
 rebase workspace switch prod
 ```
 
+## Environments and GitOps
+
+Environments are workspace namespaces, not values baked into an app. Projects and
+their compute, runs, endpoints, schedules, models, secrets, volumes, and buckets all
+live in one environment. The same project name can therefore exist independently in
+`dev`, `staging`, a pull-request environment, or `prod`.
+
+Select a default for the current workspace:
+
+```bash
+rebase environment create preview
+rebase environment use preview
+```
+
+Or keep the choice in Python. An explicit environment wins over the ambient context,
+which wins over `REBASE_ENVIRONMENT` and the locally selected default:
+
+```python
+import rebase as rb
+
+preview = rb.Environment.from_name("preview", create_if_missing=True)
+
+with preview:
+    project = rb.project("forecasting")
+
+    @project.function(buckets=["forecasts"])
+    def build_forecast() -> dict:
+        return {"ok": True}
+
+    project.deploy()
+```
+
+Persistent resources use the same context and are isolated by environment:
+
+```python
+with rb.Environment.from_name("prod"):
+    forecasts = rb.Bucket.from_name("forecasts", create_if_missing=True)
+    cache = rb.Volume.from_name("model-cache", create_if_missing=True)
+    credentials = rb.Secret.from_name("weather-api")
+```
+
+Environment access is explicit when a workspace needs narrower boundaries:
+
+```python
+prod = rb.Environment.from_name("prod")
+prod.grant(profile_id="PROFILE_UUID", access="read")
+prod.grant(api_key_id="API_KEY_UUID", access="write")
+```
+
+Protect an environment and bind each of its projects to a Git ref and Python
+declaration file:
+
+```bash
+rebase environment protect prod --allowed-branch main
+rebase environment track-project prod forecasting \
+  --connection CONNECTION_ID \
+  --ref refs/heads/main \
+  --entrypoint deploy.py
+```
+
+A signed GitHub push then reconciles the exact merged commit in an isolated job. The
+Python file is the desired state—there is no deployment YAML. Objects removed from the
+file are pruned from compute after a successful apply; secrets, buckets, volumes, and
+their data are retained. Endpoint URLs include the environment, for example
+`/e/acme/prod/forecasting/predict`.
+
 ## Minimal Function
 
 ```python
