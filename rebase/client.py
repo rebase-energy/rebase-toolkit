@@ -748,6 +748,215 @@ def _resolve_volumes_payload(
     return attachments
 
 
+@dataclass(frozen=True)
+class BucketObject:
+    """One object in a provider-neutral :class:`Bucket`."""
+
+    key: str
+    size: int
+    updated: str | None = None
+    content_type: str | None = None
+    etag: str | None = None
+    version: str | None = None
+    digest: str | None = None
+
+
+class Bucket:
+    """A named object store managed through Rebase.
+
+    The backing provider is deliberately not part of this API. Reads and writes
+    use short-lived capability URLs issued by Rebase, so hosted code does not
+    receive cloud credentials and callers do not need provider SDKs.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        create_if_missing: bool = False,
+        client: Client | None = None,
+    ) -> None:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Bucket requires a non-empty name")
+        self.name = name.strip()
+        self.create_if_missing = create_if_missing
+        self._client = client
+        self._ensured = False
+
+    @classmethod
+    def from_name(cls, name: str, *, create_if_missing: bool = False) -> Bucket:
+        return cls(name, create_if_missing=create_if_missing)
+
+    def __repr__(self) -> str:
+        return f"Bucket({self.name!r})"
+
+    def _resolved_client(self) -> Client:
+        if self._client is None:
+            self._client = default_client()
+        return self._client
+
+    def ensure(self) -> dict[str, Any]:
+        """Resolve this logical bucket, creating it when requested."""
+        client = self._resolved_client()
+        value = client.create_bucket(self.name) if self.create_if_missing else client.get_bucket(self.name)
+        self._ensured = True
+        return value
+
+    def _ensure_for_write(self) -> None:
+        if self.create_if_missing and not self._ensured:
+            self.ensure()
+
+    def put(self, key: str, data: bytes | str | Path, *, content_type: str | None = None) -> str:
+        """Write one object from bytes, text, or a local path."""
+        self._ensure_for_write()
+        if isinstance(data, Path):
+            return self.put_file(data, key, content_type=content_type)
+        payload = data.encode("utf-8") if isinstance(data, str) else data
+        signed = self._signed_url(key, method="PUT", content_type=content_type)
+        headers = {"Content-Type": content_type} if content_type else None
+        response = requests.put(signed, data=payload, headers=headers, timeout=600)
+        if response.status_code >= 400:
+            raise RebaseWorkflowError(f"bucket upload failed: {response.status_code} {response.text[:200]}")
+        return key.lstrip("/")
+
+    def put_file(
+        self,
+        local_path: str | Path,
+        key: str | None = None,
+        *,
+        content_type: str | None = None,
+    ) -> str:
+        """Stream one local file into the bucket."""
+        local = Path(local_path)
+        target = (key or local.name).lstrip("/")
+        self._ensure_for_write()
+        signed = self._signed_url(target, method="PUT", content_type=content_type)
+        headers = {"Content-Type": content_type} if content_type else None
+        with local.open("rb") as handle:
+            response = requests.put(signed, data=handle, headers=headers, timeout=600)
+        if response.status_code >= 400:
+            raise RebaseWorkflowError(f"bucket upload failed: {response.status_code} {response.text[:200]}")
+        return target
+
+    def get(self, key: str) -> bytes:
+        """Read one object into memory."""
+        response = requests.get(self._signed_url(key, method="GET"), timeout=600)
+        if response.status_code >= 400:
+            raise RebaseWorkflowError(f"bucket download failed: {response.status_code} {response.text[:200]}")
+        return response.content
+
+    def download(self, key: str, local_path: str | Path) -> Path:
+        """Stream one object to a local path."""
+        local = Path(local_path)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        with requests.get(self._signed_url(key, method="GET"), timeout=600, stream=True) as response:
+            if response.status_code >= 400:
+                raise RebaseWorkflowError(f"bucket download failed: {response.status_code} {response.text[:200]}")
+            with local.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    handle.write(chunk)
+        return local
+
+    def list(
+        self,
+        prefix: str = "",
+        *,
+        delimiter: str | None = None,
+        limit: int = 1000,
+        page_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Return one page of objects and logical prefixes."""
+        data = self._resolved_client().list_bucket_objects(
+            self.name,
+            prefix=prefix,
+            delimiter=delimiter,
+            limit=limit,
+            page_token=page_token,
+        )
+        return {
+            "objects": [_bucket_object(item) for item in data.get("objects", [])],
+            "prefixes": list(data.get("prefixes", [])),
+            "next_page_token": data.get("next_page_token"),
+        }
+
+    def iter_all(self, prefix: str = "") -> Iterator[BucketObject]:
+        """Iterate every object under a prefix."""
+        page_token: str | None = None
+        while True:
+            page = self.list(prefix, page_token=page_token)
+            yield from page["objects"]
+            page_token = page["next_page_token"]
+            if not page_token:
+                return
+
+    def stat(self, key: str) -> dict[str, Any]:
+        return self._resolved_client().stat_bucket_object(self.name, key)
+
+    def exists(self, key: str) -> bool:
+        try:
+            self.stat(key)
+        except RebaseWorkflowError as exc:
+            if exc.status_code == 404:
+                return False
+            raise
+        return True
+
+    def delete(self, key: str) -> None:
+        self._resolved_client().delete_bucket_object(self.name, key.lstrip("/"))
+
+    def signed_url(self, key: str, *, method: str = "GET", content_type: str | None = None) -> str:
+        """Return a short-lived object capability URL."""
+        return self._signed_url(key, method=method, content_type=content_type)
+
+    def _signed_url(self, key: str, *, method: str, content_type: str | None = None) -> str:
+        cleaned = key.lstrip("/")
+        data = self._resolved_client().create_bucket_signed_urls(
+            self.name,
+            [cleaned],
+            method=method,
+            content_type=content_type,
+        )
+        urls = data.get("urls", [])
+        if len(urls) != 1 or urls[0].get("path") != cleaned:
+            raise RebaseWorkflowError(f"no signed URL returned for {cleaned!r}")
+        return str(urls[0]["url"])
+
+
+def _bucket_object(item: dict[str, Any]) -> BucketObject:
+    return BucketObject(
+        key=str(item.get("path", "")),
+        size=int(item.get("size", 0)),
+        updated=item.get("updated"),
+        content_type=item.get("content_type"),
+        etag=item.get("etag"),
+        version=item.get("version"),
+        digest=item.get("digest"),
+    )
+
+
+def _resolve_buckets_payload(buckets: list[Any] | None) -> list[dict[str, str]]:
+    """Normalize a deployment's logical bucket attachments."""
+    if buckets is None:
+        return []
+    attachments: list[dict[str, str]] = []
+    for item in buckets:
+        if isinstance(item, Bucket) and item.create_if_missing:
+            item.ensure()
+        if isinstance(item, dict):
+            name = item.get("bucket")
+        elif isinstance(item, Bucket):
+            name = item.name
+        else:
+            name = item if isinstance(item, str) else None
+        if not isinstance(name, str) or not name.strip():
+            raise RebaseWorkflowError("buckets entries must be rebase.Bucket or bucket names")
+        attachments.append({"bucket": name.strip()})
+    names = [item["bucket"] for item in attachments]
+    if len(names) != len(set(names)):
+        raise RebaseWorkflowError("bucket attachments must be unique")
+    return sorted(attachments, key=lambda item: item["bucket"])
+
+
 def _coerce_config_dict(value: Any, *, field_name: str) -> dict[str, Any] | None:
     """Normalize a Contract/Freshness instance (anything with ``to_dict``) or dict to a dict."""
     if value is None:
@@ -2108,6 +2317,76 @@ class Client:
     def delete_volume_object(self, name: str, path: str) -> None:
         self.request("DELETE", f"/volumes/{name}/objects", params={"path": path})
 
+    def list_buckets(self) -> list[dict[str, Any]]:
+        response = self.request("GET", "/buckets")
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected bucket list response")
+        return response
+
+    def create_bucket(self, name: str) -> dict[str, Any]:
+        response = self.request("POST", "/buckets", json={"name": name})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected bucket response")
+        return response
+
+    def get_bucket(self, name: str) -> dict[str, Any]:
+        response = self.request("GET", f"/buckets/{name}")
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected bucket response")
+        return response
+
+    def list_bucket_objects(
+        self,
+        name: str,
+        *,
+        prefix: str = "",
+        delimiter: str | None = None,
+        limit: int | None = None,
+        page_token: str | None = None,
+    ) -> dict[str, Any]:
+        params = {
+            key: value
+            for key, value in {
+                "prefix": prefix or None,
+                "delimiter": delimiter,
+                "limit": limit,
+                "page_token": page_token,
+            }.items()
+            if value is not None
+        }
+        response = self.request("GET", f"/buckets/{name}/objects", params=params or None)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected bucket object list response")
+        return response
+
+    def stat_bucket_object(self, name: str, path: str) -> dict[str, Any]:
+        response = self.request("GET", f"/buckets/{name}/objects/stat", params={"path": path})
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected bucket object stat response")
+        return response
+
+    def delete_bucket_object(self, name: str, path: str) -> None:
+        self.request("DELETE", f"/buckets/{name}/objects", params={"path": path})
+
+    def create_bucket_signed_urls(
+        self,
+        name: str,
+        paths: list[str],
+        *,
+        method: str = "GET",
+        content_type: str | None = None,
+        expires_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"paths": paths, "method": method}
+        if content_type is not None:
+            payload["content_type"] = content_type
+        if expires_seconds is not None:
+            payload["expires_seconds"] = expires_seconds
+        response = self.request("POST", f"/buckets/{name}/signed-urls", json=payload)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected bucket signed URL response")
+        return response
+
     def create_dataset(self, name: str, description: str | None = None) -> dict[str, Any]:
         response = self.request("POST", "/datasets", json={"name": name, "description": description})
         if not isinstance(response, dict):
@@ -3453,6 +3732,7 @@ class Client:
         run_type: RunType = DEFAULT_RUN_TYPE,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
+        buckets: list[dict[str, str]] | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         project: str | None = None,
@@ -3488,6 +3768,7 @@ class Client:
                 "run_type": _validate_run_type(run_type, target_type="workflow"),
                 "env": env or {},
                 "secrets": secrets or {},
+                "buckets": buckets or [],
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "environment": environment,
@@ -3523,6 +3804,7 @@ class Client:
         run_type: RunType | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
+        buckets: list[dict[str, str]] | object = _UNSET,
         enabled: bool | None = None,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         environment: str | None = None,
@@ -3570,6 +3852,8 @@ class Client:
             payload["schedule"] = schedule
         if trigger is not _UNSET:
             payload["trigger"] = trigger
+        if buckets is not _UNSET:
+            payload["buckets"] = buckets
         response = self.request("PATCH", f"/workflows/{workflow_id}", json=payload)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected workflow response")
@@ -3846,6 +4130,12 @@ class Client:
             raise RebaseWorkflowError("expected run artifact response")
         return response
 
+    def open_run_artifact(self, run_id: str, artifact_id: str) -> str:
+        response = self.request("POST", f"/runs/{run_id}/artifacts/{artifact_id}/open")
+        if not isinstance(response, dict) or not isinstance(response.get("url"), str):
+            raise RebaseWorkflowError("expected artifact open URL response")
+        return response["url"]
+
     def list_run_events(self, run_id: str) -> list[dict[str, Any]]:
         response = self.request("GET", f"/runs/{run_id}/events")
         if not isinstance(response, list):
@@ -4063,6 +4353,7 @@ class Project:
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | list[Secret | str] | None = None,
+        buckets: list[Bucket | str] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
         resources: dict[str, Any] | None = None,
@@ -4089,6 +4380,7 @@ class Project:
                 image=image,
                 env=env,
                 secrets=secrets,
+                buckets=buckets,
                 min_instances=min_instances,
                 concurrency=concurrency,
                 resources=resources,
@@ -5314,6 +5606,7 @@ class Workflow:
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | list[Secret | str] | None = None,
+        buckets: list[Bucket | str] | list[dict[str, Any]] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
         resources: dict[str, Any] | None = None,
@@ -5332,6 +5625,7 @@ class Workflow:
         self.project_source_mode = project_source_mode
         self.env = dict(env or (data.get("env") if data else None) or {})
         self.secrets = secrets if secrets is not None else dict((data.get("secrets") if data else None) or {})
+        self.buckets = buckets if buckets is not None else list((data.get("buckets") if data else None) or [])
         self.name = name or (data["name"] if data else None)
         self.flow_ref: str | None = None
         self.source_code: str | None = None
@@ -5504,6 +5798,7 @@ class Workflow:
         step_graph = self._build_step_graph()
         source_metadata = self._source_metadata_for_deploy(deploy_source)
         secrets_payload = _resolve_secrets_payload(self.secrets, self._client)
+        buckets_payload = _resolve_buckets_payload(self.buckets)
         existing = self._client.find_workflow(name, project=self.project)
         if existing is not None:
             workflow = self._client.update_workflow(
@@ -5520,6 +5815,7 @@ class Workflow:
                 run_type=self.run_type,
                 env=self.env,
                 secrets=secrets_payload,
+                buckets=buckets_payload,
                 enabled=self.enabled,
                 endpoint=self.endpoint,
                 environment=environment,
@@ -5545,6 +5841,7 @@ class Workflow:
             run_type=self.run_type,
             env=self.env,
             secrets=secrets_payload,
+            buckets=buckets_payload,
             enabled=self.enabled,
             endpoint=self.endpoint,
             environment=environment,

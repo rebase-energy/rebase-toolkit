@@ -8,7 +8,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from rebase.client import Client, RebaseWorkflowError
+from rebase.client import Bucket, Client, RebaseWorkflowError
 from rebase.runtime import _current_reporting_context, current_run
 from rebase.tasks import _current_task_id
 
@@ -24,7 +24,9 @@ class Artifact:
     """A durable output pointer registered against the current hosted run."""
 
     name: str
-    uri: str
+    uri: str | None = None
+    bucket: Bucket | str | None = None
+    object_key: str | None = None
     key: str | None = None
     disposition: ArtifactDisposition = "created"
     media_type: str | None = None
@@ -37,9 +39,16 @@ class Artifact:
 
     def __post_init__(self) -> None:
         self.name = self._required_string(self.name, field_name="name")
-        self.uri = self._required_string(self.uri, field_name="uri")
-        if not urlsplit(self.uri).scheme:
+        self.uri = self._optional_string(self.uri, field_name="uri")
+        bucket_name = self.bucket.name if isinstance(self.bucket, Bucket) else self.bucket
+        self.bucket = self._optional_string(bucket_name, field_name="bucket")
+        self.object_key = self._optional_string(self.object_key, field_name="object_key")
+        if self.uri is not None and not urlsplit(self.uri).scheme:
             raise ValueError("artifact uri must be an absolute URI with a scheme")
+        if self.uri is not None and (self.bucket is not None or self.object_key is not None):
+            raise ValueError("artifact accepts either uri or bucket plus object_key, not both")
+        if self.uri is None and (self.bucket is None or self.object_key is None):
+            raise ValueError("artifact requires uri or bucket plus object_key")
         self.key = self._optional_string(self.key, field_name="key")
         self.media_type = self._optional_string(self.media_type, field_name="media_type")
         self.version = self._optional_string(self.version, field_name="version")
@@ -89,6 +98,9 @@ class Artifact:
             "metadata": self.metadata,
             "client_token": self.client_token,
         }
+        if self.bucket is not None:
+            payload["bucket"] = self.bucket
+            payload["object_key"] = self.object_key
         if run.step_run_id is not None:
             payload["step_run_id"] = run.step_run_id
         task_id = _current_task_id() or run.task_id
@@ -107,7 +119,9 @@ class Artifact:
 def artifact(
     name: str,
     *,
-    uri: str,
+    uri: str | None = None,
+    bucket: Bucket | str | None = None,
+    object_key: str | None = None,
     key: str | None = None,
     disposition: ArtifactDisposition = "created",
     media_type: str | None = None,
@@ -120,6 +134,8 @@ def artifact(
     value = Artifact(
         name=name,
         uri=uri,
+        bucket=bucket,
+        object_key=object_key,
         key=key,
         disposition=disposition,
         media_type=media_type,

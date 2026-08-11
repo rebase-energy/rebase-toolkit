@@ -91,6 +91,26 @@ def test_hosted_artifact_reports_run_step_and_inline_task() -> None:
     }
 
 
+def test_bucket_artifact_reports_only_logical_bucket_and_object_key() -> None:
+    with _activate_run_context(
+        "run-1",
+        api_url="https://api.example",
+        api_key="rb_run",
+    ):
+        artifact = rb.artifact(
+            "curve",
+            bucket=rb.Bucket("power-system-data"),
+            object_key="raw/nordpool/curve.json",
+        )
+
+    payload = RecordingClient.instances[0].created[0][1]
+    assert payload["uri"] is None
+    assert payload["bucket"] == "power-system-data"
+    assert payload["object_key"] == "raw/nordpool/curve.json"
+    assert "gs://" not in str(payload)
+    assert artifact.bucket == "power-system-data"
+
+
 def test_mapped_artifact_uses_the_runtime_task_identity() -> None:
     with _activate_run_context(
         "child-run",
