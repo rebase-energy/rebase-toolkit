@@ -57,7 +57,7 @@ from rebase.client import (
     _flatten_config,
     _git,
     _parse_github_remote,
-    _validate_run_type,
+    _validate_execution,
 )
 from rebase.config import (
     DEFAULT_PROFILE,
@@ -350,10 +350,9 @@ def _print_run_help() -> None:
     options.add_column("Description")
     options.add_row("--param, -p", "Target parameter as name=json_value. Can be passed more than once.")
     options.add_row("--parameters-json", "JSON object with target parameters.")
-    options.add_row(
-        "--run-type, -r",
-        "Override the run type for this ephemeral run: quick, quick_shared (functions only), or long.",
-    )
+    options.add_row("--mode", "Execution mode: interactive (default) or job.")
+    options.add_row("--isolation, -i", "Interactive isolation: shared (default) or dedicated.")
+    options.add_row("--run-type, -r", "Deprecated alias: quick, quick_shared, or long.")
     options.add_row("--module, -m", "Interpret the target source as a Python module path instead of a file.")
     options.add_row("--wait / --no-wait, -w", "Wait for the function result before exiting. Defaults to --wait.")
     options.add_row("--timeout, -t", "Maximum seconds to wait for the result. Defaults to 600.")
@@ -522,12 +521,22 @@ def _parse_run_parameters(parameters_json: str | None, parameters: Iterable[str]
     return parsed
 
 
-def _validate_run_type_override(run_type: str | None, target: RunnableTarget) -> str | None:
-    if run_type is None:
+def _validate_execution_override(
+    mode: str | None,
+    isolation: str | None,
+    run_type: str | None,
+    target: RunnableTarget,
+) -> tuple[str, str] | None:
+    if mode is None and isolation is None and run_type is None:
         return None
     target_type = "workflow" if isinstance(target, Workflow) else "function"
     try:
-        return _validate_run_type(run_type, target_type=target_type)
+        return _validate_execution(
+            mode if mode is not None else (None if run_type is not None else target.mode),
+            isolation if isolation is not None else (None if run_type is not None else target.isolation),
+            target_type=target_type,
+            run_type=run_type,
+        )
     except ValueError as exc:
         raise RebaseWorkflowError(str(exc)) from exc
 
@@ -559,7 +568,7 @@ def _runs_table(runs: list[dict[str, Any]], *, project_names: dict[str, str]) ->
     table.add_column("ID", style="rebase.muted")
     table.add_column("Target")
     table.add_column("Status", style="rebase.value")
-    table.add_column("Run type")
+    table.add_column("Execution")
     table.add_column("Project")
     table.add_column("Created", style="rebase.muted")
     table.add_column("Finished", style="rebase.muted")
@@ -569,7 +578,7 @@ def _runs_table(runs: list[dict[str, Any]], *, project_names: dict[str, str]) ->
             str(run.get("id", "-")),
             _format_value(run.get("target_type")),
             _format_value(run.get("status")),
-            _format_value(run.get("run_type")),
+            _execution_label(run),
             project_names.get(project_id, project_id or "-"),
             _format_value(run.get("created_at")),
             _format_value(run.get("finished_at")),
@@ -593,6 +602,10 @@ def _emit_event_to_reporter(
         reporter.update(message)
     elif status == "failed":
         reporter.fail(message)
+    elif status == "info":
+        # An announcement introduces work rather than reporting on it, so it is neither a
+        # transient spinner line nor a tick. Ticking it would claim something finished.
+        reporter.announce(message)
     else:
         reporter.complete(message)
 
@@ -658,6 +671,10 @@ class _LineRunProgressReporter:
         prefix, style = _progress_prefix("running")
         console.print(f"{prefix} {message}", style=style)
 
+    def announce(self, message: str) -> None:
+        prefix, style = _progress_prefix("info")
+        console.print(f"{prefix} {message}", style=style)
+
     def complete(self, message: str) -> None:
         prefix, style = _progress_prefix("completed")
         console.print(f"{prefix} {message}", style=style)
@@ -711,6 +728,13 @@ class _TerminalRunProgressReporter:
             self._header.update(text=Text(message, style="rebase.info"))
         else:
             self._header = Spinner("dots", text=Text(message, style="rebase.info"))
+        self._refresh()
+
+    def announce(self, message: str) -> None:
+        # Kept in the tree rather than shown on the spinner: an announcement is a milestone
+        # worth still being able to read once the next stage has replaced the header, and it
+        # is not a tick — nothing completed.
+        self._tree.add(f"[dim]•[/dim] {message}")
         self._refresh()
 
     def complete(self, message: str) -> None:
@@ -810,28 +834,28 @@ def _stream_run_result(
     first_iteration = True
 
     while True:
-        if events_supported:
+        # The submit response already carries the terminal record for synchronous
+        # quick runs — in that case every per-iteration fetch below would be a
+        # wasted round trip: the run is over, so there is no progress to stream.
+        already_terminal = (
+            first_iteration and bool(run.data) and str(run.data.get("status") or "") in terminal_statuses
+        )
+
+        if events_supported and not already_terminal:
             try:
                 for event in run.events():
                     event_id = str(event.get("id", ""))
                     if not event_id or event_id in seen_event_ids:
                         continue
                     seen_event_ids.add(event_id)
-                    event_status = str(event.get("status") or "info")
-                    message = str(event.get("message") or "")
-                    if not message:
-                        continue
-                    if event_status == "running":
-                        reporter.update(message)
-                        continue
-                    if event_status == "failed":
-                        reporter.fail(message)
-                    else:
-                        reporter.complete(message)
+                    # Routed through the same helper the snapshot path uses. This loop used
+                    # to carry its own copy of the mapping, so a new status had to be taught
+                    # to both or the live view and the replayed one disagreed.
+                    _emit_event_to_reporter(reporter, event)
             except RebaseWorkflowError:
                 events_supported = False
 
-        if steps_supported:
+        if steps_supported and not already_terminal:
             try:
                 for step in run.steps():
                     step_key = str(step.get("id") or step.get("node_key") or step.get("name") or "")
@@ -847,7 +871,9 @@ def _stream_run_result(
             except RebaseWorkflowError:
                 steps_supported = False
 
-        if log_follower is not None:
+        if log_follower is not None and not already_terminal:
+            # Skipping here is safe: the terminal branch below does its own final
+            # log_follower.poll, which is the fetch that matters.
             log_follower.poll(reporter)
 
         data = run.data if first_iteration and run.data else run.refresh()
@@ -1605,6 +1631,14 @@ def _format_value(value: Any) -> str:
     return str(value)
 
 
+def _execution_label(value: dict[str, Any]) -> str:
+    mode = value.get("mode")
+    isolation = value.get("isolation")
+    if mode is not None:
+        return f"{mode}/{isolation}" if isolation is not None else str(mode)
+    return _format_value(value.get("run_type"))
+
+
 def _print_json(data: Any) -> None:
     console.print_json(data=data)
 
@@ -1669,7 +1703,7 @@ def _function_table(functions: list[dict[str, Any]], *, project_names: dict[str,
     )
     table.add_column("Name", style="rebase.value")
     table.add_column("Project")
-    table.add_column("Run type")
+    table.add_column("Execution")
     table.add_column("Enabled")
     table.add_column("ID", style="rebase.muted")
     table.add_column("Updated", style="rebase.muted")
@@ -1678,7 +1712,7 @@ def _function_table(functions: list[dict[str, Any]], *, project_names: dict[str,
         table.add_row(
             str(function.get("name", "-")),
             project_names.get(project_id, project_id or "-"),
-            _format_value(function.get("run_type")),
+            _execution_label(function),
             _format_value(function.get("enabled")),
             str(function.get("id", "-")),
             _format_value(function.get("updated_at")),
@@ -1697,7 +1731,7 @@ def _workflow_table(workflows: list[dict[str, Any]], *, project_names: dict[str,
     )
     table.add_column("Name", style="rebase.value")
     table.add_column("Project")
-    table.add_column("Run type")
+    table.add_column("Execution")
     table.add_column("Enabled")
     table.add_column("Schedule")
     table.add_column("ID", style="rebase.muted")
@@ -1707,7 +1741,7 @@ def _workflow_table(workflows: list[dict[str, Any]], *, project_names: dict[str,
         table.add_row(
             str(workflow.get("name", "-")),
             project_names.get(project_id, project_id or "-"),
-            _format_value(workflow.get("run_type")),
+            _execution_label(workflow),
             _format_value(workflow.get("enabled")),
             _format_schedule(workflow.get("schedule")),
             str(workflow.get("id", "-")),
@@ -1752,7 +1786,7 @@ def _model_table(models: list[dict[str, Any]], *, project_names: dict[str, str])
     table.add_column("Project")
     table.add_column("Kind")
     table.add_column("Operation")
-    table.add_column("Run type")
+    table.add_column("Execution")
     table.add_column("ID", style="rebase.muted")
     table.add_column("Updated", style="rebase.muted")
     for model in models:
@@ -1762,7 +1796,7 @@ def _model_table(models: list[dict[str, Any]], *, project_names: dict[str, str])
             project_names.get(project_id, project_id or "-"),
             _format_value(model.get("kind")),
             _format_value(model.get("operation_name")),
-            _format_value(model.get("run_type")),
+            _execution_label(model),
             str(model.get("id", "-")),
             _format_value(model.get("updated_at")),
         )
@@ -1835,14 +1869,14 @@ def _version_table(title: str, versions: list[dict[str, Any]]) -> Table:
     table.add_column("Version", style="rebase.value")
     table.add_column("ID", style="rebase.muted")
     table.add_column("Fingerprint")
-    table.add_column("Run type")
+    table.add_column("Execution")
     table.add_column("Created", style="rebase.muted")
     for version in versions:
         table.add_row(
             _format_value(version.get("version_number")),
             str(version.get("id", "-")),
             _format_value(version.get("fingerprint")),
-            _format_value(version.get("run_type")),
+            _execution_label(version),
             _format_value(version.get("created_at")),
         )
     return table
@@ -2818,6 +2852,13 @@ def secret_create_command(
         return
     keys = ", ".join(sorted((secret.get("secret_refs") or {}).keys()))
     console.print(f"Created secret [rebase.value]{secret.get('name', name)}[/rebase.value] with keys: {keys}")
+    # Name the workspace explicitly. `rebase workspace list` marks one profile
+    # active, but a mutating command resolves its target separately, and when the
+    # two disagree the write lands somewhere else entirely -- silently, because
+    # nothing in the output says where it went. Secrets are the worst case: this
+    # put a service-account key and a bot token in an unrelated workspace.
+    if client.workspace_id:
+        console.print(f"Workspace:   [rebase.value]{client.workspace_id}[/rebase.value]")
     console.print(
         f'Use it with: [rebase.value]secrets=[rebase.Secret.from_name("{secret.get("name", name)}")][/rebase.value]'
     )
@@ -4226,7 +4267,8 @@ def function_get_command(
                 "workspace_id",
                 "description",
                 "entrypoint",
-                "run_type",
+                "mode",
+                "isolation",
                 "enabled",
                 "default_parameters",
                 "image_spec",
@@ -4344,7 +4386,8 @@ def workflow_get_command(
                 "description",
                 "entrypoint",
                 "flow_ref",
-                "run_type",
+                "mode",
+                "isolation",
                 "enabled",
                 "default_parameters",
                 "current_version_id",
@@ -4555,7 +4598,7 @@ def workflow_schedule_trigger_command(
             _detail_table(
                 "Run Submitted",
                 run.data,
-                preferred_keys=["id", "status", "target_type", "run_type", "execution_backend", "created_at"],
+                preferred_keys=["id", "status", "target_type", "mode", "isolation", "execution_backend", "created_at"],
             )
         )
         return
@@ -4952,7 +4995,8 @@ def model_get_command(
                 "kind",
                 "operation_name",
                 "description",
-                "run_type",
+                "mode",
+                "isolation",
                 "enabled",
                 "default_parameters",
                 "image_spec",
@@ -5411,12 +5455,20 @@ def run_command(
         str | None,
         typer.Option("--parameters-json", help="JSON object with target parameters."),
     ] = None,
+    mode: Annotated[
+        str | None,
+        typer.Option("--mode", help="Execution mode: interactive (default) or job."),
+    ] = None,
+    isolation: Annotated[
+        str | None,
+        typer.Option("--isolation", "-i", help="Interactive isolation: shared (default) or dedicated."),
+    ] = None,
     run_type: Annotated[
         str | None,
         typer.Option(
             "--run-type",
             "-r",
-            help="Override the run type for this ephemeral run: quick, quick_shared (functions only), or long.",
+            help="Deprecated alias for execution mode/isolation: quick, quick_shared, or long.",
         ),
     ] = None,
     module: Annotated[
@@ -5439,8 +5491,8 @@ def run_command(
 ) -> None:
     """Run local Rebase targets and inspect submitted runs."""
     if local:
-        if run_type is not None:
-            raise RebaseWorkflowError("--local runs in-process; --run-type selects a cloud run type")
+        if mode is not None or isolation is not None or run_type is not None:
+            raise RebaseWorkflowError("--local runs in-process; execution options select cloud execution")
         if not wait:
             raise RebaseWorkflowError("--local always runs synchronously; drop --no-wait")
         _run_local_target(target_ref, as_module=module, parameters_json=parameters_json, parameter=parameter)
@@ -5455,9 +5507,9 @@ def run_command(
         target = _resolve_run_target(target_ref, as_module=module)
         reporter.complete("Loaded local Rebase target.")
 
-        run_type_override = _validate_run_type_override(run_type, target)
-        if run_type_override is not None:
-            target.run_type = run_type_override
+        execution_override = _validate_execution_override(mode, isolation, run_type, target)
+        if execution_override is not None:
+            target.mode, target.isolation = execution_override
 
         parameters = _parse_run_parameters(parameters_json, parameter)
         if isinstance(target, Workflow):
@@ -5549,7 +5601,8 @@ def run_get_command(
                 "id",
                 "target_type",
                 "status",
-                "run_type",
+                "mode",
+                "isolation",
                 "execution_backend",
                 "project_id",
                 "workflow_id",
@@ -5599,16 +5652,34 @@ def run_logs_command(
             _render_run_snapshot(run=run_data, events=events, steps=steps, reporter=reporter)
             _RunLogFollower(run).poll(reporter)
             return
-        _stream_run_result(
-            run,
-            target_type=str(run_data.get("target_type") or ""),
-            reporter=reporter,
-            started_at=time.monotonic(),
-            timeout=timeout,
-            poll_interval=poll_interval,
-            return_result=False,
-            log_follower=_RunLogFollower(run),
-        )
+        try:
+            _stream_run_result(
+                run,
+                target_type=str(run_data.get("target_type") or ""),
+                reporter=reporter,
+                started_at=time.monotonic(),
+                timeout=timeout,
+                poll_interval=poll_interval,
+                return_result=False,
+                log_follower=_RunLogFollower(run),
+            )
+        except TimeoutError:
+            # Following a run whose worker died means waiting the full timeout
+            # and then printing a stack trace, which reads like a bug in the CLI
+            # rather than what it is: the run stopped reporting. Say that, show
+            # what did arrive, and exit non-zero without the traceback.
+            reporter.fail(
+                f"Stopped following after {timeout}s; the run has not reached a terminal state. "
+                "If it is also producing no output, its worker may be gone -- "
+                "the platform settles such runs, or `rebase run cancel` ends it now."
+            )
+            _render_run_snapshot(
+                run=run.refresh(),
+                events=client.list_run_events(run_id),
+                steps=client.list_run_steps(run_id) if run_data.get("target_type") == "workflow" else [],
+                reporter=reporter,
+            )
+            raise typer.Exit(code=1) from None
 
 
 @run_app.command("cancel")
@@ -5626,7 +5697,16 @@ def run_cancel_command(
         _detail_table(
             "Cancelled Run",
             cancelled,
-            preferred_keys=["id", "status", "target_type", "run_type", "execution_backend", "error", "finished_at"],
+            preferred_keys=[
+                "id",
+                "status",
+                "target_type",
+                "mode",
+                "isolation",
+                "execution_backend",
+                "error",
+                "finished_at",
+            ],
         )
     )
 

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
+import subprocess
 import textwrap
+import webbrowser
 from collections import Counter
-from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
@@ -13,6 +16,7 @@ from functools import partial
 from pathlib import Path
 from time import monotonic
 from typing import Any, Literal
+from urllib.parse import quote
 from zoneinfo import ZoneInfo, available_timezones
 
 from rich.json import JSON
@@ -102,7 +106,7 @@ LAST_RUN_STEP_SCAN = 5
 STEP_GRAPH_FANOUT_WORKERS = 8
 #: The run, its events, its steps and its tasks: four independent reads behind one
 #: keypress, so they go together rather than one after another.
-RUN_DETAIL_FANOUT_WORKERS = 5
+RUN_DETAIL_FANOUT_WORKERS = 6
 #: What each level of the project view adds, outermost first. Level 0 is the target
 #: table alone; selecting a target reveals level 1, selecting a run reveals level 2.
 REVEAL_LEVELS: tuple[tuple[str, ...], ...] = (
@@ -111,7 +115,16 @@ REVEAL_LEVELS: tuple[tuple[str, ...], ...] = (
 )
 #: Header text per table, added when the rows are and never before. See `_setup_tables`.
 TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
-    "projects-table": ("Project", "Functions", "Workflows", "Cron jobs", "Endpoints"),
+    "projects-table": (
+        "Project",
+        "Functions",
+        "Workflows",
+        "Cron jobs",
+        "Endpoints",
+        "Last run",
+        "Next run",
+        "Created",
+    ),
     "workspace-profiles-table": ("Active", "Profile", "Workspace", "Workspace ID", "API URL"),
     # `Origin` sits second in both: you read what a thing is called, then what kind of
     # thing it is, and every column after it is one a one-off has no answer for.
@@ -120,7 +133,7 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "Origin",
         "Workflow",
         "Step",
-        "Run type",
+        "Execution",
         "State",
         "Endpoint",
         "Last run",
@@ -130,7 +143,9 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "workflows-table": (
         "Name",
         "Origin",
-        "Run type",
+        "Source",
+        "Commit",
+        "Execution",
         "State",
         "Endpoint",
         "Schedule",
@@ -140,10 +155,21 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "Updated",
     ),
     "runs-table": ("Run", "Status", "Trigger", "Created", "Started", "Finished", "Duration"),
-    # The Type column only earns its place under `All`; every other filter would
+    # The Type column only earns its place under Activity; every other filter would
     # repeat one word down the whole table. See `_timeline_columns`.
     "timeline-table": ("Time", "Stage", "Status", "Message"),
-    "timeline-table-all": ("Time", "Type", "Stage", "Status", "Message"),
+    "timeline-table-all": ("Time", "Type", "Scope", "Item", "Status", "Summary"),
+    "timeline-table-tasks": (
+        "Task",
+        "Step",
+        "Kind",
+        "Status",
+        "Started",
+        "Duration",
+        "Artifacts",
+        "Result / Error",
+    ),
+    "timeline-table-artifacts": ("Artifact", "Produced by", "Disposition", "Type", "Size", "URI"),
 }
 #: The tab each target table belongs to, in the order `left`/`right` cycle them.
 TARGET_TABS: tuple[tuple[str, str], ...] = (
@@ -163,6 +189,10 @@ AUTO_REFRESH_FAILURE_LIMIT = 3
 #: Run states still worth re-reading. Anything else has finished and cannot change, so
 #: polling its timeline is pure cost — and that is exactly where a reader is scrolling.
 LIVE_RUN_STATUSES = frozenset({"queued", "submitted", "accepted", "starting", "pending", "running"})
+#: Run states that are over. Listed explicitly rather than taken as everything outside
+#: `LIVE_RUN_STATUSES`, so a status this build has never heard of is treated as possibly
+#: live: the cost of being wrong is de-emphasising a stage that really is still working.
+TERMINAL_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 #: Tables whose place is put back after a repaint. Anything the reader can move a cursor
 #: through, mark rows in, or scroll sideways — see `RebaseTuiApp._preserve_view`.
 PRESERVED_TABLE_IDS: tuple[str, ...] = (
@@ -185,25 +215,34 @@ EPHEMERAL_ROW_PREFIX = "ephemeral:"
 #: row beside the `one-off` one, carrying the schedule and version it now has.
 ORIGIN_DEPLOYED = "deployed"
 ORIGIN_ONE_OFF = "one-off"
+#: Version source modes whose deployed code is pinned to the connected GitHub repository.
+#: `project_repo` predates workspace-level connections but describes the same provenance.
+GITHUB_SOURCE_MODES = frozenset({"workspace_repo", "project_repo"})
 #: Runs scanned when grouping one-off runs into rows, and the ceiling on how many of a
 #: single group's runs the runs table then lists.
 EPHEMERAL_SCAN_LIMIT = 200
-#: What the timeline's chips filter down to. `logs` carries the platform's own
-#: lifecycle events as well: both are the run talking, one in stages and one in output.
+#: What the run-detail chips filter down to. Execution children stay beside one another,
+#: followed by the two observability views. Steps, tasks and artifacts are hidden for a
+#: run that has none; the other views are always useful ways into the run's own account.
 TIMELINE_FILTERS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("timeline-all", "[ All ]", ("event", "step", "task", "log")),
+    ("timeline-all", "[ Activity ]", ("event", "step", "task", "artifact", "log")),
     ("timeline-steps", "[ Steps ]", ("step",)),
+    ("timeline-tasks", "[ Tasks ]", ("task",)),
+    ("timeline-artifacts", "[ Artifacts ]", ("artifact",)),
     # Events and Logs deliberately overlap: the stages are the run's own account of
     # itself and belong in both "what happened" and "everything it said".
-    ("timeline-events", "[ Events ]", ("event",)),
     ("timeline-logs", "[ Logs ]", ("event", "log")),
-    ("timeline-tasks", "[ Tasks ]", ("task",)),
+    ("timeline-events", "[ Events ]", ("event",)),
 )
+#: Log severities not worth naming on the line. A log row's severity is deliberately kept
+#: out of the Status column — that column means lifecycle for an event and outcome for a
+#: step, and `INFO` is neither — so the level leads the message instead. At these levels it
+#: would only repeat what the `log` type already says on every row; anything else (warnings,
+#: errors, whatever a runtime invents) still names itself, in its own colour.
+ROUTINE_LOG_SEVERITIES = frozenset({"INFO", "DEBUG", "NOTSET", "-", ""})
 #: What to say when a filter has nothing to show, rather than leaving a blank table.
 TIMELINE_EMPTY: dict[str, str] = {
-    "timeline-steps": "No steps — this workflow's body does the work itself.",
     "timeline-events": "No lifecycle events recorded for this run.",
-    "timeline-tasks": "No tasks reported for this run.",
     "timeline-logs": "No log output recorded for this run.",
     "timeline-all": "Nothing recorded for this run yet.",
 }
@@ -241,6 +280,8 @@ class ProjectSummary:
     workflow_count: int
     endpoint_count: int = 0
     cron_count: int = 0
+    last_run: dict[str, Any] | None = None
+    next_run_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -249,6 +290,8 @@ class OverviewCounts:
     workflows: dict[str, int]
     endpoints: dict[str, int]
     crons: dict[str, int]
+    last_runs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    next_runs: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -314,6 +357,9 @@ class ProjectTargetsData:
     endpoints: list[dict[str, Any]]
     #: Every step of every workflow in the project, workflow by workflow.
     steps: tuple[WorkflowStep, ...] = ()
+    #: The deployed current version by workflow id. Besides the graph used above, this
+    #: carries the GitHub source mode and exact commit the workflow is pinned to.
+    workflow_versions: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: When each function last executed, by function id. See `load_last_runs`.
     last_runs: dict[str, str] = field(default_factory=dict)
     #: One entry per name that has only ever run one-off. See `group_ephemeral_runs`.
@@ -336,19 +382,26 @@ class RunDetailData:
     steps: list[dict[str, Any]]
     #: The fan-out inside those steps, one row per unit of work.
     tasks: list[dict[str, Any]] = field(default_factory=list)
+    #: Durable output pointers emitted by the run and its tasks.
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
     #: The runtime's own output, which the Logs chip shows alongside the events.
     logs: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class TimelineRow:
-    """One line of a run's timeline: a lifecycle event, a step, or a log line."""
+    """One line of a run's activity, with its declared execution lineage intact."""
 
     at: datetime | None
     stage: str
     status: str
     message: str
-    kind: Literal["event", "step", "task", "log"]
+    kind: Literal["event", "step", "task", "artifact", "log"]
+    #: The owning step/task path, or ``run`` when this record has no narrower owner.
+    scope: str = "run"
+    #: The complete API record behind task/artifact detail drawers.
+    record: dict[str, Any] = field(default_factory=dict)
+    url: str | None = None
 
 
 def _optional_entries(load: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -385,19 +438,64 @@ def _ephemeral_identity(run: dict[str, Any]) -> tuple[str, str] | None:
     return (target_type if isinstance(target_type, str) and target_type else "workflow", name)
 
 
-def group_ephemeral_runs(runs: list[dict[str, Any]]) -> tuple[EphemeralGroup, ...]:
-    """One row per name that has run one-off, most recently run first.
+def deployed_identities(
+    workflows: Iterable[dict[str, Any]],
+    functions: Iterable[dict[str, Any]] = (),
+) -> set[tuple[str, str]]:
+    """The (target_type, name) of every registered target, in `_ephemeral_identity`'s shape.
+
+    Both tables are read because a one-off run's name is matched against whichever kind
+    it ran as, and the two namespaces are independent: a workflow and a function may
+    share a name without being the same thing.
+    """
+    identities = {("workflow", str(item["name"])) for item in workflows if item.get("name")}
+    identities |= {("function", str(item["name"])) for item in functions if item.get("name")}
+    return identities
+
+
+def target_ids_by_identity(
+    workflows: Iterable[dict[str, Any]],
+    functions: Iterable[dict[str, Any]] = (),
+) -> dict[tuple[str, str], str]:
+    """Registered target ids keyed by (target_type, name).
+
+    The inverse of `deployed_identities`, for attributing a one-off run — which carries a
+    name but no target_id — to the row that name belongs to.
+    """
+    mapping = {
+        ("workflow", str(item["name"])): str(item["id"]) for item in workflows if item.get("name") and item.get("id")
+    }
+    mapping |= {
+        ("function", str(item["name"])): str(item["id"]) for item in functions if item.get("name") and item.get("id")
+    }
+    return mapping
+
+
+def group_ephemeral_runs(
+    runs: list[dict[str, Any]],
+    deployed: Collection[tuple[str, str]] = (),
+) -> tuple[EphemeralGroup, ...]:
+    """One row per name that has *only* run one-off, most recently run first.
 
     Ordered by recency rather than by name because these rows sit under the deployed
     ones, where the useful question is what you ran last, not what it was called.
+
+    `deployed` is the (target_type, name) of everything the project has registered, and
+    those names are left out. A one-off run of a deployed target is the same workflow —
+    `rebase run …::sync` against the code behind the scheduled `sync` — so giving it a
+    second row said there were two `sync` workflows when there is one. It is not lost:
+    `load_last_runs` folds its time into the deployed row's Last run, and the runs table
+    tells the two apart per run in its Trigger column (`schedule` against `api`), which
+    is the level the distinction actually lives at.
     """
+    known = set(deployed)
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
     for run in runs:
         identity = _ephemeral_identity(run)
-        if identity is None:
+        if identity is None or identity in known:
             continue
         when = run.get("started_at") or run.get("created_at")
-        entry = grouped.setdefault(identity, {"runs": 0, "last_run": None, "run_type": run.get("run_type")})
+        entry = grouped.setdefault(identity, {"runs": 0, "last_run": None, "run_type": format_execution(run)})
         entry["runs"] += 1
         if isinstance(when, str) and when > (entry["last_run"] or ""):
             entry["last_run"] = when
@@ -436,6 +534,8 @@ class RebaseTuiData:
                     workflow_count=counts.workflows.get(str(project["id"]), 0),
                     endpoint_count=counts.endpoints.get(str(project["id"]), 0),
                     cron_count=counts.crons.get(str(project["id"]), 0),
+                    last_run=counts.last_runs.get(str(project["id"])),
+                    next_run_at=counts.next_runs.get(str(project["id"])),
                 )
                 for project in projects
             ],
@@ -459,15 +559,22 @@ class RebaseTuiData:
             # without the route should cost the column, not the whole overview.
             endpoints = executor.submit(self._counts_by_project, lambda: _optional_list(self.client.list_endpoints))
             functions = executor.submit(self._counts_by_project, self.client.list_functions)
-        workflow_counts, cron_counts = workflows.result()
+            # One row per project from the server. Assembling this client-side from
+            # `list_runs` does not work: runs come back newest-first across the
+            # workspace, so a project on a 15-minute cron fills any page size and
+            # the quiet projects — the ones worth checking — drop off the end.
+            last_runs = executor.submit(self.client.list_latest_runs_by_project)
+        workflow_counts, cron_counts, next_runs = workflows.result()
         return OverviewCounts(
             functions=functions.result(),
             workflows=workflow_counts,
             endpoints=endpoints.result(),
             crons=cron_counts,
+            last_runs={str(run["project_id"]): run for run in last_runs.result() if run.get("project_id")},
+            next_runs=next_runs,
         )
 
-    def _workflow_and_cron_counts(self) -> tuple[dict[str, int], dict[str, int]]:
+    def _workflow_and_cron_counts(self) -> tuple[dict[str, int], dict[str, int], dict[str, str]]:
         """Workflows per project, and how many of them are on a live cron.
 
         Both come out of the one workspace-wide call, so the cron column costs no
@@ -478,11 +585,23 @@ class RebaseTuiData:
         only give them somewhere to drift apart.
         """
         workflows = self.client.list_workflows()
+        # The soonest fire time per project, out of the same read the counts come
+        # from — so the column costs no request of its own. Earliest wins: with
+        # several schedules in a project, the next thing to happen is the answer.
+        next_runs: dict[str, str] = {}
+        for item in workflows:
+            project_id, next_run_at = str(item.get("project_id") or ""), item.get("next_run_at")
+            if not project_id or not next_run_at:
+                continue
+            current = next_runs.get(project_id)
+            if current is None or str(next_run_at) < current:
+                next_runs[project_id] = str(next_run_at)
         return (
             Counter(str(item["project_id"]) for item in workflows if item.get("project_id")),
             Counter(
                 str(item["project_id"]) for item in workflows if item.get("project_id") and item.get("next_run_at")
             ),
+            next_runs,
         )
 
     @staticmethod
@@ -517,15 +636,19 @@ class RebaseTuiData:
                 lambda: _optional_list(lambda: self.client.list_runs(project_id=project_id, limit=EPHEMERAL_SCAN_LIMIT))
             )
         run_rows = runs.result()
+        workflow_rows = workflows.result()
+        function_rows = functions.result()
         return (
             ProjectTargetsData(
                 project=project,
-                functions=functions.result(),
-                workflows=workflows.result(),
+                functions=function_rows,
+                workflows=workflow_rows,
                 endpoints=endpoints.result(),
                 # Grouping one-off runs is local work on the runs already read, so the
-                # rows it produces are there from the first paint.
-                ephemeral=group_ephemeral_runs(run_rows),
+                # rows it produces are there from the first paint. The deployed names go
+                # in so a one-off run of a deployed target folds into that target's row
+                # instead of becoming a second row with the same name.
+                ephemeral=group_ephemeral_runs(run_rows, deployed_identities(workflow_rows, function_rows)),
             ),
             run_rows,
         )
@@ -537,9 +660,20 @@ class RebaseTuiData:
         needs the other.
         """
         with ThreadPoolExecutor(max_workers=2) as executor:
-            steps = executor.submit(self.load_workflow_steps, base.workflows)
-            last_runs = executor.submit(self.load_last_runs, str(base.project["id"]), runs)
-        return replace(base, steps=steps.result(), last_runs=last_runs.result())
+            versions = executor.submit(self.load_workflow_versions, base.workflows)
+            last_runs = executor.submit(
+                self.load_last_runs,
+                str(base.project["id"]),
+                runs,
+                target_ids_by_identity(base.workflows, base.functions),
+            )
+        resolved_versions = versions.result()
+        return replace(
+            base,
+            steps=self._workflow_steps_from_versions(base.workflows, resolved_versions),
+            workflow_versions=resolved_versions,
+            last_runs=last_runs.result(),
+        )
 
     def load_ephemeral_runs(self, name: str, target_type: str, project_id: str) -> list[dict[str, Any]]:
         """The one-off runs that ran under *name*, newest first.
@@ -552,7 +686,12 @@ class RebaseTuiData:
         runs = self.client.list_runs(project_id=project_id, limit=EPHEMERAL_SCAN_LIMIT)
         return [run for run in runs if _ephemeral_identity(run) == (target_type, name)]
 
-    def load_last_runs(self, project_id: str, runs: list[dict[str, Any]] | None = None) -> dict[str, str]:
+    def load_last_runs(
+        self,
+        project_id: str,
+        runs: list[dict[str, Any]] | None = None,
+        target_ids: dict[tuple[str, str], str] | None = None,
+    ) -> dict[str, str]:
         """When each workflow and function last executed, by target id.
 
         Keyed on the run's `target_id`, not `function_id` or `workflow_id`: those two
@@ -566,12 +705,15 @@ class RebaseTuiData:
         workflow runs, capped at `LAST_RUN_STEP_SCAN` requests.
 
         That cap is the honest limit of this column: a step that last ran longer ago than
-        the scanned window shows no time rather than a wrong one. An ephemeral run has no
-        registered target and so belongs to no *deployed* row, which is why its null
-        target_id is skipped here rather than treated as missing data — it is picked up
-        instead by `group_ephemeral_runs`, which gives it a row of its own. Supplementary
-        like the endpoint list — a run history that will not load must not cost you the
-        table.
+        the scanned window shows no time rather than a wrong one. Supplementary like the
+        endpoint list — a run history that will not load must not cost you the table.
+
+        An ephemeral run carries a name instead of a target_id. Given `target_ids` it is
+        attributed to the row of the same name, so `rebase run …::sync` updates the
+        deployed `sync` row's Last run — it is that workflow being run, just triggered by
+        hand rather than by the schedule. Without the map it is skipped, and a name that
+        matches nothing deployed still is: that one gets its own row from
+        `group_ephemeral_runs`.
 
         Takes `runs` when the caller has already read them, so the project view pays for
         the project's run list once rather than once per thing derived from it.
@@ -588,10 +730,17 @@ class RebaseTuiData:
 
         workflow_run_ids: list[str] = []
         for run in runs:
-            record(run.get("target_id"), run.get("started_at") or run.get("created_at"))
-            # Ephemeral runs are skipped here as well as above: their steps are not
-            # registered functions either, so opening them spends one of a capped number
-            # of requests to attribute a time to a row that does not exist.
+            when = run.get("started_at") or run.get("created_at")
+            record(run.get("target_id"), when)
+            # Ephemeral runs have no target_id, so `record` above did nothing for them.
+            # Route them to the deployed row of the same name when there is one.
+            if run.get("is_ephemeral") and target_ids:
+                identity = _ephemeral_identity(run)
+                if identity is not None:
+                    record(target_ids.get(identity), when)
+            # Their steps are not registered functions either, so opening them spends one
+            # of a capped number of requests to attribute a time to a row that does not
+            # exist.
             if run.get("is_ephemeral"):
                 continue
             if run.get("target_type") == "workflow" and isinstance(run.get("id"), str):
@@ -607,37 +756,84 @@ class RebaseTuiData:
                         record(step.get("function_id"), step.get("started_at") or step.get("created_at"))
         return latest
 
-    def load_workflow_steps(self, workflows: list[dict[str, Any]]) -> tuple[WorkflowStep, ...]:
-        """The step graph of every workflow in the project, read concurrently.
+    def load_workflow_versions(self, workflows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """The current deployed version of every workflow, read concurrently.
 
-        The graph lives on the workflow *version*, not on the workflow, so this costs a
-        request per workflow — hence the pool. Like the endpoint list it is supplementary:
-        an old API, a workflow with no current version, or a single failed read costs the
-        Workflow column for that workflow and nothing more.
+        Both the step graph and source provenance live on the version rather than the
+        workflow, so one response fills the function grouping and the workflow's Source
+        and Commit columns. Like the endpoint list it is supplementary: an old API, a
+        workflow with no current version, or one failed read costs those cells only.
         """
         versioned = [
-            (str(workflow["id"]), str(workflow.get("name", "-")), str(workflow["current_version_id"]))
+            (str(workflow["id"]), str(workflow["current_version_id"]))
             for workflow in workflows
             if workflow.get("id") is not None and workflow.get("current_version_id")
         ]
         if not versioned:
-            return ()
+            return {}
 
-        def load(entry: tuple[str, str, str]) -> tuple[WorkflowStep, ...]:
-            workflow_id, workflow_name, version_id = entry
+        def load(entry: tuple[str, str]) -> tuple[str, dict[str, Any] | None]:
+            workflow_id, version_id = entry
             try:
                 version = self.client.get_workflow_version(workflow_id, version_id)
             except Exception:
-                return ()
-            return workflow_steps(workflow_id, workflow_name, version.get("step_graph"))
+                return workflow_id, None
+            return workflow_id, version
 
         with ThreadPoolExecutor(max_workers=min(STEP_GRAPH_FANOUT_WORKERS, len(versioned))) as executor:
-            return tuple(step for steps in executor.map(load, versioned) for step in steps)
+            return {
+                workflow_id: version for workflow_id, version in executor.map(load, versioned) if version is not None
+            }
 
-    def load_target_runs(self, target_type: TargetType, target_id: str) -> list[dict[str, Any]]:
+    def load_workflow_steps(self, workflows: list[dict[str, Any]]) -> tuple[WorkflowStep, ...]:
+        """Compatibility helper for callers that only need the deployed step graphs."""
+        return self._workflow_steps_from_versions(workflows, self.load_workflow_versions(workflows))
+
+    @staticmethod
+    def _workflow_steps_from_versions(
+        workflows: list[dict[str, Any]], versions: dict[str, dict[str, Any]]
+    ) -> tuple[WorkflowStep, ...]:
+        steps: list[WorkflowStep] = []
+        for workflow in workflows:
+            workflow_id = str(workflow.get("id") or "")
+            version = versions.get(workflow_id)
+            if version is None:
+                continue
+            steps.extend(workflow_steps(workflow_id, str(workflow.get("name", "-")), version.get("step_graph")))
+        return tuple(steps)
+
+    def load_target_runs(
+        self,
+        target_type: TargetType,
+        target_id: str,
+        *,
+        name: str | None = None,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Every run of this target, registered and one-off alike, newest first.
+
+        `/runs` selects on target_id, which a one-off run does not have — it carries the
+        name it ran as instead. So a workflow every one of whose runs was a `rebase run
+        …::sync` matched nothing here and the table came up empty, while the Last run
+        column beside it showed a time: the same runs, found by name there and by id
+        here. Given a name and project, those runs are read and merged in.
+        """
         if target_type == "function":
-            return self.client.list_runs(function_id=target_id, target_type="function", limit=self.limit)
-        return self.client.list_runs(workflow_id=target_id, target_type="workflow", limit=self.limit)
+            registered = self.client.list_runs(function_id=target_id, target_type="function", limit=self.limit)
+        else:
+            registered = self.client.list_runs(workflow_id=target_id, target_type="workflow", limit=self.limit)
+        if not name or not project_id:
+            return registered
+
+        # Supplementary, like every other by-name read: a target's own runs must not
+        # disappear because the scan for one-off ones failed.
+        ephemeral = _optional_list(lambda: self.load_ephemeral_runs(name, target_type, project_id))
+        if not ephemeral:
+            return registered
+
+        merged = registered + ephemeral
+        merged.sort(key=lambda run: str(run.get("created_at") or ""), reverse=True)
+        return merged[: self.limit]
 
     def load_run_detail(self, run_id: str, *, target_type: str | None = None) -> RunDetailData:
         """Everything behind one run, fetched in one round trip's worth of waiting.
@@ -662,11 +858,10 @@ class RebaseTuiData:
             # rows and not the run view.
             wanted_steps = target_type in (None, "workflow")
             steps = (
-                executor.submit(_optional_list, lambda: self.client.list_run_steps(run_id))
-                if wanted_steps
-                else None
+                executor.submit(_optional_list, lambda: self.client.list_run_steps(run_id)) if wanted_steps else None
             )
             tasks = executor.submit(_optional_list, lambda: self.client.list_run_tasks(run_id))
+            artifacts = executor.submit(_optional_list, lambda: self.load_run_artifacts(run_id))
             resolved = run.result()
             is_workflow = resolved.get("target_type") == "workflow"
             return RunDetailData(
@@ -674,12 +869,18 @@ class RebaseTuiData:
                 events=events.result(),
                 steps=steps.result() if steps is not None and is_workflow else [],
                 tasks=tasks.result(),
+                artifacts=artifacts.result(),
                 logs=logs.result(),
             )
 
     def load_run_logs(self, run_id: str) -> list[dict[str, Any]]:
         entries = self.client.get_run_logs(run_id, limit=RUN_LOG_LIMIT).get("entries")
         return entries if isinstance(entries, list) else []
+
+    def load_run_artifacts(self, run_id: str) -> list[dict[str, Any]]:
+        """Compatibility seam for TUI test clients and pre-artifact client builds."""
+        load = getattr(self.client, "list_run_artifacts", None)
+        return load(run_id) if callable(load) else []
 
 
 def workflow_steps(workflow_id: str, workflow_name: str, step_graph: Any) -> tuple[WorkflowStep, ...]:
@@ -717,17 +918,46 @@ def build_timeline(
     steps: Sequence[dict[str, Any]],
     logs: Sequence[dict[str, Any]] | None,
     tasks: Sequence[dict[str, Any]] = (),
+    artifacts: Sequence[dict[str, Any]] = (),
 ) -> list[TimelineRow]:
     """Everything that happened during a run, in the order it happened.
 
-    Events, steps, tasks and log lines are four separate routes. Tasks say which step
-    fanned them out, so they could be nested properly — but a log entry carries a
-    timestamp, a severity and a message and nothing else, so the grouping here is
-    chronological rather than declared: a row sits under the last step or stage that
-    began before it, which is what "belongs to" means when the producer never said.
-    Sorting them together is the whole mechanism; the indent is what makes it read as
-    grouping.
+    Events, steps, tasks, artifacts and log lines arrive from separate routes. Their
+    timestamps put them into one readable account of the run. The explicit step/task
+    foreign keys build a scope path; timestamps decide order, never parentage.
     """
+    step_names = {
+        str(step["id"]): str(step.get("name") or step.get("node_key") or step["id"])
+        for step in steps
+        if step.get("id") is not None
+    }
+    task_names = {
+        str(task["id"]): str(task.get("name") or f"task {task.get('item_index', '-')}")
+        for task in tasks
+        if task.get("id") is not None
+    }
+    task_steps = {
+        str(task["id"]): str(task["step_run_id"])
+        for task in tasks
+        if task.get("id") is not None and task.get("step_run_id") is not None
+    }
+
+    def task_scope(task: dict[str, Any]) -> str:
+        step_id = task.get("step_run_id")
+        return step_names.get(str(step_id), f"step {compact_id(step_id)}") if step_id is not None else "run"
+
+    def artifact_scope(artifact: dict[str, Any]) -> str:
+        task_id = artifact.get("task_id")
+        step_id = artifact.get("step_run_id")
+        if step_id is None and task_id is not None:
+            step_id = task_steps.get(str(task_id))
+        parts: list[str] = []
+        if step_id is not None:
+            parts.append(step_names.get(str(step_id), f"step {compact_id(step_id)}"))
+        if task_id is not None:
+            parts.append(task_names.get(str(task_id), f"task {compact_id(task_id)}"))
+        return " › ".join(parts) or "run"
+
     rows = [
         TimelineRow(
             at=_parse_timestamp(event.get("created_at")),
@@ -735,6 +965,7 @@ def build_timeline(
             status=str(event.get("status", "-")),
             message=format_json_summary(event.get("message"), max_length=200),
             kind="event",
+            record=dict(event),
         )
         for event in events
     ]
@@ -758,6 +989,7 @@ def build_timeline(
                 status=str(step.get("status", "-")),
                 message=detail or "-",
                 kind="step",
+                record=dict(step),
             )
         )
     for task in tasks:
@@ -773,6 +1005,23 @@ def build_timeline(
                 status=str(task.get("status", "-")),
                 message=f"{format_json_summary(task.get('parameters'), max_length=90)} -> {detail}",
                 kind="task",
+                scope=task_scope(task),
+                record=dict(task),
+            )
+        )
+    for artifact in artifacts:
+        media_type = str(artifact.get("media_type") or "-")
+        uri = str(artifact.get("uri") or "-")
+        rows.append(
+            TimelineRow(
+                at=_parse_timestamp(artifact.get("created_at")),
+                stage=str(artifact.get("name") or "artifact"),
+                status=str(artifact.get("disposition") or "created"),
+                message=f"{media_type} · {uri}",
+                kind="artifact",
+                scope=artifact_scope(artifact),
+                record=dict(artifact),
+                url=uri if uri.startswith(("https://", "http://")) else None,
             )
         )
     for entry in logs or []:
@@ -783,6 +1032,7 @@ def build_timeline(
                 status=str(entry.get("severity") or "-"),
                 message=str(entry.get("message") or ""),
                 kind="log",
+                record=dict(entry),
             )
         )
     # A row with no usable timestamp sorts to the top rather than being dropped: it is
@@ -821,6 +1071,18 @@ def format_duration(started: Any, finished: Any) -> str:
     return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m{seconds:02d}s"
 
 
+def format_bytes(value: Any) -> str:
+    """A compact artifact size, leaving absent or invalid values visibly unknown."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return "-"
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return "-"
+
+
 def _parse_timestamp(value: Any) -> datetime | None:
     if value in {None, ""}:
         return None
@@ -837,6 +1099,128 @@ def compact_id(value: Any, *, length: int = 8) -> str:
     if len(text) <= length + 4:
         return text
     return f"{text[:length]}..."
+
+
+def is_github_backed(version: dict[str, Any] | None) -> bool:
+    """Whether a deployed version is pinned to source in the connected GitHub repo."""
+    return isinstance(version, dict) and version.get("source_mode") in GITHUB_SOURCE_MODES
+
+
+def format_workflow_source(version: dict[str, Any] | None) -> str:
+    """The source-of-truth label for a deployed workflow version."""
+    if is_github_backed(version):
+        return "GitHub"
+    if isinstance(version, dict) and version.get("source_mode") == "rebase_hosted":
+        return "Rebase"
+    return "-"
+
+
+def format_workflow_commit(version: dict[str, Any] | None, *, compact: bool = True) -> str:
+    """The Git commit a GitHub-backed workflow is deployed from."""
+    if not is_github_backed(version):
+        return "-"
+    commit = version.get("git_commit_sha") if version is not None else None
+    if not isinstance(commit, str) or not commit:
+        return "-"
+    return compact_id(commit) if compact else commit
+
+
+def github_workflow_source_url(version: dict[str, Any] | None, *, line: int | None = None) -> str | None:
+    """A GitHub blob URL pinned to the exact source commit of a workflow version."""
+    if not is_github_backed(version):
+        return None
+    owner = version.get("repo_owner") if version is not None else None
+    repo = version.get("repo_name") if version is not None else None
+    commit = version.get("git_commit_sha") if version is not None else None
+    source_path = version.get("source_path") if version is not None else None
+    if not all(isinstance(value, str) and value for value in (owner, repo, commit, source_path)):
+        return None
+    normalized_path = str(source_path).replace("\\", "/").lstrip("/")
+    if not normalized_path or ".." in normalized_path.split("/"):
+        return None
+    url = (
+        f"https://github.com/{quote(str(owner), safe='')}/{quote(str(repo), safe='')}"
+        f"/blob/{quote(str(commit), safe='')}/{quote(normalized_path, safe='/')}"
+    )
+    return f"{url}#L{line}" if isinstance(line, int) and line > 0 else url
+
+
+def workflow_definition_line(source: str, entrypoint: str, deployed_source: str | None = None) -> int | None:
+    """Locate an entrypoint in a complete source file without importing or executing it.
+
+    When a name is defined more than once, the standalone source stored on the deployed
+    version identifies which definition was actually shipped. With no unambiguous match,
+    returning no line is safer than opening GitHub at the wrong function.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    candidates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == entrypoint
+    ]
+    if deployed_source:
+        expected = textwrap.dedent(deployed_source).strip()
+        matching = [
+            node
+            for node in candidates
+            if (segment := ast.get_source_segment(source, node)) is not None
+            and textwrap.dedent(segment).strip() == expected
+        ]
+        if len(matching) == 1:
+            return matching[0].lineno
+    return candidates[0].lineno if len(candidates) == 1 else None
+
+
+def _git_source_at_commit(repo: Path, commit: str, source_path: str) -> str | None:
+    try:
+        completed = subprocess.run(  # noqa: S603
+            ["git", "show", f"{commit}:{source_path}"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    return completed.stdout
+
+
+def workflow_definition_line_at_commit(version: dict[str, Any], roots: Iterable[Path]) -> int | None:
+    """Resolve the definition line from a local checkout's exact committed Git object."""
+    commit = version.get("git_commit_sha")
+    source_path = version.get("source_path")
+    entrypoint = version.get("entrypoint")
+    if not all(isinstance(value, str) and value for value in (commit, source_path, entrypoint)):
+        return None
+    commit = str(commit)
+    if not 7 <= len(commit) <= 64 or any(character not in "0123456789abcdefABCDEF" for character in commit):
+        return None
+    source_path = str(source_path).replace("\\", "/").lstrip("/")
+    if not source_path or ".." in source_path.split("/"):
+        return None
+
+    seen: set[Path] = set()
+    for root in roots:
+        candidate = Path(root).expanduser()
+        if not candidate.is_dir():
+            continue
+        repo = git_toplevel(candidate)
+        if repo is None or repo in seen:
+            continue
+        seen.add(repo)
+        source = _git_source_at_commit(repo, commit, source_path)
+        if source is not None:
+            deployed_source = version.get("source_code")
+            return workflow_definition_line(
+                source,
+                str(entrypoint),
+                deployed_source if isinstance(deployed_source, str) else None,
+            )
+    return None
 
 
 def format_timestamp(value: Any, tz: tzinfo | None = None) -> str:
@@ -862,6 +1246,14 @@ def format_bool(value: Any) -> str:
     if value is False:
         return "disabled"
     return "-"
+
+
+def format_execution(value: dict[str, Any]) -> str:
+    mode = value.get("mode")
+    isolation = value.get("isolation")
+    if mode is not None:
+        return f"{mode}/{isolation}" if isolation is not None else str(mode)
+    return str(value.get("run_type") or "-")
 
 
 def format_schedule(value: Any) -> str:
@@ -937,6 +1329,25 @@ def format_url(item: dict[str, Any], *, api_url: str) -> str:
     if isinstance(url_path, str) and url_path:
         return f"{api_url}{url_path}"
     return "-"
+
+
+def collapse_message(message: str) -> str:
+    """One line standing in for a possibly many-line message.
+
+    A row is one line high, so a multi-line message showed its first line and hid the
+    rest — and a program whose output began with a newline got a row that was simply
+    blank, which reads as "nothing was logged" rather than "press enter". A block of
+    captured application output usually does begin with one.
+
+    So the stand-in is the first line with something on it, and a count of what is
+    waiting behind it. Expanding the row still shows the whole thing.
+    """
+    lines = message.splitlines()
+    if len(lines) <= 1:
+        return message
+    first = next((line for line in lines if line.strip()), "")
+    hidden = len([line for line in lines if line.strip()]) - 1
+    return f"{first}  (+{hidden} more)" if hidden > 0 else first
 
 
 def status_style(status: Any) -> str:
@@ -1601,6 +2012,7 @@ class RebaseTuiApp(App[None]):
         # you move around with kept their places and the rest went one keystroke away.
         Binding("d", "delete_selection", "Delete", show=False),
         Binding("o", "open_source", "Open source", show=False),
+        Binding("g", "open_github", "Open deployed code on GitHub", show=False),
         Binding("s", "toggle_terminal_select", "Select text", show=False),
         Binding("p", "show_details", "Details", show=False),
         Binding("l", "toggle_logs", "Logs", show=False),
@@ -1851,7 +2263,7 @@ class RebaseTuiApp(App[None]):
         #: How to re-read the open runs box, captured when a target was selected. A
         #: deployed target and a one-off group are read two different ways, and the tick
         #: should not have to re-derive which it is looking at.
-        self._runs_reload: Callable[[bool], Awaitable[None]] | None = None
+        self._runs_reload: Callable[..., Awaitable[None]] | None = None
         self.profile_name = selected_profile_name()
         self.profile_data = load_profile(self.profile_name)
         self.workspace_overview: WorkspaceOverviewData | None = None
@@ -1874,6 +2286,9 @@ class RebaseTuiApp(App[None]):
         self._run_detail: RunDetailData | None = None
         #: Which of the timeline's chips is showing. `l` jumps to the logs one.
         self._timeline_filter = TIMELINE_FILTERS[0][0]
+        #: The activity record behind each currently rendered row, for lineage-aware
+        #: task and artifact drawers. Keys match the DataTable's row keys.
+        self._timeline_rows: dict[str, TimelineRow] = {}
         #: Timeline rows opened out to their full text, by position in the current view.
         #: Position, not identity: changing filter or run reshuffles the list, and both
         #: clear this rather than leaving an expansion attached to some other line.
@@ -2356,7 +2771,7 @@ class RebaseTuiApp(App[None]):
             return
         await self._load_project_targets(self.selected_project, preserve=True, announce=False)
         if self._reveal_level >= 1 and self._runs_reload is not None:
-            await self._runs_reload(False)
+            await self._runs_reload(preserve=True, announce=False)
         if self._reveal_level >= 2 and self._live_run_id is not None:
             await self._load_run_detail(self._live_run_id, preserve=True, announce=False)
 
@@ -2597,6 +3012,64 @@ class RebaseTuiApp(App[None]):
             exclusive=True,
         )
 
+    def _selected_workflow_version(self) -> tuple[str, dict[str, Any]] | None:
+        """The deployed workflow under the cursor, or behind the open run/timeline."""
+        if self.current_view != "project" or self.project_targets is None:
+            return None
+        focused = self.focused
+        table_id = str(focused.id) if isinstance(focused, DataTable) else ""
+        workflow_id: str | None = None
+        if table_id == "workflows-table":
+            workflow_id = self._cursor_key(focused)
+        elif table_id in {"runs-table", "timeline-table"} and self.selected_target_type == "workflow":
+            target_id = (self.selected_target or {}).get("id")
+            workflow_id = str(target_id) if target_id is not None else None
+        if workflow_id is None or workflow_id.startswith(EPHEMERAL_ROW_PREFIX):
+            return None
+        workflow = self._workflow_rows.get(workflow_id)
+        version = self.project_targets.workflow_versions.get(workflow_id)
+        if workflow is None or version is None:
+            return None
+        return str(workflow.get("name") or workflow_id), version
+
+    def action_open_github(self) -> None:
+        """Open the selected workflow's exact deployed source revision on GitHub."""
+        selected = self._selected_workflow_version()
+        if selected is None:
+            self.notify("Select a deployed workflow first — g opens its pinned GitHub source.", severity="warning")
+            return
+        workflow_name, version = selected
+        if not is_github_backed(version):
+            self.notify(f"{workflow_name} is stored by Rebase, not deployed from GitHub.", severity="warning")
+            return
+        if github_workflow_source_url(version) is None:
+            self.notify(f"{workflow_name} has incomplete GitHub source metadata.", severity="warning")
+            return
+        roots = [Path.cwd(), *(Path(entry) for entry in search_paths(self._workspace_key()))]
+        self.run_worker(
+            self._open_github_workflow(workflow_name, dict(version), roots),
+            name="open-github",
+            group="tui-open",
+            exclusive=True,
+        )
+
+    async def _open_github_workflow(self, workflow_name: str, version: dict[str, Any], roots: list[Path]) -> None:
+        line = await asyncio.to_thread(workflow_definition_line_at_commit, version, roots)
+        url = github_workflow_source_url(version, line=line)
+        if url is None:
+            self.notify(f"{workflow_name} has incomplete GitHub source metadata.", severity="warning")
+            return
+        try:
+            opened = await asyncio.to_thread(webbrowser.open, url)
+        except Exception as exc:
+            self.notify(f"Could not open GitHub: {exc}", severity="error")
+            return
+        if not opened:
+            self.notify(f"Could not open a browser for {url}", severity="error")
+            return
+        location = f" at line {line}" if line is not None else ""
+        self.notify(f"Opened {workflow_name} at {format_workflow_commit(version)}{location} on GitHub.")
+
     async def _open_project_source(self, project_name: str) -> None:
         roots = [Path(entry) for entry in search_paths(self._workspace_key())]
         # Off the event loop: walking a large repository must not freeze the UI.
@@ -2809,12 +3282,17 @@ class RebaseTuiApp(App[None]):
     async def _load_project_targets(
         self, project: dict[str, Any], *, preserve: bool = False, announce: bool = True
     ) -> None:
-        """Paint the tables as soon as the targets are known, then fill in the rest.
+        """Load a project's targets, progressively on entry and atomically on refresh.
 
         Step graphs and last-run times take a second round trip, and holding the whole
         view back for them meant staring at an empty box for twice as long as the names
         actually took to arrive. The first paint is everything the first phase read; the
-        second fills the Last run column and the functions' workflow grouping.
+        second fills provenance, Last run, and the functions' workflow grouping.
+
+        A refresh is different: a complete table is already on screen. Painting its base
+        phase would temporarily replace those details with dashes and resize the columns,
+        then reverse both changes when the version reads finished. Under *preserve*, keep
+        the last complete frame until its complete replacement is ready.
         """
         try:
             base, runs = await asyncio.to_thread(self.data.load_project_base, project)
@@ -2822,15 +3300,16 @@ class RebaseTuiApp(App[None]):
             self._set_error(exc, announce=announce)
             return
         self._refresh_failures = 0
-        self.project_targets = base
-        with self._preserve_view() if preserve else nullcontext():
-            self._render_project_targets(base, preserve=preserve)
+        if not preserve:
+            self.project_targets = base
+            self._render_project_targets(base)
 
         try:
             targets = await asyncio.to_thread(self.data.load_project_detail, base, runs)
         except Exception as exc:
-            # The names are already on screen and still usable; say what is missing
-            # rather than replacing a working table with an error.
+            # On entry, the names are already on screen and still usable. On refresh,
+            # the previous complete frame is still there. In either case, say what is
+            # missing rather than replacing a working table with an error.
             self._set_error(exc, announce=announce)
             return
         self.project_targets = targets
@@ -2840,14 +3319,31 @@ class RebaseTuiApp(App[None]):
         with self._preserve_view():
             self._render_project_targets(targets, preserve=True)
 
-    async def _load_runs(self, target_type: TargetType, target_id: str, announce: bool = True) -> None:
+    async def _load_runs(
+        self,
+        target_type: TargetType,
+        target_id: str,
+        *,
+        name: str | None = None,
+        preserve: bool = False,
+        announce: bool = True,
+    ) -> None:
+        project_id = str(self.selected_project["id"]) if self.selected_project else None
         try:
-            runs = await asyncio.to_thread(self.data.load_target_runs, target_type, target_id)
+            runs = await asyncio.to_thread(
+                partial(
+                    self.data.load_target_runs,
+                    target_type,
+                    target_id,
+                    name=name,
+                    project_id=project_id,
+                )
+            )
         except Exception as exc:
             self._set_error(exc, announce=announce)
             return
-        with self._preserve_view() if not announce else nullcontext():
-            self._render_runs(runs)
+        with self._preserve_view() if preserve else nullcontext():
+            self._render_runs(runs, preserve=preserve)
 
     def _select_ephemeral(self, row_key: str) -> None:
         """Open a one-off row's runs, the same way selecting a deployed target does."""
@@ -2874,14 +3370,16 @@ class RebaseTuiApp(App[None]):
             exclusive=True,
         )
 
-    async def _load_ephemeral_runs(self, group: EphemeralGroup, project_id: str, announce: bool = True) -> None:
+    async def _load_ephemeral_runs(
+        self, group: EphemeralGroup, project_id: str, *, preserve: bool = False, announce: bool = True
+    ) -> None:
         try:
             runs = await asyncio.to_thread(self.data.load_ephemeral_runs, group.name, group.target_type, project_id)
         except Exception as exc:
             self._set_error(exc, announce=announce)
             return
-        with self._preserve_view() if not announce else nullcontext():
-            self._render_runs(runs)
+        with self._preserve_view() if preserve else nullcontext():
+            self._render_runs(runs, preserve=preserve)
 
     async def _load_run_detail(self, run_id: str, *, preserve: bool = False, announce: bool = True) -> None:
         target_type = (self._run_rows.get(run_id) or {}).get("target_type")
@@ -2906,11 +3404,11 @@ class RebaseTuiApp(App[None]):
         return self._timeline_filter == "timeline-logs"
 
     def action_toggle_logs(self) -> None:
-        """Jump the timeline to its Logs chip, or back to All."""
+        """Jump the timeline to its Logs chip, or back to Activity."""
         self._jump_to_timeline_filter("timeline-logs", "l shows everything the run said")
 
     def action_toggle_events(self) -> None:
-        """Jump the timeline to its Events chip, or back to All."""
+        """Jump the timeline to its Events chip, or back to Activity."""
         self._jump_to_timeline_filter("timeline-events", "e shows the run's stages on their own")
 
     def _jump_to_timeline_filter(self, tab_id: str, hint: str) -> None:
@@ -2919,7 +3417,48 @@ class RebaseTuiApp(App[None]):
             return
         self._select_timeline_filter(TIMELINE_FILTERS[0][0] if self._timeline_filter == tab_id else tab_id)
 
+    def _available_timeline_filters(self) -> list[str]:
+        """The chips that describe something this run actually has.
+
+        Events and Logs remain available even when empty because they are stable
+        observability views. Execution children are structural: showing an empty Steps,
+        Tasks or Artifacts branch implies the run has that shape when it does not.
+        """
+        detail = self._run_detail
+        if detail is None:
+            return [TIMELINE_FILTERS[0][0], "timeline-logs", "timeline-events"]
+        present = {
+            "timeline-steps": bool(detail.steps),
+            "timeline-tasks": bool(detail.tasks),
+            "timeline-artifacts": bool(detail.artifacts),
+        }
+        return [tab_id for tab_id, _, _ in TIMELINE_FILTERS if tab_id not in present or present[tab_id]]
+
+    def _sync_timeline_tabs(self) -> None:
+        """Hide absent execution branches and put useful counts on present ones."""
+        detail = self._run_detail
+        counts = {
+            "timeline-steps": len(detail.steps) if detail is not None else 0,
+            "timeline-tasks": len(detail.tasks) if detail is not None else 0,
+            "timeline-artifacts": len(detail.artifacts) if detail is not None else 0,
+        }
+        available = set(self._available_timeline_filters())
+        tabs = self.query_one("#timeline-tabs", Tabs)
+        for tab_id, label, _ in TIMELINE_FILTERS:
+            tab = tabs.query_one(f"#{tab_id}", Tab)
+            tab.styles.display = "block" if tab_id in available else "none"
+            count = counts.get(tab_id)
+            rendered = label if count is None else f"[ {label[2:-2]} {count} ]"
+            # Brackets are literal chip chrome, not Rich/Textual markup.
+            tab.label = Content(rendered)
+        if self._timeline_filter not in available:
+            self._timeline_filter = TIMELINE_FILTERS[0][0]
+        if tabs.active != self._timeline_filter:
+            tabs.active = self._timeline_filter
+
     def _select_timeline_filter(self, tab_id: str) -> None:
+        if tab_id not in self._available_timeline_filters():
+            return
         self._timeline_filter = tab_id
         self._expanded_timeline.clear()
         tabs = self.query_one("#timeline-tabs", Tabs)
@@ -2929,12 +3468,16 @@ class RebaseTuiApp(App[None]):
 
     def action_switch_timeline_filter(self, delta: int) -> None:
         """Step between the timeline's chips. Bound to left/right on its table."""
-        order = [tab_id for tab_id, _, _ in TIMELINE_FILTERS]
+        order = self._available_timeline_filters()
         current = order.index(self._timeline_filter) if self._timeline_filter in order else 0
         self._select_timeline_filter(order[(current + delta) % len(order)])
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
-        if event.tabs.id == "timeline-tabs" and event.tab.id != self._timeline_filter:
+        if (
+            event.tabs.id == "timeline-tabs"
+            and event.tab.id in self._available_timeline_filters()
+            and event.tab.id != self._timeline_filter
+        ):
             self._timeline_filter = str(event.tab.id)
             self._expanded_timeline.clear()
             self._render_timeline()
@@ -2961,12 +3504,23 @@ class RebaseTuiApp(App[None]):
         projects = self._fill_table("projects-table")
         for project_id, summary in self._project_rows.items():
             project = summary.project
+            last_run = summary.last_run or {}
+            # Time carries the status colour rather than spending a column on the
+            # word: on a row of counts, whether the last run was green or red is
+            # the signal, and the timestamp is already there to hang it on.
+            last_run_cell = Text(
+                self._time(last_run.get("created_at")),
+                style=status_style(last_run["status"]) if last_run.get("status") else "",
+            )
             projects.add_row(
                 str(project.get("name", "-")),
                 str(summary.function_count),
                 str(summary.workflow_count),
                 str(summary.cron_count),
                 str(summary.endpoint_count),
+                last_run_cell,
+                self._time(summary.next_run_at),
+                self._time(project.get("created_at")),
                 key=project_id,
             )
 
@@ -3007,7 +3561,7 @@ class RebaseTuiApp(App[None]):
                 ORIGIN_DEPLOYED,
                 format_step_workflows(steps),
                 format_step_keys(steps),
-                str(function.get("run_type") or "-"),
+                format_execution(function),
                 format_bool(function.get("enabled")),
                 format_endpoint(self._target_endpoints("function", function_id)),
                 self._time(self._last_runs.get(function_id)),
@@ -3032,10 +3586,13 @@ class RebaseTuiApp(App[None]):
 
         workflows = self._fill_table("workflows-table")
         for workflow_id, workflow in self._workflow_rows.items():
+            version = targets.workflow_versions.get(workflow_id)
             workflows.add_row(
                 str(workflow.get("name", "-")),
                 ORIGIN_DEPLOYED,
-                str(workflow.get("run_type") or "-"),
+                format_workflow_source(version),
+                format_workflow_commit(version),
+                format_execution(workflow),
                 format_bool(workflow.get("enabled")),
                 format_endpoint(self._target_endpoints("workflow", workflow_id)),
                 format_schedule(workflow.get("schedule")),
@@ -3052,6 +3609,8 @@ class RebaseTuiApp(App[None]):
             workflows.add_row(
                 group.name,
                 ORIGIN_ONE_OFF,
+                "-",
+                "-",
                 group.run_type,
                 "-",
                 "-",
@@ -3090,7 +3649,14 @@ class RebaseTuiApp(App[None]):
     def _target_endpoints(self, target_type: str, target_id: str) -> list[dict[str, Any]]:
         return self._endpoints_by_target.get((target_type, target_id), [])
 
-    def _render_runs(self, runs: list[dict[str, Any]]) -> None:
+    def _render_runs(self, runs: list[dict[str, Any]], *, preserve: bool = False) -> None:
+        """Draw the runs box. With *preserve*, leave the timeline below it alone.
+
+        Clearing the timeline is right when a different target was opened — what is under
+        the runs box then describes a run of something else. It is wrong on a refresh: the
+        reader is looking at that timeline, and a finished run is deliberately not re-read,
+        so wiping it left an empty screen until a keypress redrew it from memory.
+        """
         self._run_rows = {str(item["id"]): item for item in runs if item.get("id") is not None}
         table = self._fill_table("runs-table")
         for run_id, run in self._run_rows.items():
@@ -3104,7 +3670,8 @@ class RebaseTuiApp(App[None]):
                 format_duration(run.get("started_at"), run.get("finished_at")),
                 key=run_id,
             )
-        self.query_one("#timeline-table", DataTable).clear(columns=True)
+        if not preserve:
+            self.query_one("#timeline-table", DataTable).clear(columns=True)
 
     def _render_timeline(self) -> None:
         """The selected run's lifecycle events, steps and — when `l` is on — its logs.
@@ -3118,41 +3685,108 @@ class RebaseTuiApp(App[None]):
         if detail is None:
             return
         self._reveal(2)
+        self._sync_timeline_tabs()
         run_id = str(detail.run.get("id", ""))
         logs = self._run_logs.get(run_id)
+        # A finished run has nothing in flight, whatever its events still say. The platform
+        # used to open stages it never closed — `step-graph` on every workflow run — leaving
+        # a row reading `running` under a run that had succeeded minutes earlier. That is
+        # fixed at the source, but events already written keep their status forever, and the
+        # timeline should not be able to claim a finished run is still working regardless.
+        run_finished = str(detail.run.get("status") or "") in TERMINAL_RUN_STATUSES
         kinds = dict((tab_id, kinds) for tab_id, _, kinds in TIMELINE_FILTERS)[self._timeline_filter]
         showing_all = self._timeline_filter == TIMELINE_FILTERS[0][0]
+        table_name = {
+            "timeline-tasks": "timeline-table-tasks",
+            "timeline-artifacts": "timeline-table-artifacts",
+        }.get(self._timeline_filter, "timeline-table-all" if showing_all else "timeline-table")
+        table = self._fill_table(table_name, widget="timeline-table")
         message_width = self._timeline_message_width()
-        table = self._fill_table("timeline-table-all" if showing_all else "timeline-table", widget="timeline-table")
+        self._timeline_rows = {}
+        artifacts_by_task = Counter(
+            str(artifact["task_id"]) for artifact in detail.artifacts if artifact.get("task_id") is not None
+        )
         shown = 0
-        for row in build_timeline(detail.events, detail.steps, logs, detail.tasks):
+        for row in build_timeline(detail.events, detail.steps, logs, detail.tasks, detail.artifacts):
             if row.kind not in kinds:
                 continue
             shown += 1
-            # Indented under the step above them: tasks by one level, log lines by two,
-            # which is the order they nest in even though the timeline sorts by time.
-            # Indent only under All, where the nesting is what tells the kinds apart;
-            # a filtered view is one kind throughout and reads better flush left.
-            indent = {"task": "  ", "log": "    "}.get(row.kind, "") if showing_all else ""
-            cells: list[Any] = [self._time(row.at)]
-            if showing_all:
-                cells.append(Text(row.kind, style=BRAND_MEDIUM_GRAY))
             # An expanded row keeps its full text, wrapped to what is on screen, and
             # grows to fit. Wrapped here rather than left to the column, because the
             # column is as wide as the longest *un*expanded line and that is the width
             # this row is trying to escape.
             expanded = shown - 1 in self._expanded_timeline
-            message = textwrap.fill(row.message, message_width) if expanded else row.message
-            cells.extend(
-                (
-                    Text(f"{indent}{row.stage}", style=MARK_STYLE if row.kind == "step" else ""),
+            message = textwrap.fill(row.message, message_width) if expanded else collapse_message(row.message)
+            row_key = str(shown - 1)
+            self._timeline_rows[row_key] = row
+
+            if row.kind == "task" and self._timeline_filter == "timeline-tasks":
+                task = row.record
+                outcome = format_json_summary(task.get("error"), max_length=160)
+                if outcome == "-":
+                    outcome = format_json_summary(task.get("result"), max_length=160)
+                outcome = textwrap.fill(outcome, message_width) if expanded else collapse_message(outcome)
+                task_id = task.get("id")
+                table.add_row(
+                    row.stage,
+                    row.scope if row.scope != "run" else "-",
+                    str(task.get("kind") or "-"),
                     status_text(row.status),
-                    Text(message, style=BRAND_MEDIUM_GRAY if row.kind == "log" else ""),
+                    self._time(task.get("started_at") or task.get("created_at")),
+                    format_duration(task.get("started_at"), task.get("finished_at")),
+                    str(artifacts_by_task.get(str(task_id), 0)) if task_id is not None else "0",
+                    Text(outcome, style=BRAND_MEDIUM_GRAY),
+                    height=outcome.count("\n") + 1 if expanded else 1,
+                    key=row_key,
                 )
-            )
-            table.add_row(*cells, height=message.count("\n") + 1 if expanded else 1, key=str(shown - 1))
-        # An empty table looks broken; saying why it is empty is the whole point of
-        # having asked for Steps on a workflow that has none.
+                continue
+
+            if row.kind == "artifact" and self._timeline_filter == "timeline-artifacts":
+                artifact = row.record
+                uri = str(artifact.get("uri") or "-")
+                shown_uri = textwrap.fill(uri, message_width) if expanded else collapse_message(uri)
+                table.add_row(
+                    row.stage,
+                    row.scope,
+                    row.status,
+                    str(artifact.get("media_type") or "-"),
+                    format_bytes(artifact.get("size_bytes")),
+                    Text(shown_uri, style=f"link {row.url}" if row.url else ""),
+                    height=shown_uri.count("\n") + 1 if expanded else 1,
+                    key=row_key,
+                )
+                continue
+
+            cells: list[Any] = [self._time(row.at)]
+            if showing_all:
+                cells.append(Text(row.kind, style=BRAND_MEDIUM_GRAY))
+                cells.append(Text(row.scope, style=BRAND_MEDIUM_GRAY))
+            if row.kind == "log":
+                # A log row is left flush with the messages around it: indenting it read as
+                # ragged rather than as nesting, and the `log` type beside it already says
+                # what the row is. Severity stays out of the Status column — that column
+                # means lifecycle for an event and outcome for a step, and `INFO` is
+                # neither — so a level worth naming leads the message instead.
+                message_cell = Text()
+                if row.status.strip().upper() not in ROUTINE_LOG_SEVERITIES:
+                    message_cell.append(f"{row.status} ", style=status_style(row.status))
+                message_cell.append(message, style=BRAND_MEDIUM_GRAY)
+                cells.extend((Text(""), Text(""), message_cell))
+            else:
+                stale = run_finished and row.kind == "event" and row.status.strip().lower() == "running"
+                item = row.stage
+                if not showing_all and row.kind in {"task", "artifact"} and row.scope != "run":
+                    item = f"{row.scope} › {item}"
+                cells.extend(
+                    (
+                        Text(item, style=MARK_STYLE if row.kind == "step" else ""),
+                        Text(row.status, style=BRAND_MEDIUM_GRAY) if stale else status_text(row.status),
+                        Text(message, style=f"link {row.url}" if row.url else ""),
+                    )
+                )
+            table.add_row(*cells, height=message.count("\n") + 1 if expanded else 1, key=row_key)
+        # Activity, Events and Logs are stable views even before they have rows; an
+        # explicit note distinguishes that state from a table that failed to paint.
         if not shown:
             note = TIMELINE_EMPTY.get(self._timeline_filter, "Nothing to show.")
             table.add_row(*self._timeline_note(showing_all, "empty", note))
@@ -3164,10 +3798,10 @@ class RebaseTuiApp(App[None]):
             )
 
     def _timeline_message_width(self) -> int:
-        """How wide the Message column can be before it needs the horizontal scrollbar.
+        """How wide the run-detail table's final prose column can be.
 
-        Read off the columns as they were last laid out: everything to the left of
-        Message keeps its width, and Message gets whatever the pane has left.
+        Everything to its left keeps its width; Summary, Result/Error or URI gets
+        whatever the pane has left before a horizontal scrollbar is necessary.
         """
         table = self.query_one("#timeline-table", DataTable)
         columns = list(table.columns.values())
@@ -3179,8 +3813,9 @@ class RebaseTuiApp(App[None]):
 
     @staticmethod
     def _timeline_note(showing_all: bool, status: str, message: str) -> list[Any]:
-        cells: list[Any] = ["", Text(status, style=BRAND_AMBER), Text(message, style=BRAND_MEDIUM_GRAY)]
-        return [cells[0], "", *cells[1:]] if showing_all else cells
+        status_cell = Text(status, style=BRAND_AMBER)
+        message_cell = Text(message, style=BRAND_MEDIUM_GRAY)
+        return ["", "", "", "", status_cell, message_cell] if showing_all else ["", "", status_cell, message_cell]
 
     def _clear_target_detail(self, *, clear_project: bool = True) -> None:
         if clear_project:
@@ -3194,6 +3829,7 @@ class RebaseTuiApp(App[None]):
         self.query_one("#timeline-table", DataTable).clear(columns=True)
         self._run_rows = {}
         self._run_detail = None
+        self._timeline_rows = {}
         self._reveal(0)
 
     def _select_project(self, project_id: str) -> None:
@@ -3319,13 +3955,55 @@ class RebaseTuiApp(App[None]):
             sections=sections,
         )
 
+    @staticmethod
+    def _task_drawer(row: TimelineRow) -> DetailDrawer:
+        task = row.record
+        output: dict[str, Any] = {"result": task.get("result")}
+        if task.get("error"):
+            output["error"] = task["error"]
+        if task.get("error_type"):
+            output["error_type"] = task["error_type"]
+        status = str(task.get("status") or row.status or "unknown")
+        return DetailDrawer(
+            fields=[
+                DetailField("Task", str(task.get("name") or row.stage)),
+                DetailField("Status", status, status_style(status)),
+                DetailField("Scope", row.scope),
+                DetailField("Kind", str(task.get("kind") or "-")),
+                DetailField("Task ID", str(task.get("id") or "-")),
+            ],
+            sections=[{"parameters": task.get("parameters") or {}}, output],
+        )
+
+    @staticmethod
+    def _artifact_drawer(row: TimelineRow) -> DetailDrawer:
+        artifact = row.record
+        disposition = str(artifact.get("disposition") or row.status or "created")
+        return DetailDrawer(
+            fields=[
+                DetailField("Artifact", str(artifact.get("name") or row.stage)),
+                DetailField("Disposition", disposition),
+                DetailField("Scope", row.scope),
+                DetailField("URI", str(artifact.get("uri") or "-")),
+                DetailField("Artifact ID", str(artifact.get("id") or "-")),
+                DetailField("Producer run", str(artifact.get("producer_run_id") or "-")),
+            ],
+            sections=[detail_payload(artifact)],
+        )
+
     def _selected_details(self) -> DetailDrawer | None:
         """The drawer for the focused table's row, or None when there is nothing to show."""
         focused = self.focused
         table_id = str(focused.id) if isinstance(focused, DataTable) else ""
-        # The timeline is one run's own story, so `p` there means that run — there is no
-        # per-row record behind a log line or a stage to show instead.
         if table_id == "timeline-table":
+            row_key = self._cursor_key(focused)
+            row = self._timeline_rows.get(row_key or "")
+            if row is not None and row.kind == "task":
+                return self._task_drawer(row)
+            if row is not None and row.kind == "artifact":
+                return self._artifact_drawer(row)
+            # Events, steps and log lines are observations within the run rather than
+            # richer resources of their own, so their detail action remains the run.
             return None if self._run_detail is None else self._run_drawer(self._run_detail.run)
         key = focused.cursor_key if isinstance(focused, SelectableDataTable) else self._cursor_key(focused)
         if key is None:
@@ -3378,15 +4056,23 @@ class RebaseTuiApp(App[None]):
             item = self._workflow_rows.get(key)
             if item is None:
                 return None
+            version = self.project_targets.workflow_versions.get(key) if self.project_targets is not None else None
             own = sorted(
                 (step for steps in self._steps_by_function.values() for step in steps if step.workflow_id == key),
                 key=lambda step: step.order,
             )
+            fields = [
+                DetailField("Workflow", str(item.get("name", "-"))),
+                DetailField("State", format_bool(item.get("enabled"))),
+            ]
+            source = format_workflow_source(version)
+            if source != "-":
+                fields.append(DetailField("Source", source))
+            commit = format_workflow_commit(version, compact=False)
+            if commit != "-":
+                fields.append(DetailField("Commit", commit))
             return DetailDrawer(
-                fields=[
-                    DetailField("Workflow", str(item.get("name", "-"))),
-                    DetailField("State", format_bool(item.get("enabled"))),
-                ],
+                fields=fields,
                 sections=[
                     detail_payload(
                         item,
@@ -3435,8 +4121,14 @@ class RebaseTuiApp(App[None]):
             self.selected_target_type = "function"
             self.selected_target = target
             self._reveal(1)
-            self._runs_reload = partial(self._load_runs, "function", row_id)
-            self.run_worker(self._load_runs("function", row_id), name="runs", group="tui", exclusive=True)
+            target_name = str(target.get("name") or "") or None
+            self._runs_reload = partial(self._load_runs, "function", row_id, name=target_name)
+            self.run_worker(
+                self._load_runs("function", row_id, name=target_name),
+                name="runs",
+                group="tui",
+                exclusive=True,
+            )
         elif event.data_table.id == "workflows-table":
             target = self._workflow_rows.get(row_id)
             if target is None:
@@ -3444,8 +4136,14 @@ class RebaseTuiApp(App[None]):
             self.selected_target_type = "workflow"
             self.selected_target = target
             self._reveal(1)
-            self._runs_reload = partial(self._load_runs, "workflow", row_id)
-            self.run_worker(self._load_runs("workflow", row_id), name="runs", group="tui", exclusive=True)
+            target_name = str(target.get("name") or "") or None
+            self._runs_reload = partial(self._load_runs, "workflow", row_id, name=target_name)
+            self.run_worker(
+                self._load_runs("workflow", row_id, name=target_name),
+                name="runs",
+                group="tui",
+                exclusive=True,
+            )
         elif event.data_table.id == "timeline-table":
             # Enter, or a click, opens the row out to its full text and closes it again.
             # A log line is the one thing here that does not fit its row, and scrolling

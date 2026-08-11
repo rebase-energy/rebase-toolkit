@@ -7,6 +7,7 @@ import pytest
 
 import rebase as rb
 from rebase.runtime import _activate_run_context
+from rebase.tasks import _current_task_id
 
 
 class RecordingClient:
@@ -120,6 +121,7 @@ def test_task_supports_async_context_and_contexts_do_not_leak() -> None:
             async with rb.task("async") as task:
                 await asyncio.sleep(0)
                 assert rb.current_run() == rb.RunContext(run_id=run_id)
+                assert _current_task_id() == task.id
                 task.set_result({"run": run_id})
             return task.status
 
@@ -128,3 +130,4 @@ def test_task_supports_async_context_and_contexts_do_not_leak() -> None:
 
     assert asyncio.run(scenario()) == ["succeeded", "succeeded"]
     assert rb.current_run() is None
+    assert _current_task_id() is None

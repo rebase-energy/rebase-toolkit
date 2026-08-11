@@ -4,6 +4,32 @@
 
 ### Added
 
+- **Execution is now configured with `mode` and `isolation`.** Functions, models, workflows,
+  and `rebase run` default to `mode="interactive", isolation="shared"` for the lowest-latency
+  cloud loop. Functions and models can select `isolation="dedicated"` for a private Cloud Run
+  service, while `mode="job"` uses a fresh Cloud Run Job execution. Workflows support the
+  shared interactive worker and job mode. The former `quick`, `quick_shared`, and `long`
+  `run_type` values remain accepted as deprecated compatibility aliases.
+
+- **`rb.artifact(...)` registers durable output URIs on the current run.** It records a
+  name, optional logical key, created-or-reused disposition, media type, size, object
+  version, digest, and JSON metadata without moving the object itself. Registration is
+  strict in hosted runs and a validated no-op locally. Artifacts inherit the active step
+  and inline task automatically; mapped function runs use their map-task identity so the
+  artifact appears on the canonical parent workflow as well as retaining its producer run.
+  `Run.artifacts()` and `Client.list_run_artifacts(...)` expose the records, and the TUI adds
+  an `[ Artifacts ]` timeline filter with HTTP links rendered as links.
+
+- **The TUI shows where each deployed workflow comes from.** The workflow table now has
+  Source and Commit columns: a Git-backed deployment reads `GitHub` beside the shortened
+  SHA it is pinned to, while a source stored by Rebase reads `Rebase` and has no commit to
+  imply. Pressing `p` on a GitHub-backed workflow shows the full, copyable SHA; pressing
+  `g` opens the file on GitHub at that exact commit. When the connected checkout still has
+  the commit, the TUI reads the committed file directly from Git and anchors the URL to the
+  workflow function's definition line; if it cannot prove the line, it opens the exact file
+  without guessing. The provenance data already comes back with the current-version request
+  used for workflow step graphs, so the display adds no API round trip.
+
 - **`rebase setup` lets you sign in as someone else.** A stored session used to be reused in
   silence, which put the provider picker out of reach for as long as the token lived: someone
   who signed in with GitHub, and whose invite had gone to a work address GitHub never reports,
@@ -88,23 +114,22 @@
   for a run that has one). Each body keeps its own top-level key rather than taking a caption,
   because the key is genuinely part of the document. The rules are Rich's, drawn to the drawer's
   real width, so they are lines rather than a guess at one.
-- **`Client.list_run_tasks(run_id, step_run_id=...)`**, and **the TUI's timeline shows a step's
-  tasks** indented under it, one row per unit of work with its own status, its parameters and
-  either its result or its error. A step reports one outcome for everything inside it; the task
-  rows are where "which one of them failed" survives. Against an API without the route the
+- **`Client.list_run_tasks(run_id, step_run_id=...)`**, and **the TUI's activity view preserves
+  each task's real lineage**, one row per unit of work with its own status, parameters and result
+  or error. Tasks and artifacts carry their owning `step_run_id`/`task_id` path rather than being
+  indented merely because of their type, so a run-level output no longer looks like it belongs to
+  whichever task happens to precede it. A step reports one outcome for everything inside it; the
+  task rows are where "which one of them failed" survives. Against an API without the route the
   method returns no tasks rather than raising, so an older platform costs the rows and not the
   run view.
-- **`[ All ] [ Steps ] [ Events ] [ Logs ] [ Tasks ]` over the timeline.** A run's lifecycle
-  events, its steps, the tasks fanned out inside them and its log output were one
-  undifferentiated list, and the question was usually about one of them. The chips filter it;
-  `left`/`right` step between them, the same gesture the target pane already uses, while `l`
-  jumps straight to Logs and `e` to Events, each going back to All on a second press. `All`
-  keeps everything interleaved by time and adds a Type column saying which each row is — dropped
-  under the others, where every row would repeat one word. `Events` and `Logs` overlap on
-  purpose: the stages are the run's own account of itself, so they belong both to "what
-  happened" and to "everything it said". An empty filter says why it is empty rather than
-  showing a blank table, which is how a workflow with no step graph now tells you so. One `Tabs`
-  over one table, not five panes holding five slices of the same run.
+- **`[ Activity ] [ Steps n ] [ Tasks n ] [ Artifacts n ] [ Logs ] [ Events ]` over the run
+  detail.** Activity keeps the records interleaved by time and adds Type and Scope columns;
+  `left`/`right` step between the focused views, while `l` jumps straight to Logs and `e` to
+  Events. Steps, Tasks and Artifacts appear only when the selected run actually has them, so a
+  simple function run does not advertise three empty branches. Events and Logs remain stable
+  observability views and overlap on purpose: the stages are the run's own account of itself,
+  so they belong both to "what happened" and to "everything it said". One `Tabs` strip filters
+  one table rather than mounting six panes holding slices of the same run.
 - **A timeline row too wide for the pane can be read two ways.** The table scrolls sideways —
   `^pgup`/`^pgdn`, the wheel, or the bar — where the others stay clipped, because a log line is
   not a column you can widen your way out of. And `enter`, or a click, opens the row out: the
@@ -274,6 +299,34 @@
 
 ### Fixed
 
+- **Automatic refresh no longer makes the workflow table pulse between two widths.** The
+  fast first paint used when opening a project contains names and schedules but not the
+  version-backed Source, Commit, step graph or last-run time. Reusing that progressive
+  paint during a refresh replaced a complete table with dashes every tick, resized its
+  columns, then reversed the change when the detail reads returned. Refresh now leaves the
+  previous complete frame on screen until its complete replacement is ready; progressive
+  painting remains in place only when there is no existing project table to look at.
+
+- **A finished run no longer shows a stage as still running.** The platform opened stages it
+  never closed — `step-graph` on every workflow run, `submit` on two function paths — so a run
+  that had succeeded minutes earlier kept a row reading `running`, in the brightest green on
+  the screen. The emitters now say `info` for an announcement that introduces work rather than
+  reporting on it, which is what the event enum has always had for the purpose. Events already
+  written keep their status forever, so the timeline also mutes a non-terminal status on a run
+  that has reached `succeeded`, `failed` or `cancelled`: the word is still what the API sent,
+  since inventing a status would be worse, but it no longer reads as live. The CLI renders
+  `info` as a neutral bullet rather than a green tick, and its streaming path now shares the
+  snapshot path's status mapping instead of carrying a second copy that had to be taught each
+  new status separately.
+
+- **Log lines in the timeline no longer borrow columns that mean something else.** A log row
+  carries no stage, so the four-space indent meant to nest it landed in an empty Stage cell and
+  rendered as nothing — the one kind it was meant to set apart got no indent at all, while
+  tasks did. Severity had the matching problem in Status, a column that means lifecycle for an
+  event and outcome for a step, where `INFO` is neither and only ever repeated the `log` type
+  beside it. Log rows are now flush with the messages around them, Status is left to the two
+  vocabularies it belongs to, and a severity worth noticing leads the message in its own colour.
+
 - **Clicking the header of an empty table no longer crashes the TUI.** Textual's
   header-click handler reads `ordered_columns[column_index]` without checking the list is
   populated, so a click there raised `IndexError` and took the whole app down — reported
@@ -282,6 +335,13 @@
   still drawing a header row. A shared `HeaderSafeDataTable` base swallows the click, using
   `prevent_default` rather than `stop` because Textual invokes `_on_click` for every class
   in the MRO — stopping the bubble to parents does not stop the base handler that indexes.
+
+- **The timeline no longer empties itself while you are reading it.** An automatic refresh
+  re-reads the runs box, and drawing that box cleared the timeline underneath — right when a
+  different target is opened, since that timeline belongs to another run, but wrong on a
+  refresh. A finished run is deliberately not re-read, so nothing put it back: the screen
+  went blank until an arrow key redrew it from memory. The clear now only happens on a fresh
+  selection.
 
 - **Opening a run took about 1.3 seconds.** The run, its events, its steps and its tasks were
   four sequential round trips behind one keypress — measured at 266ms, 330ms, 314ms and 353ms
@@ -303,9 +363,9 @@
   severity split are Textual's and are kept, re-pointed at the brand green, amber and coral, so
   a warning and an error read apart before you read them.
 
-- **`p` did nothing in the timeline box.** The drawer resolved a record per row, and a log line
-  or a lifecycle stage has none, so it said "select a row first" while sitting on a run's own
-  timeline. The timeline *is* one run's story, so `p` there now opens that run.
+- **`p` did nothing in the timeline box.** Tasks and artifacts now open their own full records,
+  including scope and producer-run provenance, while a lifecycle event, step or log line opens
+  the run it belongs to.
 
 - **Every project's runs showed under every other project's workflow.** Opening a workflow in
   the TUI, or running `rebase workflow runs <name>`, listed every run in the workspace: the

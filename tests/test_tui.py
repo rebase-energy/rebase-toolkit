@@ -36,17 +36,27 @@ from rebase.tui import (
     RebaseTuiData,
     SelectableDataTable,
     TimezoneChoiceScreen,
+    collapse_message,
     compact_id,
+    deployed_identities,
     detail_payload,
     endpoints_by_target,
+    format_bytes,
     format_duration,
     format_endpoint,
     format_json_summary,
     format_step_keys,
     format_step_workflows,
     format_timestamp,
+    format_workflow_commit,
+    format_workflow_source,
+    github_workflow_source_url,
     group_ephemeral_runs,
+    is_github_backed,
     status_style,
+    target_ids_by_identity,
+    workflow_definition_line,
+    workflow_definition_line_at_commit,
 )
 
 
@@ -63,6 +73,8 @@ class FakeClient:
         self.api_url = "https://api.example.com"
         self.run_calls: list[dict[str, Any]] = []
         self.run_detail_calls = 0
+        self.latest_run_calls = 0
+        self.latest_runs_by_project: list[dict[str, Any]] = []
         self.deleted: list[tuple[str, str, bool]] = []
         self.delete_lock = threading.Lock()
         self.batch_calls: list[list[str]] = []
@@ -76,9 +88,11 @@ class FakeClient:
         self.version_calls: list[tuple[str, str]] = []
         self.log_calls: list[str] = []
         self.task_calls: list[str] = []
+        self.artifact_calls: list[str] = []
         # Empty by default: a workflow whose steps fan out into nothing has no tasks,
         # which is most of them. `SteppedClient` is the other kind.
         self.tasks: list[dict[str, Any]] = []
+        self.artifacts: list[dict[str, Any]] = []
         # One line between the run's only event and its only step, so the timeline has to
         # interleave the three routes rather than concatenate them.
         self.log_entries: list[dict[str, Any]] = [
@@ -148,11 +162,32 @@ class FakeClient:
 
     def get_workflow_version(self, workflow_id: str, version_id: str) -> dict[str, Any]:
         self.version_calls.append((workflow_id, version_id))
-        return {"id": version_id, "workflow_id": workflow_id, "step_graph": self.step_graph}
+        return {
+            "id": version_id,
+            "workflow_id": workflow_id,
+            "step_graph": self.step_graph,
+            "source_mode": "workspace_repo",
+            "repo_owner": "rebase-energy",
+            "repo_name": "grid-workflows",
+            "source_path": "deploy/forecast.py",
+            "git_commit_sha": "0123456789abcdef0123456789abcdef01234567",
+            "entrypoint": "forecast",
+            "source_code": "def forecast():\n    return {'ok': True}\n",
+        }
 
     def list_run_tasks(self, run_id: str, *, step_run_id: str | None = None) -> list[dict[str, Any]]:
         self.task_calls.append(run_id)
         return self.tasks
+
+    def list_run_artifacts(
+        self,
+        run_id: str,
+        *,
+        step_run_id: str | None = None,
+        task_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self.artifact_calls.append(run_id)
+        return self.artifacts
 
     def get_run_logs(self, run_id: str, *, since: str | None = None, limit: int | None = None) -> dict[str, Any]:
         self.log_calls.append(run_id)
@@ -229,6 +264,10 @@ class FakeClient:
             return self.runs[:limit]
         return []
 
+    def list_latest_runs_by_project(self) -> list[dict[str, Any]]:
+        self.latest_run_calls += 1
+        return self.latest_runs_by_project
+
     def get_run(self, run_id: str) -> dict[str, Any]:
         assert run_id == "run-id"
         self.run_detail_calls += 1
@@ -293,6 +332,7 @@ class SteppedClient(FakeClient):
             {
                 "id": "task-0",
                 "name": "Capture NO1",
+                "step_run_id": "step-id",
                 "batch_id": "batch-id",
                 "item_index": 0,
                 "parameters": {"area": "NO1"},
@@ -306,6 +346,7 @@ class SteppedClient(FakeClient):
             {
                 "id": "task-1",
                 "name": "Capture SE3",
+                "step_run_id": "step-id",
                 "batch_id": "batch-id",
                 "item_index": 1,
                 "parameters": {"area": "SE3"},
@@ -316,6 +357,21 @@ class SteppedClient(FakeClient):
                 "started_at": "2026-06-16T14:00:07Z",
                 "finished_at": "2026-06-16T14:00:09Z",
             },
+        ]
+        self.artifacts = [
+            {
+                "id": "artifact-id",
+                "name": "NO1 day-ahead curves",
+                "key": "nordpool/2026-06-16/NO1.json",
+                "uri": "gs://nordpool-curves/2026-06-16/NO1.json",
+                "disposition": "created",
+                "media_type": "application/json",
+                "size_bytes": 4096,
+                "producer_run_id": "mapped-run-id",
+                "step_run_id": "step-id",
+                "task_id": "task-0",
+                "created_at": "2026-06-16T14:00:08Z",
+            }
         ]
         self.step_graph = {
             "schema_version": 1,
@@ -356,6 +412,58 @@ def test_tui_format_helpers() -> None:
     assert format_timestamp("2026-06-16T12:00:00Z") == "2026-06-16 12:00:00"
     assert format_json_summary({"b": 2, "a": 1}) == '{"a": 1, "b": 2}'
     assert status_style("failed") == "#E46962"
+
+    github = {"source_mode": "workspace_repo", "git_commit_sha": "0123456789abcdef"}
+    assert is_github_backed(github) is True
+    assert format_workflow_source(github) == "GitHub"
+    assert format_workflow_commit(github) == "01234567..."
+    assert format_workflow_commit(github, compact=False) == "0123456789abcdef"
+
+    hosted = {"source_mode": "rebase_hosted", "git_commit_sha": "must-not-be-shown"}
+    assert is_github_backed(hosted) is False
+    assert format_workflow_source(hosted) == "Rebase"
+    assert format_workflow_commit(hosted) == "-"
+
+
+def test_tui_github_source_url_is_pinned_and_can_name_the_definition_line() -> None:
+    version = {
+        "source_mode": "workspace_repo",
+        "repo_owner": "rebase-energy",
+        "repo_name": "grid workflows",
+        "git_commit_sha": "0123456789abcdef",
+        "source_path": "deploy/forecast curves.py",
+    }
+    assert github_workflow_source_url(version, line=17) == (
+        "https://github.com/rebase-energy/grid%20workflows/blob/0123456789abcdef/deploy/forecast%20curves.py#L17"
+    )
+    assert github_workflow_source_url({**version, "source_mode": "rebase_hosted"}) is None
+
+    committed = "def forecast():\n    return 1\n\n\ndef forecast():\n    return 2\n"
+    deployed = "def forecast():\n    return 2\n"
+    assert workflow_definition_line(committed, "forecast", deployed) == 5
+    # Two definitions and no deployed body to disambiguate them: do not guess a line.
+    assert workflow_definition_line(committed, "forecast") is None
+
+
+def test_tui_definition_line_reads_the_exact_git_object(monkeypatch, tmp_path) -> None:
+    committed = "VALUE = 1\n\ndef forecast():\n    return VALUE\n"
+    seen: list[tuple[Path, str, str]] = []
+    monkeypatch.setattr("rebase.tui.git_toplevel", lambda root: tmp_path)
+
+    def git_source(repo: Path, commit: str, source_path: str) -> str:
+        seen.append((repo, commit, source_path))
+        return committed
+
+    monkeypatch.setattr("rebase.tui._git_source_at_commit", git_source)
+    version = {
+        "git_commit_sha": "0123456789abcdef",
+        "source_path": "deploy/forecast.py",
+        "entrypoint": "forecast",
+        "source_code": "def forecast():\n    return VALUE\n",
+    }
+
+    assert workflow_definition_line_at_commit(version, [tmp_path]) == 3
+    assert seen == [(tmp_path, "0123456789abcdef", "deploy/forecast.py")]
 
 
 def test_tui_data_loads_project_filtered_overview_and_runs() -> None:
@@ -422,6 +530,7 @@ def test_tui_data_reads_the_step_graph_off_the_current_workflow_version() -> Non
         ("forecast", "normalize", ("load_weather",)),
     ]
     assert set(targets.steps_by_function()) == {"load-function-id", "function-id"}
+    assert targets.workflow_versions["workflow-id"]["git_commit_sha"] == ("0123456789abcdef0123456789abcdef01234567")
 
 
 def test_tui_data_reports_no_steps_for_a_workflow_that_is_its_own_body() -> None:
@@ -495,6 +604,14 @@ def test_tui_format_duration() -> None:
     assert format_duration("nonsense", "2026-06-16T14:01:00Z") == "-"
 
 
+def test_tui_format_artifact_size() -> None:
+    assert format_bytes(0) == "0 B"
+    assert format_bytes(4096) == "4.0 KiB"
+    assert format_bytes(3 * 1024 * 1024) == "3.0 MiB"
+    assert format_bytes(None) == "-"
+    assert format_bytes(-1) == "-"
+
+
 def test_tui_data_tolerates_a_missing_endpoint_route() -> None:
     class Unsupported(FakeClient):
         def list_project_endpoints(self, project_id: str) -> list[dict[str, Any]]:
@@ -555,9 +672,13 @@ def test_tui_project_row_puts_each_count_under_its_own_header() -> None:
                 "Workflows",
                 "Cron jobs",
                 "Endpoints",
+                "Last run",
+                "Next run",
+                "Created",
             ]
-            assert [str(cell) for cell in projects.get_row_at(0)] == ["energy", "3", "2", "1", "1"]
-            assert [str(cell) for cell in projects.get_row_at(1)] == ["trading", "0", "0", "0", "0"]
+            # The count columns keep their order; the three time columns follow.
+            assert [str(cell) for cell in projects.get_row_at(0)][:5] == ["energy", "3", "2", "1", "1"]
+            assert [str(cell) for cell in projects.get_row_at(1)][:5] == ["trading", "0", "0", "0", "0"]
 
     asyncio.run(scenario())
 
@@ -659,15 +780,18 @@ def test_tui_app_mounts_and_renders_selected_workflow_run() -> None:
 
             runs = app.query_one("#runs-table", DataTable)
             assert runs.row_count == 1
-            assert client.run_calls[-1]["workflow_id"] == "workflow-id"
+            # Selected by id — asserted over the calls rather than on the last one,
+            # because opening a target also scans the project for runs that ran under
+            # its name and that scan passes no workflow_id.
+            assert any(call.get("workflow_id") == "workflow-id" for call in client.run_calls)
 
             runs.focus()
             runs.move_cursor(row=0)
             await pilot.press("enter")
             await pilot.pause(0.2)
 
-            # Event, log and step land in one timeline, in the order they happened, and
-            # under All each says which it is. Columns: Time, Type, Stage, Status, Message.
+            # Event, log and step land in one activity view, in the order they happened.
+            # Columns: Time, Type, Scope, Item, Status, Summary.
             timeline = app.query_one("#timeline-table", DataTable)
             assert timeline.row_count == 3
             assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(3)] == [
@@ -675,7 +799,7 @@ def test_tui_app_mounts_and_renders_selected_workflow_run() -> None:
                 "log",
                 "step",
             ]
-            assert [str(timeline.get_cell_at(Coordinate(row, 2))).strip() for row in range(3)] == [
+            assert [str(timeline.get_cell_at(Coordinate(row, 3))).strip() for row in range(3)] == [
                 "dispatch",
                 "",
                 "load_weather",
@@ -702,7 +826,7 @@ def test_tui_app_mounts_and_renders_selected_workflow_run() -> None:
     asyncio.run(scenario())
 
 
-def test_tui_app_shows_the_endpoint_column_and_the_target_tabs() -> None:
+def test_tui_app_shows_workflow_provenance_the_endpoint_column_and_the_target_tabs() -> None:
     async def scenario() -> None:
         app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
 
@@ -716,9 +840,14 @@ def test_tui_app_shows_the_endpoint_column_and_the_target_tabs() -> None:
 
             workflows = app.query_one("#workflows-table", DataTable)
             functions = app.query_one("#functions-table", DataTable)
-            # Endpoint is the 5th workflow column and the 7th function column, which
-            # carries two more up front for the step graph.
-            assert str(workflows.get_cell_at(Coordinate(0, 4))) == "POST /forecast"
+            # A GitHub-backed workflow names its source and deployed commit. The table
+            # shortens the SHA; the drawer below keeps the copyable value intact.
+            assert str(workflows.get_cell_at(Coordinate(0, 2))) == "GitHub"
+            assert str(workflows.get_cell_at(Coordinate(0, 3))) == "01234567..."
+
+            # Endpoint is the 7th workflow column and the 7th function column, which
+            # carries two different columns up front for the step graph.
+            assert str(workflows.get_cell_at(Coordinate(0, 6))) == "POST /forecast"
             assert str(functions.get_cell_at(Coordinate(0, 6))) == "-"
 
             # The workflow's endpoint, with the full URL the column has no room for.
@@ -731,6 +860,8 @@ def test_tui_app_shows_the_endpoint_column_and_the_target_tabs() -> None:
             assert [(f.label, f.value) for f in drawer.fields] == [
                 ("Workflow", "forecast"),
                 ("State", "enabled"),
+                ("Source", "GitHub"),
+                ("Commit", "0123456789abcdef0123456789abcdef01234567"),
             ]
             assert drawer.payload["endpoints"][0]["url"] == "https://api.example.com/e/energy-workspace/energy/forecast"
             await pilot.press("escape")
@@ -763,8 +894,107 @@ def test_tui_app_shows_the_endpoint_column_and_the_target_tabs() -> None:
     asyncio.run(scenario())
 
 
+def test_tui_marks_rebase_hosted_workflow_without_a_git_commit() -> None:
+    """A hosted source is explicit too, and never borrows incidental local git metadata."""
+
+    class HostedClient(FakeClient):
+        def get_workflow_version(self, workflow_id: str, version_id: str) -> dict[str, Any]:
+            version = super().get_workflow_version(workflow_id, version_id)
+            return {**version, "source_mode": "rebase_hosted", "git_commit_sha": "local-only-sha"}
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(HostedClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", DataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            workflows = app.query_one("#workflows-table", DataTable)
+            assert str(workflows.get_cell_at(Coordinate(0, 2))) == "Rebase"
+            assert str(workflows.get_cell_at(Coordinate(0, 3))) == "-"
+
+            workflows.focus()
+            workflows.move_cursor(row=0)
+            await pilot.press("p")
+            await pilot.pause(0.2)
+            drawer = app.screen
+            assert isinstance(drawer, DetailDrawer)
+            assert [(f.label, f.value) for f in drawer.fields] == [
+                ("Workflow", "forecast"),
+                ("State", "enabled"),
+                ("Source", "Rebase"),
+            ]
+
+    asyncio.run(scenario())
+
+
+def test_tui_g_opens_the_selected_workflow_at_its_deployed_commit_and_definition(monkeypatch) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr("rebase.tui.workflow_definition_line_at_commit", lambda version, roots: 17)
+    monkeypatch.setattr("rebase.tui.webbrowser.open", lambda url: opened.append(url) or True)
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", DataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            workflows = app.query_one("#workflows-table", DataTable)
+            workflows.focus()
+            workflows.move_cursor(row=0)
+            await pilot.press("g")
+            await pilot.pause(0.3)
+
+    asyncio.run(scenario())
+    assert opened == [
+        "https://github.com/rebase-energy/grid-workflows/blob/"
+        "0123456789abcdef0123456789abcdef01234567/deploy/forecast.py#L17"
+    ]
+
+
+def test_tui_g_does_not_open_rebase_hosted_workflow(monkeypatch) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr("rebase.tui.webbrowser.open", lambda url: opened.append(url) or True)
+
+    class HostedClient(FakeClient):
+        def get_workflow_version(self, workflow_id: str, version_id: str) -> dict[str, Any]:
+            return {**super().get_workflow_version(workflow_id, version_id), "source_mode": "rebase_hosted"}
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(HostedClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", DataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            workflows = app.query_one("#workflows-table", DataTable)
+            workflows.focus()
+            workflows.move_cursor(row=0)
+            await pilot.press("g")
+            await pilot.pause(0.2)
+
+    asyncio.run(scenario())
+    assert opened == []
+
+
 @contextmanager
-def local_rebase_api() -> Iterator[tuple[str, list[tuple[str, dict[str, list[str]], str | None]]]]:
+def local_rebase_api(
+    log_entries: list[dict[str, Any]] | None = None,
+    run_events: list[dict[str, Any]] | None = None,
+) -> Iterator[tuple[str, list[tuple[str, dict[str, list[str]], str | None]]]]:
     seen_requests: list[tuple[str, dict[str, list[str]], str | None]] = []
     projects = [{"id": "project-id", "name": "energy"}]
     functions = [
@@ -834,15 +1064,19 @@ def local_rebase_api() -> Iterator[tuple[str, list[tuple[str, dict[str, list[str
         "created_at": "2026-06-16T14:00:00Z",
         "finished_at": "2026-06-16T14:01:00Z",
     }
-    events = [
-        {
-            "id": "event-id",
-            "stage": "dispatch",
-            "status": "completed",
-            "message": "Accepted run request.",
-            "created_at": "2026-06-16T14:00:01Z",
-        }
-    ]
+    events = (
+        run_events
+        if run_events is not None
+        else [
+            {
+                "id": "event-id",
+                "stage": "dispatch",
+                "status": "completed",
+                "message": "Accepted run request.",
+                "created_at": "2026-06-16T14:00:01Z",
+            }
+        ]
+    )
     steps = [
         {
             "id": "step-id",
@@ -856,10 +1090,14 @@ def local_rebase_api() -> Iterator[tuple[str, list[tuple[str, dict[str, list[str
     ]
     # One line inside each of the two windows above, so the timeline has to interleave
     # them rather than append them: log, event, log, step is the wrong order to show.
-    log_entries = [
-        {"timestamp": "2026-06-16T14:00:02Z", "severity": "INFO", "message": "Fetching curves."},
-        {"timestamp": "2026-06-16T14:00:07Z", "severity": "INFO", "message": "Wrote 96 rows."},
-    ]
+    log_entries = (
+        log_entries
+        if log_entries is not None
+        else [
+            {"timestamp": "2026-06-16T14:00:02Z", "severity": "INFO", "message": "Fetching curves."},
+            {"timestamp": "2026-06-16T14:00:07Z", "severity": "INFO", "message": "Wrote 96 rows."},
+        ]
+    )
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -927,8 +1165,10 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
 
                 projects = app.query_one("#projects-table", DataTable)
                 assert projects.row_count == 1
-                # Project, Functions, Workflows, Cron jobs, Endpoints.
-                assert [str(cell) for cell in projects.get_row_at(0)] == ["energy", "1", "1", "1", "1"]
+                # Project, Functions, Workflows, Cron jobs, Endpoints. The Last run,
+                # Next run and Created columns follow; their values depend on when
+                # this ran, so the counts are what is asserted.
+                assert [str(cell) for cell in projects.get_row_at(0)][:5] == ["energy", "1", "1", "1", "1"]
                 assert app.query_one("#workspace-view").styles.display == "block"
                 assert app.query_one("#project-view").styles.display == "none"
                 projects.focus()
@@ -964,7 +1204,7 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
                 await pilot.press("enter")
                 await pilot.pause(0.2)
 
-                # All: the event, both log lines and the step, interleaved by time.
+                # Activity: the event, both log lines and the step, interleaved by time.
                 timeline = app.query_one("#timeline-table", DataTable)
                 assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(4)] == [
                     "event",
@@ -972,7 +1212,7 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
                     "step",
                     "log",
                 ]
-                assert str(timeline.get_cell_at(Coordinate(1, 4))).strip() == "Fetching curves."
+                assert str(timeline.get_cell_at(Coordinate(1, 5))).strip() == "Fetching curves."
 
                 # `l` narrows to the log output and its events; `l` again goes back.
                 await pilot.press("l")
@@ -1005,6 +1245,136 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
             assert any(path == "/workflows/workflow-id/versions/workflow-version-id" for path, _, _ in seen_requests)
             assert any(path == "/runs/run-id/events" for path, _, _ in seen_requests)
             assert any(path == "/runs/run-id/steps" for path, _, _ in seen_requests)
+
+    asyncio.run(scenario())
+
+
+def test_tui_log_rows_stay_flush_and_keep_severity_out_of_status() -> None:
+    """A log line sits flush with the messages around it, and its severity is not a status.
+
+    The Status column means lifecycle for an event and outcome for a step; `INFO` is neither
+    and only ever repeated the `log` type beside it, so a routine severity says nothing and
+    anything worth naming leads the message. The Stage cell stays empty rather than holding
+    an indent, which only ever rendered as invisible whitespace.
+    """
+
+    async def scenario() -> None:
+        entries = [
+            {"timestamp": "2026-06-16T14:00:02Z", "severity": "INFO", "message": "Fetching curves."},
+            {"timestamp": "2026-06-16T14:00:07Z", "severity": "WARNING", "message": "Retrying once."},
+        ]
+        with local_rebase_api(entries) as (api_url, _seen_requests):
+            client = Client(api_key="rbw_test", api_url=api_url)
+            app = RebaseTuiApp(data=RebaseTuiData(client, project="energy", limit=5))
+
+            async with app.run_test(size=(140, 42)) as pilot:
+                await pilot.pause(0.2)
+                projects = app.query_one("#projects-table", DataTable)
+                projects.focus()
+                projects.move_cursor(row=0)
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+                workflows = app.query_one("#workflows-table", DataTable)
+                workflows.focus()
+                workflows.move_cursor(row=0)
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+                runs = app.query_one("#runs-table", DataTable)
+                runs.focus()
+                runs.move_cursor(row=0)
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+
+                # Rows are event, log, step, log. Columns are Time, Type, Scope,
+                # Item, Status and Summary.
+                timeline = app.query_one("#timeline-table", DataTable)
+                kinds = [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(4)]
+                assert kinds == ["event", "log", "step", "log"]
+
+                # Left flush with the messages around it, and no stray indent in the Item
+                # cell either — that only ever rendered as invisible whitespace.
+                info_message = str(timeline.get_cell_at(Coordinate(1, 5)))
+                assert info_message == "Fetching curves."
+                assert str(timeline.get_cell_at(Coordinate(1, 3))) == ""
+
+                # A routine severity says nothing; the event above it still owns Status.
+                assert str(timeline.get_cell_at(Coordinate(1, 4))) == ""
+                assert str(timeline.get_cell_at(Coordinate(0, 4))) == "completed"
+
+                # A level worth noticing still names itself, on the line rather than in
+                # the Status column.
+                warning_message = str(timeline.get_cell_at(Coordinate(3, 5)))
+                assert warning_message.strip() == "WARNING Retrying once."
+                assert str(timeline.get_cell_at(Coordinate(3, 4))) == ""
+
+    asyncio.run(scenario())
+
+
+def test_tui_does_not_show_a_finished_run_as_still_running() -> None:
+    """A stage left open in `running` must not read as live once the run is over.
+
+    The platform used to open stages it never closed — `step-graph` on every workflow run —
+    so a succeeded run kept a row claiming work was in flight, in the brightest green on the
+    screen. That is fixed at the source, but events already written keep their status
+    forever, so the timeline de-emphasises them rather than trusting the stream.
+    """
+
+    async def scenario() -> None:
+        events = [
+            {
+                "id": "event-1",
+                "stage": "dispatch",
+                "status": "completed",
+                "message": "Accepted run request.",
+                "created_at": "2026-06-16T14:00:01Z",
+            },
+            {
+                "id": "event-2",
+                "stage": "step-graph",
+                "status": "running",
+                "message": "Materializing workflow steps.",
+                "created_at": "2026-06-16T14:00:03Z",
+            },
+        ]
+        with local_rebase_api(None, events) as (api_url, _seen_requests):
+            client = Client(api_key="rbw_test", api_url=api_url)
+            app = RebaseTuiApp(data=RebaseTuiData(client, project="energy", limit=5))
+
+            async with app.run_test(size=(140, 42)) as pilot:
+                await pilot.pause(0.2)
+                projects = app.query_one("#projects-table", DataTable)
+                projects.focus()
+                projects.move_cursor(row=0)
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+                workflows = app.query_one("#workflows-table", DataTable)
+                workflows.focus()
+                workflows.move_cursor(row=0)
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+                runs = app.query_one("#runs-table", DataTable)
+                runs.focus()
+                runs.move_cursor(row=0)
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+
+                # Located by stage rather than by index: the run's log lines interleave with
+                # its events by timestamp, so the row numbers depend on the fixture's clock.
+                timeline = app.query_one("#timeline-table", DataTable)
+                rows = {str(timeline.get_cell_at(Coordinate(row, 3))): row for row in range(timeline.row_count)}
+                assert {"dispatch", "step-graph"} <= rows.keys()
+
+                # The word is still what the API sent — inventing a status would be worse —
+                # but it is muted rather than styled as a live state.
+                stale = timeline.get_cell_at(Coordinate(rows["step-graph"], 4))
+                assert str(stale) == "running"
+                assert stale.style == BRAND_MEDIUM_GRAY
+                assert stale.style != status_style("running")
+
+                # A genuinely terminal status is untouched.
+                closed = timeline.get_cell_at(Coordinate(rows["dispatch"], 4))
+                assert str(closed) == "completed"
+                assert closed.style == status_style("completed")
 
     asyncio.run(scenario())
 
@@ -1816,6 +2186,9 @@ def test_tui_tables_have_no_header_until_their_rows_arrive() -> None:
                 "Workflows",
                 "Cron jobs",
                 "Endpoints",
+                "Last run",
+                "Next run",
+                "Created",
             ]
 
             # Entering a project is the same story one level down.
@@ -2362,11 +2735,13 @@ def test_tui_build_timeline_keeps_rows_with_no_usable_timestamp() -> None:
     assert [row.stage for row in rows] == ["undated", "late"]
 
 
-def test_tui_build_timeline_nests_a_steps_tasks_under_it() -> None:
+def test_tui_build_timeline_preserves_a_steps_task_lineage() -> None:
     """A step reports one outcome; its tasks are where "which one failed" survives."""
-    steps = [{"name": "fetch", "status": "succeeded", "started_at": "2026-06-16T14:00:05Z"}]
+    steps = [{"id": "step-1", "name": "fetch", "status": "succeeded", "started_at": "2026-06-16T14:00:05Z"}]
     tasks = [
         {
+            "id": "task-0",
+            "step_run_id": "step-1",
             "item_index": 0,
             "parameters": {"area": "NO1"},
             "status": "succeeded",
@@ -2374,6 +2749,8 @@ def test_tui_build_timeline_nests_a_steps_tasks_under_it() -> None:
             "started_at": "2026-06-16T14:00:06Z",
         },
         {
+            "id": "task-1",
+            "step_run_id": "step-1",
             "item_index": 1,
             "parameters": {"area": "SE3"},
             "status": "failed",
@@ -2391,12 +2768,32 @@ def test_tui_build_timeline_nests_a_steps_tasks_under_it() -> None:
     # The parameters say which unit of work it was; the error says what became of it.
     assert rows[1].message == '{"area": "NO1"} -> {"objects": 1}'
     assert rows[2].message == '{"area": "SE3"} -> 401 Unauthorized'
+    assert [row.scope for row in rows] == ["run", "fetch", "fetch"]
 
     # A task that has not started yet sorts with its batch, not to the top of the run.
     queued = tui_module.build_timeline(
         [], steps, None, [{"item_index": 0, "status": "queued", "created_at": "2026-06-16T14:00:06Z"}]
     )
     assert [row.kind for row in queued] == ["step", "task"]
+
+
+def test_tui_build_timeline_places_artifacts_under_their_declared_owner() -> None:
+    steps = [{"id": "step-1", "name": "fetch", "started_at": "2026-06-16T14:00:05Z"}]
+    tasks = [{"id": "task-1", "name": "Capture NO1", "step_run_id": "step-1"}]
+    artifacts = [
+        {"id": "a1", "name": "curves", "uri": "gs://curves/no1", "task_id": "task-1"},
+        {"id": "a2", "name": "summary", "uri": "gs://curves/summary", "step_run_id": "step-1"},
+        {"id": "a3", "name": "manifest", "uri": "gs://curves/manifest"},
+    ]
+
+    rows = tui_module.build_timeline([], steps, None, tasks, artifacts)
+    scopes = {row.stage: row.scope for row in rows if row.kind == "artifact"}
+
+    assert scopes == {
+        "curves": "fetch › Capture NO1",
+        "summary": "fetch",
+        "manifest": "run",
+    }
 
 
 def test_tui_functions_table_names_the_workflow_each_step_belongs_to() -> None:
@@ -2652,6 +3049,48 @@ def test_tui_p_in_the_timeline_opens_the_run_it_belongs_to() -> None:
     asyncio.run(scenario())
 
 
+def test_tui_p_opens_the_task_or_artifact_behind_an_activity_row() -> None:
+    """Execution children keep their own record instead of falling back to the run."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(SteppedClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(180, 42)) as pilot:
+            await _open_run(app, pilot)
+            timeline = app.query_one("#timeline-table", DataTable)
+
+            app._select_timeline_filter("timeline-tasks")
+            timeline.focus()
+            timeline.move_cursor(row=0)
+            await pilot.press("p")
+            await pilot.pause(0.2)
+            task_drawer = app.screen
+            assert isinstance(task_drawer, DetailDrawer)
+            assert task_drawer.drawer_title == "Capture NO1"
+            assert [(field.label, field.value) for field in task_drawer.fields[1:3]] == [
+                ("Status", "succeeded"),
+                ("Scope", "load_weather"),
+            ]
+            assert task_drawer.sections[0] == {"parameters": {"area": "NO1"}}
+
+            await pilot.press("p")
+            app._select_timeline_filter("timeline-artifacts")
+            timeline.focus()
+            timeline.move_cursor(row=0)
+            await pilot.press("p")
+            await pilot.pause(0.2)
+            artifact_drawer = app.screen
+            assert isinstance(artifact_drawer, DetailDrawer)
+            assert artifact_drawer.drawer_title == "NO1 day-ahead curves"
+            assert ("Scope", "load_weather › Capture NO1") in [
+                (field.label, field.value) for field in artifact_drawer.fields
+            ]
+            assert ("Producer run", "mapped-run-id") in [(field.label, field.value) for field in artifact_drawer.fields]
+            assert artifact_drawer.payload["uri"] == "gs://nordpool-curves/2026-06-16/NO1.json"
+
+    asyncio.run(scenario())
+
+
 def test_tui_run_drawer_puts_an_error_before_the_result() -> None:
     run = {"id": "run-9", "status": "failed", "parameters": {"a": 1}, "result": None, "error": "boom"}
     app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
@@ -2714,8 +3153,9 @@ def test_tui_footer_shows_only_the_keys_you_move_around_with() -> None:
                 for _, binding, _, _ in app.screen.active_bindings.values()
                 if not binding.show
             }
-            for key in ("d", "o", "s", "p", "l", "m"):
+            for key in ("d", "o", "g", "s", "p", "l", "m"):
                 assert key in hidden, key
+            assert hidden["g"] == "Open deployed code on GitHub"
             assert hidden["m"] == "Maximise pane"
 
             tab = next(b for _, b, _, _ in app.screen.active_bindings.values() if b.key == "tab")
@@ -2813,7 +3253,7 @@ def _open_run(app, pilot):
 
 
 def test_tui_timeline_chips_filter_the_run_by_kind() -> None:
-    """One table, four chips: the same run seen four ways rather than four tables."""
+    """One table and its chips show the same run at different levels of detail."""
 
     async def scenario() -> None:
         app = RebaseTuiApp(data=fake_tui_data(SteppedClient(), project="energy", limit=5))
@@ -2822,18 +3262,27 @@ def test_tui_timeline_chips_filter_the_run_by_kind() -> None:
             await _open_run(app, pilot)
             timeline = app.query_one("#timeline-table", DataTable)
             assert [str(tab.label) for tab in app.query("#timeline-tabs Tab")] == [
-                "[ All ]",
-                "[ Steps ]",
-                "[ Events ]",
+                "[ Activity ]",
+                "[ Steps 1 ]",
+                "[ Tasks 2 ]",
+                "[ Artifacts 1 ]",
                 "[ Logs ]",
-                "[ Tasks ]",
+                "[ Events ]",
             ]
 
             def kinds() -> list[str]:
                 return [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(timeline.row_count)]
 
-            # All: the Type column says which each row is, and everything is present.
-            assert set(kinds()) == {"event", "log", "step", "task"}
+            # Activity: the Type column says which each row is, and everything is present.
+            assert set(kinds()) == {"artifact", "event", "log", "step", "task"}
+            task_row = next(
+                row for row in range(timeline.row_count) if str(timeline.get_cell_at(Coordinate(row, 1))) == "task"
+            )
+            artifact_row = next(
+                row for row in range(timeline.row_count) if str(timeline.get_cell_at(Coordinate(row, 1))) == "artifact"
+            )
+            assert str(timeline.get_cell_at(Coordinate(task_row, 2))) == "load_weather"
+            assert str(timeline.get_cell_at(Coordinate(artifact_row, 2))) == "load_weather › Capture NO1"
 
             # left/right steps the chips, the same gesture as the target pane's.
             await pilot.press("right")
@@ -2852,9 +3301,42 @@ def test_tui_timeline_chips_filter_the_run_by_kind() -> None:
 
             await pilot.press("right")
             await pilot.pause(0.2)
-            assert app._timeline_filter == "timeline-events"
-            # Events is the platform's own account of the run: stages, no output.
-            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(timeline.row_count)] == ["dispatch"]
+            assert app._timeline_filter == "timeline-tasks"
+            assert [str(column.label) for column in timeline.columns.values()] == [
+                "Task",
+                "Step",
+                "Kind",
+                "Status",
+                "Started",
+                "Duration",
+                "Artifacts",
+                "Result / Error",
+            ]
+            assert [str(timeline.get_cell_at(Coordinate(row, 0))) for row in range(timeline.row_count)] == [
+                "Capture NO1",
+                "Capture SE3",
+            ]
+            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(timeline.row_count)] == [
+                "load_weather",
+                "load_weather",
+            ]
+            assert [str(timeline.get_cell_at(Coordinate(row, 6))) for row in range(timeline.row_count)] == ["1", "0"]
+
+            await pilot.press("right")
+            await pilot.pause(0.2)
+            assert app._timeline_filter == "timeline-artifacts"
+            assert [str(column.label) for column in timeline.columns.values()] == [
+                "Artifact",
+                "Produced by",
+                "Disposition",
+                "Type",
+                "Size",
+                "URI",
+            ]
+            assert str(timeline.get_cell_at(Coordinate(0, 0))) == "NO1 day-ahead curves"
+            assert str(timeline.get_cell_at(Coordinate(0, 1))) == "load_weather › Capture NO1"
+            assert str(timeline.get_cell_at(Coordinate(0, 4))) == "4.0 KiB"
+            assert "gs://nordpool-curves/2026-06-16/NO1.json" in str(timeline.get_cell_at(Coordinate(0, 5)))
 
             await pilot.press("right")
             await pilot.pause(0.2)
@@ -2864,11 +3346,9 @@ def test_tui_timeline_chips_filter_the_run_by_kind() -> None:
 
             await pilot.press("right")
             await pilot.pause(0.2)
-            assert app._timeline_filter == "timeline-tasks"
-            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(timeline.row_count)] == [
-                "Capture NO1",
-                "Capture SE3",
-            ]
+            assert app._timeline_filter == "timeline-events"
+            # Events is the platform's own account of the run: stages, no output.
+            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(timeline.row_count)] == ["dispatch"]
 
             await pilot.press("right")
             await pilot.pause(0.2)
@@ -2877,20 +3357,64 @@ def test_tui_timeline_chips_filter_the_run_by_kind() -> None:
     asyncio.run(scenario())
 
 
-def test_tui_timeline_says_why_a_filter_is_empty() -> None:
-    """An empty table looks broken; this is the run saying it has no steps."""
+def test_tui_hides_empty_steps_tasks_and_artifacts_filters() -> None:
+    """A run with no execution children should not advertise empty branches."""
+
+    class EmptyRunDetailClient(FakeClient):
+        def list_run_steps(self, run_id: str) -> list[dict[str, Any]]:
+            assert run_id == "run-id"
+            return []
 
     async def scenario() -> None:
-        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+        app = RebaseTuiApp(data=fake_tui_data(EmptyRunDetailClient(), project="energy", limit=5))
 
         async with app.run_test(size=(160, 40)) as pilot:
             await _open_run(app, pilot)
-            timeline = app.query_one("#timeline-table", DataTable)
+            visible = [str(tab.id) for tab in app.query("#timeline-tabs Tab") if tab.display]
+            assert visible == ["timeline-all", "timeline-logs", "timeline-events"]
+            assert app._available_timeline_filters() == visible
 
+            # Hidden filters are absent from both direct selection and arrow navigation.
             app._select_timeline_filter("timeline-tasks")
+            assert app._timeline_filter == "timeline-all"
+            await pilot.press("right")
             await pilot.pause(0.2)
-            assert timeline.row_count == 1
-            assert "No tasks" in str(timeline.get_cell_at(Coordinate(0, 2)))
+            assert app._timeline_filter == "timeline-logs"
+
+    asyncio.run(scenario())
+
+
+def test_tui_returns_to_activity_when_the_next_run_lacks_the_open_branch() -> None:
+    """A Tasks chip selected on one run cannot remain active but invisible on the next."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(SteppedClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(160, 40)) as pilot:
+            await _open_run(app, pilot)
+            app._select_timeline_filter("timeline-tasks")
+            assert app._timeline_filter == "timeline-tasks"
+            detail = app._run_detail
+            assert detail is not None
+            app._run_detail = tui_module.RunDetailData(
+                run={**detail.run, "id": "plain-run"},
+                events=detail.events,
+                steps=[],
+                tasks=[],
+                artifacts=[],
+                logs=detail.logs,
+            )
+
+            app._render_timeline()
+            await pilot.pause(0.2)
+
+            assert app._timeline_filter == "timeline-all"
+            assert app.query_one("#timeline-tabs", Tabs).active == "timeline-all"
+            assert [str(tab.id) for tab in app.query("#timeline-tabs Tab") if tab.display] == [
+                "timeline-all",
+                "timeline-logs",
+                "timeline-events",
+            ]
 
     asyncio.run(scenario())
 
@@ -2944,7 +3468,7 @@ def test_tui_enter_opens_a_timeline_row_out_to_its_full_text() -> None:
             # Same row, now several lines tall, carrying the whole message.
             key = timeline.coordinate_to_cell_key(Coordinate(log_row, 0)).row_key
             assert timeline.rows[key].height > 1
-            message = str(timeline.get_cell_at(Coordinate(log_row, 4)))
+            message = str(timeline.get_cell_at(Coordinate(log_row, 5)))
             assert "\n" in message
             # Wrapping only moves the line breaks; nothing is dropped or truncated.
             assert " ".join(message.split()) == client.log_entries[0]["message"]
@@ -3187,6 +3711,127 @@ def test_ephemeral_runs_group_into_one_row_per_name_they_ran_as() -> None:
     assert groups[1].row_key == "ephemeral:workflow:collect"
 
 
+def test_a_one_off_run_of_a_deployed_target_gets_no_row_of_its_own() -> None:
+    """`rebase run …::sync` is the deployed `sync`, not a second workflow of that name.
+
+    Giving it its own row said the project had two `sync` workflows, one carrying the
+    schedule and one carrying the last run — the same thing, split across two lines.
+    """
+    runs = [
+        _ephemeral_run("r1", "sync", started="2026-08-11T12:38:14Z"),
+        _ephemeral_run("r2", "health", started="2026-08-11T12:37:47Z"),
+        _ephemeral_run("r3", "scratch", started="2026-08-11T10:00:00Z"),
+    ]
+    deployed = deployed_identities([{"name": "sync", "id": "w1"}, {"name": "health", "id": "w2"}])
+
+    assert [g.name for g in group_ephemeral_runs(runs, deployed)] == ["scratch"]
+    # Without the deployed names it is the old behaviour, so the filtering is what changed.
+    assert {g.name for g in group_ephemeral_runs(runs)} == {"sync", "health", "scratch"}
+
+
+def test_a_deployed_row_shows_when_it_last_ran_by_hand() -> None:
+    """Dropping the duplicate row must not drop the timestamp that row carried."""
+    client = FakeClient()
+    data = RebaseTuiData(client)
+    workflows = [{"name": "sync", "id": "w1"}]
+
+    last_runs = data.load_last_runs(
+        "p1",
+        runs=[_ephemeral_run("r1", "sync", started="2026-08-11T12:38:14Z")],
+        target_ids=target_ids_by_identity(workflows),
+    )
+
+    assert last_runs["w1"] == "2026-08-11T12:38:14Z"
+
+
+def test_a_one_off_run_matching_nothing_deployed_is_left_for_its_own_row() -> None:
+    """Only a name that is deployed folds in; the rest still need somewhere to appear."""
+    client = FakeClient()
+    data = RebaseTuiData(client)
+
+    last_runs = data.load_last_runs(
+        "p1",
+        runs=[_ephemeral_run("r1", "scratch", started="2026-08-11T12:00:00Z")],
+        target_ids=target_ids_by_identity([{"name": "sync", "id": "w1"}]),
+    )
+
+    assert last_runs == {}
+
+
+def test_identity_helpers_keep_the_two_namespaces_apart() -> None:
+    """A workflow and a function may share a name without being the same target."""
+    workflows = [{"name": "collect", "id": "w1"}]
+    functions = [{"name": "collect", "id": "f1"}]
+
+    assert deployed_identities(workflows, functions) == {("workflow", "collect"), ("function", "collect")}
+    assert target_ids_by_identity(workflows, functions) == {
+        ("workflow", "collect"): "w1",
+        ("function", "collect"): "f1",
+    }
+
+
+def test_selecting_a_deployed_target_shows_its_one_off_runs_too() -> None:
+    """The runs table has to find the same runs the Last run column counted.
+
+    `/runs` selects on target_id, which a one-off run has not got. A workflow run only
+    ever by `rebase run …::sync` therefore matched nothing and showed an empty table
+    beside a populated Last run — the same runs, found by name in one place and by id in
+    the other.
+    """
+
+    class SplitClient(FakeClient):
+        def list_runs(self, **kwargs: Any) -> list[dict[str, Any]]:
+            super().list_runs(**kwargs)
+            # Registered runs are selected by id; this target has none.
+            if kwargs.get("workflow_id") is not None:
+                return []
+            return [
+                _ephemeral_run("r1", "sync", started="2026-08-11T13:00:15Z"),
+                _ephemeral_run("r2", "other", started="2026-08-11T12:00:00Z"),
+            ]
+
+    data = RebaseTuiData(SplitClient())
+
+    assert data.load_target_runs("workflow", "w1") == []
+    runs = data.load_target_runs("workflow", "w1", name="sync", project_id="p1")
+    assert [run["id"] for run in runs] == ["r1"]
+
+
+def test_registered_and_one_off_runs_come_back_newest_first() -> None:
+    """One target, one history: the two sources interleave by time, not by kind."""
+
+    class BothClient(FakeClient):
+        def list_runs(self, **kwargs: Any) -> list[dict[str, Any]]:
+            super().list_runs(**kwargs)
+            if kwargs.get("workflow_id") is not None:
+                return [
+                    {"id": "scheduled", "target_id": "w1", "created_at": "2026-08-11T05:30:00Z"},
+                ]
+            return [_ephemeral_run("manual", "sync", started="2026-08-11T13:00:15Z")]
+
+    data = RebaseTuiData(BothClient())
+    runs = data.load_target_runs("workflow", "w1", name="sync", project_id="p1")
+
+    assert [run["id"] for run in runs] == ["manual", "scheduled"]
+
+
+def test_a_multi_line_log_row_stands_in_for_itself_rather_than_going_blank() -> None:
+    """A block of captured output usually starts with a newline. That row was blank.
+
+    One row is one line high, so the collapsed form has to be a line worth reading —
+    "nothing was logged" and "press enter for eleven more lines" must not look alike.
+    """
+    captured = "\n=== Step 2: Fortnox Transaction Matching ===\n\nFound 124 MISSING transactions\n"
+
+    collapsed = collapse_message(captured)
+
+    assert collapsed.startswith("=== Step 2: Fortnox Transaction Matching ===")
+    assert "(+1 more)" in collapsed
+    # Single-line messages are handed back untouched, counter and all.
+    assert collapse_message("Accepted run request.") == "Accepted run request."
+    assert collapse_message("") == ""
+
+
 def test_ephemeral_grouping_skips_a_run_that_declared_no_name() -> None:
     """A row has to be labelled something. Absence is not a name to group under."""
     groups = group_ephemeral_runs(
@@ -3269,10 +3914,11 @@ def test_tui_one_off_runs_get_a_row_and_open_like_any_target() -> None:
                 ("forecast", tui_module.ORIGIN_DEPLOYED),
                 ("collect", tui_module.ORIGIN_ONE_OFF),
             ]
-            # Everything after Run type is a deployment-time fact a one-off has none of.
+            # A one-off has no deployed source, commit, state, endpoint or schedule.
             one_off = rows[1]
-            assert one_off[3:7] == ["-", "-", "-", "-"]
-            assert (one_off[8], one_off[9]) == ("-", "-")
+            assert one_off[2:4] == ["-", "-"]
+            assert one_off[5:9] == ["-", "-", "-", "-"]
+            assert (one_off[10], one_off[11]) == ("-", "-")
 
             workflows.focus()
             workflows.move_cursor(row=1)
@@ -3398,14 +4044,61 @@ def test_tui_paints_the_targets_before_the_slower_detail_arrives() -> None:
                 "collect",
             ]
             # The Last run column is what it is still waiting on.
-            assert str(workflows.get_row_at(0)[7]) == "-"
+            assert str(workflows.get_row_at(0)[9]) == "-"
 
             client.release_detail.set()
             for _ in range(50):
                 await pilot.pause(0.05)
-                if str(workflows.get_row_at(0)[7]) != "-":
+                if str(workflows.get_row_at(0)[9]) != "-":
                     break
-            assert str(workflows.get_row_at(0)[7]) != "-"
+            assert str(workflows.get_row_at(0)[9]) != "-"
+
+    asyncio.run(scenario())
+
+
+def test_tui_refresh_keeps_the_complete_frame_until_slow_detail_arrives() -> None:
+    """A timer tick must not flash provenance and other second-phase cells back to dashes."""
+
+    async def scenario() -> None:
+        client = SlowDetailClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5), refresh_interval=0)
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+
+            # Let the initial progressive load finish so a complete frame is on screen.
+            for _ in range(50):
+                await pilot.pause(0.05)
+                if client.detail_started.is_set():
+                    break
+            client.release_detail.set()
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            for _ in range(50):
+                await pilot.pause(0.05)
+                if str(workflows.get_cell_at(Coordinate(0, 2))) == "GitHub":
+                    break
+            before = [str(cell) for cell in workflows.get_row_at(0)]
+            assert before[2:4] == ["GitHub", "01234567..."]
+            assert before[9] != "-"
+
+            # Hold the detail phase of a refresh open. The old implementation painted
+            # `base` here, making Source, Commit and Last run disappear every tick.
+            client.detail_started.clear()
+            client.release_detail.clear()
+            app.action_refresh()
+            for _ in range(50):
+                await pilot.pause(0.05)
+                if client.detail_started.is_set():
+                    break
+            assert client.detail_started.is_set()
+            assert [str(cell) for cell in workflows.get_row_at(0)] == before
+
+            client.release_detail.set()
+            await pilot.pause(0.3)
 
     asyncio.run(scenario())
 
@@ -3440,7 +4133,7 @@ def test_tui_second_paint_keeps_the_row_you_already_opened() -> None:
             client.release_detail.set()
             for _ in range(50):
                 await pilot.pause(0.05)
-                if str(workflows.get_row_at(0)[7]) != "-":
+                if str(workflows.get_row_at(0)[9]) != "-":
                     break
 
             # Still on the same row, and its runs are still on screen.
@@ -3653,6 +4346,52 @@ def test_clicking_the_header_of_an_empty_table_does_not_crash() -> None:
             await pilot.pause(0.2)
 
             # Still alive, and the header click changed nothing.
+            assert app.query_one("#timeline-table", DataTable).row_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_a_tick_leaves_the_timeline_you_are_reading_on_screen() -> None:
+    """The runs box clears the timeline when a *different* target is opened, not on refresh.
+
+    Reported as: open a run's logs, wait ten seconds, the screen goes empty until an arrow
+    key redraws it from memory. The tick re-read the runs box, which wiped the timeline,
+    and a finished run is deliberately not re-read — so nothing put it back.
+    """
+
+    async def scenario() -> None:
+        client = FakeClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5), refresh_interval=0)
+
+        async with app.run_test(size=(200, 42)) as pilot:
+            await _open_project(pilot, app)
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            workflows.focus()
+            workflows.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+            runs = app.query_one("#runs-table", DataTable)
+            runs.focus()
+            runs.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+
+            timeline = app.query_one("#timeline-table", DataTable)
+            rows_before = timeline.row_count
+            assert rows_before and app._reveal_level == 2
+            assert app._live_run_id is None  # finished, so the tick will not re-read it
+
+            app._last_key_at = 0.0
+            app._refresh_tick()
+            await pilot.pause(0.8)
+
+            assert timeline.row_count == rows_before
+            assert list(timeline.columns)
+
+            # Opening a different target still clears it: that timeline is another run's.
+            workflows.focus()
+            await pilot.press("enter")
+            await pilot.pause(0.4)
             assert app.query_one("#timeline-table", DataTable).row_count == 0
 
     asyncio.run(scenario())

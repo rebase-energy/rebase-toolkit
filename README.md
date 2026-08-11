@@ -152,6 +152,10 @@ run = add.spawn(a=2, b=3)
 print(run.result(timeout=120))
 ```
 
+Functions default to `mode="interactive", isolation="shared"` for the lowest-latency cloud
+loop. Use `@project.function(isolation="dedicated")` for a private warm Cloud Run service or
+`@project.function(mode="job")` for a fresh, cancellable Cloud Run Job execution.
+
 ## Minimal Workflow
 
 ```python
@@ -210,6 +214,39 @@ when later tasks should continue. `set_result()` is optional and records a
 JSON-object domain result; lifecycle status stays `succeeded` for outcomes such
 as skipped or pending. Outside a hosted Rebase run the same context manager is a
 transparent in-memory no-op, which keeps local execution ordinary Python.
+
+## Artifacts
+
+Use `rb.artifact` after writing a durable output to register its URI on the
+current run. Rebase records the pointer and metadata; it does not upload or copy
+the object.
+
+```python
+@project.workflow()
+def capture(dataset: str = "SE3") -> dict:
+    uri = write_curve_to_gcs(dataset)
+    artifact = rb.artifact(
+        f"Day-ahead curve {dataset}",
+        uri=uri,
+        key=f"day-ahead/{dataset}",
+        disposition="created",
+        media_type="application/json",
+        size_bytes=42_018,
+        version="1741632447112345",
+        digest="md5:8d777f385d3dfec8815d20f7496026dc",
+        metadata={"dataset": dataset, "points": 96},
+    )
+    return {"artifact_id": artifact.id, "uri": artifact.uri}
+```
+
+Use `disposition="reused"` when the workflow found an existing output instead
+of creating it. A `key` identifies the logical output within the run, making a
+retry with the same key and URI idempotent. Artifacts created inside `rb.task`
+or a `Function.map` item are attributed to that task automatically and are also
+listed on the parent workflow run. In a hosted run registration is strict: a
+reporting failure raises `ArtifactReportingError`, so a successful upload is not
+silently omitted from the run record. Local calls validate their arguments and
+otherwise remain in-memory no-ops.
 
 Deploy a file from the command line:
 

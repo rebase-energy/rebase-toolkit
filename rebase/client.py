@@ -72,6 +72,10 @@ DEFAULT_API_KEY_PERMISSIONS = [
     "runs:read",
 ]
 DEPLOY_REQUEST_TIMEOUT_SECONDS = 300
+# (connect, read) for POST /runs/ephemeral: the server executes quick runs inside
+# the request and enforces a 300 s run cap, so the read timeout is that plus
+# headroom. The old default of 30 s failed any run longer than half a minute.
+EPHEMERAL_RUN_REQUEST_TIMEOUT_SECONDS = (10, 330)
 
 
 class RebaseWorkflowError(RuntimeError):
@@ -383,9 +387,17 @@ class OnUpdate:
 Schedule = Cron | dict[str, Any]
 Trigger = OnWorkflow | OnUpdate | dict[str, Any]
 _RESERVED_WORKFLOW_PARAMETERS = frozenset({"ctx"})
+ExecutionMode = str
+Isolation = str
+EXECUTION_MODES = ("interactive", "job")
+ISOLATIONS = ("shared", "dedicated")
+DEFAULT_MODE: ExecutionMode = "interactive"
+DEFAULT_ISOLATION: Isolation = "shared"
+
+# Deprecated compatibility names. New code should use mode/isolation.
 RunType = str
 RUN_TYPES = ("quick", "quick_shared", "long")
-DEFAULT_RUN_TYPE: RunType = "quick"
+DEFAULT_RUN_TYPE: RunType = "quick_shared"
 WORKFLOW_RUN_TYPES = ("quick", "long")
 DeploySource = str
 DEFAULT_DEPLOY_SOURCE: DeploySource = "rebase"
@@ -394,17 +406,53 @@ DEFAULT_MODEL_DEPENDENCY = (
     "emflow @ git+https://github.com/rebase-energy/emflow.git@2d0205e1b479d439df72e50c6865735d0b26de8d"
 )
 LEGACY_BACKEND_REMOVED_ERROR = (
-    "the 'backend' parameter was removed; use run_type='quick' | 'quick_shared' | 'long' "
-    "('interactive' → 'quick', 'batch' → 'long')"
+    "the 'backend' parameter was removed; use mode='interactive' | 'job' and "
+    "isolation='shared' | 'dedicated'"
 )
+
+
+def _validate_execution(
+    mode: ExecutionMode | None = None,
+    isolation: Isolation | None = None,
+    *,
+    target_type: str = "function",
+    run_type: RunType | None = None,
+) -> tuple[ExecutionMode, Isolation]:
+    """Validate execution settings and translate deprecated run_type values."""
+    if run_type is not None:
+        _validate_run_type(run_type, target_type=target_type)
+        if mode is not None or isolation is not None:
+            raise ValueError("use either mode/isolation or the deprecated run_type, not both")
+        if run_type == "long":
+            return "job", DEFAULT_ISOLATION
+        if run_type == "quick_shared":
+            return "interactive", "shared"
+        return ("interactive", "shared") if target_type == "workflow" else ("interactive", "dedicated")
+
+    resolved_mode = mode or DEFAULT_MODE
+    resolved_isolation = isolation or DEFAULT_ISOLATION
+    if resolved_mode not in EXECUTION_MODES:
+        raise ValueError("mode must be 'interactive' or 'job'")
+    if resolved_isolation not in ISOLATIONS:
+        raise ValueError("isolation must be 'shared' or 'dedicated'")
+    if target_type == "workflow" and resolved_mode == "interactive" and resolved_isolation == "dedicated":
+        raise ValueError("workflows support mode='interactive' only with isolation='shared'")
+    return resolved_mode, resolved_isolation
+
+
+def _legacy_run_type(mode: ExecutionMode, isolation: Isolation, *, target_type: str = "function") -> RunType:
+    if mode == "job":
+        return "long"
+    if target_type == "workflow":
+        return "quick"
+    return "quick_shared" if isolation == "shared" else "quick"
 
 
 def _validate_run_type(run_type: RunType, target_type: str = "function") -> RunType:
     if run_type not in RUN_TYPES or (target_type == "workflow" and run_type not in WORKFLOW_RUN_TYPES):
         raise ValueError(
             "run_type must be 'quick', 'quick_shared', or 'long' (workflows: 'quick' or 'long'). "
-            "Legacy backends were removed: 'interactive' is now 'quick', 'batch' is now 'long'; "
-            "'modal', 'prefect', 'prefect_cloud', 'cloud_run*' are no longer selectable."
+            "run_type is deprecated; use mode='interactive' | 'job' and isolation='shared' | 'dedicated'."
         )
     return run_type
 
@@ -1880,7 +1928,8 @@ class _WorkflowTrace:
                 {
                     "source_code": step.source_code,
                     "default_parameters": step.default_parameters,
-                    "run_type": step.run_type,
+                    "mode": step.mode,
+                    "isolation": step.isolation,
                     "image_spec": step.image_spec,
                 }
             )
@@ -2095,16 +2144,53 @@ class Client:
         profile_api_url = configured_api_url if isinstance(configured_api_url, str) else None
         selected_api_url = api_url or os.getenv("REBASE_WORKFLOWS_API_URL") or profile_api_url or DEFAULT_SERVER_URL
         self.api_url = selected_api_url.rstrip("/")
+        # Lazily-created keep-alive session plus the pid that owns it: reusing one
+        # connection avoids a fresh TCP+TLS handshake per request (the bulk of
+        # per-call latency), and the pid check rebuilds it after a fork, where an
+        # inherited socket would be shared with the parent.
+        self._session: requests.Session | None = None
+        self._session_pid: int | None = None
+        # Cache for tokens read from disk by load_access_token(); explicit
+        # credentials (api_key/access_token) never go through this.
+        self._cached_disk_token: str | None = None
+
+    def _http_session(self) -> requests.Session:
+        pid = os.getpid()
+        if self._session is None or self._session_pid != pid:
+            # No retry adapter on purpose: a retried POST /runs/ephemeral would
+            # execute the run twice.
+            self._session = requests.Session()
+            self._session_pid = pid
+        return self._session
+
+    def _http_request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+        """Single seam for all HTTP traffic; tests patch this instead of `requests`."""
+        return self._http_session().request(method, f"{self.api_url}{path}", **kwargs)
+
+    def _bearer_token(self) -> str | None:
+        token = self.api_key or self.access_token
+        if token is not None:
+            return token
+        if self._cached_disk_token is None:
+            try:
+                self._cached_disk_token = load_access_token()
+            except AuthError as exc:
+                raise RebaseWorkflowError(str(exc)) from exc
+        return self._cached_disk_token
+
+    def _invalidate_cached_token(self) -> bool:
+        """Drop the disk-token cache after a 401. Returns whether a retry makes sense:
+        only when the rejected token actually came from the cache (not an explicit
+        api_key/access_token, which a retry would resend unchanged)."""
+        if self.api_key or self.access_token or self._cached_disk_token is None:
+            return False
+        self._cached_disk_token = None
+        return True
 
     def _request_headers(self, *, auth: bool, headers: dict[str, str] | None = None) -> dict[str, str]:
         resolved_headers = dict(headers or {})
         if auth:
-            bearer_token = self.api_key or self.access_token
-            if bearer_token is None:
-                try:
-                    bearer_token = load_access_token()
-                except AuthError as exc:
-                    raise RebaseWorkflowError(str(exc)) from exc
+            bearer_token = self._bearer_token()
             if bearer_token:
                 resolved_headers["Authorization"] = f"Bearer {bearer_token}"
         if self.workspace_id and "X-Rebase-Workspace" not in resolved_headers:
@@ -2114,9 +2200,13 @@ class Client:
     def request(
         self, method: str, path: str, *, auth: bool = True, **kwargs: Any
     ) -> dict[str, Any] | list[dict[str, Any]]:
-        headers = self._request_headers(auth=auth, headers=kwargs.pop("headers", {}))
+        caller_headers = kwargs.pop("headers", {})
+        headers = self._request_headers(auth=auth, headers=caller_headers)
         timeout = kwargs.pop("timeout", 30)
-        response = requests.request(method, f"{self.api_url}{path}", headers=headers, timeout=timeout, **kwargs)
+        response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
+        if getattr(response, "status_code", None) == 401 and auth and self._invalidate_cached_token():
+            headers = self._request_headers(auth=auth, headers=caller_headers)
+            response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
@@ -2130,9 +2220,13 @@ class Client:
 
         ``request`` always parses the response as JSON, which a 204 has none of.
         """
-        headers = self._request_headers(auth=auth, headers=kwargs.pop("headers", {}))
+        caller_headers = kwargs.pop("headers", {})
+        headers = self._request_headers(auth=auth, headers=caller_headers)
         timeout = kwargs.pop("timeout", 30)
-        response = requests.request(method, f"{self.api_url}{path}", headers=headers, timeout=timeout, **kwargs)
+        response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
+        if getattr(response, "status_code", None) == 401 and auth and self._invalidate_cached_token():
+            headers = self._request_headers(auth=auth, headers=caller_headers)
+            response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
@@ -2143,9 +2237,9 @@ class Client:
     def stream_request(self, method: str, path: str, *, auth: bool = True, **kwargs: Any) -> Iterator[dict[str, Any]]:
         headers = self._request_headers(auth=auth, headers=kwargs.pop("headers", {}))
         timeout = kwargs.pop("timeout", None)
-        response = requests.request(
+        response = self._http_request(
             method,
-            f"{self.api_url}{path}",
+            path,
             headers=headers,
             timeout=timeout,
             stream=True,
@@ -3221,7 +3315,11 @@ class Client:
                 "env": env,
                 "secrets": secrets,
                 "volumes": volumes,
-                "buckets": buckets,
+                # `or None` so an empty list is dropped by the filter below, the
+                # same rule the create path applies: an API predating this field
+                # forbids extras, and an unconditional "buckets" 422s every
+                # update-deploy from this client.
+                "buckets": buckets or None,
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_max_instances": cloud_run_max_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
@@ -3260,7 +3358,9 @@ class Client:
         entrypoint: str,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        run_type: RunType = DEFAULT_RUN_TYPE,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         image_spec: dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
@@ -3284,13 +3384,15 @@ class Client:
         git_dirty: bool | None = None,
     ) -> dict[str, Any]:
         project_id = self.ensure_project(project)["id"]
+        resolved_mode, resolved_isolation = _validate_execution(mode, isolation, run_type=run_type)
         payload: dict[str, Any] = {
             "name": name,
             "description": description,
             "source_code": source_code,
             "entrypoint": entrypoint,
             "default_parameters": default_parameters or {},
-            "run_type": _validate_run_type(run_type),
+            "mode": resolved_mode,
+            "isolation": resolved_isolation,
             "image_spec": image_spec,
             "env": env or {},
             "secrets": secrets or {},
@@ -3334,6 +3436,8 @@ class Client:
         entrypoint: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
         run_type: RunType | None = None,
         image_spec: dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
@@ -3357,6 +3461,10 @@ class Client:
         git_tag: str | None = None,
         git_dirty: bool | None = None,
     ) -> dict[str, Any]:
+        execution_payload: dict[str, Any] = {}
+        if mode is not None or isolation is not None or run_type is not None:
+            resolved_mode, resolved_isolation = _validate_execution(mode, isolation, run_type=run_type)
+            execution_payload = {"mode": resolved_mode, "isolation": resolved_isolation}
         payload = {
             key: value
             for key, value in {
@@ -3365,12 +3473,12 @@ class Client:
                 "source_code": source_code,
                 "entrypoint": entrypoint,
                 "default_parameters": default_parameters,
-                "run_type": _validate_run_type(run_type) if run_type else None,
                 "image_spec": image_spec,
                 "env": env,
                 "secrets": secrets,
                 "volumes": volumes,
-                "buckets": buckets,
+                # See the note on update_asgi_app: empty must be omitted, not sent.
+                "buckets": buckets or None,
                 "cloud_run_min_instances": cloud_run_min_instances,
                 "cloud_run_concurrency": cloud_run_concurrency,
                 "cloud_run_cpu": cloud_run_cpu,
@@ -3390,6 +3498,7 @@ class Client:
             }.items()
             if value is not None
         }
+        payload.update(execution_payload)
         response = self.request("PATCH", f"/functions/{function_id}", json=payload)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected function response")
@@ -3469,7 +3578,9 @@ class Client:
         source_code: str,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        run_type: RunType = DEFAULT_RUN_TYPE,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         image_spec: dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
@@ -3491,6 +3602,7 @@ class Client:
         git_dirty: bool | None = None,
     ) -> dict[str, Any]:
         project_id = self.ensure_project(project)["id"]
+        resolved_mode, resolved_isolation = _validate_execution(mode, isolation, run_type=run_type)
         response = self.request(
             "POST",
             f"/projects/{project_id}/models",
@@ -3501,7 +3613,8 @@ class Client:
                 "description": description,
                 "source_code": source_code,
                 "default_parameters": default_parameters or {},
-                "run_type": _validate_run_type(run_type),
+                "mode": resolved_mode,
+                "isolation": resolved_isolation,
                 "image_spec": image_spec,
                 "env": env or {},
                 "secrets": secrets or {},
@@ -3537,6 +3650,8 @@ class Client:
         source_code: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
         run_type: RunType | None = None,
         image_spec: dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
@@ -3558,6 +3673,10 @@ class Client:
         git_tag: str | None = None,
         git_dirty: bool | None = None,
     ) -> dict[str, Any]:
+        execution_payload: dict[str, Any] = {}
+        if mode is not None or isolation is not None or run_type is not None:
+            resolved_mode, resolved_isolation = _validate_execution(mode, isolation, run_type=run_type)
+            execution_payload = {"mode": resolved_mode, "isolation": resolved_isolation}
         payload = {
             key: value
             for key, value in {
@@ -3567,7 +3686,6 @@ class Client:
                 "description": description,
                 "source_code": source_code,
                 "default_parameters": default_parameters,
-                "run_type": _validate_run_type(run_type) if run_type else None,
                 "image_spec": image_spec,
                 "env": env,
                 "secrets": secrets,
@@ -3590,6 +3708,7 @@ class Client:
             }.items()
             if value is not None
         }
+        payload.update(execution_payload)
         response = self.request("PATCH", f"/models/{model_id}", json=payload)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected model response")
@@ -3817,7 +3936,9 @@ class Client:
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
         required_parameters: list[str] | None = None,
-        run_type: RunType = DEFAULT_RUN_TYPE,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
         enabled: bool = True,
@@ -3838,6 +3959,12 @@ class Client:
         if project is not None:
             project_id = self.ensure_project(project)["id"]
             path = f"/projects/{project_id}/workflows"
+        resolved_mode, resolved_isolation = _validate_execution(
+            mode,
+            isolation,
+            target_type="workflow",
+            run_type=run_type,
+        )
         response = self.request(
             "POST",
             path,
@@ -3852,7 +3979,8 @@ class Client:
                 "trigger": trigger,
                 "default_parameters": default_parameters or {},
                 "required_parameters": required_parameters or [],
-                "run_type": _validate_run_type(run_type, target_type="workflow"),
+                "mode": resolved_mode,
+                "isolation": resolved_isolation,
                 "env": env or {},
                 "secrets": secrets or {},
                 "enabled": enabled,
@@ -3887,6 +4015,8 @@ class Client:
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
         required_parameters: list[str] | None = None,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
         run_type: RunType | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
@@ -3903,6 +4033,15 @@ class Client:
         git_tag: str | None = None,
         git_dirty: bool | None = None,
     ) -> dict[str, Any]:
+        execution_payload: dict[str, Any] = {}
+        if mode is not None or isolation is not None or run_type is not None:
+            resolved_mode, resolved_isolation = _validate_execution(
+                mode,
+                isolation,
+                target_type="workflow",
+                run_type=run_type,
+            )
+            execution_payload = {"mode": resolved_mode, "isolation": resolved_isolation}
         payload: dict[str, Any] = {
             key: value
             for key, value in {
@@ -3913,7 +4052,6 @@ class Client:
                 "entrypoint": entrypoint,
                 "default_parameters": default_parameters,
                 "required_parameters": required_parameters,
-                "run_type": _validate_run_type(run_type, target_type="workflow") if run_type else None,
                 "env": env,
                 "secrets": secrets,
                 "enabled": enabled,
@@ -3931,6 +4069,7 @@ class Client:
             }.items()
             if value is not None
         }
+        payload.update(execution_payload)
         if step_graph is not _UNSET:
             payload["step_graph"] = step_graph
         if schedule is not _UNSET:
@@ -3983,7 +4122,9 @@ class Client:
         entrypoint: str,
         default_parameters: dict[str, Any] | None = None,
         parameters: dict[str, Any] | None = None,
-        run_type: RunType,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         image_spec: dict[str, Any] | None = None,
         step_graph: dict[str, Any] | None = None,
         required_parameters: list[str] | None = None,
@@ -3992,6 +4133,12 @@ class Client:
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
     ) -> Run:
+        resolved_mode, resolved_isolation = _validate_execution(
+            mode,
+            isolation,
+            target_type=target_type,
+            run_type=run_type,
+        )
         payload: dict[str, Any] = {
             "target_type": target_type,
             "project": project,
@@ -4000,7 +4147,8 @@ class Client:
             "entrypoint": entrypoint,
             "default_parameters": default_parameters or {},
             "parameters": parameters or {},
-            "run_type": _validate_run_type(run_type, target_type=target_type),
+            "mode": resolved_mode,
+            "isolation": resolved_isolation,
             "image_spec": image_spec,
             "step_graph": step_graph,
             "required_parameters": required_parameters or [],
@@ -4021,7 +4169,12 @@ class Client:
         if secrets:
             payload["secrets"] = dict(secrets)
 
-        response = self.request("POST", "/runs/ephemeral", json=payload)
+        response = self.request(
+            "POST",
+            "/runs/ephemeral",
+            json=payload,
+            timeout=EPHEMERAL_RUN_REQUEST_TIMEOUT_SECONDS,
+        )
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected run response")
         return Run(response["id"], client=self, data=response)
@@ -4151,6 +4304,36 @@ class Client:
             raise RebaseWorkflowError("expected run list response")
         return response
 
+    def list_latest_runs_by_project(self) -> list[dict[str, Any]]:
+        """The newest run of each project, one row per project.
+
+        `list_runs` cannot answer this: it returns runs newest-first across the
+        whole workspace, so one project running every fifteen minutes fills any
+        page size and the quiet projects fall off the end — and those are exactly
+        the ones where "when did this last run" is worth asking.
+
+        Empty against an API without the route, so a toolkit ahead of its
+        platform loses the column rather than the view.
+
+        Such an API does not answer 404. `/runs/{run_id}` is declared there and
+        matches first, so FastAPI takes "latest-by-project" for a run id and
+        rejects it as an invalid UUID — a 422. Only that shape is treated as an
+        absent route: a real call to this path carries no run id, so a
+        `uuid_parsing` complaint about one cannot be a genuine error, and 422
+        stays meaningful everywhere else.
+        """
+        try:
+            response = self.request("GET", "/runs/latest-by-project")
+        except RebaseWorkflowError as exc:
+            if exc.status_code in ROUTE_ABSENT_STATUSES:
+                return []
+            if exc.status_code == 422 and "uuid_parsing" in str(exc) and "run_id" in str(exc):
+                return []
+            raise
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected run list response")
+        return response
+
     def list_run_steps(self, run_id: str) -> list[dict[str, Any]]:
         response = self.request("GET", f"/runs/{run_id}/steps")
         if not isinstance(response, list):
@@ -4184,6 +4367,35 @@ class Client:
         response = self.request("PATCH", f"/runs/{run_id}/tasks/{task_id}", json=payload)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected run task response")
+        return response
+
+    def list_run_artifacts(
+        self,
+        run_id: str,
+        *,
+        step_run_id: str | None = None,
+        task_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """The durable output pointers registered for a run."""
+        params = {
+            key: value
+            for key, value in {"step_run_id": step_run_id, "task_id": task_id}.items()
+            if value is not None
+        }
+        try:
+            response = self.request("GET", f"/runs/{run_id}/artifacts", params=params or None)
+        except RebaseWorkflowError as exc:
+            if exc.status_code in ROUTE_ABSENT_STATUSES:
+                return []
+            raise
+        if not isinstance(response, list):
+            raise RebaseWorkflowError("expected run artifact list response")
+        return response
+
+    def create_run_artifact(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self.request("POST", f"/runs/{run_id}/artifacts", json=payload)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected run artifact response")
         return response
 
     def list_run_events(self, run_id: str) -> list[dict[str, Any]]:
@@ -4276,7 +4488,9 @@ class Project:
         name: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        run_type: RunType = DEFAULT_RUN_TYPE,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
@@ -4301,6 +4515,8 @@ class Project:
                 project=self.name,
                 description=description,
                 default_parameters=default_parameters,
+                mode=mode,
+                isolation=isolation,
                 run_type=run_type,
                 dependencies=dependencies,
                 image=image,
@@ -4416,7 +4632,9 @@ class Project:
         schedule: Schedule | None = None,
         trigger: Trigger | None = None,
         default_parameters: dict[str, Any] | None = None,
-        run_type: RunType = DEFAULT_RUN_TYPE,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
@@ -4440,6 +4658,8 @@ class Project:
                 schedule=schedule,
                 trigger=trigger,
                 default_parameters=default_parameters,
+                mode=mode,
+                isolation=isolation,
                 run_type=run_type,
                 enabled=enabled,
                 endpoint=endpoint,
@@ -4650,7 +4870,9 @@ class Function:
         project: str,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
-        run_type: RunType = DEFAULT_RUN_TYPE,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
@@ -4692,7 +4914,15 @@ class Function:
         self.source_code: str | None = None
         self.entrypoint: str | None = None
         self.default_parameters = default_parameters or {}
-        self.run_type: RunType = (data.get("run_type") or DEFAULT_RUN_TYPE) if data else DEFAULT_RUN_TYPE
+        data_mode = data.get("mode") if data else None
+        data_isolation = data.get("isolation") if data else None
+        data_run_type = data.get("run_type") if data and data_mode is None and data_isolation is None else None
+        self.mode, self.isolation = _validate_execution(
+            data_mode if data else mode,
+            data_isolation if data else isolation,
+            run_type=data_run_type if data else run_type,
+        )
+        self.run_type: RunType = _legacy_run_type(self.mode, self.isolation)
         self.image_spec: dict[str, Any] | None = data.get("image_spec") if data else None
         self.image_fingerprint: str | None = data.get("image_fingerprint") if data else None
         self.cloud_run_min_instances: int | None = data.get("cloud_run_min_instances") if data else None
@@ -4709,7 +4939,8 @@ class Function:
             self.name = _target_name(fn, name)
             inferred_defaults = _defaults_for(fn, target="Function")
             self.default_parameters = {**inferred_defaults, **(default_parameters or {})}
-            self.run_type = _validate_run_type(run_type)
+            self.mode, self.isolation = _validate_execution(mode, isolation, run_type=run_type)
+            self.run_type = _legacy_run_type(self.mode, self.isolation)
             self.image_spec = _image_spec_for(image=image, dependencies=dependencies)
             if min_instances is not None and min_instances < 0:
                 raise ValueError("min_instances must be greater than or equal to 0")
@@ -4770,7 +5001,8 @@ class Function:
                 source_code=self.source_code,
                 entrypoint=self.entrypoint,
                 default_parameters=self.default_parameters,
-                run_type=self.run_type,
+                mode=self.mode,
+                isolation=self.isolation,
                 image_spec=self.image_spec,
                 env=self.env,
                 secrets=secrets_payload,
@@ -4796,7 +5028,8 @@ class Function:
             source_code=self.source_code,
             entrypoint=self.entrypoint,
             default_parameters=self.default_parameters,
-            run_type=self.run_type,
+            mode=self.mode,
+            isolation=self.isolation,
             image_spec=self.image_spec,
             env=self.env,
             secrets=secrets_payload,
@@ -4911,7 +5144,8 @@ class Function:
             entrypoint=self.entrypoint,
             default_parameters=self.default_parameters,
             parameters=parameters,
-            run_type=self.run_type,
+            mode=self.mode,
+            isolation=self.isolation,
             image_spec=self.image_spec,
             cloud_run_min_instances=self.cloud_run_min_instances,
             cloud_run_concurrency=self.cloud_run_concurrency,
@@ -5166,7 +5400,9 @@ class Model(_EmflowModel):
     project: str | None = "default"
     description: str | None = None
     default_parameters: dict[str, Any] | None = None
-    run_type: RunType = DEFAULT_RUN_TYPE
+    mode: ExecutionMode = DEFAULT_MODE
+    isolation: Isolation = DEFAULT_ISOLATION
+    run_type: RunType | None = None
     dependencies: list[str] | tuple[str, ...] | None = None
     image: Image | dict[str, Any] | None = None
     env: dict[str, str] | None = None
@@ -5186,6 +5422,8 @@ class Model(_EmflowModel):
         project: str | None = None,
         description: str | None = None,
         default_parameters: dict[str, Any] | None = None,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
         run_type: RunType | None = None,
         dependencies: list[str] | tuple[str, ...] | None = None,
         image: Image | dict[str, Any] | None = None,
@@ -5212,7 +5450,23 @@ class Model(_EmflowModel):
         self.default_parameters: dict[str, Any] = (
             dict(default_parameters) if default_parameters is not None else dict(class_default_parameters or {})
         )
-        self.run_type = _validate_run_type(run_type or getattr(cls, "run_type", DEFAULT_RUN_TYPE))
+        class_run_type = (
+            cls.__dict__.get("run_type") if mode is None and isolation is None and run_type is None else None
+        )
+        resolved_mode = (
+            mode if mode is not None else (None if class_run_type is not None else getattr(cls, "mode", DEFAULT_MODE))
+        )
+        resolved_isolation = (
+            isolation
+            if isolation is not None
+            else (None if class_run_type is not None else getattr(cls, "isolation", DEFAULT_ISOLATION))
+        )
+        self.mode, self.isolation = _validate_execution(
+            resolved_mode,
+            resolved_isolation,
+            run_type=run_type if run_type is not None else class_run_type,
+        )
+        self.run_type = _legacy_run_type(self.mode, self.isolation)
         self.dependencies = dependencies if dependencies is not None else getattr(cls, "dependencies", None)
         self.image = image if image is not None else getattr(cls, "image", None)
         self.env = dict(env if env is not None else (getattr(cls, "env", None) or {}))
@@ -5281,13 +5535,14 @@ class Model(_EmflowModel):
                 name=str(self.name),
                 description=self.description,
                 default_parameters={**inferred_defaults, **default_parameters},
+                mode=self.mode,
+                isolation=self.isolation,
                 enabled=self.enabled,
                 deploy_source=self.deploy_source,
                 client=self._client,
             )
             function.source_code = _source_for_model(self, operation_name=operation_name)
             function.entrypoint = operation_name
-            function.run_type = self.run_type
             function.image_spec = _model_image_spec_for(image=self.image, dependencies=self.dependencies)
             function.cloud_run_min_instances = self.cloud_run_min_instances
             function.cloud_run_concurrency = self.cloud_run_concurrency
@@ -5446,7 +5701,8 @@ class Model(_EmflowModel):
                 description=self.description,
                 source_code=function.source_code,
                 default_parameters=function.default_parameters,
-                run_type=function.run_type,
+                mode=function.mode,
+                isolation=function.isolation,
                 image_spec=function.image_spec,
                 env=self.env,
                 secrets=secrets_payload,
@@ -5468,7 +5724,8 @@ class Model(_EmflowModel):
                 description=self.description,
                 source_code=function.source_code,
                 default_parameters=function.default_parameters,
-                run_type=function.run_type,
+                mode=function.mode,
+                isolation=function.isolation,
                 image_spec=function.image_spec,
                 env=self.env,
                 secrets=secrets_payload,
@@ -5517,7 +5774,8 @@ class Model(_EmflowModel):
             entrypoint=function.entrypoint,
             default_parameters=function.default_parameters,
             parameters=parameters,
-            run_type=function.run_type,
+            mode=function.mode,
+            isolation=function.isolation,
             image_spec=function.image_spec,
             cloud_run_min_instances=function.cloud_run_min_instances,
             cloud_run_concurrency=function.cloud_run_concurrency,
@@ -5596,8 +5854,9 @@ class Step(Function):
             description=description,
             default_parameters=default_parameters,
             # Steps execute in-flow inside their workflow's Prefect run; the
-            # stored run type is never used for dispatch, so use the default.
-            run_type=DEFAULT_RUN_TYPE,
+            # stored execution settings are never used for dispatch.
+            mode=DEFAULT_MODE,
+            isolation=DEFAULT_ISOLATION,
             dependencies=None,
             image=None,
             min_instances=None,
@@ -5675,7 +5934,9 @@ class Workflow:
         schedule: Schedule | None = None,
         trigger: Trigger | None = None,
         default_parameters: dict[str, Any] | None = None,
-        run_type: RunType = DEFAULT_RUN_TYPE,
+        mode: ExecutionMode | None = None,
+        isolation: Isolation | None = None,
+        run_type: RunType | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
@@ -5715,7 +5976,16 @@ class Workflow:
         )
         self.trigger = _trigger_payload(trigger) if trigger is not None else (data.get("trigger") if data else None)
         self.default_parameters = default_parameters or {}
-        self.run_type: RunType = (data.get("run_type") or DEFAULT_RUN_TYPE) if data else DEFAULT_RUN_TYPE
+        data_mode = data.get("mode") if data else None
+        data_isolation = data.get("isolation") if data else None
+        data_run_type = data.get("run_type") if data and data_mode is None and data_isolation is None else None
+        self.mode, self.isolation = _validate_execution(
+            data_mode if data else mode,
+            data_isolation if data else isolation,
+            target_type="workflow",
+            run_type=data_run_type if data else run_type,
+        )
+        self.run_type: RunType = _legacy_run_type(self.mode, self.isolation, target_type="workflow")
         self.required_parameters: list[str] = list(data.get("required_parameters", [])) if data else []
         self.source_metadata: dict[str, Any] = {}
         self.image_spec: dict[str, Any] | None = None
@@ -5732,7 +6002,13 @@ class Workflow:
                 fn, target="Workflow", reserved=_RESERVED_WORKFLOW_PARAMETERS
             )
             self.default_parameters = {**inferred_defaults, **(default_parameters or {})}
-            self.run_type = _validate_run_type(run_type, target_type="workflow")
+            self.mode, self.isolation = _validate_execution(
+                mode,
+                isolation,
+                target_type="workflow",
+                run_type=run_type,
+            )
+            self.run_type = _legacy_run_type(self.mode, self.isolation, target_type="workflow")
             self.source_code = _source_for(fn, target="workflow")
             self.entrypoint = fn.__name__
             self.source_metadata = _git_metadata_for(fn)
@@ -5890,7 +6166,8 @@ class Workflow:
                 trigger=self.trigger,
                 default_parameters=self.default_parameters,
                 required_parameters=self.required_parameters,
-                run_type=self.run_type,
+                mode=self.mode,
+                isolation=self.isolation,
                 env=self.env,
                 secrets=secrets_payload,
                 enabled=self.enabled,
@@ -5915,7 +6192,8 @@ class Workflow:
             trigger=self.trigger,
             default_parameters=self.default_parameters,
             required_parameters=self.required_parameters,
-            run_type=self.run_type,
+            mode=self.mode,
+            isolation=self.isolation,
             env=self.env,
             secrets=secrets_payload,
             enabled=self.enabled,
@@ -5952,7 +6230,8 @@ class Workflow:
             entrypoint=self.entrypoint,
             default_parameters=self.default_parameters,
             parameters=parameters,
-            run_type=self.run_type,
+            mode=self.mode,
+            isolation=self.isolation,
             step_graph=self._build_step_graph(ephemeral=True),
             required_parameters=self.required_parameters,
             # image_spec too: without it an ephemeral workflow runs on the default
@@ -5984,6 +6263,9 @@ class Run:
     def tasks(self) -> list[dict[str, Any]]:
         return self.client.list_run_tasks(self.id)
 
+    def artifacts(self) -> list[dict[str, Any]]:
+        return self.client.list_run_artifacts(self.id)
+
     def events(self) -> list[dict[str, Any]]:
         return self.client.list_run_events(self.id)
 
@@ -6007,9 +6289,17 @@ class Run:
     def result(self, *, timeout: int = 600, poll_interval: float = 5.0) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
         terminal_statuses = {"succeeded", "failed", "cancelled"}
+        # The ephemeral submit response is already terminal on current servers, so
+        # the data in hand usually answers without a single GET. Non-terminal data
+        # (older servers, async run types) falls through to the poll loop.
+        first_iteration = True
 
         while True:
-            data = self.refresh()
+            if first_iteration and self.data and self.data.get("status") in terminal_statuses:
+                data = self.data
+            else:
+                data = self.refresh()
+            first_iteration = False
             status = data["status"]
             if status in terminal_statuses:
                 if status == "succeeded":

@@ -75,6 +75,8 @@ def test_run_help_shows_execution_and_inspection_commands(capsys) -> None:
     assert "Usage: rebase run [OPTIONS] TARGET_REF" in output
     assert "--param, -p" in output
     assert "--parameters-json" in output
+    assert "--mode" in output
+    assert "--isolation" in output
     assert "--run-type" in output
     assert "--module, -m" in output
     assert "--wait / --no-wait" in output
@@ -523,7 +525,8 @@ def add(a: int, b: int) -> dict:
         "project": "math",
         "name": "add",
         "entrypoint": "add",
-        "run_type": "quick",
+        "mode": "interactive",
+        "isolation": "shared",
         "parameters": {"a": 1, "b": 2},
         "default_parameters": {},
         "image_spec": {"kind": "python", "python_version": "3.13", "uv_pip_packages": [], "uv_version": None},
@@ -673,7 +676,8 @@ def hello_workflow(name: str = "World") -> dict:
     assert observed["project"] == "hello"
     assert observed["name"] == "hello-workflow"
     assert observed["parameters"] == {"name": "Rebase"}
-    assert observed["run_type"] == "quick"
+    assert observed["mode"] == "interactive"
+    assert observed["isolation"] == "shared"
     assert [node["name"] for node in observed["step_graph"]["nodes"]] == ["load-name", "package"]
     assert all(node["source_code"] for node in observed["step_graph"]["nodes"])
     output = capsys.readouterr().out
@@ -4819,7 +4823,7 @@ def test_run_local_rejects_conflicting_flags(tmp_path: Path, capsys) -> None:
     target.write_text("", encoding="utf-8")
 
     assert main(["run", str(target), "--local", "--run-type", "long"]) == 1
-    assert "--run-type selects a cloud run type" in capsys.readouterr().err
+    assert "execution options select cloud execution" in capsys.readouterr().err
 
     assert main(["run", str(target), "--local", "--no-wait"]) == 1
     assert "--local always runs synchronously" in capsys.readouterr().err
@@ -5222,3 +5226,64 @@ def test_bucket_create_and_ls_commands(monkeypatch, capsys) -> None:
     output = capsys.readouterr().out
     assert "2026/" in output
     assert "2.0 KiB" in output
+
+
+def test_stream_run_result_skips_fetches_when_submit_is_terminal(monkeypatch) -> None:
+    """A terminal submit response must not trigger events/steps/refresh fetches —
+    the whole point of the inline-result contract is a single POST."""
+    import time as time_module
+
+    from rebase.cli import _LineRunProgressReporter, _stream_run_result
+
+    class FakeRun:
+        id = "run-1"
+        data = {"id": "run-1", "status": "succeeded", "result": {"value": 3}}
+
+        def events(self) -> list[dict[str, Any]]:
+            pytest.fail("terminal submit response must not fetch events")
+
+        def steps(self) -> list[dict[str, Any]]:
+            pytest.fail("terminal submit response must not fetch steps")
+
+        def refresh(self) -> dict[str, Any]:
+            pytest.fail("terminal submit response must not refresh")
+
+    result = _stream_run_result(
+        FakeRun(),
+        reporter=_LineRunProgressReporter(),
+        started_at=time_module.monotonic(),
+        timeout=5,
+        poll_interval=0,
+    )
+
+    assert result == {"value": 3}
+
+
+def test_stream_run_result_still_polls_non_terminal_submit(monkeypatch) -> None:
+    """Old-server contract: a `submitted` body keeps the poll loop (with events)."""
+    import time as time_module
+
+    from rebase.cli import _LineRunProgressReporter, _stream_run_result
+
+    class FakeRun:
+        id = "run-1"
+        data = {"id": "run-1", "status": "submitted"}
+        events_calls = 0
+
+        def events(self) -> list[dict[str, Any]]:
+            type(self).events_calls += 1
+            return []
+
+        def refresh(self) -> dict[str, Any]:
+            return {"id": "run-1", "status": "succeeded", "result": {"value": 4}}
+
+    result = _stream_run_result(
+        FakeRun(),
+        reporter=_LineRunProgressReporter(),
+        started_at=time_module.monotonic(),
+        timeout=5,
+        poll_interval=0,
+    )
+
+    assert result == {"value": 4}
+    assert FakeRun.events_calls >= 1

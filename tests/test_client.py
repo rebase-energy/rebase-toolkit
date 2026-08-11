@@ -7,6 +7,8 @@ from typing import Any
 import pytest
 import requests
 
+from http_stub import patch_client_http
+
 import rebase as rb
 from rebase.config import DEFAULT_API_URL, DEFAULT_SERVER_URL, write_profile
 
@@ -60,7 +62,7 @@ def test_client_sends_bearer_token(monkeypatch) -> None:
         observed["headers"] = kwargs["headers"]
         return FakeResponse([])
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     assert client.list_workflows() == []
@@ -81,7 +83,7 @@ def test_client_request_accepts_custom_timeout(monkeypatch) -> None:
         observed["timeout"] = kwargs["timeout"]
         return FakeResponse({"ok": True})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     assert client.request("POST", "/slow", timeout=123, json={}) == {"ok": True}
@@ -111,7 +113,7 @@ def test_stream_request_parses_ndjson(monkeypatch) -> None:
         observed["timeout"] = kwargs["timeout"]
         return response
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     events = list(client.stream_request("POST", "/functions/fn/map", json={"items": [1]}))
@@ -231,6 +233,40 @@ def test_client_list_run_tasks_tolerates_an_api_without_the_route(monkeypatch) -
     monkeypatch.setattr(client, "request", broken)
     with pytest.raises(rb.RebaseWorkflowError, match="boom"):
         client.list_run_tasks("run-1")
+
+
+def test_client_lists_and_creates_run_artifacts(monkeypatch) -> None:
+    calls: list[tuple[str, str, Any]] = []
+
+    def fake_request(method: str, path: str, **kwargs: Any) -> Any:
+        calls.append((method, path, kwargs))
+        return [{"id": "artifact-1"}] if method == "GET" else {"id": "artifact-1"}
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    monkeypatch.setattr(client, "request", fake_request)
+
+    assert client.list_run_artifacts("run-1", step_run_id="step-1", task_id="task-1") == [
+        {"id": "artifact-1"}
+    ]
+    assert client.create_run_artifact("run-1", {"uri": "gs://bucket/object"}) == {"id": "artifact-1"}
+    assert calls == [
+        (
+            "GET",
+            "/runs/run-1/artifacts",
+            {"params": {"step_run_id": "step-1", "task_id": "task-1"}},
+        ),
+        ("POST", "/runs/run-1/artifacts", {"json": {"uri": "gs://bucket/object"}}),
+    ]
+
+
+def test_client_list_run_artifacts_tolerates_an_api_without_the_route(monkeypatch) -> None:
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    def absent(*args: Any, **kwargs: Any) -> Any:
+        raise _http_error("Not Found", 404)
+
+    monkeypatch.setattr(client, "request", absent)
+    assert client.list_run_artifacts("run-1") == []
 
 
 def test_client_list_runs_filters_on_target_id_not_workflow_id(monkeypatch) -> None:
@@ -373,7 +409,7 @@ def test_create_github_starter_workflow_posts_path(monkeypatch) -> None:
             }
         )
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     response = client.create_github_starter_workflow("connection-id")
@@ -406,7 +442,7 @@ def test_find_github_repository_installation_gets_repo_full_name(monkeypatch) ->
             }
         )
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     response = client.find_github_repository_installation("rebase/platform")
@@ -428,7 +464,7 @@ def test_list_github_repo_connections_gets_workspace_connections(monkeypatch) ->
         observed["params"] = kwargs["params"]
         return FakeResponse([{"repo_owner": "rebase", "repo_name": "platform", "scope": "workspace"}])
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     response = client.list_github_repo_connections()
@@ -442,8 +478,8 @@ def test_list_github_repo_connections_gets_workspace_connections(monkeypatch) ->
 
 
 def test_client_uses_fastapi_detail_for_http_errors(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "requests.request",
+    patch_client_http(
+        monkeypatch,
         lambda *args, **kwargs: FakeErrorResponse({"detail": "Rebase Workflows is invite-only."}),
     )
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
@@ -468,7 +504,7 @@ def test_client_formats_credit_exhaustion_errors(monkeypatch) -> None:
                 }
             }
 
-    monkeypatch.setattr("requests.request", lambda *args, **kwargs: CreditErrorResponse({}))
+    patch_client_http(monkeypatch, lambda *args, **kwargs: CreditErrorResponse({}))
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     with pytest.raises(rb.RebaseWorkflowError) as exc_info:
@@ -487,7 +523,7 @@ def test_get_workspace_usage_calls_active_workspace_endpoint(monkeypatch) -> Non
         observed["url"] = url
         return FakeResponse({"workspace_id": "beta-team", "monthly_credit_cents": 2000})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     assert client.get_workspace_usage()["monthly_credit_cents"] == 2000
@@ -506,7 +542,7 @@ def test_create_platform_invite_posts_email(monkeypatch) -> None:
         observed["json"] = kwargs["json"]
         return FakeResponse({"id": "invite-id", "email": "new@example.com", "status": "pending"})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     response = client.create_platform_invite("new@example.com", workspace_creation_limit=3)
@@ -528,7 +564,7 @@ def test_create_platform_invite_posts_null_workspace_limit(monkeypatch) -> None:
         observed["json"] = kwargs["json"]
         return FakeResponse({"id": "invite-id", "email": "new@example.com", "status": "pending"})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     response = client.create_platform_invite("new@example.com", workspace_creation_limit=None)
@@ -558,7 +594,7 @@ def test_create_workspace_invite_posts_identity_and_role(monkeypatch) -> None:
             }
         )
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     response = client.create_workspace_invite(email="new@example.com", role="Developer")
@@ -593,7 +629,7 @@ def test_list_workspace_members_requests_members_endpoint(monkeypatch) -> None:
             ]
         )
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     response = client.list_workspace_members()
@@ -613,7 +649,7 @@ def test_list_api_keys_requests_workspace_endpoint(monkeypatch) -> None:
         observed["url"] = url
         return FakeResponse([{"id": "key-id", "name": "agent"}])
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     response = client.list_api_keys()
@@ -634,7 +670,7 @@ def test_create_api_key_posts_payload(monkeypatch) -> None:
         observed["json"] = kwargs["json"]
         return FakeResponse({"id": "key-id", "name": "agent", "api_key": "rb_secret"})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     response = client.create_api_key(
@@ -664,7 +700,7 @@ def test_create_api_key_defaults_to_agent_permissions(monkeypatch) -> None:
         observed["json"] = kwargs["json"]
         return FakeResponse({"id": "key-id", "name": "agent", "api_key": "rb_secret"})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     client.create_api_key("agent")
@@ -689,7 +725,7 @@ def test_revoke_api_key_deletes_workspace_key(monkeypatch) -> None:
         observed["url"] = url
         return FakeResponse({"id": "key-id", "enabled": False})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     response = client.revoke_api_key("key-id")
@@ -710,7 +746,7 @@ def test_client_get_project_requests_project_endpoint(monkeypatch) -> None:
         observed["headers"] = kwargs["headers"]
         return FakeResponse({"id": "project-id", "name": "energy"})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     assert client.get_project("project-id") == {"id": "project-id", "name": "energy"}
@@ -731,7 +767,7 @@ def test_client_lists_run_events_from_events_endpoint(monkeypatch) -> None:
         observed["headers"] = kwargs["headers"]
         return FakeResponse([{"id": "event-id", "message": "Accepted run request."}])
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     assert client.list_run_events("run-id") == [{"id": "event-id", "message": "Accepted run request."}]
@@ -753,7 +789,7 @@ def test_client_lists_runs_with_filters(monkeypatch) -> None:
         observed["params"] = kwargs["params"]
         return FakeResponse([{"id": "run-id", "status": "succeeded"}])
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     assert client.list_runs(project_id="project-id", target_type="workflow", limit=25) == [
@@ -781,7 +817,7 @@ def test_client_lists_runs_serializes_time_and_source_filters(monkeypatch) -> No
         observed["params"] = kwargs["params"]
         return FakeResponse([])
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     client.list_runs(
@@ -817,7 +853,7 @@ def _fake_replay_endpoint(monkeypatch, observed: dict[str, Any]) -> None:
             {"id": "replay-run-id", "status": "queued", "replay_of": "run-id", "trigger_source": "replay"}
         )
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
 
 def test_client_replay_run_defaults_to_original_version(monkeypatch) -> None:
@@ -939,7 +975,7 @@ def test_client_sends_workspace_header_from_local_profile(monkeypatch, tmp_path)
         observed["headers"] = kwargs["headers"]
         return FakeResponse([])
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     client = rb.Client()
     assert client.list_workflows() == []
@@ -966,7 +1002,7 @@ def test_client_prefers_explicit_access_token_over_profile_api_key(monkeypatch, 
         observed["headers"] = kwargs["headers"]
         return FakeResponse([])
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     client = rb.Client(access_token="supabase-token", profile="default")
     assert client.list_my_workspaces() == []
@@ -997,7 +1033,7 @@ def test_list_functions_with_project_name_does_not_create_project(monkeypatch) -
         observed["url"] = url
         return FakeResponse([])
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     monkeypatch.setattr(client, "find_project", lambda name: {"id": "project-id", "name": name})
     monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: (_ for _ in ()).throw(AssertionError()))
@@ -1039,8 +1075,10 @@ def test_workflow_deploy_updates_existing_workflow_version(monkeypatch) -> None:
     assert observed["entrypoint"] == "forecast"
     assert observed["source_code"].startswith("def forecast")
     assert observed["step_graph"] is None
-    assert rb.DEFAULT_RUN_TYPE == "quick"
-    assert observed["run_type"] == "quick"
+    assert rb.DEFAULT_MODE == "interactive"
+    assert rb.DEFAULT_ISOLATION == "shared"
+    assert observed["mode"] == "interactive"
+    assert observed["isolation"] == "shared"
 
 
 def test_update_workflow_omits_step_graph_unless_explicit(monkeypatch) -> None:
@@ -1050,7 +1088,7 @@ def test_update_workflow_omits_step_graph_unless_explicit(monkeypatch) -> None:
         observed_payloads.append(kwargs["json"])
         return FakeResponse({"id": "workflow-id", "name": "forecast"})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     client.update_workflow("workflow-id", description="Updated")
@@ -1084,7 +1122,8 @@ def test_workflow_deploy_registers_function_source(monkeypatch) -> None:
     assert observed["entrypoint"] == "add"
     assert "def add(left: float = 0, right: float = 0) -> dict:" in observed["source_code"]
     assert observed["default_parameters"] == {"left": 0, "right": 0}
-    assert observed["run_type"] == "quick"
+    assert observed["mode"] == "interactive"
+    assert observed["isolation"] == "shared"
     assert workflow.run_type == "quick"
 
 
@@ -1105,7 +1144,8 @@ def test_workflow_can_use_long_run_type(monkeypatch) -> None:
     ).deploy()
 
     assert workflow.run_type == "long"
-    assert observed["run_type"] == "long"
+    assert observed["mode"] == "job"
+    assert observed["isolation"] == "shared"
 
 
 def test_workflow_accepts_quick_and_long_run_types(monkeypatch) -> None:
@@ -1135,9 +1175,9 @@ def test_workflow_accepts_quick_and_long_run_types(monkeypatch) -> None:
 
     assert quick.run_type == "quick"
     assert long.run_type == "long"
-    assert [payload["run_type"] for payload in observed] == [
-        "quick",
-        "long",
+    assert [(payload["mode"], payload["isolation"]) for payload in observed] == [
+        ("interactive", "shared"),
+        ("job", "shared"),
     ]
 
 
@@ -1207,10 +1247,11 @@ def test_project_deploy_registers_function_source(monkeypatch) -> None:
     assert "@project.function" not in observed["source_code"]
     assert "def normalize_weather(site_id: str, horizon_hours: int = 24) -> dict:" in observed["source_code"]
     assert observed["default_parameters"] == {"horizon_hours": 24}
-    assert observed["run_type"] == "quick"
+    assert observed["mode"] == "interactive"
+    assert observed["isolation"] == "shared"
     assert observed["source_mode"] == "rebase_hosted"
-    assert rb.DEFAULT_RUN_TYPE == "quick"
-    assert normalize_weather.run_type == "quick"
+    assert rb.DEFAULT_ISOLATION == "shared"
+    assert normalize_weather.run_type == "quick_shared"
 
 
 def test_project_deploy_registers_asgi_app_source(monkeypatch) -> None:
@@ -1271,7 +1312,7 @@ def test_asgi_app_create_and_update_use_deploy_timeout(monkeypatch) -> None:
         observed.append({"method": method, "url": url, "timeout": kwargs["timeout"], "json": kwargs["json"]})
         return FakeResponse({"id": "asgi-app-id", "name": "grid-api"})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     monkeypatch.setattr(client, "ensure_project", lambda name: {"id": "project-id", "name": name})
 
@@ -1488,7 +1529,8 @@ def test_project_function_can_use_quick_run_type(monkeypatch) -> None:
     project.deploy()
 
     assert quick_function.run_type == "quick"
-    assert observed["run_type"] == "quick"
+    assert observed["mode"] == "interactive"
+    assert observed["isolation"] == "dedicated"
 
 
 def test_project_function_can_use_quick_shared_run_type(monkeypatch) -> None:
@@ -1507,7 +1549,8 @@ def test_project_function_can_use_quick_shared_run_type(monkeypatch) -> None:
     project.deploy()
 
     assert quick_shared_function.run_type == "quick_shared"
-    assert observed["run_type"] == "quick_shared"
+    assert observed["mode"] == "interactive"
+    assert observed["isolation"] == "shared"
 
 
 def test_project_function_can_use_long_run_type(monkeypatch) -> None:
@@ -1526,7 +1569,31 @@ def test_project_function_can_use_long_run_type(monkeypatch) -> None:
     project.deploy()
 
     assert long_function.run_type == "long"
-    assert observed["run_type"] == "long"
+    assert observed["mode"] == "job"
+    assert observed["isolation"] == "shared"
+
+
+def test_project_function_defaults_to_shared_and_accepts_dedicated_isolation() -> None:
+    project = rb.Project("energy-forecasting")
+
+    @project.function(name="shared-function")
+    def shared_function() -> dict:
+        return {"status": "ok"}
+
+    @project.function(name="dedicated-function", isolation="dedicated")
+    def dedicated_function() -> dict:
+        return {"status": "ok"}
+
+    assert (shared_function.mode, shared_function.isolation) == ("interactive", "shared")
+    assert (dedicated_function.mode, dedicated_function.isolation) == ("interactive", "dedicated")
+
+
+def test_function_rejects_mixed_new_and_deprecated_execution_settings() -> None:
+    def execute() -> dict:
+        return {"status": "ok"}
+
+    with pytest.raises(ValueError, match="either mode/isolation"):
+        rb.Function(execute, project="energy", isolation="shared", run_type="quick")
 
 
 def test_project_function_rejects_legacy_backend_parameter() -> None:
@@ -1686,8 +1753,9 @@ def test_project_deploy_registers_step_workflow_graph(monkeypatch) -> None:
     project.deploy()
 
     assert [item["name"] for item in observed_functions] == ["load-weather", "build-forecast"]
-    assert [item["run_type"] for item in observed_functions] == ["quick", "quick"]
-    assert observed_workflow["run_type"] == "quick"
+    assert all(item["mode"] == "interactive" and item["isolation"] == "shared" for item in observed_functions)
+    assert observed_workflow["mode"] == "interactive"
+    assert observed_workflow["isolation"] == "shared"
     graph = observed_workflow["step_graph"]
     assert graph["schema_version"] == 1
     assert graph["engine"] == "prefect"
@@ -1750,7 +1818,7 @@ def test_scheduled_workflow_requires_defaults(monkeypatch) -> None:
     def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
         raise AssertionError("scheduled workflow validation should run before API calls")
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     project = rb.Project("energy-forecasting", client=client)
 
@@ -1862,7 +1930,7 @@ def test_triggered_workflow_requires_defaults(monkeypatch) -> None:
     def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
         raise AssertionError("triggered workflow validation should run before API calls")
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     project = rb.Project("energy-forecasting", client=client)
 
@@ -1912,7 +1980,7 @@ def test_update_workflow_omits_trigger_unless_explicit(monkeypatch) -> None:
         observed_payloads.append(kwargs["json"])
         return FakeResponse({"id": "workflow-id", "name": "forecast"})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     client.update_workflow("workflow-id", description="Updated")
@@ -1939,7 +2007,7 @@ def test_dataset_client_methods_hit_expected_endpoints(monkeypatch) -> None:
             return FakeResponse({"deleted": "nordpool/prices"})
         return FakeResponse({"id": "dataset-id", "name": "nordpool/prices"})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     client.create_dataset("nordpool/prices", description="Day-ahead prices")
@@ -1973,7 +2041,7 @@ def test_dataset_mark_updated_signals(monkeypatch) -> None:
         observed["json"] = kwargs.get("json")
         return FakeResponse({"dataset": "nordpool/prices", "fired": []})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     dataset = rb.Dataset("nordpool/prices", client=client)
@@ -2137,7 +2205,8 @@ def test_function_ephemeral_run_sends_source_without_deploy(monkeypatch) -> None
     assert observed["name"] == "add"
     assert observed["entrypoint"] == "add"
     assert observed["parameters"] == {"a": 1, "b": 2}
-    assert observed["run_type"] == "quick"
+    assert observed["mode"] == "interactive"
+    assert observed["isolation"] == "shared"
     assert "def add(a: int, b: int) -> dict:" in observed["source_code"]
 
 
@@ -2155,7 +2224,9 @@ def test_predictor_as_function_generates_predict_wrapper() -> None:
     assert function.name == "price-forecast"
     assert function.entrypoint == "predict"
     assert function.default_parameters == {"zone": "SE3", "horizon_hours": 24}
-    assert function.run_type == "quick"
+    assert function.mode == "interactive"
+    assert function.isolation == "shared"
+    assert function.run_type == "quick_shared"
     assert function.image_spec is not None
     assert "boltons==25.0.0" in function.image_spec["uv_pip_packages"]
     assert any("emflow" in package for package in function.image_spec["uv_pip_packages"])
@@ -2191,7 +2262,8 @@ def test_predictor_deploy_registers_model(monkeypatch) -> None:
     assert observed["operation_name"] == "predict"
     assert observed["environment"] == "dev"
     assert observed["default_parameters"] == {"zone": "SE3"}
-    assert observed["run_type"] == "quick"
+    assert observed["mode"] == "interactive"
+    assert observed["isolation"] == "shared"
     assert any("emflow" in package for package in observed["image_spec"]["uv_pip_packages"])
 
 
@@ -2204,7 +2276,7 @@ def test_client_records_model_publication(monkeypatch) -> None:
         observed["json"] = kwargs["json"]
         return FakeResponse({"id": "publication-id", **kwargs["json"]})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     publication = client.record_model_publication(
@@ -2453,7 +2525,8 @@ def test_predictor_ephemeral_run_sends_model_payload(monkeypatch) -> None:
     assert observed["entrypoint"] == "predict"
     assert observed["parameters"] == {"zone": "SE4"}
     assert observed["default_parameters"] == {"zone": "SE3"}
-    assert observed["run_type"] == "quick"
+    assert observed["mode"] == "interactive"
+    assert observed["isolation"] == "shared"
 
 
 def test_predictor_handle_runs_model(monkeypatch) -> None:
@@ -2593,7 +2666,8 @@ def test_workflow_ephemeral_run_embeds_step_sources_without_deploy(monkeypatch) 
     assert observed["project"] == "hello"
     assert observed["name"] == "hello-workflow"
     assert observed["parameters"] == {"name": "Rebase"}
-    assert observed["run_type"] == "quick"
+    assert observed["mode"] == "interactive"
+    assert observed["isolation"] == "shared"
     nodes = observed["step_graph"]["nodes"]
     assert [node["name"] for node in nodes] == ["load-name", "package"]
     assert all(node["function_version_id"] is None for node in nodes)
@@ -2616,7 +2690,7 @@ def test_get_workflow_schedule(monkeypatch) -> None:
             }
         )
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     schedule = client.get_workflow_schedule("workflow-id")
@@ -2635,7 +2709,7 @@ def test_cancel_run_posts_to_cancel_endpoint(monkeypatch) -> None:
         observed["url"] = url
         return FakeResponse({"id": "run-id", "status": "cancelled"})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     cancelled = client.cancel_run("run-id")
@@ -2649,7 +2723,7 @@ def test_run_cancel_helper_updates_data(monkeypatch) -> None:
     def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
         return FakeResponse({"id": "run-id", "status": "cancelled"})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     run = rb.Run("run-id", client=client, data={"id": "run-id", "status": "running"})
@@ -2673,7 +2747,7 @@ def test_get_run_logs_passes_cursor_params(monkeypatch) -> None:
             }
         )
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     logs = client.get_run_logs("run-id", since="2026-07-11T10:00:00Z", limit=100)
@@ -2700,7 +2774,7 @@ def test_workspace_notifications_roundtrip(monkeypatch) -> None:
             }
         )
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
 
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
@@ -2753,7 +2827,7 @@ def test_volume_rpcs_and_file_ops(monkeypatch, tmp_path) -> None:
         transferred["get_url"] = url
         return FakeTransferResponse()
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     monkeypatch.setattr("requests.put", fake_put)
     monkeypatch.setattr("requests.get", fake_get)
 
@@ -2842,7 +2916,7 @@ def test_update_dataset_sends_only_provided_keys(monkeypatch) -> None:
         observed.append({"method": method, "url": url, "json": kwargs["json"]})
         return FakeResponse({"id": "dataset-id", "name": "nordpool/prices"})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     contract = {"$schema": "rebase/contract-v1", "properties": {}, "required": [], "x-rebase": {}}
@@ -2864,7 +2938,7 @@ def test_signal_dataset_includes_validation_when_given(monkeypatch) -> None:
         observed.append(kwargs["json"])
         return FakeResponse({"dataset": "nordpool/prices", "fired": []})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     client.signal_dataset("nordpool/prices", watermark="w-1")
@@ -2893,7 +2967,7 @@ def test_dataset_sync_config_publishes_absent_and_warns_on_drift(monkeypatch) ->
             return FakeResponse({**stored, **kwargs["json"]})
         return FakeResponse({"dataset": "nordpool/prices", "fired": []})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     dataset = rb.Dataset(
@@ -2922,7 +2996,7 @@ def test_dataset_sync_config_skips_patch_when_stored_matches(monkeypatch) -> Non
             return FakeResponse({"name": "nordpool/prices", "contract": contract, "freshness": None})
         return FakeResponse({"dataset": "nordpool/prices", "fired": []})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     dataset = rb.Dataset("nordpool/prices", client=client, contract=contract)
@@ -2937,7 +3011,7 @@ def test_dataset_sync_config_survives_get_failure(monkeypatch) -> None:
             raise requests.ConnectionError("api down")
         return FakeResponse({"dataset": "nordpool/prices", "fired": []})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     dataset = rb.Dataset("nordpool/prices", client=client, freshness={"max_age": "45m"})
@@ -3265,7 +3339,7 @@ def test_unfiltered_list_functions_makes_one_request(monkeypatch) -> None:
         paths.append(url.split("workflows.example.com")[-1])
         return FakeResponse([{"id": "fn-1", "project_id": "p1"}, {"id": "fn-2", "project_id": "p2"}])
 
-    monkeypatch.setattr(requests, "request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     functions = client.list_functions()
@@ -3287,10 +3361,171 @@ def test_unfiltered_list_functions_falls_back_when_the_route_is_missing(monkeypa
             return FakeResponse([{"id": "p1", "name": "one"}, {"id": "p2", "name": "two"}])
         return FakeResponse([{"id": f"fn-{path[-11]}", "project_id": path.split("/")[2]}])
 
-    monkeypatch.setattr(requests, "request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
 
     functions = client.list_functions()
 
     assert len(functions) == 2
     assert paths == ["/functions", "/projects", "/projects/p1/functions", "/projects/p2/functions"]
+
+
+# --- inline-result contract & transport (ephemeral fast path) -----------------
+
+
+def test_ephemeral_run_terminal_response_needs_no_refetch(monkeypatch) -> None:
+    """The submit response already carries the terminal record; `.result()` must
+    answer from it without a single follow-up GET."""
+    calls: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append(f"{method} {url.split('workflows.example.com')[-1]}")
+        return FakeResponse({"id": "run-1", "status": "succeeded", "result": {"value": 7}})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    run = client.run_ephemeral(
+        target_type="function",
+        project="demo",
+        name="fn",
+        source_code="def fn():\n    return 7\n",
+        entrypoint="fn",
+        run_type="quick_shared",
+    )
+
+    assert run.result() == {"value": 7}
+    assert calls == ["POST /runs/ephemeral"]
+
+
+def test_ephemeral_run_non_terminal_response_still_polls(monkeypatch) -> None:
+    """Old-server contract: a `submitted` body falls back to the poll loop."""
+    calls: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append(method)
+        if method == "POST":
+            return FakeResponse({"id": "run-1", "status": "submitted"})
+        return FakeResponse({"id": "run-1", "status": "succeeded", "result": {"value": 1}})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    run = client.run_ephemeral(
+        target_type="function",
+        project="demo",
+        name="fn",
+        source_code="def fn():\n    return 1\n",
+        entrypoint="fn",
+        run_type="quick_shared",
+    )
+
+    assert run.result(poll_interval=0) == {"value": 1}
+    assert calls == ["POST", "GET"]
+
+
+def test_ephemeral_run_uses_long_read_timeout(monkeypatch) -> None:
+    """Quick runs execute inside the request; the old 30 s default cut them off."""
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["timeout"] = kwargs["timeout"]
+        return FakeResponse({"id": "run-1", "status": "succeeded", "result": None})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.run_ephemeral(
+        target_type="function",
+        project="demo",
+        name="fn",
+        source_code="def fn():\n    return None\n",
+        entrypoint="fn",
+        run_type="quick_shared",
+    )
+
+    from rebase.client import EPHEMERAL_RUN_REQUEST_TIMEOUT_SECONDS
+
+    assert observed["timeout"] == EPHEMERAL_RUN_REQUEST_TIMEOUT_SECONDS
+
+
+def test_client_reuses_one_session_across_requests(monkeypatch) -> None:
+    """Keep-alive: every request must go through the same Session object."""
+    sessions: list[Any] = []
+
+    class FakeSession:
+        def request(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
+            sessions.append(self)
+            return FakeResponse([])
+
+    fake_session = FakeSession()
+    monkeypatch.setattr("requests.Session", lambda: fake_session)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.list_workflows()
+    client.list_workflows()
+
+    assert sessions == [fake_session, fake_session]
+
+
+def test_client_rebuilds_session_after_fork(monkeypatch) -> None:
+    """A forked child must not reuse the parent's socket."""
+    created: list[Any] = []
+
+    class FakeSession:
+        def request(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
+            return FakeResponse([])
+
+    def make_session() -> FakeSession:
+        session = FakeSession()
+        created.append(session)
+        return session
+
+    monkeypatch.setattr("requests.Session", make_session)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.list_workflows()
+    monkeypatch.setattr("rebase.client.os.getpid", lambda: -1)  # simulate fork
+    client.list_workflows()
+
+    assert len(created) == 2
+
+
+def test_disk_token_cached_and_invalidated_on_401(monkeypatch) -> None:
+    """load_access_token() is disk IO: read once, drop the cache on a 401 and retry."""
+    token_reads: list[int] = []
+    responses: list[FakeResponse] = []
+
+    class FakeUnauthorized(FakeResponse):
+        status_code = 401
+        text = '{"detail":"expired"}'
+
+        def raise_for_status(self) -> None:
+            raise requests.HTTPError("401")
+
+    def fake_load_access_token() -> str:
+        token_reads.append(1)
+        return f"token-{len(token_reads)}"
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        response = responses.pop(0)
+        response.auth_header = kwargs["headers"].get("Authorization")  # type: ignore[attr-defined]
+        return response
+
+    monkeypatch.setattr("rebase.client.load_access_token", fake_load_access_token)
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key=None, api_url="https://workflows.example.com")
+    client.access_token = None  # force the disk-token path even if env vars leak in
+
+    ok_one, ok_two = FakeResponse([]), FakeResponse([])
+    responses = [ok_one, ok_two]
+    client.list_workflows()
+    client.list_workflows()
+    assert token_reads == [1]  # cached across requests
+    assert ok_two.auth_header == "Bearer token-1"  # type: ignore[attr-defined]
+
+    unauthorized, recovered = FakeUnauthorized([]), FakeResponse([])
+    responses = [unauthorized, recovered]
+    client.list_workflows()
+    assert token_reads == [1, 1]  # 401 dropped the cache and re-read
+    assert recovered.auth_header == "Bearer token-2"  # type: ignore[attr-defined]

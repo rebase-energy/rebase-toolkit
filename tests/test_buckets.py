@@ -4,6 +4,8 @@ from typing import Any
 
 import pytest
 
+from http_stub import patch_client_http
+
 import rebase as rb
 from rebase.client import Bucket, BucketObject, Client, RebaseWorkflowError, _resolve_buckets_payload, bucket_env_var
 
@@ -81,7 +83,7 @@ class TestRpcs:
                 )
             return FakeResponse({"name": "forecasts", "uri": "gs://rb-x"})
 
-        monkeypatch.setattr("requests.request", fake_request)
+        patch_client_http(monkeypatch, fake_request)
         monkeypatch.setattr("requests.put", lambda url, data=None, timeout=None: FakeResponse())
 
         got: dict[str, Any] = {}
@@ -112,7 +114,7 @@ class TestRpcs:
             observed.update(kwargs.get("params") or {})
             return FakeResponse({"objects": [], "prefixes": ["2026/"], "next_page_token": "t"})
 
-        monkeypatch.setattr("requests.request", fake_request)
+        patch_client_http(monkeypatch, fake_request)
         page = Bucket("forecasts", client=_client()).list("2026/", delimiter="/", page_token="abc")
         assert observed["delimiter"] == "/"
         assert observed["page_token"] == "abc"
@@ -130,7 +132,7 @@ class TestRpcs:
             calls.append((kwargs.get("params") or {}).get("page_token"))
             return FakeResponse(pages[len(calls) - 1])
 
-        monkeypatch.setattr("requests.request", fake_request)
+        patch_client_http(monkeypatch, fake_request)
         keys = [obj.key for obj in Bucket("forecasts", client=_client()).iter_all()]
         assert keys == ["a", "b"]
         assert calls == [None, "t"]
@@ -145,7 +147,7 @@ class TestRpcs:
                 {"urls": [{"path": p, "url": f"https://s/{p}", "method": "GET", "expires_seconds": 60} for p in paths]}
             )
 
-        monkeypatch.setattr("requests.request", fake_request)
+        patch_client_http(monkeypatch, fake_request)
         keys = [f"f{i}.txt" for i in range(250)]
         urls = Bucket("forecasts", client=_client()).signed_urls(keys)
         assert len(urls) == 250
@@ -226,7 +228,7 @@ def test_register_function_omits_buckets_when_empty(monkeypatch) -> None:
             observed.update(kwargs.get("json") or {})
         return FakeResponse({"id": "function-id"})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     monkeypatch.setattr(Client, "ensure_project", lambda self, name: {"id": "project-id"})
     _client().register_function(project="ml", name="train", source_code="def f(): pass", entrypoint="f")
     assert "buckets" not in observed
@@ -242,7 +244,7 @@ def test_register_function_includes_buckets_when_set(monkeypatch) -> None:
             observed.update(kwargs.get("json") or {})
         return FakeResponse({"id": "function-id"})
 
-    monkeypatch.setattr("requests.request", fake_request)
+    patch_client_http(monkeypatch, fake_request)
     monkeypatch.setattr(Client, "ensure_project", lambda self, name: {"id": "project-id"})
     _client().register_function(
         project="ml",

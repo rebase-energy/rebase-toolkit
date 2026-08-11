@@ -367,7 +367,7 @@ def start_hosted_search(
             "seed_solution_code": seed_solution_code or "",
             "knowledge_context": knowledge_context or "",
         },
-        run_type="long",
+        mode="job",
         image_spec={"runtime": "hillclimb"},
     )
 
