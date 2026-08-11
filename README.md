@@ -314,6 +314,9 @@ reporting failure raises `ArtifactReportingError`, so a successful upload is not
 silently omitted from the run record. Local calls validate their arguments and
 otherwise remain in-memory no-ops.
 
+The TUI lists artifacts under `[ Artifacts ]`; select one and press `a` to
+resolve and open its current location.
+
 Deploy a file from the command line:
 
 ```bash

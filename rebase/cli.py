@@ -840,9 +840,7 @@ def _stream_run_result(
         # The submit response already carries the terminal record for synchronous
         # quick runs — in that case every per-iteration fetch below would be a
         # wasted round trip: the run is over, so there is no progress to stream.
-        already_terminal = (
-            first_iteration and bool(run.data) and str(run.data.get("status") or "") in terminal_statuses
-        )
+        already_terminal = first_iteration and bool(run.data) and str(run.data.get("status") or "") in terminal_statuses
 
         if events_supported and not already_terminal:
             try:
@@ -2629,9 +2627,7 @@ def environment_grants_command(
 @environment_app.command("grant")
 def environment_grant_command(
     environment: Annotated[str, typer.Argument(help="Environment name.")],
-    profile_id: Annotated[
-        str | None, typer.Option("--profile-id", "-p", help="Workspace profile UUID.")
-    ] = None,
+    profile_id: Annotated[str | None, typer.Option("--profile-id", "-p", help="Workspace profile UUID.")] = None,
     api_key_id: Annotated[str | None, typer.Option("--api-key-id", help="Workspace API key UUID.")] = None,
     access: Annotated[str, typer.Option("--access", "-a", help="read, write, or admin.")] = "read",
     json_output: Annotated[bool, typer.Option("--json", "-j")] = False,
@@ -2668,9 +2664,7 @@ def environment_delete_command(
 def environment_track_project_command(
     environment: Annotated[str, typer.Argument(help="Environment name.")],
     project: Annotated[str, typer.Argument(help="Project name in that environment.")],
-    connection_id: Annotated[
-        str, typer.Option("--connection", "-c", help="GitHub repository connection ID.")
-    ],
+    connection_id: Annotated[str, typer.Option("--connection", "-c", help="GitHub repository connection ID.")],
     ref: Annotated[str, typer.Option("--ref", "-r", help="Tracked branch or tag ref.")],
     entrypoint: Annotated[str, typer.Option("--entrypoint", "-e", help="Python declaration file.")],
     repo_path: Annotated[str | None, typer.Option("--repo-path")] = None,

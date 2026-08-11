@@ -292,9 +292,7 @@ def active_environment(workspace_id: str, *, path: Path | None = None) -> str | 
     return value if isinstance(value, str) and value else None
 
 
-def set_active_environment(
-    workspace_id: str, environment: str, *, path: Path | None = None
-) -> None:
+def set_active_environment(workspace_id: str, environment: str, *, path: Path | None = None) -> None:
     """Persist a personal environment selection in the global user config."""
     resolved_path = path or config_path()
     data = read_config(resolved_path)

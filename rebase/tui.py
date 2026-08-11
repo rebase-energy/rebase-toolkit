@@ -16,7 +16,7 @@ from functools import partial
 from pathlib import Path
 from time import monotonic
 from typing import Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo, available_timezones
 
 from rich.json import JSON
@@ -250,6 +250,8 @@ ROUTINE_LOG_SEVERITIES = frozenset({"INFO", "DEBUG", "NOTSET", "-", ""})
 #: What to say when a filter has nothing to show, rather than leaving a blank table.
 TIMELINE_EMPTY: dict[str, str] = {
     "timeline-events": "No lifecycle events recorded for this run.",
+    "timeline-tasks": "No tasks reported for this run.",
+    "timeline-artifacts": "No artifacts registered for this run.",
     "timeline-logs": "No log output recorded for this run.",
     "timeline-all": "Nothing recorded for this run yet.",
 }
@@ -412,6 +414,10 @@ class TimelineRow:
     scope: str = "run"
     #: The complete API record behind task/artifact detail drawers.
     record: dict[str, Any] = field(default_factory=dict)
+    #: Original pointer plus its browser-safe destination, for artifact rows only.
+    artifact_uri: str | None = None
+    artifact_id: str | None = None
+    artifact_run_id: str | None = None
     url: str | None = None
 
 
@@ -957,6 +963,19 @@ def workflow_steps(workflow_id: str, workflow_name: str, step_graph: Any) -> tup
     return tuple(steps)
 
 
+def artifact_browser_url(uri: str) -> str | None:
+    """Turn a durable artifact URI into a safe destination for the user's browser."""
+    value = uri.strip()
+    parsed = urlsplit(value)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return value
+    if parsed.scheme != "gs" or not parsed.netloc or not parsed.path.lstrip("/"):
+        return None
+    bucket = quote(parsed.netloc, safe="")
+    object_name = quote(parsed.path.lstrip("/"), safe="/")
+    return f"https://console.cloud.google.com/storage/browser/_details/{bucket}/{object_name}"
+
+
 def build_timeline(
     events: Sequence[dict[str, Any]],
     steps: Sequence[dict[str, Any]],
@@ -1055,7 +1074,16 @@ def build_timeline(
         )
     for artifact in artifacts:
         media_type = str(artifact.get("media_type") or "-")
-        uri = str(artifact.get("uri") or "-")
+        # An artifact points either at an absolute URI or at a logical bucket object.
+        # The bucket form has no browsable location until the API resolves it, so it is
+        # shown as its logical pointer and only turned into a destination on `a`.
+        bucket = artifact.get("bucket")
+        object_key = artifact.get("object_key")
+        uri = (
+            f"rb://bucket/{bucket}/{str(object_key).lstrip('/')}"
+            if bucket and object_key
+            else str(artifact.get("uri") or "-")
+        )
         rows.append(
             TimelineRow(
                 at=_parse_timestamp(artifact.get("created_at")),
@@ -1065,7 +1093,10 @@ def build_timeline(
                 kind="artifact",
                 scope=artifact_scope(artifact),
                 record=dict(artifact),
-                url=uri if uri.startswith(("https://", "http://")) else None,
+                artifact_uri=uri,
+                artifact_id=str(artifact.get("id")) if artifact.get("id") else None,
+                artifact_run_id=str(artifact.get("workflow_run_id")) if artifact.get("workflow_run_id") else None,
+                url=artifact_browser_url(uri),
             )
         )
     for entry in logs or []:
@@ -2120,6 +2151,7 @@ class RebaseTuiApp(App[None]):
         Binding("g", "open_github", "Open deployed code on GitHub", show=False),
         Binding("w", "switch_workspace", "Switch workspace", show=False),
         Binding("v", "choose_environment", "Switch environment", show=False),
+        Binding("a", "open_artifact", "Open artifact", show=False),
         Binding("s", "toggle_terminal_select", "Select text", show=False),
         Binding("p", "show_details", "Details", show=False),
         Binding("l", "toggle_logs", "Logs", show=False),
@@ -2422,7 +2454,8 @@ class RebaseTuiApp(App[None]):
         #: Which of the timeline's chips is showing. `l` jumps to the logs one.
         self._timeline_filter = TIMELINE_FILTERS[0][0]
         #: The activity record behind each currently rendered row, for lineage-aware
-        #: task and artifact drawers. Keys match the DataTable's row keys.
+        #: task and artifact drawers, and so actions operate on the row under the
+        #: cursor. Keys match the DataTable's row keys.
         self._timeline_rows: dict[str, TimelineRow] = {}
         #: Timeline rows opened out to their full text, by position in the current view.
         #: Position, not identity: changing filter or run reshuffles the list, and both
@@ -3274,6 +3307,44 @@ class RebaseTuiApp(App[None]):
             return
         self.notify(describe_failure(result), severity="warning")
 
+    def action_open_artifact(self) -> None:
+        """Open the artifact under the timeline cursor at its durable location."""
+        focused = self.focused
+        key = self._cursor_key(focused) if getattr(focused, "id", None) == "timeline-table" else None
+        row = self._timeline_rows.get(key or "")
+        if row is None or row.kind != "artifact":
+            self.notify("Select an artifact in the timeline first — a opens its location.", severity="warning")
+            return
+        if row.url is None and (row.artifact_id is None or row.artifact_run_id is None):
+            self.notify(f"No browser destination is available for {row.artifact_uri or row.stage}.", severity="warning")
+            return
+        self.run_worker(
+            self._open_artifact(row),
+            name="open-artifact",
+            group="tui-open",
+            exclusive=True,
+        )
+
+    async def _open_artifact(self, row: TimelineRow) -> None:
+        try:
+            url = row.url
+            if row.artifact_id is not None and row.artifact_run_id is not None:
+                url = await asyncio.to_thread(
+                    self.data.client.open_run_artifact,
+                    row.artifact_run_id,
+                    row.artifact_id,
+                )
+            if url is None:
+                raise RebaseWorkflowError("artifact has no browser destination")
+            opened = await asyncio.to_thread(webbrowser.open, url)
+        except Exception as exc:
+            self.notify(f"Could not open artifact: {exc}", severity="error")
+            return
+        if not opened:
+            self.notify(f"Could not open a browser for {url}", severity="error")
+            return
+        self.notify(f"Opened {row.stage} in the browser.")
+
     def _on_source_chosen(self, chosen: ProjectDeclaration | None) -> None:
         if chosen is not None:
             self._launch_editor(chosen)
@@ -3731,9 +3802,7 @@ class RebaseTuiApp(App[None]):
 
     def _render_environment_resources(self, overview: WorkspaceOverviewData) -> None:
         buckets = self._fill_table("buckets-table")
-        bucket_rows = {
-            str(item.get("id") or item.get("name")): item for item in overview.buckets if item.get("name")
-        }
+        bucket_rows = {str(item.get("id") or item.get("name")): item for item in overview.buckets if item.get("name")}
         self._workspace_resource_rows["buckets-table"] = bucket_rows
         for key, item in bucket_rows.items():
             buckets.add_row(
@@ -3744,9 +3813,7 @@ class RebaseTuiApp(App[None]):
             )
 
         volumes = self._fill_table("volumes-table")
-        volume_rows = {
-            str(item.get("id") or item.get("name")): item for item in overview.volumes if item.get("name")
-        }
+        volume_rows = {str(item.get("id") or item.get("name")): item for item in overview.volumes if item.get("name")}
         self._workspace_resource_rows["volumes-table"] = volume_rows
         for key, item in volume_rows.items():
             volumes.add_row(
@@ -4074,8 +4141,8 @@ class RebaseTuiApp(App[None]):
         self.query_one("#runs-table", DataTable).clear(columns=True)
         self.query_one("#timeline-table", DataTable).clear(columns=True)
         self._run_rows = {}
-        self._run_detail = None
         self._timeline_rows = {}
+        self._run_detail = None
         self._reveal(0)
 
     def _select_project(self, project_id: str) -> None:

@@ -36,6 +36,7 @@ from rebase.tui import (
     RebaseTuiData,
     SelectableDataTable,
     TimezoneChoiceScreen,
+    artifact_browser_url,
     collapse_message,
     compact_id,
     deployed_identities,
@@ -89,6 +90,7 @@ class FakeClient:
         self.log_calls: list[str] = []
         self.task_calls: list[str] = []
         self.artifact_calls: list[str] = []
+        self.artifact_open_calls: list[tuple[str, str]] = []
         # Empty by default: a workflow whose steps fan out into nothing has no tasks,
         # which is most of them. `SteppedClient` is the other kind.
         self.tasks: list[dict[str, Any]] = []
@@ -159,6 +161,7 @@ class FakeClient:
                 "finished_at": "2026-06-16T14:01:00Z",
             }
         ]
+
     def get_workflow_version(self, workflow_id: str, version_id: str) -> dict[str, Any]:
         self.version_calls.append((workflow_id, version_id))
         return {
@@ -179,14 +182,14 @@ class FakeClient:
         return self.tasks
 
     def list_run_artifacts(
-        self,
-        run_id: str,
-        *,
-        step_run_id: str | None = None,
-        task_id: str | None = None,
+        self, run_id: str, *, step_run_id: str | None = None, task_id: str | None = None
     ) -> list[dict[str, Any]]:
         self.artifact_calls.append(run_id)
         return self.artifacts
+
+    def open_run_artifact(self, run_id: str, artifact_id: str) -> str:
+        self.artifact_open_calls.append((run_id, artifact_id))
+        return "https://storage.example/signed-object"
 
     def get_run_logs(self, run_id: str, *, since: str | None = None, limit: int | None = None) -> dict[str, Any]:
         self.log_calls.append(run_id)
@@ -394,6 +397,7 @@ class SteppedClient(FakeClient):
                 "media_type": "application/json",
                 "size_bytes": 4096,
                 "producer_run_id": "mapped-run-id",
+                "workflow_run_id": "run-id",
                 "step_run_id": "step-id",
                 "task_id": "task-0",
                 "created_at": "2026-06-16T14:00:08Z",
@@ -516,6 +520,14 @@ def test_tui_definition_line_reads_the_exact_git_object(monkeypatch, tmp_path) -
 
     assert workflow_definition_line_at_commit(version, [tmp_path]) == 3
     assert seen == [(tmp_path, "0123456789abcdef", "deploy/forecast.py")]
+
+
+def test_artifact_browser_url_targets_the_exact_gcs_object() -> None:
+    assert artifact_browser_url("gs://power-system-data/raw/nordpool/curve 1.json") == (
+        "https://console.cloud.google.com/storage/browser/_details/power-system-data/raw/nordpool/curve%201.json"
+    )
+    assert artifact_browser_url("https://example.com/result.json") == "https://example.com/result.json"
+    assert artifact_browser_url("s3://bucket/result.json") is None
 
 
 def test_tui_data_loads_project_filtered_overview_and_runs() -> None:
@@ -3246,10 +3258,11 @@ def test_tui_footer_shows_only_the_keys_you_move_around_with() -> None:
                 for _, binding, _, _ in app.screen.active_bindings.values()
                 if not binding.show
             }
-            for key in ("d", "o", "g", "w", "s", "p", "l", "m"):
+            for key in ("a", "d", "o", "g", "w", "s", "p", "l", "m"):
                 assert key in hidden, key
             assert hidden["g"] == "Open deployed code on GitHub"
             assert hidden["w"] == "Switch workspace"
+            assert hidden["a"] == "Open artifact"
             assert hidden["m"] == "Maximise pane"
 
             tab = next(b for _, b, _, _ in app.screen.active_bindings.values() if b.key == "tab")
@@ -3510,7 +3523,35 @@ def test_tui_returns_to_activity_when_the_next_run_lacks_the_open_branch() -> No
                 "timeline-events",
             ]
 
+            # A filter the next run cannot show is not merely deselected, it is
+            # unreachable: selecting it directly is ignored rather than painting an
+            # empty table for a branch this run does not have.
+            app._select_timeline_filter("timeline-artifacts")
+            await pilot.pause(0.2)
+            assert app._timeline_filter == "timeline-all"
+
     asyncio.run(scenario())
+
+
+def test_tui_a_resolves_and_opens_the_selected_bucket_artifact(monkeypatch) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr("rebase.tui.webbrowser.open", lambda url: opened.append(url) or True)
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(SteppedClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(160, 40)) as pilot:
+            await _open_run(app, pilot)
+            app._select_timeline_filter("timeline-artifacts")
+            await pilot.pause(0.2)
+            timeline = app.query_one("#timeline-table", DataTable)
+            timeline.focus()
+            timeline.move_cursor(row=0)
+            await pilot.press("a")
+            await pilot.pause(0.3)
+
+    asyncio.run(scenario())
+    assert opened == ["https://storage.example/signed-object"]
 
 
 def test_tui_l_jumps_to_the_logs_chip_and_back() -> None:

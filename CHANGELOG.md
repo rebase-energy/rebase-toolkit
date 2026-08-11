@@ -32,7 +32,9 @@
   and inline task automatically; mapped function runs use their map-task identity so the
   artifact appears on the canonical parent workflow as well as retaining its producer run.
   `Run.artifacts()` and `Client.list_run_artifacts(...)` expose the records, and the TUI adds
-  an `[ Artifacts ]` timeline filter with HTTP links rendered as links.
+  an `[ Artifacts ]` timeline filter with HTTP links rendered as links. An artifact can point
+  at a bucket object instead of a URI, in which case selecting it and pressing `a` resolves
+  and opens its current destination rather than storing a physical location up front.
 
 - **The TUI shows where each deployed workflow comes from.** The workflow table now has
   Source and Commit columns: a Git-backed deployment reads `GitHub` beside the shortened

@@ -61,9 +61,7 @@ _EmflowSimulator: Any = _ImportedEmflowSimulator
 
 
 _default_client: Client | None = None
-_environment_context: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "rebase_environment", default=None
-)
+_environment_context: contextvars.ContextVar[str | None] = contextvars.ContextVar("rebase_environment", default=None)
 
 
 def _resolve_environment(client: Client, environment: str | None) -> str:
@@ -435,8 +433,7 @@ DEFAULT_MODEL_DEPENDENCY = (
     "emflow @ git+https://github.com/rebase-energy/emflow.git@2d0205e1b479d439df72e50c6865735d0b26de8d"
 )
 LEGACY_BACKEND_REMOVED_ERROR = (
-    "the 'backend' parameter was removed; use mode='interactive' | 'job' and "
-    "isolation='shared' | 'dedicated'"
+    "the 'backend' parameter was removed; use mode='interactive' | 'job' and isolation='shared' | 'dedicated'"
 )
 
 
@@ -1008,6 +1005,8 @@ class BucketObject:
     updated: str | None = None
     content_type: str | None = None
     etag: str | None = None
+    version: str | None = None
+    digest: str | None = None
 
 
 class Bucket:
@@ -1031,6 +1030,10 @@ class Bucket:
     object store is a filesystem: there is no ``commit``/``reload`` pair, and a
     write costs one request rather than a silent read-modify-write of the whole
     object.
+
+    The backing provider is deliberately not part of this API: reads and writes
+    use short-lived capability URLs issued by Rebase, so hosted code never
+    receives cloud credentials and callers need no provider SDKs.
     """
 
     def __init__(
@@ -1041,7 +1044,7 @@ class Bucket:
         client: Client | None = None,
         environment_name: str | None = None,
     ) -> None:
-        if not name or not name.strip():
+        if not isinstance(name, str) or not name.strip():
             raise ValueError("Bucket requires a non-empty name")
         self.name = name.strip()
         self.create_if_missing = create_if_missing
@@ -1099,26 +1102,34 @@ class Bucket:
             self._uri = injected if injected else str(self.ensure().get("uri") or "")
         return self._uri
 
-    def put(self, key: str, data: bytes | str | Path) -> str:
+    def put(self, key: str, data: bytes | str | Path, *, content_type: str | None = None) -> str:
         """Write one object. Accepts bytes, text, or a path to upload."""
         self._ensure_once()
         if isinstance(data, Path):
-            return self.put_file(data, key)
+            return self.put_file(data, key, content_type=content_type)
         payload = data.encode("utf-8") if isinstance(data, str) else data
-        signed = self._signed_url(key, method="PUT")
-        response = requests.put(signed, data=payload, timeout=600)
+        signed = self._signed_url(key, method="PUT", content_type=content_type)
+        headers = {"Content-Type": content_type} if content_type else None
+        response = requests.put(signed, data=payload, headers=headers, timeout=600)
         if response.status_code >= 400:
             raise RebaseWorkflowError(f"bucket upload failed: {response.status_code} {response.text[:200]}")
-        return key
+        return key.lstrip("/")
 
-    def put_file(self, local_path: str | Path, key: str | None = None) -> str:
+    def put_file(
+        self,
+        local_path: str | Path,
+        key: str | None = None,
+        *,
+        content_type: str | None = None,
+    ) -> str:
         """Upload one local file. Streams, so object size is not bounded by memory."""
         local = Path(local_path)
         target = (key or local.name).lstrip("/")
         self._ensure_once()
-        signed = self._signed_url(target, method="PUT")
+        signed = self._signed_url(target, method="PUT", content_type=content_type)
+        headers = {"Content-Type": content_type} if content_type else None
         with local.open("rb") as handle:
-            response = requests.put(signed, data=handle, timeout=600)
+            response = requests.put(signed, data=handle, headers=headers, timeout=600)
         if response.status_code >= 400:
             raise RebaseWorkflowError(f"bucket upload failed: {response.status_code} {response.text[:200]}")
         return target
@@ -1233,21 +1244,32 @@ class Bucket:
                 self.delete(obj.key)
                 deleted += 1
 
+    def signed_url(self, key: str, *, method: str = "GET", content_type: str | None = None) -> str:
+        """A short-lived capability URL for one object."""
+        return self._signed_url(key, method=method, content_type=content_type)
+
     def signed_urls(self, keys: Sequence[str], *, method: str = "GET") -> dict[str, str]:
         """Presigned URLs for many objects in one round trip."""
         return self._signed_urls(list(keys), method=method)
 
-    def _signed_url(self, key: str, *, method: str) -> str:
-        return self._signed_urls([key.lstrip("/")], method=method)[key.lstrip("/")]
+    def _signed_url(self, key: str, *, method: str, content_type: str | None = None) -> str:
+        cleaned = key.lstrip("/")
+        return self._signed_urls([cleaned], method=method, content_type=content_type)[cleaned]
 
-    def _signed_urls(self, keys: Sequence[str], *, method: str) -> dict[str, str]:
+    def _signed_urls(
+        self,
+        keys: Sequence[str],
+        *,
+        method: str,
+        content_type: str | None = None,
+    ) -> dict[str, str]:
         cleaned = [key.lstrip("/") for key in keys]
         urls: dict[str, str] = {}
         client = self._resolved_client()
         # The API caps a batch; chunk so a big directory upload still works.
         for start in range(0, len(cleaned), _SIGNED_URL_BATCH):
             chunk = cleaned[start : start + _SIGNED_URL_BATCH]
-            data = client.create_bucket_signed_urls(self.name, chunk, method=method)
+            data = client.create_bucket_signed_urls(self.name, chunk, method=method, content_type=content_type)
             urls.update({item["path"]: item["url"] for item in data.get("urls", [])})
         missing = [key for key in cleaned if key not in urls]
         if missing:
@@ -1260,11 +1282,13 @@ _SIGNED_URL_BATCH = 100
 
 def _bucket_object(item: dict[str, Any]) -> BucketObject:
     return BucketObject(
-        key=item.get("path", ""),
+        key=str(item.get("path", "")),
         size=int(item.get("size", 0)),
         updated=item.get("updated"),
         content_type=item.get("content_type"),
         etag=item.get("etag"),
+        version=item.get("version"),
+        digest=item.get("digest"),
     )
 
 
@@ -1293,6 +1317,9 @@ def _resolve_buckets_payload(
                 raise RebaseWorkflowError("resolving buckets requires an authenticated client")
             bucket.ensure(client)
         attachments.append({"bucket": bucket.name})
+    names = [str(entry.get("bucket", "")) for entry in attachments]
+    if len(names) != len(set(names)):
+        raise RebaseWorkflowError("bucket attachments must be unique")
     return sorted(attachments, key=lambda entry: str(entry.get("bucket", "")))
 
 
@@ -2385,12 +2412,7 @@ class Client:
         )
         self.workspace_id = resolved_workspace_id or None
         configured_environment = active_environment(self.workspace_id) if self.workspace_id else None
-        self.environment_name = (
-            environment_name
-            or os.getenv("REBASE_ENVIRONMENT")
-            or configured_environment
-            or "dev"
-        )
+        self.environment_name = environment_name or os.getenv("REBASE_ENVIRONMENT") or configured_environment or "dev"
         profile_api_url = configured_api_url if isinstance(configured_api_url, str) else None
         selected_api_url = api_url or os.getenv("REBASE_WORKFLOWS_API_URL") or profile_api_url or DEFAULT_SERVER_URL
         self.api_url = selected_api_url.rstrip("/")
@@ -2457,9 +2479,7 @@ class Client:
         if self.workspace_id and "X-Rebase-Workspace" not in resolved_headers:
             resolved_headers["X-Rebase-Workspace"] = self.workspace_id
         if "X-Rebase-Environment" not in resolved_headers:
-            resolved_headers["X-Rebase-Environment"] = (
-                _environment_context.get() or self.environment_name
-            )
+            resolved_headers["X-Rebase-Environment"] = _environment_context.get() or self.environment_name
         release_id = os.getenv("REBASE_GITOPS_RELEASE_ID")
         if release_id and "X-Rebase-GitOps-Release" not in resolved_headers:
             resolved_headers["X-Rebase-GitOps-Release"] = release_id
@@ -2811,14 +2831,17 @@ class Client:
         paths: list[str],
         *,
         method: str = "GET",
+        content_type: str | None = None,
         expires_seconds: int | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"paths": paths, "method": method}
+        if content_type is not None:
+            payload["content_type"] = content_type
         if expires_seconds is not None:
             payload["expires_seconds"] = expires_seconds
         response = self.request("POST", f"/buckets/{name}/signed-urls", json=payload)
         if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected bucket signed url response")
+            raise RebaseWorkflowError("expected bucket signed URL response")
         return response
 
     def create_dataset(self, name: str, description: str | None = None) -> dict[str, Any]:
@@ -4331,6 +4354,7 @@ class Client:
         run_type: RunType | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
+        buckets: list[dict[str, str]] | None = None,
         enabled: bool = True,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         project: str | None = None,
@@ -4374,6 +4398,7 @@ class Client:
                 "isolation": resolved_isolation,
                 "env": env or {},
                 "secrets": secrets or {},
+                "buckets": buckets or [],
                 "enabled": enabled,
                 "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
                 "environment": environment,
@@ -4411,6 +4436,7 @@ class Client:
         run_type: RunType | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
+        buckets: list[dict[str, str]] | object = _UNSET,
         enabled: bool | None = None,
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         environment: str | None = None,
@@ -4467,6 +4493,8 @@ class Client:
             payload["schedule"] = schedule
         if trigger is not _UNSET:
             payload["trigger"] = trigger
+        if buckets is not _UNSET:
+            payload["buckets"] = buckets
         response = self.request("PATCH", f"/workflows/{workflow_id}", json=payload)
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected workflow response")
@@ -4769,9 +4797,7 @@ class Client:
     ) -> list[dict[str, Any]]:
         """The durable output pointers registered for a run."""
         params = {
-            key: value
-            for key, value in {"step_run_id": step_run_id, "task_id": task_id}.items()
-            if value is not None
+            key: value for key, value in {"step_run_id": step_run_id, "task_id": task_id}.items() if value is not None
         }
         try:
             response = self.request("GET", f"/runs/{run_id}/artifacts", params=params or None)
@@ -4788,6 +4814,12 @@ class Client:
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected run artifact response")
         return response
+
+    def open_run_artifact(self, run_id: str, artifact_id: str) -> str:
+        response = self.request("POST", f"/runs/{run_id}/artifacts/{artifact_id}/open")
+        if not isinstance(response, dict) or not isinstance(response.get("url"), str):
+            raise RebaseWorkflowError("expected artifact open URL response")
+        return response["url"]
 
     def list_run_events(self, run_id: str) -> list[dict[str, Any]]:
         response = self.request("GET", f"/runs/{run_id}/events")
@@ -5038,6 +5070,7 @@ class Project:
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | list[Secret | str] | None = None,
+        buckets: list[Bucket | str] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
         resources: dict[str, Any] | None = None,
@@ -5066,6 +5099,7 @@ class Project:
                 image=image,
                 env=env,
                 secrets=secrets,
+                buckets=buckets,
                 min_instances=min_instances,
                 concurrency=concurrency,
                 resources=resources,
@@ -6355,6 +6389,7 @@ class Workflow:
         image: Image | dict[str, Any] | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | list[Secret | str] | None = None,
+        buckets: list[Bucket | str] | list[dict[str, Any]] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
         resources: dict[str, Any] | None = None,
@@ -6373,6 +6408,7 @@ class Workflow:
         self.project_source_mode = project_source_mode
         self.env = dict(env or (data.get("env") if data else None) or {})
         self.secrets = secrets if secrets is not None else dict((data.get("secrets") if data else None) or {})
+        self.buckets = buckets if buckets is not None else list((data.get("buckets") if data else None) or [])
         self.name = name or (data["name"] if data else None)
         self.flow_ref: str | None = None
         self.source_code: str | None = None
@@ -6577,6 +6613,7 @@ class Workflow:
         step_graph = self._build_step_graph()
         source_metadata = self._source_metadata_for_deploy(deploy_source)
         secrets_payload = _resolve_secrets_payload(self.secrets, self._client)
+        buckets_payload = _resolve_buckets_payload(self.buckets, self._client)
         existing = self._client.find_workflow(name, project=self.project)
         if existing is not None:
             workflow = self._client.update_workflow(
@@ -6594,6 +6631,7 @@ class Workflow:
                 isolation=self.isolation,
                 env=self.env,
                 secrets=secrets_payload,
+                buckets=buckets_payload,
                 enabled=self.enabled,
                 endpoint=self.endpoint,
                 environment=environment,
@@ -6620,6 +6658,7 @@ class Workflow:
             isolation=self.isolation,
             env=self.env,
             secrets=secrets_payload,
+            buckets=buckets_payload,
             enabled=self.enabled,
             endpoint=self.endpoint,
             environment=environment,

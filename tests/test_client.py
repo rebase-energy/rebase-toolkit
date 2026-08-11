@@ -6,7 +6,6 @@ from typing import Any
 
 import pytest
 import requests
-
 from http_stub import patch_client_http
 
 import rebase as rb
@@ -236,7 +235,7 @@ def test_client_list_run_tasks_tolerates_an_api_without_the_route(monkeypatch) -
 
 
 def test_client_lists_and_creates_run_artifacts(monkeypatch) -> None:
-    calls: list[tuple[str, str, Any]] = []
+    calls: list[tuple[str, str, dict[str, Any]]] = []
 
     def fake_request(method: str, path: str, **kwargs: Any) -> Any:
         calls.append((method, path, kwargs))
@@ -245,17 +244,15 @@ def test_client_lists_and_creates_run_artifacts(monkeypatch) -> None:
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     monkeypatch.setattr(client, "request", fake_request)
 
-    assert client.list_run_artifacts("run-1", step_run_id="step-1", task_id="task-1") == [
-        {"id": "artifact-1"}
-    ]
-    assert client.create_run_artifact("run-1", {"uri": "gs://bucket/object"}) == {"id": "artifact-1"}
+    assert client.list_run_artifacts("run-1", step_run_id="step-1", task_id="task-1") == [{"id": "artifact-1"}]
+    assert client.create_run_artifact("run-1", {"uri": "gs://bucket/a.json"}) == {"id": "artifact-1"}
     assert calls == [
         (
             "GET",
             "/runs/run-1/artifacts",
             {"params": {"step_run_id": "step-1", "task_id": "task-1"}},
         ),
-        ("POST", "/runs/run-1/artifacts", {"json": {"uri": "gs://bucket/object"}}),
+        ("POST", "/runs/run-1/artifacts", {"json": {"uri": "gs://bucket/a.json"}}),
     ]
 
 
@@ -2113,10 +2110,10 @@ def test_project_deploy_sends_source_settings(monkeypatch) -> None:
         "description": None,
         "source_mode": "workspace_repo",
         "repo_owner": None,
-            "repo_name": None,
-            "repo_path": "projects/energy-forecasting",
-            "environment_name": "dev",
-        }
+        "repo_name": None,
+        "repo_path": "projects/energy-forecasting",
+        "environment_name": "dev",
+    }
 
 
 def test_function_from_name_spawns_remote_run(monkeypatch) -> None:

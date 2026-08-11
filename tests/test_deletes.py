@@ -12,7 +12,6 @@ from typing import Any
 
 import pytest
 import requests
-
 from http_stub import patch_client_http
 
 import rebase as rb
