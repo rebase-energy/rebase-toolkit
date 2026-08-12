@@ -313,6 +313,13 @@ WORKSPACE_ROLES = ("Viewer", "Developer", "Admin", "Owner")
 
 KNOWN_PERMISSIONS = frozenset(
     {
+        # Must match app.permissions.ALL_PERMISSIONS on the server. This is
+        # validated client-side only to fail fast; the server validates too, so a
+        # list that drifts short does not protect anything — it just makes
+        # permissions the server supports impossible to request. That is exactly
+        # what happened: seven of these were missing, which blocked minting keys
+        # for tasks, artifacts, buckets and datasets entirely.
+        # tests/test_permissions_parity.py in the toolkit repo guards the match.
         "workspace:read",
         "workspace:update",
         "members:read",
@@ -336,6 +343,15 @@ KNOWN_PERMISSIONS = frozenset(
         "models:execute",
         "runs:read",
         "runs:write",
+        "tasks:write",
+        "artifacts:write",
+        "buckets:read",
+        "buckets:write",
+        "datasets:read",
+        "datasets:write",
+        "datasets:signal",
+        "shell:execute",
+        "asgi:source_token",
     }
 )
 
