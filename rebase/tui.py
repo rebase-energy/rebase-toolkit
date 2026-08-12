@@ -4482,12 +4482,6 @@ class RebaseTuiApp(App[None]):
         elif event.data_table.id == "workspace-profiles-table":
             self._select_workspace_profile(row_id)
 
-    def _project_name(self, item: dict[str, Any]) -> str:
-        if self.workspace_overview is None:
-            return str(item.get("project_id", "-"))
-        project_id = str(item.get("project_id", ""))
-        return self.workspace_overview.project_names.get(project_id, project_id or "-")
-
     def _workspace_label(self) -> str:
         """The workspace the data actually comes from, which a marker may have pinned.
 

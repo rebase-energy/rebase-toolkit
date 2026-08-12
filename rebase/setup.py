@@ -29,7 +29,7 @@ from rebase.auth import (
     save_session,
 )
 from rebase.brand import BRAND_BRIGHT_GREEN, BRAND_MEDIUM_GRAY
-from rebase.client import Client, RebaseWorkflowError, _parse_github_remote
+from rebase.client import Client, RebaseWorkflowError, _git, _parse_github_remote
 from rebase.config import selected_profile_name, write_local_config, write_profile
 
 JOIN_WORKSPACE = "Join an existing workspace"
@@ -471,15 +471,6 @@ def _choose(label: str, values: list[str], *, default: str | None = None, title:
     return selected
 
 
-def _git(args: list[str], *, cwd: Path | None = None) -> str | None:
-    try:
-        completed = subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return None
-    value = completed.stdout.strip()
-    return value or None
-
-
 def _run_git(args: list[str], *, cwd: Path, action: str, timeout: float = 60) -> None:
     try:
         subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True, timeout=timeout)
@@ -835,19 +826,6 @@ def _start_github_installation(args: Any, client: Client, *, workspace_id: str) 
         webbrowser.open(install_url)
         _hint("Opened browser for GitHub App installation")
     return setup_session
-
-
-def _wait_for_github_installation(args: Any, client: Client, setup_session: dict[str, Any]) -> dict[str, Any]:
-    deadline = time.monotonic() + args.github_timeout
-    while time.monotonic() < deadline:
-        status = client.get_github_setup_session(setup_session["id"])
-        if status["status"] == "installed" and status.get("installation_id") is not None:
-            _success("GitHub App installation ready")
-            return status
-        if status["status"] == "expired":
-            raise RebaseWorkflowError("GitHub setup session expired")
-        time.sleep(args.poll_interval)
-    raise RebaseWorkflowError("timed out waiting for GitHub App installation")
 
 
 def _select_repo(

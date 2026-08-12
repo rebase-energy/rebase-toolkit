@@ -8,7 +8,7 @@ import json
 import os
 import sys
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -451,14 +451,6 @@ def _load_target_module(source_ref: str, *, as_module: bool) -> ModuleType:
 
 
 RunnableTarget = Function | Workflow | Model
-
-
-def _function_objects(module: ModuleType) -> list[tuple[str, Function]]:
-    return [
-        (name, function)
-        for name, function in _unique_named_objects(module, (Function,))
-        if not isinstance(function, Step)
-    ]
 
 
 def _runnable_objects(module: ModuleType) -> list[tuple[str, RunnableTarget]]:
@@ -1939,6 +1931,31 @@ def _resolve_project_selector(client: Client, name: str | None, *, project_id: s
     return _resolve_project_by_name(client, name)
 
 
+def _resolve_target_selector(
+    client: Client,
+    name: str | None,
+    *,
+    target_id: str | None,
+    project_name: str | None,
+    target_type: str,
+    get_by_id: Callable[[str], dict[str, Any]],
+    list_by_project: Callable[..., list[dict[str, Any]]],
+) -> dict[str, Any]:
+    if target_id is not None:
+        if name is not None:
+            raise RebaseWorkflowError(f"provide either a {target_type} name or --id, not both")
+        return get_by_id(target_id)
+    if name is None:
+        raise RebaseWorkflowError(f"{target_type} name is required unless --id is provided")
+    if not project_name:
+        raise RebaseWorkflowError(f"--project is required when selecting a {target_type} by name")
+    project = _resolve_project_by_name(client, project_name)
+    for target in list_by_project(project_id=str(project["id"])):
+        if target.get("name") == name:
+            return target
+    raise RebaseWorkflowError(f"{target_type} not found: {project_name}/{name}")
+
+
 def _resolve_function_selector(
     client: Client,
     name: str | None,
@@ -1946,19 +1963,15 @@ def _resolve_function_selector(
     function_id: str | None = None,
     project_name: str | None = None,
 ) -> dict[str, Any]:
-    if function_id is not None:
-        if name is not None:
-            raise RebaseWorkflowError("provide either a function name or --id, not both")
-        return client.get_function(function_id)
-    if name is None:
-        raise RebaseWorkflowError("function name is required unless --id is provided")
-    if not project_name:
-        raise RebaseWorkflowError("--project is required when selecting a function by name")
-    project = _resolve_project_by_name(client, project_name)
-    for function in client.list_functions(project_id=str(project["id"])):
-        if function.get("name") == name:
-            return function
-    raise RebaseWorkflowError(f"function not found: {project_name}/{name}")
+    return _resolve_target_selector(
+        client,
+        name,
+        target_id=function_id,
+        project_name=project_name,
+        target_type="function",
+        get_by_id=client.get_function,
+        list_by_project=client.list_functions,
+    )
 
 
 def _resolve_workflow_selector(
@@ -1968,19 +1981,15 @@ def _resolve_workflow_selector(
     workflow_id: str | None = None,
     project_name: str | None = None,
 ) -> dict[str, Any]:
-    if workflow_id is not None:
-        if name is not None:
-            raise RebaseWorkflowError("provide either a workflow name or --id, not both")
-        return client.get_workflow(workflow_id)
-    if name is None:
-        raise RebaseWorkflowError("workflow name is required unless --id is provided")
-    if not project_name:
-        raise RebaseWorkflowError("--project is required when selecting a workflow by name")
-    project = _resolve_project_by_name(client, project_name)
-    for workflow in client.list_workflows(project_id=str(project["id"])):
-        if workflow.get("name") == name:
-            return workflow
-    raise RebaseWorkflowError(f"workflow not found: {project_name}/{name}")
+    return _resolve_target_selector(
+        client,
+        name,
+        target_id=workflow_id,
+        project_name=project_name,
+        target_type="workflow",
+        get_by_id=client.get_workflow,
+        list_by_project=client.list_workflows,
+    )
 
 
 def _resolve_model_selector(
@@ -1990,23 +1999,30 @@ def _resolve_model_selector(
     model_id: str | None = None,
     project_name: str | None = None,
 ) -> dict[str, Any]:
-    if model_id is not None:
-        if name is not None:
-            raise RebaseWorkflowError("provide either a model name or --id, not both")
-        return client.get_model(model_id)
-    if name is None:
-        raise RebaseWorkflowError("model name is required unless --id is provided")
-    if not project_name:
-        raise RebaseWorkflowError("--project is required when selecting a model by name")
-    project = _resolve_project_by_name(client, project_name)
-    for model in client.list_models(project_id=str(project["id"])):
-        if model.get("name") == name:
-            return model
-    raise RebaseWorkflowError(f"model not found: {project_name}/{name}")
+    return _resolve_target_selector(
+        client,
+        name,
+        target_id=model_id,
+        project_name=project_name,
+        target_type="model",
+        get_by_id=client.get_model,
+        list_by_project=client.list_models,
+    )
 
 
 def _project_name_map(projects: list[dict[str, Any]]) -> dict[str, str]:
     return {str(project.get("id", "")): str(project.get("name", "-")) for project in projects}
+
+
+def _list_project_targets(
+    client: Client,
+    project_name: str | None,
+    load: Callable[..., list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    if project_name is None:
+        return load(), _project_name_map(client.list_projects())
+    project = _resolve_project_by_name(client, project_name)
+    return load(project_id=str(project["id"])), {str(project["id"]): str(project["name"])}
 
 
 @app.command("setup")
@@ -4377,13 +4393,7 @@ def function_list_command(
 ) -> None:
     """List functions in the active workspace."""
     client = Client()
-    if project is not None:
-        project_data = _resolve_project_by_name(client, project)
-        functions = client.list_functions(project_id=str(project_data["id"]))
-        project_names = {str(project_data["id"]): str(project_data["name"])}
-    else:
-        functions = client.list_functions()
-        project_names = _project_name_map(client.list_projects())
+    functions, project_names = _list_project_targets(client, project, client.list_functions)
     if json_output:
         _print_json(functions)
         return
@@ -4495,13 +4505,7 @@ def workflow_list_command(
 ) -> None:
     """List workflows in the active workspace."""
     client = Client()
-    if project is not None:
-        project_data = _resolve_project_by_name(client, project)
-        workflows = client.list_workflows(project_id=str(project_data["id"]))
-        project_names = {str(project_data["id"]): str(project_data["name"])}
-    else:
-        workflows = client.list_workflows()
-        project_names = _project_name_map(client.list_projects())
+    workflows, project_names = _list_project_targets(client, project, client.list_workflows)
     if json_output:
         _print_json(workflows)
         return
@@ -5107,13 +5111,7 @@ def model_list_command(
 ) -> None:
     """List models in the active workspace."""
     client = Client()
-    if project is not None:
-        project_data = _resolve_project_by_name(client, project)
-        models = client.list_models(project_id=str(project_data["id"]))
-        project_names = {str(project_data["id"]): str(project_data["name"])}
-    else:
-        models = client.list_models()
-        project_names = _project_name_map(client.list_projects())
+    models, project_names = _list_project_targets(client, project, client.list_models)
     if json_output:
         _print_json(models)
         return
