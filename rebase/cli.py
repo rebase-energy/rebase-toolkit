@@ -77,6 +77,7 @@ from rebase.config import (
     selected_profile_name,
     set_active_environment,
     set_default_profile,
+    set_profile_workspace,
     workspace_key,
     write_profile,
 )
@@ -217,6 +218,25 @@ app = typer.Typer(
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
+
+
+@app.callback()
+def main_callback(
+    workspace: Annotated[
+        str | None,
+        typer.Option("--workspace", "-W", help="Operate on this workspace id instead of the active one."),
+    ] = None,
+) -> None:
+    """Global options applied before any subcommand runs."""
+    # Exported rather than threaded through: there are ~100 bare Client()
+    # constructions across this module, and the SDK already resolves
+    # REBASE_WORKSPACE at the top of its precedence chain. Setting the variable
+    # means every one of them picks the override up with no further wiring, and
+    # the precedence rule stays defined in exactly one place.
+    if workspace:
+        os.environ["REBASE_WORKSPACE"] = workspace
+
+
 workspace_app = typer.Typer(
     add_completion=False,
     cls=AlphabeticalTyperGroup,
@@ -2357,20 +2377,58 @@ def workspace_create_command(
         raise SystemExit(130) from None
 
 
-def _switch_workspace(profile: str) -> None:
-    _switch_profile(profile, workspace_alias=True)
+def _switch_workspace(workspace: str) -> None:
+    """Point the active profile at one of the workspaces it can reach.
+
+    The profile is the identity and stays put; only the selection moves, since
+    the workspace travels per request in a header. Membership is checked against
+    the server rather than the local config so that a workspace joined on
+    another machine is switchable here without re-running setup.
+    """
+    client = Client()
+    memberships = client.list_my_workspaces()
+    match = next(
+        (
+            item
+            for item in memberships
+            if workspace in {item.get("id"), item.get("workspace_id"), item.get("name")}
+        ),
+        None,
+    )
+    if match is None:
+        reachable = ", ".join(sorted(str(item.get("name") or item.get("id")) for item in memberships))
+        raise RebaseWorkflowError(
+            f"not a member of workspace {workspace!r}. This profile can reach: {reachable or '(none)'}"
+        )
+
+    workspace_id = str(match.get("id") or match.get("workspace_id") or workspace)
+    workspace_name = match.get("name") if isinstance(match.get("name"), str) else None
+    profile_name = selected_profile_name()
+    try:
+        set_profile_workspace(workspace_id, workspace_name, profile=profile_name)
+    except KeyError as exc:
+        raise RebaseWorkflowError(f"unknown profile: {profile_name}. Run `rebase setup` first.") from exc
+    label = workspace_name or workspace_id
+    console.print(
+        f"Profile '[rebase.value]{profile_name}[/rebase.value]' now uses workspace "
+        f"'[rebase.value]{label}[/rebase.value]'"
+    )
 
 
 @workspace_app.command("switch")
-def workspace_switch_command(profile: Annotated[str, typer.Argument(help="Profile name.")]) -> None:
-    """Switch the active workspace profile."""
-    _switch_workspace(profile)
+def workspace_switch_command(
+    workspace: Annotated[str, typer.Argument(help="Workspace name or id you belong to.")],
+) -> None:
+    """Switch the active workspace, keeping the current profile."""
+    _switch_workspace(workspace)
 
 
 @workspace_app.command("use", hidden=True)
-def workspace_use_command(profile: Annotated[str, typer.Argument(help="Profile name.")]) -> None:
+def workspace_use_command(
+    workspace: Annotated[str, typer.Argument(help="Workspace name or id you belong to.")],
+) -> None:
     """Alias for `rebase workspace switch`."""
-    _switch_workspace(profile)
+    _switch_workspace(workspace)
 
 
 def _validate_workspace_role(role: str) -> None:
@@ -2591,6 +2649,94 @@ def workspace_notifications_set_command(
 
 
 workspace_app.add_typer(notifications_app, name="notifications")
+
+
+compute_policy_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Inspect and adjust the workspace's compute limits.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+COMPUTE_POLICY_DETAIL_KEYS = [
+    "workspace_id",
+    "max_run_timeout_seconds",
+    "max_concurrent_cloud_run_runs",
+    "max_cloud_run_instances",
+    "max_cloud_run_concurrency",
+    "cloud_run_enabled",
+    "gpu_allowed",
+    "updated_at",
+]
+
+
+@compute_policy_app.command("show")
+def workspace_compute_policy_show_command(
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show the workspace's compute limits."""
+    policy = Client().get_workspace_compute_policy()
+    if json_output:
+        _print_json(policy)
+        return
+    console.print(_detail_table("Compute Policy", policy, preferred_keys=COMPUTE_POLICY_DETAIL_KEYS))
+
+
+@compute_policy_app.command("set")
+def workspace_compute_policy_set_command(
+    max_run_timeout_seconds: Annotated[
+        int | None,
+        typer.Option(
+            "--max-run-timeout-seconds",
+            "-m",
+            help="Ceiling for a single request, in seconds (max 3600). Raising it requires superadmin.",
+        ),
+    ] = None,
+    max_concurrent_runs: Annotated[
+        int | None, typer.Option("--max-concurrent-runs", help="Cloud Run runs allowed in flight at once.")
+    ] = None,
+    max_instances: Annotated[
+        int | None, typer.Option("--max-instances", help="Ceiling for a service's max instance count.")
+    ] = None,
+    max_concurrency: Annotated[
+        int | None, typer.Option("--max-concurrency", help="Ceiling for a service's per-instance concurrency.")
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Update the workspace's compute limits.
+
+    The policy is a ceiling, not a default: an app still opts in to a longer timeout
+    through its own `cloud_run_timeout_seconds`. A longer timeout also costs
+    proportionally more credits, since ASGI traffic is charged on elapsed runtime.
+    """
+    if (
+        max_run_timeout_seconds is None
+        and max_concurrent_runs is None
+        and max_instances is None
+        and max_concurrency is None
+    ):
+        raise RebaseWorkflowError(
+            "nothing to update; pass --max-run-timeout-seconds, --max-concurrent-runs, "
+            "--max-instances, or --max-concurrency"
+        )
+    kwargs: dict[str, Any] = {}
+    if max_run_timeout_seconds is not None:
+        kwargs["max_run_timeout_seconds"] = max_run_timeout_seconds
+    if max_concurrent_runs is not None:
+        kwargs["max_concurrent_cloud_run_runs"] = max_concurrent_runs
+    if max_instances is not None:
+        kwargs["max_cloud_run_instances"] = max_instances
+    if max_concurrency is not None:
+        kwargs["max_cloud_run_concurrency"] = max_concurrency
+    policy = Client().update_workspace_compute_policy(**kwargs)
+    if json_output:
+        _print_json(policy)
+        return
+    console.print(_detail_table("Compute Policy", policy, preferred_keys=COMPUTE_POLICY_DETAIL_KEYS))
+
+
+workspace_app.add_typer(compute_policy_app, name="compute-policy")
 
 
 @environment_app.command("list")

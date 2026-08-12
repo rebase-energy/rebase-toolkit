@@ -2369,19 +2369,34 @@ class Client:
         configured_workspace_id = profile_data.get("workspace_id")
         self.access_token = access_token or env_access_token
         self.api_key = api_key or env_api_key
-        if self.api_key is None and self.access_token is None and isinstance(configured_api_key, str):
-            self.api_key = configured_api_key
         # A `.rebase/config.json` marker pins the workspace, not the credentials: the
         # workspace travels as one header and an API key reaches every workspace you
         # belong to, so a repo can override the globally active workspace without a
-        # second profile or another sign-in. Precedence: argument, marker, profile.
+        # second profile or another sign-in. Precedence: argument, REBASE_WORKSPACE,
+        # marker, profile -- the env var outranks the marker because setting it is a
+        # deliberate act where the marker is ambient.
         pinned_workspace_id = local_workspace_id()
+        env_workspace_id = os.getenv("REBASE_WORKSPACE")
         resolved_workspace_id = (
             workspace_id
+            or env_workspace_id
             or pinned_workspace_id
             or (configured_workspace_id if isinstance(configured_workspace_id, str) else None)
         )
         self.workspace_id = resolved_workspace_id or None
+        if self.api_key is None and self.access_token is None and isinstance(configured_api_key, str):
+            # A deliberate override -- an explicit argument or REBASE_WORKSPACE, as set
+            # by `--workspace` -- must not silently reuse the profile's stored API key.
+            # That key is minted for one workspace (api_keys.workspace_id is NOT NULL)
+            # and the server reads the workspace off the key row, ignoring the header,
+            # so carrying it would quietly act on the wrong workspace. Falling through
+            # to the signed-in session is also the only path on which superadmin works.
+            #
+            # The directory marker is deliberately exempt: it is ambient context, and
+            # keeping the key on that path is long-standing documented behaviour.
+            deliberate_override = workspace_id or env_workspace_id
+            if not deliberate_override or resolved_workspace_id == configured_workspace_id:
+                self.api_key = configured_api_key
         configured_environment = active_environment(self.workspace_id) if self.workspace_id else None
         self.environment_name = environment_name or os.getenv("REBASE_ENVIRONMENT") or configured_environment or "dev"
         profile_api_url = configured_api_url if isinstance(configured_api_url, str) else None
@@ -4386,6 +4401,33 @@ class Client:
             payload["webhook_secret"] = "" if webhook_secret is None else webhook_secret
         return self._request_dict(
             "PATCH", "/workspace/notifications", json=payload, expected="workspace notification response"
+        )
+
+    def get_workspace_compute_policy(self) -> dict[str, Any]:
+        return self._request_dict("GET", "/workspace/compute-policy", expected="workspace compute policy response")
+
+    def update_workspace_compute_policy(
+        self,
+        *,
+        max_run_timeout_seconds: int | None = None,
+        max_concurrent_cloud_run_runs: int | None = None,
+        max_cloud_run_instances: int | None = None,
+        max_cloud_run_concurrency: int | None = None,
+    ) -> dict[str, Any]:
+        # No _UNSET sentinel here, unlike update_workspace_notifications: these are
+        # NOT NULL integers with no clear-to-null semantics, so plain "None means not
+        # set" is the correct encoding rather than an omission the server must undo.
+        payload: dict[str, Any] = {}
+        if max_run_timeout_seconds is not None:
+            payload["max_run_timeout_seconds"] = max_run_timeout_seconds
+        if max_concurrent_cloud_run_runs is not None:
+            payload["max_concurrent_cloud_run_runs"] = max_concurrent_cloud_run_runs
+        if max_cloud_run_instances is not None:
+            payload["max_cloud_run_instances"] = max_cloud_run_instances
+        if max_cloud_run_concurrency is not None:
+            payload["max_cloud_run_concurrency"] = max_cloud_run_concurrency
+        return self._request_dict(
+            "PATCH", "/workspace/compute-policy", json=payload, expected="workspace compute policy response"
         )
 
     def list_runs(

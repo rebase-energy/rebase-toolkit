@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from rebase import cli
 from rebase.auth import AuthSession
 from rebase.cli import _format_duration, deploy_file, main
 from rebase.client import (
@@ -3146,50 +3147,90 @@ def test_profile_show_unknown_profile_errors(monkeypatch, tmp_path: Path) -> Non
     assert main(["profile", "show", "prod"]) == 1
 
 
-def test_workspace_use_changes_default_profile(monkeypatch, tmp_path: Path, capsys) -> None:
+
+
+def _config_with_profiles(tmp_path: Path, monkeypatch) -> Path:
     config_path = tmp_path / "config.json"
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
     config_path.write_text(
         json.dumps(
             {
-                "default_profile": "dev",
+                "default_profile": "work",
                 "profiles": {
-                    "dev": {"api_key": "rbw_dev"},
-                    "prod": {"api_key": "rbw_prod"},
+                    "work": {"api_key": "rbw_work", "workspace_id": "alpha", "workspace_name": "Alpha"},
+                    "other": {"api_key": "rbw_other"},
                 },
             }
         ),
         encoding="utf-8",
     )
+    return config_path
 
-    assert main(["workspace", "use", "prod"]) == 0
+
+class _WorkspacesClient:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def list_my_workspaces(self) -> list[dict[str, Any]]:
+        return [
+            {"id": "alpha", "name": "Alpha"},
+            {"id": "beta", "name": "Beta"},
+        ]
+
+
+def test_workspace_switch_moves_the_selection_not_the_profile(monkeypatch, tmp_path: Path, capsys) -> None:
+    """The profile is the identity; only the workspace selection moves.
+
+    Switching workspace used to switch profile, which is why belonging to four
+    workspaces meant keeping four profiles.
+    """
+    config_path = _config_with_profiles(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "Client", _WorkspacesClient)
+
+    assert main(["workspace", "switch", "beta"]) == 0
 
     data = json.loads(config_path.read_text(encoding="utf-8"))
-    assert data["default_profile"] == "prod"
-    assert capsys.readouterr().out == "Switched workspace profile to 'prod'\n"
+    assert data["default_profile"] == "work", "the active profile must not change"
+    assert data["profiles"]["work"]["workspace_id"] == "beta"
+    assert data["profiles"]["work"]["workspace_name"] == "Beta"
+    assert data["profiles"]["work"]["api_key"] == "rbw_work", "credentials must survive"
+    assert "Beta" in capsys.readouterr().out
 
 
-def test_workspace_switch_changes_default_profile(monkeypatch, tmp_path: Path, capsys) -> None:
-    config_path = tmp_path / "config.json"
-    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
-    config_path.write_text(
-        json.dumps(
-            {
-                "default_profile": "dev",
-                "profiles": {
-                    "dev": {"api_key": "rbw_dev"},
-                    "prod": {"api_key": "rbw_prod"},
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
+def test_workspace_switch_accepts_an_id_as_well_as_a_name(monkeypatch, tmp_path: Path) -> None:
+    config_path = _config_with_profiles(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "Client", _WorkspacesClient)
 
-    assert main(["workspace", "switch", "prod"]) == 0
+    assert main(["workspace", "switch", "beta"]) == 0
+    assert json.loads(config_path.read_text(encoding="utf-8"))["profiles"]["work"]["workspace_id"] == "beta"
+
+
+def test_workspace_switch_refuses_a_workspace_you_are_not_in(monkeypatch, tmp_path: Path) -> None:
+    """Better to name what this profile can reach than to write a selection the
+    server will reject on every later call."""
+    _config_with_profiles(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "Client", _WorkspacesClient)
+
+    with pytest.raises(RebaseWorkflowError, match="not a member of workspace 'gamma'"):
+        cli._switch_workspace("gamma")
+
+
+def test_workspace_use_is_an_alias_for_switch(monkeypatch, tmp_path: Path) -> None:
+    config_path = _config_with_profiles(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "Client", _WorkspacesClient)
+
+    assert main(["workspace", "use", "beta"]) == 0
 
     data = json.loads(config_path.read_text(encoding="utf-8"))
-    assert data["default_profile"] == "prod"
-    assert capsys.readouterr().out == "Switched workspace profile to 'prod'\n"
+    assert data["default_profile"] == "work"
+    assert data["profiles"]["work"]["workspace_id"] == "beta"
+
+
+def test_profile_switch_still_changes_the_active_profile(monkeypatch, tmp_path: Path) -> None:
+    config_path = _config_with_profiles(tmp_path, monkeypatch)
+
+    assert main(["profile", "switch", "other"]) == 0
+    assert json.loads(config_path.read_text(encoding="utf-8"))["default_profile"] == "other"
 
 
 def test_workspace_create_command_dispatches_to_setup_helper(monkeypatch) -> None:
