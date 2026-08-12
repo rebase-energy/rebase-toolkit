@@ -6628,6 +6628,16 @@ class Workflow:
             if self._references_step():
                 raise RebaseWorkflowError("Step workflows must be synchronous in the SDK graph compiler.")
             return None
+        # Tracing works by CALLING the body and intercepting its step calls, so a
+        # body that references no steps has nothing to intercept and would simply
+        # run — which for a job-mode workflow means executing the user's real
+        # pipeline on their laptop at `rebase deploy` time. That is not
+        # hypothetical: deploying the accounting sync once ran a live financial
+        # sync locally. A step-free body could never produce trace nodes anyway
+        # (the no-nodes path below already returns None), so skipping the call is
+        # behaviour-preserving minus the side effects.
+        if not self._references_step():
+            return None
         trace = _WorkflowTrace(ephemeral=ephemeral)
         _trace_stack.append(trace)
         try:
