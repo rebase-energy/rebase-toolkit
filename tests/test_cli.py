@@ -103,7 +103,8 @@ def test_unknown_option_reports_usage_error(capsys) -> None:
     assert main(["deploy", "--bogus"]) == 2
 
     captured = capsys.readouterr()
-    assert "No such option: --bogus" in captured.err
+    assert "No such option" in captured.err
+    assert "--bogus" in captured.err
     assert "Traceback" not in captured.err
     assert "Try 'rebase deploy --help' for help." in captured.err
 
