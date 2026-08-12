@@ -23,10 +23,9 @@ source .venv/bin/activate
 uv pip install -e . --group dev
 ```
 
-> Two setup gotchas, both covered in [Known rough edges](#8-known-rough-edges):
+> One setup gotcha, covered in [Known rough edges](#8-known-rough-edges):
 > `dev` is a dependency *group*, not an extra — `uv pip install -e ".[dev]"`
-> silently installs no dev tools. And **`uv sync` / bare `uv run` currently fail**;
-> use `uv run --no-sync …` or the venv's interpreter directly.
+> silently installs no dev tools.
 
 Point the CLI at the hosted API and authenticate:
 
@@ -57,20 +56,17 @@ Useful overrides: `REBASE_DEV_PROFILE`, `REBASE_DEV_PROVIDER`, `REBASE_DEV_REPO`
 ## 2. Verify your setup
 
 ```bash
-uv run --no-sync pytest -q
+uv run --locked pytest -q
 ```
 
-**Expected today: `1 failed, 512 passed`.** The one failure,
-`tests/test_client.py::test_project_deploy_registers_step_workflow_graph`, is
-pre-existing (it also fails at the `v0.6.0` tag) — step registration order comes
-back reversed. You did not break it. Everything else should be green.
+**Expected today: `847 passed`.**
 
 Lint and types:
 
 ```bash
-uv run --no-sync ruff check .            # clean today
-uv run --no-sync ruff format --check .   # 2 files are already unformatted on master
-uv run --no-sync ty check                # ~81 diagnostics today — not a clean gate
+uv run --locked ruff check .
+uv run --locked ruff format --check .
+uv run --locked ty check                 # not yet a clean gate
 ```
 
 Keep `ruff check` clean in your changes. `ty` has a large pre-existing backlog, so
@@ -87,8 +83,8 @@ REBASE_TOOLKIT_GIT_REF=my-branch scripts/smoke_uv_install.sh github
 
 ## 3. The codebase in one page
 
-Everything is in `rebase/`. Two files hold most of the weight — `client.py`
-(~5.3k lines) and `cli.py` (~5.5k lines).
+Everything is in `rebase/`. Two files hold most of the weight — `client.py` and
+`cli.py` (both roughly 6.5k lines).
 
 | File | What it is |
 | --- | --- |
@@ -205,12 +201,10 @@ fastest way to discover which `Client` method does what.
 ## 7. Making a change
 
 1. Branch off `master`.
-2. Write the code **and** a test — the suite is mocked and fast (~13 s), so
-   there's no excuse to skip it.
-3. `uv run --no-sync ruff check .`, then `ruff format` **only the files you
-   touched** — a bare `ruff format .` also reformats two unrelated files that are
-   already unformatted on `master`, which muddies your diff.
-4. `uv run --no-sync pytest -q` — expect the one known failure, nothing more.
+2. Write the code **and** a test — the suite is mocked, so it needs no platform
+   credentials or cloud resources.
+3. `uv run --locked ruff check .`, then `ruff format` **only the files you touched**.
+4. `uv run --locked pytest -q`.
 5. If you changed the public surface, update `README.md` and add a `CHANGELOG.md`
    entry (we keep it hand-written, grouped under a version heading).
 6. Version bumps touch **three** places: `pyproject.toml`, `rebase/version.py`,
@@ -223,22 +217,11 @@ fastest way to discover which `Client` method does what.
 Real potholes, discovered while writing this guide. Don't lose an afternoon to
 them:
 
-- **`uv sync` and bare `uv run` are broken.** `uv.lock` is stale — it pins
-  `rebase-toolkit` at `0.2.0` while `pyproject.toml` says `0.6.0` — so uv
-  re-resolves from scratch. That resolution is *universal*: it covers every extra
-  on every platform, including one optional dependency that isn't published to
-  PyPI, so it dead-ends at "No solution found". This bites even though you need
-  none of those extras. Workaround: `uv run --no-sync …`, or just call
-  `.venv/bin/python -m pytest`.
 - **`uv pip install -e ".[dev]"` is a silent no-op.** `dev` is a
   `[dependency-groups]` entry, not an optional extra, so uv accepts the command,
   exits 0, and installs no dev tooling. Use `--group dev`.
-- **`rebase/version.py` says `0.2.0`.** `rb.__version__` reports `0.2.0` while we
-  ship `0.6.0`. `tests/test_packaging.py` only checks `pyproject.toml` against the
-  `pypi/rebase` alias, so the drift is untested.
-- **One test fails on a clean checkout** (see §2). Pre-existing, not yours.
-- **`ty check` is not a clean gate** (~81 diagnostics) and `ruff format --check`
-  flags 2 files. Don't treat either total as a regression signal.
+- **`ty check` is not a clean gate.** Judge it by whether your change adds
+  diagnostics, not by the existing total.
 - **`rebase/setup.py` is the auth wizard**, not packaging config.
 - **`Dataset` registration is process-global.** Tests rely on the `conftest.py`
   fixture to reset it; remember that if you add tests outside `tests/`.
@@ -254,6 +237,5 @@ them:
 - `tests/test_public_api.py` — a compact, executable inventory of the public
   surface.
 
-Good first task: fix the `rebase/version.py` drift (§8) and add a packaging test
-that asserts `rebase.__version__` matches `pyproject.toml`. It's small,
-self-contained, and stops the next person from shipping a wrong version string.
+Good first task: start with a focused module and its matching test file, then use
+`tests/test_public_api.py` to check whether the change affects the supported surface.
