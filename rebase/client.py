@@ -261,6 +261,19 @@ def _find_named(items: Iterable[dict[str, Any]], name: str) -> dict[str, Any] | 
     return next((item for item in items if item["name"] == name), None)
 
 
+# Receiver for raw image-build log lines while Client.build_image polls.
+# Module-level on purpose, mirroring how Modal gates output: deploy targets
+# construct their own Client instances internally, so a per-instance attribute
+# set by the CLI would never reach the client that actually builds.
+_build_log_consumer: Callable[[str], None] | None = None
+
+
+def set_build_log_consumer(consumer: Callable[[str], None] | None) -> None:
+    """Install (or with None remove) the receiver for raw build-log lines."""
+    global _build_log_consumer
+    _build_log_consumer = consumer
+
+
 def run_failure_summary(run: dict[str, Any]) -> str | None:
     """One human line for a failed run, preferring the structured diagnosis.
 
@@ -4634,6 +4647,37 @@ class Client:
             raise RebaseWorkflowError(str(response.get("error") or "source bundle did not become ready"))
         return response
 
+    def get_image_build_logs(
+        self, build_id: str, *, cursor: str | None = None, limit: int | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if cursor:
+            params["cursor"] = cursor
+        if limit:
+            params["limit"] = limit
+        return self._request_dict(
+            "GET", f"/image-builds/{build_id}/logs", params=params, expected="image build logs response"
+        )
+
+    def _stream_build_logs(self, build_id: str, cursor: str | None) -> tuple[str | None, bool]:
+        """Feed one increment of build output to the installed consumer.
+
+        Returns (cursor, still_streaming). Any failure disables streaming
+        rather than the build: older servers answer this route with a redirect
+        to a console URL, and a log hiccup must not kill a deploy.
+        """
+        consumer = _build_log_consumer
+        if consumer is None:
+            return cursor, False
+        try:
+            payload = self.get_image_build_logs(build_id, cursor=cursor)
+        except Exception:
+            return cursor, False
+        for line in payload.get("lines") or []:
+            consumer(str(line))
+        next_cursor = payload.get("cursor")
+        return (next_cursor if isinstance(next_cursor, str) else cursor), True
+
     def build_image(self, *, source_bundle_id: str, recipe: dict[str, Any]) -> dict[str, Any]:
         response = self._request_dict(
             "POST",
@@ -4644,6 +4688,8 @@ class Client:
         )
         build_id = response.get("id")
         deadline = time.monotonic() + IMAGE_BUILD_TIMEOUT_SECONDS
+        log_cursor: str | None = None
+        streaming = _build_log_consumer is not None
         while response.get("status") in {"queued", "building"}:
             if not isinstance(build_id, str):
                 raise RebaseWorkflowError("image build response is missing an id")
@@ -4653,6 +4699,12 @@ class Client:
                 raise RebaseWorkflowError(f"image build did not finish within 30 minutes.{suffix}")
             time.sleep(IMAGE_BUILD_POLL_SECONDS)
             response = self._request_dict("GET", f"/image-builds/{build_id}", expected="image build status response")
+            if streaming:
+                log_cursor, streaming = self._stream_build_logs(build_id, log_cursor)
+        if streaming and isinstance(build_id, str):
+            # Final drain: log ingestion lags the terminal status, and on a
+            # failed build the trailing lines are the ones that matter.
+            self._stream_build_logs(build_id, log_cursor)
         if response.get("status") != "succeeded" or not response.get("image_digest"):
             logs_url = response.get("logs_url")
             suffix = f" Logs: {logs_url}" if logs_url else ""

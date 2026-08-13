@@ -61,6 +61,7 @@ from rebase.client import (
     _parse_github_remote,
     _validate_execution,
     run_failure_summary,
+    set_build_log_consumer,
 )
 from rebase.config import (
     DEFAULT_PROFILE,
@@ -5622,8 +5623,34 @@ def deploy_command(
             )
         )
         return
-    deployed = deploy_file(file, object_names=name, deploy_source=source, environment=environment)
+    # Stream raw build output while any image builds — without this a first
+    # deploy of a new image is a silent blocking call of up to 30 minutes.
+    set_build_log_consumer(_build_log_printer())
+    try:
+        deployed = deploy_file(file, object_names=name, deploy_source=source, environment=environment)
+    finally:
+        set_build_log_consumer(None)
     console.print(_deploy_table(deployed))
+
+
+def _build_log_printer() -> Callable[[str], None]:
+    """Raw build lines, Modal-style: announce once, then verbatim output.
+
+    markup=False matters — build output is arbitrary text and rich would
+    otherwise eat anything in square brackets; highlight=False keeps rich from
+    syntax-coloring it. The lines themselves stay full brightness: this is the
+    user's own toolchain talking, not decoration.
+    """
+    announced = False
+
+    def emit(line: str) -> None:
+        nonlocal announced
+        if not announced:
+            console.print("• Building image — streaming build output:", style="rebase.muted", highlight=False)
+            announced = True
+        console.print(line, markup=False, highlight=False)
+
+    return emit
 
 
 def _normalize_local_result(result: Any) -> dict[str, Any]:
