@@ -60,6 +60,7 @@ from rebase.client import (
     _git,
     _parse_github_remote,
     _validate_execution,
+    run_failure_summary,
 )
 from rebase.config import (
     DEFAULT_PROFILE,
@@ -666,7 +667,7 @@ def _render_run_snapshot(
         if status == "succeeded":
             reporter.finish("Run completed.")
         elif status == "failed":
-            reporter.fail(str(run.get("error") or "Run failed."))
+            reporter.fail(run_failure_summary(run) or "Run failed.")
         else:
             reporter.fail("Run cancelled.")
     else:
@@ -918,10 +919,10 @@ def _stream_run_result(
                 else:
                     reporter.finish("Run completed.")
                 return data.get("result") if return_result else None
-            error = data.get("error") or f"run ended with status {status}"
-            reporter.fail(str(error))
+            error = run_failure_summary(data) or f"run ended with status {status}"
+            reporter.fail(error)
             if return_result:
-                raise RebaseWorkflowError(str(error))
+                raise RebaseWorkflowError(error)
             return None
         if status == "queued" and not seen_event_ids:
             reporter.update("Run queued.")

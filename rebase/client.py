@@ -261,11 +261,35 @@ def _find_named(items: Iterable[dict[str, Any]], name: str) -> dict[str, Any] | 
     return next((item for item in items if item["name"] == name), None)
 
 
+def run_failure_summary(run: dict[str, Any]) -> str | None:
+    """One human line for a failed run, preferring the structured diagnosis.
+
+    Servers that diagnose failures attach ``failure_reason``
+    ({code, message, hint, observed}) alongside the free-text ``error`` — the
+    diagnosis knows *why* the container died and which knob to turn (the hint),
+    so it wins. Older servers simply have no such key and fall back to
+    ``error``; returns None when the run carries neither.
+    """
+    reason = run.get("failure_reason")
+    if isinstance(reason, dict):
+        message = reason.get("message")
+        if isinstance(message, str) and message:
+            summary = message[0].upper() + message[1:]
+            hint = reason.get("hint")
+            if isinstance(hint, str) and hint:
+                return f"{summary}. {hint}"
+            return summary
+    error = run.get("error")
+    return str(error) if error else None
+
+
 def _response_error_message(response: requests.Response) -> str:
+    # The final fallbacks guard against empty bodies (a bare 500, a proxy 502):
+    # an empty message here surfaced to users as literally "Error: ".
     try:
         payload = response.json()
     except ValueError:
-        return response.text
+        return response.text or f"HTTP {response.status_code} with an empty response body"
     if isinstance(payload, dict):
         detail = payload.get("detail")
         if isinstance(detail, str):
@@ -285,7 +309,7 @@ def _response_error_message(response: requests.Response) -> str:
             return f"{message} (contains {contents})"
         if detail is not None:
             return json.dumps(detail)
-    return response.text
+    return response.text or f"HTTP {response.status_code} with an empty response body"
 
 
 class Cron:
@@ -6574,7 +6598,7 @@ class Run:
             if status in terminal_statuses:
                 if status == "succeeded":
                     return data["result"]
-                raise RebaseWorkflowError(data.get("error") or f"run ended with status {status}")
+                raise RebaseWorkflowError(run_failure_summary(data) or f"run ended with status {status}")
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"run {self.id} did not finish within {timeout} seconds")
             time.sleep(poll_interval)

@@ -4259,6 +4259,11 @@ class RebaseTuiApp(App[None]):
         output: dict[str, Any] = {"result": run.get("result")}
         if run.get("error"):
             output["error"] = run["error"]
+        # The structured diagnosis, when the server produced one: why the run
+        # died and which knob to turn, in toolkit vocabulary.
+        reason = run.get("failure_reason")
+        if isinstance(reason, dict) and reason.get("message"):
+            output["diagnosis"] = {key: reason[key] for key in ("message", "hint") if reason.get(key)}
         sections: list[Any] = [{"parameters": run.get("parameters") or {}}, output]
         status = str(run.get("status", "unknown"))
         return DetailDrawer(
