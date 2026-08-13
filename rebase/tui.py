@@ -60,7 +60,7 @@ from rebase.brand import (
     BRAND_MEDIUM_GRAY,
     BRAND_SLATE_BLUE,
 )
-from rebase.client import Client, RebaseWorkflowError
+from rebase.client import Client, RebaseWorkflowError, run_timing_summary
 from rebase.config import (
     add_search_path,
     editor_settings,
@@ -4266,11 +4266,15 @@ class RebaseTuiApp(App[None]):
             output["diagnosis"] = {key: reason[key] for key in ("message", "hint") if reason.get(key)}
         sections: list[Any] = [{"parameters": run.get("parameters") or {}}, output]
         status = str(run.get("status", "unknown"))
+        fields = [
+            DetailField("Run ID", str(run.get("id", "-"))),
+            DetailField("Status", status, status_style(status)),
+        ]
+        timing = run_timing_summary(run)
+        if timing:
+            fields.append(DetailField("Timing", timing))
         return DetailDrawer(
-            fields=[
-                DetailField("Run ID", str(run.get("id", "-"))),
-                DetailField("Status", status, status_style(status)),
-            ],
+            fields=fields,
             sections=sections,
         )
 

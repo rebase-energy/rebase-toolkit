@@ -274,6 +274,38 @@ def set_build_log_consumer(consumer: Callable[[str], None] | None) -> None:
     _build_log_consumer = consumer
 
 
+def run_timing_summary(run: dict[str, Any]) -> str | None:
+    """One phrase decomposing where a run's time went: "startup 4.1s · execution 0.6s".
+
+    Startup (provisioning + cold start) is the number that tells a user their
+    import block — not their code — is what's slow. Dispatch stands in for it
+    on the shared fast path, where there is no provisioning. Only phases that
+    actually registered are mentioned.
+    """
+    timings = run.get("timings") or {}
+    if not isinstance(timings, dict):
+        return None
+
+    def seconds(key: str) -> float | None:
+        value = timings.get(key)
+        return float(value) if isinstance(value, int | float) else None
+
+    parts: list[str] = []
+    startup = seconds("infrastructure_provision_seconds")
+    if startup is not None and startup >= 0.05:
+        parts.append(f"startup {startup:.1f}s")
+    execution = seconds("backend_execution_seconds")
+    if execution is not None:
+        parts.append(f"execution {execution:.2f}s")
+    dispatch = seconds("api_dispatch_seconds")
+    if startup is None and dispatch is not None and dispatch >= 0.05:
+        parts.append(f"dispatch {dispatch:.2f}s")
+    attempts = timings.get("backend_attempts")
+    if isinstance(attempts, int) and attempts > 1:
+        parts.append(f"{attempts} attempts")
+    return " · ".join(parts) or None
+
+
 def run_failure_summary(run: dict[str, Any]) -> str | None:
     """One human line for a failed run, preferring the structured diagnosis.
 
@@ -2594,6 +2626,17 @@ class Client:
 
     def get_workspace_usage(self) -> dict[str, Any]:
         return self._request_dict("GET", "/workspace/usage", expected="workspace usage response")
+
+    def get_workspace_usage_breakdown(self, *, limit: int = 10) -> dict[str, Any]:
+        return self._request_dict(
+            "GET",
+            "/workspace/usage/breakdown",
+            params={"limit": limit},
+            expected="workspace usage breakdown response",
+        )
+
+    def get_run_cost(self, run_id: str) -> dict[str, Any]:
+        return self._request_dict("GET", f"/runs/{run_id}/cost", expected="run cost response")
 
     def list_platform_invites(self) -> list[dict[str, Any]]:
         return self._request_list("GET", "/platform/invites", expected="platform invite list response")

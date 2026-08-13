@@ -61,6 +61,7 @@ from rebase.client import (
     _parse_github_remote,
     _validate_execution,
     run_failure_summary,
+    run_timing_summary,
     set_build_log_consumer,
 )
 from rebase.config import (
@@ -915,10 +916,14 @@ def _stream_run_result(
                 # Final fetch: log-store ingestion can lag the terminal status.
                 log_follower.poll(reporter)
             if status == "succeeded":
+                timing = run_timing_summary(data)
+                suffix = f" ({timing})" if timing else ""
                 if return_result:
-                    reporter.finish(f"Run completed in {_format_duration(time.monotonic() - started_at)} seconds.")
+                    reporter.finish(
+                        f"Run completed in {_format_duration(time.monotonic() - started_at)} seconds{suffix}."
+                    )
                 else:
-                    reporter.finish("Run completed.")
+                    reporter.finish(f"Run completed{suffix}.")
                 return data.get("result") if return_result else None
             error = run_failure_summary(data) or f"run ended with status {status}"
             reporter.fail(error)
@@ -2559,16 +2564,57 @@ def workspace_members_command(
     console.print(_workspace_members_table(members, pending_invites))
 
 
+def _usage_breakdown_table(breakdown: dict[str, Any]) -> Table | None:
+    entries = breakdown.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return None
+    currency = str(breakdown.get("currency") or "EUR")
+    table = Table(
+        title="Spend by target",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Target", style="rebase.value")
+    table.add_column("Type", style="rebase.muted")
+    table.add_column("Runs", justify="right")
+    table.add_column("Charged", justify="right")
+    table.add_column("Reserved", justify="right", style="rebase.muted")
+    for entry in entries:
+        target_type = str(entry.get("target_type") or "-")
+        name = entry.get("name") or (str(entry.get("target_id"))[:8] if entry.get("target_id") else target_type)
+        table.add_row(
+            str(name),
+            target_type,
+            str(entry.get("runs") or 0),
+            _format_cents(entry.get("charged_cents"), currency),
+            _format_cents(entry.get("reserved_cents"), currency),
+        )
+    return table
+
+
 @workspace_app.command("usage")
 def workspace_usage_command(
     json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
-    """Show monthly compute credits for the active workspace."""
-    usage = Client().get_workspace_usage()
+    """Show monthly compute credits for the active workspace, and where they went."""
+    client = Client()
+    usage = client.get_workspace_usage()
+    breakdown: dict[str, Any] | None
+    try:
+        breakdown = client.get_workspace_usage_breakdown()
+    except RebaseWorkflowError:
+        breakdown = None  # older API without the breakdown route
     if json_output:
-        _print_json(usage)
+        _print_json({**usage, "breakdown": (breakdown or {}).get("entries")})
         return
     console.print(_workspace_usage_table(usage))
+    if breakdown is not None:
+        table = _usage_breakdown_table(breakdown)
+        if table is not None:
+            console.print(table)
 
 
 notifications_app = typer.Typer(
@@ -5914,6 +5960,56 @@ def run_list_command(
     console.print(_runs_table(runs, project_names=project_names))
 
 
+def _parse_timeline_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _timeline_table(run: dict[str, Any], events: list[dict[str, Any]], steps: list[dict[str, Any]]) -> Table | None:
+    """The run's life as one chronological table with offsets from creation.
+
+    Composed entirely from data the platform already records — run
+    timestamps, staged events, workflow steps — so it works identically for
+    every execution mode and both providers.
+    """
+    entries: list[tuple[datetime, str]] = []
+    created = _parse_timeline_timestamp(run.get("created_at"))
+    if created is not None:
+        entries.append((created, "Run created"))
+    for event in events:
+        stamp = _parse_timeline_timestamp(event.get("created_at"))
+        message = str(event.get("message") or "").rstrip(".")
+        if stamp is not None and message:
+            entries.append((stamp, message))
+    for step in steps:
+        name = str(step.get("name") or "step")
+        started = _parse_timeline_timestamp(step.get("started_at"))
+        if started is not None:
+            entries.append((started, f"Step {name} started"))
+        finished = _parse_timeline_timestamp(step.get("finished_at"))
+        if finished is not None:
+            entries.append((finished, f"Step {name} {step.get('status') or 'finished'}"))
+    finished_at = _parse_timeline_timestamp(run.get("finished_at"))
+    if finished_at is not None:
+        entries.append((finished_at, f"Run {run.get('status') or 'finished'}"))
+    if len(entries) < 2:
+        return None
+    entries.sort(key=lambda item: item[0])
+    base = entries[0][0]
+    table = Table(title="Timeline", box=box.SIMPLE, title_justify="left")
+    table.add_column("Time", style="rebase.muted", no_wrap=True)
+    table.add_column("Offset", style="rebase.muted", justify="right", no_wrap=True)
+    table.add_column("Event")
+    for stamp, message in entries:
+        offset = (stamp - base).total_seconds()
+        table.add_row(stamp.strftime("%H:%M:%S"), f"+{offset:.1f}s", message)
+    return table
+
+
 @run_app.command("get")
 def run_get_command(
     run_id: Annotated[str, typer.Argument(help="Run ID.")],
@@ -5951,6 +6047,34 @@ def run_get_command(
             ],
         )
     )
+    # The composed story: chronological timeline plus where the time went.
+    # Both degrade silently — an older API without events still shows the
+    # detail table above.
+    try:
+        events = client.list_run_events(run_id)
+        steps = client.list_run_steps(run_id) if run.get("target_type") == "workflow" else []
+    except RebaseWorkflowError:
+        events, steps = [], []
+    timeline = _timeline_table(run, events, steps)
+    if timeline is not None:
+        console.print(timeline)
+    timing = run_timing_summary(run)
+    if timing:
+        console.print(f"Where the time went: {timing}", style="rebase.muted", highlight=False)
+    try:
+        cost = client.get_run_cost(run_id)
+    except RebaseWorkflowError:
+        cost = None  # older API, or a backend that never touches credits
+    if cost is not None and (cost.get("charged_cents") or cost.get("reserved_cents")):
+        currency = str(cost.get("currency") or "EUR")
+        if cost.get("settled"):
+            line = f"Cost: {_format_cents(cost.get('charged_cents'), currency)}"
+            runtime = cost.get("runtime_seconds")
+            if isinstance(runtime, int | float) and runtime > 0:
+                line += f" for {runtime:.1f}s billed"
+        else:
+            line = f"Cost: {_format_cents(cost.get('reserved_cents'), currency)} reserved while the run is active"
+        console.print(line, style="rebase.muted", highlight=False)
 
 
 @run_app.command("logs")
