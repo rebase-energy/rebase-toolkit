@@ -4702,9 +4702,16 @@ class Client:
             if streaming:
                 log_cursor, streaming = self._stream_build_logs(build_id, log_cursor)
         if streaming and isinstance(build_id, str):
-            # Final drain: log ingestion lags the terminal status, and on a
-            # failed build the trailing lines are the ones that matter.
-            self._stream_build_logs(build_id, log_cursor)
+            # Final drain: log ingestion lags the terminal status. On failure
+            # keep draining briefly — the trailing lines are the ones that
+            # explain it, and Cloud Logging can be seconds behind.
+            attempts = 1 if response.get("status") == "succeeded" else 4
+            for attempt in range(attempts):
+                log_cursor, streaming = self._stream_build_logs(build_id, log_cursor)
+                if not streaming:
+                    break
+                if attempt < attempts - 1:
+                    time.sleep(1.0)
         if response.get("status") != "succeeded" or not response.get("image_digest"):
             logs_url = response.get("logs_url")
             suffix = f" Logs: {logs_url}" if logs_url else ""
