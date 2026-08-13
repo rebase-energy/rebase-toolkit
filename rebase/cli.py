@@ -2584,7 +2584,15 @@ def _usage_breakdown_table(breakdown: dict[str, Any]) -> Table | None:
     table.add_column("Reserved", justify="right", style="rebase.muted")
     for entry in entries:
         target_type = str(entry.get("target_type") or "-")
-        name = entry.get("name") or (str(entry.get("target_id"))[:8] if entry.get("target_id") else target_type)
+        if entry.get("name"):
+            name = str(entry["name"])
+        elif entry.get("target_id"):
+            name = str(entry["target_id"])[:8]
+        elif target_type in {"function", "workflow", "model"}:
+            # Ephemeral runs have no registered target to name.
+            name = f"(ephemeral {target_type}s)"
+        else:
+            name = target_type
         table.add_row(
             str(name),
             target_type,
