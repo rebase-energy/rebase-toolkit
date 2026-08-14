@@ -15,7 +15,9 @@
 - **pandas is never a core dependency.** Import it *inside* functions, never at module level. `rebase/contract.py` and `rebase/sources/base.py` must stay importable without pandas.
 - **Never break the stored contract representation for inputs accepted today.** `config_diff` compares in-code contracts against stored ones and `preflight_datasets` blocks `deploy` on drift, so a changed serialisation shows up as phantom drift on untouched datasets.
 - **Errors follow module convention:** `rebase/contract.py` raises `ValueError`/`TypeError`; `rebase/sources/` raises `DataSourceError`.
-- **Test commands:** `uv run --no-sync pytest -q`. Expect exactly one pre-existing failure, `tests/test_client.py::test_project_deploy_registers_step_workflow_graph`. Anything beyond that is yours.
+- **Test commands:** `uv run --no-sync pytest -q`. **Measured baseline on this machine (Windows, pandas 3.0.5): `4 failed, 843 passed`.** The four are pre-existing and platform-related — `tests/test_cli.py::test_profile_list_renders_local_profiles`, `tests/test_editor.py::test_editor_uses_a_macos_app_bundle_when_no_shim_is_on_path`, and two in `tests/test_tui.py`. None sits in a file this plan touches. Anything beyond those four is yours. (`ONBOARDING.md` claims the sole failure is `test_client.py::test_project_deploy_registers_step_workflow_graph`; that test **passes** here. Trust the measured baseline.)
+- **pandas is required to actually run these tests.** It is *not* in the `dev` dependency group, and every new test is gated behind `@pandas_only` / `skipif(not _HAS_PANDAS)`. Without it the suite skips green and proves nothing. It is already installed in this checkout's `.venv`.
+- **The files this plan touches are green at baseline:** `pytest tests/test_contract.py tests/test_sources.py tests/test_sources_energy.py tests/test_timing.py -q` → `159 passed`. Use that as the fast per-task gate.
 - **Lint:** `uv run --no-sync ruff check .` must be clean. Run `ruff format` on touched files **only** — a bare `ruff format .` reformats two files already unformatted on `master`.
 - **`ty check` is not a gate** (~81 pre-existing diagnostics). Judge by added diagnostics only.
 - **Line length:** ruff is configured for long lines in this repo; match the surrounding style rather than wrapping at 88.
@@ -1656,7 +1658,7 @@ uv run --no-sync ruff format rebase/contract.py rebase/sources/base.py rebase/so
 uv run --no-sync ruff check .
 ```
 
-Expected: exactly one failure, `tests/test_client.py::test_project_deploy_registers_step_workflow_graph` (pre-existing on `master`). Ruff clean. If `ruff format` changes anything, re-run `pytest -q` before committing.
+Expected: the four pre-existing platform failures named in Global Constraints, and nothing more (`4 failed, 843 passed` plus whatever this branch adds to the passed count). Ruff clean. If `ruff format` changes anything, re-run `pytest -q` before committing.
 
 - [ ] **Step 3: Commit**
 
