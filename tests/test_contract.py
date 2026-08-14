@@ -10,6 +10,7 @@ from rebase.contract import (
     Contract,
     ContractViolation,
     Freshness,
+    Index,
     ValidationReport,
     compile_checks,
     validate_frame,
@@ -482,3 +483,60 @@ def test_registration_payload_sends_execution_semantics_not_backend(monkeypatch)
     assert payload["isolation"] == "shared"
     assert "run_type" not in payload
     assert "execution_backend" not in payload
+
+
+# --- index constraints ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"column": ""}, "non-empty column"),
+        ({"column": "t"}, "must declare monotonic"),
+        ({"column": "t", "max_gap": "P1M"}, "calendar"),
+        ({"column": "t", "max_gap": "PT0S"}, "must be positive"),
+        ({"column": "t", "max_gap": -60}, "must be positive"),
+        ({"column": "t", "max_gap": "banana"}, "max_gap must be"),
+    ],
+)
+def test_index_constructor_rejects_bad_input(kwargs, match) -> None:
+    with pytest.raises(ValueError, match=match):
+        Index(**kwargs)
+
+
+def test_index_accepts_both_duration_grammars() -> None:
+    assert Index("t", max_gap="PT1H").max_gap == "PT1H"
+    assert Index("t", max_gap="1h").max_gap == "PT1H"
+    assert Index("t", max_gap=3600).max_gap == "PT1H"
+    assert Index("t", max_gap=timedelta(hours=1)).max_gap == "PT1H"
+
+
+def test_index_gap_timedelta() -> None:
+    assert Index("t", max_gap="PT1H").gap_timedelta() == timedelta(hours=1)
+    assert Index("t", max_gap="P1D").gap_timedelta() == timedelta(days=1)
+    assert Index("t", monotonic=True).gap_timedelta() is None
+
+
+def test_index_strips_column_name() -> None:
+    assert Index("  valid_time  ", monotonic=True).column == "valid_time"
+
+
+def test_index_to_dict_omits_unset() -> None:
+    assert Index("t", monotonic=True).to_dict() == {"column": "t", "monotonic": True}
+    assert Index("t", max_gap="PT1H").to_dict() == {"column": "t", "max_gap": "PT1H"}
+    assert Index("t", monotonic=True, max_gap="PT15M").to_dict() == {
+        "column": "t",
+        "monotonic": True,
+        "max_gap": "PT15M",
+    }
+
+
+def test_index_from_dict_round_trips() -> None:
+    stored = Index("t", monotonic=True, max_gap="PT1H").to_dict()
+    assert Index.from_dict(stored).to_dict() == stored
+
+
+def test_index_from_dict_ignores_unknown_keys() -> None:
+    parsed = Index.from_dict({"column": "t", "monotonic": True, "x-future": 1})
+    assert parsed.column == "t"
+    assert parsed.monotonic is True

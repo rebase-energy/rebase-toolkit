@@ -143,6 +143,76 @@ class Column:
         )
 
 
+class Index:
+    """Row-order and spacing constraints on a dataset's index column.
+
+    ``monotonic=True`` means *strictly increasing*: duplicate index values violate it.
+    ``max_gap`` bounds the distance between consecutive rows **as delivered** — the frame is
+    never sorted first, because monotonicity is a separate assertion and sorting would
+    quietly repair a frame that failed it.
+    """
+
+    def __init__(
+        self,
+        column: str,
+        *,
+        monotonic: bool = False,
+        max_gap: str | int | float | timedelta | Any | None = None,
+    ) -> None:
+        from rebase.timing import Duration
+
+        if not isinstance(column, str) or not column.strip():
+            raise ValueError("Index requires a non-empty column name")
+        if not monotonic and max_gap is None:
+            raise ValueError(f"Index {column!r} must declare monotonic=True, max_gap=..., or both")
+        gap: str | None = None
+        if max_gap is not None:
+            if isinstance(max_gap, bool):
+                raise TypeError("Index max_gap must be a duration string, seconds, timedelta or Duration")
+            if isinstance(max_gap, (int, float)):
+                max_gap = timedelta(seconds=float(max_gap))
+            duration = Duration.coerce(max_gap, field_name="Index max_gap")
+            if duration.months:
+                raise ValueError(
+                    f"Index {column!r}: max_gap cannot be a calendar duration; "
+                    "a month has no fixed length and the check compares a fixed timedelta"
+                )
+            if duration.days <= 0 and duration.seconds <= 0:
+                raise ValueError(f"Index {column!r}: max_gap must be positive")
+            gap = duration.isoformat()
+        self.column = column.strip()
+        self.monotonic = bool(monotonic)
+        self.max_gap = gap
+
+    def gap_timedelta(self) -> timedelta | None:
+        """``max_gap`` as a fixed timedelta, or ``None`` when unset."""
+        if self.max_gap is None:
+            return None
+        from rebase.timing import Duration
+
+        duration = Duration.parse(self.max_gap, field_name="Index max_gap")
+        return timedelta(days=duration.days, seconds=duration.seconds)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"column": self.column}
+        if self.monotonic:
+            payload["monotonic"] = True
+        if self.max_gap is not None:
+            payload["max_gap"] = self.max_gap
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Index:
+        """Rebuild an Index from its stored form (unknown keys ignored)."""
+        if not isinstance(data, dict):
+            raise TypeError("Index.from_dict expects a dict")
+        return cls(
+            data.get("column", ""),
+            monotonic=bool(data.get("monotonic", False)),
+            max_gap=data.get("max_gap"),
+        )
+
+
 class Contract:
     """A dataset contract: declared columns plus table-level policies."""
 
