@@ -529,6 +529,9 @@ def compile_checks(contract: dict[str, Any]) -> list[Check]:
             checks.append(Check("range", name, _make_range_check(name, prop.get("minimum"), prop.get("maximum"))))
         if prop.get("enum"):
             checks.append(Check("isin", name, _make_isin_check(name, list(prop["enum"]))))
+        max_null_run = prop.get("x-max-null-run")
+        if max_null_run is not None:
+            checks.append(Check("null_run", name, _make_null_run_check(name, int(max_null_run))))
 
     primary_key = list(x_rebase.get("primary_key") or ())
     if primary_key:
@@ -627,6 +630,31 @@ def _make_isin_check(name: str, values: list[Any]) -> Callable[[Any], CheckFailu
             detail = f"{count} rows not in {values} (saw {', '.join(unexpected)})"
             return CheckFailure("isin", name, count, _sample_positions(mask), detail)
         except Exception:
+            return None
+
+    return run
+
+
+def _make_null_run_check(name: str, max_run: int) -> Callable[[Any], CheckFailure | None]:
+    def run(df: Any) -> CheckFailure | None:
+        if name not in df.columns:
+            return None  # the missing_column check reports the root cause
+        try:
+            nulls = df[name].isna()
+            if not bool(nulls.any()):
+                return None
+            # Number each maximal run of nulls, then measure it: cumsum over the *starts* of
+            # non-null stretches gives every consecutive null block a shared group id.
+            groups = (~nulls).cumsum()
+            lengths = nulls.groupby(groups).transform("sum")
+            mask = nulls & (lengths > max_run)
+            count = int(mask.sum())
+            if not count:
+                return None
+            longest = int(lengths[nulls].max())
+            detail = f"run of {longest} consecutive nulls exceeds {max_run} ({count} rows in over-long runs)"
+            return CheckFailure("null_run", name, count, _sample_positions(mask), detail)
+        except Exception:  # wrong dtype etc. — the dtype check reports the root cause
             return None
 
     return run

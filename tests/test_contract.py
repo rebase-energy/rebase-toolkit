@@ -716,3 +716,73 @@ def test_max_gap_check_flags_a_hole() -> None:
 def test_max_gap_check_skips_when_index_column_missing() -> None:
     report = validate_frame(_frame(v=[1.0]), _index_checks_contract(max_gap="PT1H"))
     assert [failure.check for failure in report.failures if failure.column == "t"] == ["missing_column"]
+
+
+# --- null_run check -----------------------------------------------------------------------
+
+
+def _null_run_contract(**thresholds) -> dict:
+    columns = [Column("t", "timestamp", not_null=True)]
+    columns += [Column(name, "float", max_null_run=value) for name, value in thresholds.items()]
+    return Contract(columns, index=Index("t", monotonic=True)).to_dict()
+
+
+@pandas_only
+def test_null_run_check_passes_at_the_threshold() -> None:
+    import pandas as pd
+
+    frame = _frame(
+        t=pd.date_range("2026-01-01", periods=6, freq="h", tz="UTC"),
+        v=[1.0, None, None, None, 2.0, 3.0],
+    )
+    assert validate_frame(frame, _null_run_contract(v=3)).passed
+
+
+@pandas_only
+def test_null_run_check_flags_a_long_run() -> None:
+    import pandas as pd
+
+    frame = _frame(
+        t=pd.date_range("2026-01-01", periods=8, freq="h", tz="UTC"),
+        v=[1.0, None, None, None, None, None, 2.0, 3.0],
+    )
+    report = validate_frame(frame, _null_run_contract(v=3))
+    failure = _failure(report, "null_run")
+    assert failure.column == "v"
+    assert failure.count == 5
+    assert failure.sample_rows == [1, 2, 3, 4, 5]
+    assert "run of 5 consecutive nulls" in failure.detail
+    assert "exceeds 3" in failure.detail
+
+
+@pandas_only
+def test_null_run_thresholds_are_per_column() -> None:
+    import pandas as pd
+
+    frame = _frame(
+        t=pd.date_range("2026-01-01", periods=6, freq="h", tz="UTC"),
+        v=[1.0, None, None, None, None, 2.0],
+        backup=[1.0, None, None, None, None, 2.0],
+    )
+    report = validate_frame(frame, _null_run_contract(v=3, backup=12))
+    assert [failure.column for failure in report.failures if failure.check == "null_run"] == ["v"]
+
+
+@pandas_only
+def test_null_run_check_counts_the_longest_run_in_the_detail() -> None:
+    import pandas as pd
+
+    frame = _frame(
+        t=pd.date_range("2026-01-01", periods=9, freq="h", tz="UTC"),
+        v=[None, None, None, None, 1.0, None, None, None, None],
+    )
+    report = validate_frame(frame, _null_run_contract(v=2))
+    failure = _failure(report, "null_run")
+    assert failure.count == 8
+    assert "run of 4 consecutive nulls" in failure.detail
+
+
+@pandas_only
+def test_null_run_check_skips_when_column_missing() -> None:
+    report = validate_frame(_frame(t=[1], other=[1.0]), _null_run_contract(v=3))
+    assert not [failure for failure in report.failures if failure.check == "null_run"]
