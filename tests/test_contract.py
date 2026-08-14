@@ -628,3 +628,50 @@ def test_contract_without_index_omits_the_key() -> None:
 
 def test_index_is_exported() -> None:
     assert rb.Index is Index
+
+
+# --- index_monotonic check --------------------------------------------------------------
+
+
+def _index_checks_contract(**index_kwargs) -> dict:
+    return Contract(
+        [Column("t", "timestamp", not_null=True), Column("v", "float")],
+        index=Index("t", **index_kwargs),
+    ).to_dict()
+
+
+@pandas_only
+def test_monotonic_check_passes_on_increasing_index() -> None:
+    import pandas as pd
+
+    frame = _frame(t=pd.to_datetime(["2026-01-01T00:00Z", "2026-01-01T01:00Z"]), v=[1.0, 2.0])
+    assert validate_frame(frame, _index_checks_contract(monotonic=True)).passed
+
+
+@pandas_only
+def test_monotonic_check_flags_out_of_order_and_duplicate_rows() -> None:
+    import pandas as pd
+
+    frame = _frame(
+        t=pd.to_datetime(
+            [
+                "2026-01-01T00:00Z",
+                "2026-01-01T02:00Z",
+                "2026-01-01T01:00Z",  # position 2: goes backwards
+                "2026-01-01T01:00Z",  # position 3: duplicate, so not increasing
+            ]
+        ),
+        v=[1.0, 2.0, 3.0, 4.0],
+    )
+    report = validate_frame(frame, _index_checks_contract(monotonic=True))
+    failure = _failure(report, "index_monotonic")
+    assert failure.column == "t"
+    assert failure.count == 2
+    assert failure.sample_rows == [2, 3]
+    assert "not strictly increasing" in failure.detail
+
+
+@pandas_only
+def test_monotonic_check_skips_when_index_column_missing() -> None:
+    report = validate_frame(_frame(v=[1.0]), _index_checks_contract(monotonic=True))
+    assert [failure.check for failure in report.failures if failure.column == "t"] == ["missing_column"]

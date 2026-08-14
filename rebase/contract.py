@@ -496,6 +496,16 @@ def _coerce_bound(series: Any, value: Any) -> Any:
     return value
 
 
+def _zero_like(series: Any) -> Any:
+    """The zero appropriate to ``series.diff()`` — Timedelta for temporal, 0 for numeric."""
+    import pandas as pd
+    from pandas.api import types as pdt
+
+    if pdt.is_datetime64_any_dtype(series):
+        return pd.Timedelta(0)
+    return 0
+
+
 def compile_checks(contract: dict[str, Any]) -> list[Check]:
     """Compile a stored contract dict into runnable checks."""
     if not isinstance(contract, dict):
@@ -523,6 +533,10 @@ def compile_checks(contract: dict[str, Any]) -> list[Check]:
     primary_key = list(x_rebase.get("primary_key") or ())
     if primary_key:
         checks.append(Check("primary_key", None, _make_primary_key_check(primary_key)))
+    index_spec = x_rebase.get("index") or {}
+    index_column = index_spec.get("column")
+    if index_column and index_spec.get("monotonic"):
+        checks.append(Check("index_monotonic", index_column, _make_monotonic_check(index_column)))
     min_rows = x_rebase.get("min_rows")
     if min_rows is not None:
         checks.append(Check("min_rows", None, _make_min_rows_check(int(min_rows))))
@@ -624,6 +638,32 @@ def _make_primary_key_check(primary_key: list[str]) -> Callable[[Any], CheckFail
             return None
         detail = f"{count} duplicate rows on ({', '.join(primary_key)})"
         return CheckFailure("primary_key", None, count, _sample_positions(mask), detail)
+
+    return run
+
+
+def _make_monotonic_check(name: str) -> Callable[[Any], CheckFailure | None]:
+    def run(df: Any) -> CheckFailure | None:
+        if name not in df.columns:
+            return None  # the missing_column check reports the root cause
+        try:
+            series = df[name]
+            # The first row has no predecessor and can never be a violation; positions where the
+            # diff is non-positive are the offending row, not its predecessor.
+            mask = series.diff() <= _zero_like(series)
+            mask.iloc[0] = False
+            count = int(mask.sum())
+            if not count:
+                return None
+            return CheckFailure(
+                "index_monotonic",
+                name,
+                count,
+                _sample_positions(mask),
+                f"{name} is not strictly increasing ({count} rows)",
+            )
+        except Exception:  # wrong dtype etc. — the dtype check reports the root cause
+            return None
 
     return run
 
