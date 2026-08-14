@@ -537,6 +537,10 @@ def compile_checks(contract: dict[str, Any]) -> list[Check]:
     index_column = index_spec.get("column")
     if index_column and index_spec.get("monotonic"):
         checks.append(Check("index_monotonic", index_column, _make_monotonic_check(index_column)))
+    if index_column and index_spec.get("max_gap"):
+        checks.append(
+            Check("index_max_gap", index_column, _make_max_gap_check(index_column, str(index_spec["max_gap"])))
+        )
     min_rows = x_rebase.get("min_rows")
     if min_rows is not None:
         checks.append(Check("min_rows", None, _make_min_rows_check(int(min_rows))))
@@ -662,6 +666,27 @@ def _make_monotonic_check(name: str) -> Callable[[Any], CheckFailure | None]:
                 _sample_positions(mask),
                 f"{name} is not strictly increasing ({count} rows)",
             )
+        except Exception:  # wrong dtype etc. — the dtype check reports the root cause
+            return None
+
+    return run
+
+
+def _make_max_gap_check(name: str, max_gap: str) -> Callable[[Any], CheckFailure | None]:
+    def run(df: Any) -> CheckFailure | None:
+        if name not in df.columns:
+            return None  # the missing_column check reports the root cause
+        try:
+            bound = Index(name, max_gap=max_gap).gap_timedelta()
+            diffs = df[name].diff()
+            mask = diffs > bound
+            mask = mask.fillna(False)  # the first row has no predecessor
+            count = int(mask.sum())
+            if not count:
+                return None
+            widest = diffs[mask].max()
+            detail = f"{count} gaps wider than {max_gap} (widest {widest})"
+            return CheckFailure("index_max_gap", name, count, _sample_positions(mask), detail)
         except Exception:  # wrong dtype etc. — the dtype check reports the root cause
             return None
 

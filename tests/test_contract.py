@@ -675,3 +675,44 @@ def test_monotonic_check_flags_out_of_order_and_duplicate_rows() -> None:
 def test_monotonic_check_skips_when_index_column_missing() -> None:
     report = validate_frame(_frame(v=[1.0]), _index_checks_contract(monotonic=True))
     assert [failure.check for failure in report.failures if failure.column == "t"] == ["missing_column"]
+
+
+# --- index_max_gap check -----------------------------------------------------------------
+
+
+@pandas_only
+def test_max_gap_check_passes_on_regular_cadence() -> None:
+    import pandas as pd
+
+    frame = _frame(t=pd.date_range("2026-01-01", periods=24, freq="h", tz="UTC"), v=[1.0] * 24)
+    assert validate_frame(frame, _index_checks_contract(max_gap="PT1H")).passed
+
+
+@pandas_only
+def test_max_gap_check_flags_a_hole() -> None:
+    import pandas as pd
+
+    frame = _frame(
+        t=pd.to_datetime(
+            [
+                "2026-01-01T00:00Z",
+                "2026-01-01T01:00Z",
+                "2026-01-01T07:00Z",  # position 2: six hours after its predecessor
+                "2026-01-01T08:00Z",
+            ]
+        ),
+        v=[1.0, 2.0, 3.0, 4.0],
+    )
+    report = validate_frame(frame, _index_checks_contract(max_gap="PT1H"))
+    failure = _failure(report, "index_max_gap")
+    assert failure.column == "t"
+    assert failure.count == 1
+    assert failure.sample_rows == [2]
+    assert "6:00:00" in failure.detail
+    assert "PT1H" in failure.detail
+
+
+@pandas_only
+def test_max_gap_check_skips_when_index_column_missing() -> None:
+    report = validate_frame(_frame(v=[1.0]), _index_checks_contract(max_gap="PT1H"))
+    assert [failure.check for failure in report.failures if failure.column == "t"] == ["missing_column"]
