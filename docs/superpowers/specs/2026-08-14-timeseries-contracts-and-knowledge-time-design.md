@@ -265,7 +265,9 @@ Resolution is strict, because every failure mode here is otherwise silent:
 - **`from_source(column)`** copies the named column to `knowledge_time`, coerced to UTC. Raises
   `DataSourceError` if the column is missing, and also if it carries nulls — a null publication
   time is not a knowledge time, and letting it through would reintroduce a wall-clock fallback
-  under another name.
+  under another name. A timezone-naive column warns before being assumed UTC, matching `at()`
+  and `energy.py`'s `_utc` helper: if the true zone is not UTC, every knowledge time is silently
+  wrong by the offset, which is exactly the class of failure this class exists to make loud.
 - **`from_inputs(*frames)`** takes the maximum over each frame's `knowledge_time` column and
   assigns that scalar to every row. Raises `DataSourceError` naming the offending input by
   position if a frame has no such column. This composes with `read_bitemporal`, whose output

@@ -420,7 +420,7 @@ Insert validation after the `watermark_column` check (line 174), where `known` i
         null_run_columns = [column.name for column in columns if column.max_null_run is not None]
         if null_run_columns and index is None:
             raise ValueError(
-                f"Contract column(s) {null_run_columns} declare max_null_run, which requires an index= "
+                f"Contract column(s) {null_run_columns} declare max_null_run; max_null_run requires an index= "
                 "declaration — without one, row order and therefore 'consecutive' are undefined"
             )
 ```
@@ -1190,6 +1190,11 @@ class KnowledgeTime:
                     f"KnowledgeTime.from_source({self._column!r}): column not found in frame columns "
                     f"{list(out.columns)}."
                 )
+            # Warn BEFORE the utc=True coercion — after it, a naive column is indistinguishable
+            # from a tz-aware one, and a wrong assumed zone silently offsets every knowledge time.
+            naive = pd.to_datetime(out[self._column])
+            if getattr(naive.dt, "tz", None) is None:
+                warnings.warn(f"{self._column} is timezone-naive; assuming UTC", stacklevel=2)
             values = pd.to_datetime(out[self._column], utc=True)
             missing = int(values.isna().sum())
             if missing:
@@ -1643,7 +1648,9 @@ Insert directly after the Part A bullet under `## Unreleased` → `### Added`:
   mutated. There is deliberately no `now()`: stamping wall-clock records when you *fetched*,
   which makes an upstream revision indistinguishable from a re-fetch of unchanged data —
   precisely the signal a data-quality layer needs. Resolution is strict, so a missing
-  publication column or a null publication time is an error rather than a silent fallback.
+  publication column or a null publication time is an error rather than a silent fallback, and a
+  timezone-naive publication column warns before being assumed UTC — if its true zone is not UTC,
+  every knowledge time would otherwise be silently wrong by the offset.
   Relatedly, `build_values_rows` in the canonical energy layout now stamps
   `knowledge_time`/`change_time` from the replay-aware batch clock instead of wall-clock, so a
   replay records the original run's knowledge bound.
