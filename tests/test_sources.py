@@ -691,3 +691,34 @@ def test_knowledge_time_stamp_is_visible_to_validation() -> None:
     # passing proves the stamp landed before validation ran.
     result = source.write(df, "t", dataset=dataset, knowledge_time=KnowledgeTime.from_source("issued_at"))
     assert result.validation.passed
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_replay_warns_when_knowledge_time_passes_the_replay_bound(monkeypatch, caplog) -> None:
+    import logging
+
+    import pandas as pd
+
+    monkeypatch.setenv("REBASE_REPLAY_KNOWLEDGE_TIME", _REPLAY_BOUND)
+    source = _CapturingSource()
+    later = pd.Timestamp(_REPLAY_BOUND) + pd.Timedelta(hours=3)
+    df = pd.DataFrame({"issued_at": [later], "v": [1.0]})
+    with caplog.at_level(logging.WARNING, logger="rebase.sources"):
+        source.write(df, "t", knowledge_time=KnowledgeTime.from_source("issued_at"))
+    assert any("later than the replay bound" in record.getMessage() for record in caplog.records)
+    assert source.writes == 1  # a diagnostic, not a reason to fail the job
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_replay_is_quiet_when_knowledge_time_is_within_the_bound(monkeypatch, caplog) -> None:
+    import logging
+
+    import pandas as pd
+
+    monkeypatch.setenv("REBASE_REPLAY_KNOWLEDGE_TIME", _REPLAY_BOUND)
+    source = _CapturingSource()
+    earlier = pd.Timestamp(_REPLAY_BOUND) - pd.Timedelta(hours=3)
+    df = pd.DataFrame({"issued_at": [earlier], "v": [1.0]})
+    with caplog.at_level(logging.WARNING, logger="rebase.sources"):
+        source.write(df, "t", knowledge_time=KnowledgeTime.from_source("issued_at"))
+    assert not any("later than the replay bound" in record.getMessage() for record in caplog.records)

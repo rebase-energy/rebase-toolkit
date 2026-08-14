@@ -222,6 +222,31 @@ def _replay_knowledge_time() -> datetime | None:
     return bound
 
 
+def _warn_if_past_replay_bound(df: Frame, bound: datetime, table: str) -> None:
+    """Flag a replay writing data the original run could not have known.
+
+    A declared knowledge time is *data*, so a replay must not overwrite it. But if it resolves
+    past the replay bound, the replay is inventing knowledge the original run did not have —
+    worth saying out loud, and not worth failing a job over mid-pipeline.
+    """
+    import pandas as pd
+
+    try:
+        latest = pd.to_datetime(df["knowledge_time"], utc=True).max()
+    except Exception:  # noqa: BLE001 - a diagnostic must never break the write
+        return
+    if latest is None or pd.isna(latest):
+        return
+    if latest > pd.Timestamp(bound):
+        _logger.warning(
+            "replay run: knowledge_time %s in the frame written to %r is later than the replay bound %s — "
+            "the replay is writing data the original run could not have known",
+            latest.isoformat(),
+            table,
+            bound.isoformat(),
+        )
+
+
 def _resolve_now() -> datetime:
     # Isolated so tests can monkeypatch a deterministic ingestion clock. During a replay
     # the ingestion-time fallback stamps the replay's knowledge-time bound instead of
@@ -383,6 +408,8 @@ class DataSource(ABC):
         if knowledge_time is not None:
             df = knowledge_time.apply(df)
         replay_bound = _replay_knowledge_time()
+        if knowledge_time is not None and replay_bound is not None:
+            _warn_if_past_replay_bound(df, replay_bound, table)
         if dataset is None:
             if replay_bound is not None:
                 _logger.warning(
