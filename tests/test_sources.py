@@ -9,6 +9,7 @@ from rebase.sources.base import (
     ConnectorSpec,
     DataSource,
     DataSourceError,
+    KnowledgeTime,
     SignalOutcome,
     WriteResult,
     _replay_knowledge_time,
@@ -522,3 +523,81 @@ def test_write_warns_on_drift_and_never_overwrites_stored_config(monkeypatch) ->
     assert patches == []
     assert len(signals) == 2
     assert signals[0]["source"] == "source_write"
+
+
+# --- declared knowledge time ---------------------------------------------------------
+
+
+def test_knowledge_time_constructors_validate() -> None:
+    with pytest.raises(DataSourceError, match="non-empty column"):
+        KnowledgeTime.from_source("")
+    with pytest.raises(DataSourceError, match="at least one input"):
+        KnowledgeTime.from_inputs()
+    with pytest.raises(DataSourceError, match="requires a datetime"):
+        KnowledgeTime.at("2026-01-01")
+
+
+def test_knowledge_time_at_warns_on_naive_datetime() -> None:
+    with pytest.warns(UserWarning, match="timezone-naive"):
+        KnowledgeTime.at(datetime(2026, 1, 1, 9, 0))
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_knowledge_time_from_source_stamps_the_column() -> None:
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime(["2026-01-01T00:00Z", "2026-01-01T01:00Z"]),
+            "issued_at": pd.to_datetime(["2026-01-01T00:05Z", "2026-01-01T01:05Z"]),
+            "value": [1.0, 2.0],
+        }
+    )
+    out = KnowledgeTime.from_source("issued_at").apply(df)
+    assert list(out["knowledge_time"]) == list(pd.to_datetime(["2026-01-01T00:05Z", "2026-01-01T01:05Z"]))
+    assert "knowledge_time" not in df.columns  # the caller's frame is untouched
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_knowledge_time_from_source_rejects_missing_column_and_nulls() -> None:
+    import pandas as pd
+
+    with pytest.raises(DataSourceError, match="not found in frame columns"):
+        KnowledgeTime.from_source("issued_at").apply(pd.DataFrame({"value": [1.0]}))
+    df = pd.DataFrame({"issued_at": pd.to_datetime(["2026-01-01T00:05Z", None]), "value": [1.0, 2.0]})
+    with pytest.raises(DataSourceError, match="1 rows have no publication time"):
+        KnowledgeTime.from_source("issued_at").apply(df)
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_knowledge_time_from_inputs_takes_the_max() -> None:
+    import pandas as pd
+
+    actuals = pd.DataFrame({"knowledge_time": pd.to_datetime(["2026-01-01T00:00Z", "2026-01-01T06:00Z"])})
+    weather = pd.DataFrame({"knowledge_time": pd.to_datetime(["2026-01-01T03:00Z"])})
+    out = KnowledgeTime.from_inputs(actuals, weather).apply(pd.DataFrame({"value": [1.0, 2.0]}))
+    assert set(out["knowledge_time"]) == {pd.Timestamp("2026-01-01T06:00Z")}
+    assert len(out) == 2
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_knowledge_time_from_inputs_names_the_offending_input() -> None:
+    import pandas as pd
+
+    good = pd.DataFrame({"knowledge_time": pd.to_datetime(["2026-01-01T00:00Z"])})
+    bad = pd.DataFrame({"value": [1.0]})
+    with pytest.raises(DataSourceError, match="input 1 has no knowledge_time"):
+        KnowledgeTime.from_inputs(good, bad).apply(pd.DataFrame({"value": [1.0]}))
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_knowledge_time_at_stamps_a_scalar() -> None:
+    import pandas as pd
+
+    moment = datetime(2026, 1, 1, 9, 0, tzinfo=UTC)
+    out = KnowledgeTime.at(moment).apply(pd.DataFrame({"value": [1.0, 2.0]}))
+    assert set(out["knowledge_time"]) == {pd.Timestamp(moment)}
+
+
+def test_knowledge_time_is_exported() -> None:
+    assert rb.sources.KnowledgeTime is KnowledgeTime

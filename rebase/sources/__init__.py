@@ -24,6 +24,7 @@ from rebase.sources.base import (
     BitemporalSpec,
     DataSource,
     DataSourceError,
+    KnowledgeTime,
     WriteResult,
 )
 from rebase.sources.energy import SeriesKey
@@ -61,6 +62,7 @@ __all__ = [
     "BitemporalSpec",
     "DataSource",
     "DataSourceError",
+    "KnowledgeTime",
     "SeriesKey",
     "WriteResult",
     "bigquery",

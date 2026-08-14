@@ -91,6 +91,102 @@ class BitemporalSpec:
             raise ValueError("Set at most one of knowledge_time or knowledge_delay, not both.")
 
 
+class KnowledgeTime:
+    """Where a write's ``knowledge_time`` comes from — the write-side counterpart to
+    :class:`BitemporalSpec`.
+
+    Writing to a store with a knowledge axis has one rule that is easy to get wrong and wrong
+    silently: ``knowledge_time`` must record when the data became *knowable*, not when you
+    fetched it. Stamp wall-clock instead and an upstream revision becomes indistinguishable
+    from a re-fetch of unchanged data — which is exactly the signal a data-quality layer needs
+    to tell noise from a real correction.
+
+    There is deliberately no ``now()`` constructor. Wall-clock is the failure mode, and
+    omitting ``knowledge_time=`` from :meth:`DataSource.write` already leaves the frame alone.
+    """
+
+    __slots__ = ("_column", "_inputs", "_moment")
+
+    def __init__(self, *, column: str | None = None, inputs: tuple = (), moment: datetime | None = None) -> None:
+        # Construct through the classmethods below; they are the documented surface.
+        self._column = column
+        self._inputs = tuple(inputs)
+        self._moment = moment
+
+    @classmethod
+    def from_source(cls, column: str) -> KnowledgeTime:
+        """Take ``knowledge_time`` from the upstream's publication-time column."""
+        if not isinstance(column, str) or not column.strip():
+            raise DataSourceError("KnowledgeTime.from_source requires a non-empty column name")
+        return cls(column=column.strip())
+
+    @classmethod
+    def from_inputs(cls, *frames: Frame) -> KnowledgeTime:
+        """For a derived series: ``max(knowledge_time)`` across the frames it was computed from.
+
+        Anything earlier would claim the derived value was knowable before its inputs were,
+        and any backtest reading through it would leak.
+        """
+        if not frames:
+            raise DataSourceError("KnowledgeTime.from_inputs requires at least one input frame")
+        return cls(inputs=frames)
+
+    @classmethod
+    def at(cls, moment: datetime) -> KnowledgeTime:
+        """An explicit knowledge time."""
+        if not isinstance(moment, datetime):
+            raise DataSourceError("KnowledgeTime.at requires a datetime")
+        if moment.tzinfo is None:
+            warnings.warn("knowledge_time is timezone-naive; assuming UTC", stacklevel=2)
+            moment = moment.replace(tzinfo=UTC)
+        return cls(moment=moment)
+
+    def apply(self, df: Frame) -> Frame:
+        """Return a copy of ``df`` with ``knowledge_time`` stamped. Never mutates ``df``."""
+        import pandas as pd
+
+        out = df.copy()
+        if self._column is not None:
+            if self._column not in out.columns:
+                raise DataSourceError(
+                    f"KnowledgeTime.from_source({self._column!r}): column not found in frame columns "
+                    f"{list(out.columns)}."
+                )
+            values = pd.to_datetime(out[self._column], utc=True)
+            missing = int(values.isna().sum())
+            if missing:
+                raise DataSourceError(
+                    f"KnowledgeTime.from_source({self._column!r}): {missing} rows have no publication time. "
+                    "A null publication time is not a knowledge time — fix the upstream or filter those rows."
+                )
+            out["knowledge_time"] = values
+            return out
+        if self._inputs:
+            out["knowledge_time"] = self._max_input_knowledge_time()
+            return out
+        out["knowledge_time"] = pd.Timestamp(self._moment)
+        return out
+
+    def _max_input_knowledge_time(self) -> Any:
+        import pandas as pd
+
+        moments = []
+        for position, frame in enumerate(self._inputs):
+            columns = getattr(frame, "columns", None)
+            if columns is None or "knowledge_time" not in columns:
+                raise DataSourceError(
+                    f"KnowledgeTime.from_inputs: input {position} has no knowledge_time column. "
+                    "Read it with read_bitemporal so the knowledge axis travels with the frame."
+                )
+            values = pd.to_datetime(frame["knowledge_time"], utc=True)
+            if not len(values) or bool(values.isna().all()):
+                raise DataSourceError(
+                    f"KnowledgeTime.from_inputs: input {position} has no usable knowledge_time values."
+                )
+            moments.append(values.max())
+        return max(moments)
+
+
 def _replay_knowledge_time() -> datetime | None:
     """The knowledge-time bound of the current replay run, or ``None`` outside replays.
 
