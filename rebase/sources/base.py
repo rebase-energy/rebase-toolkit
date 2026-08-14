@@ -360,6 +360,7 @@ class DataSource(ABC):
         watermark: Any = _UNSET,
         on_violation: str | None = None,
         validate: bool = True,
+        knowledge_time: KnowledgeTime | None = None,
     ) -> WriteResult:
         """Write a DataFrame to ``table``. ``mode`` is ``"append"`` or ``"replace"``.
 
@@ -374,7 +375,13 @@ class DataSource(ABC):
         (pass ``None`` explicitly to signal a null watermark). ``on_violation`` overrides the
         contract's policy (``"fail"`` or ``"warn"``); ``validate=False`` skips validation and
         flags the signal as skipped.
+
+        ``knowledge_time`` declares where the frame's knowledge axis comes from — see
+        :class:`KnowledgeTime`. It is stamped *before* validation, so a contract may declare
+        ``knowledge_time`` as a column, and the caller's frame is never mutated.
         """
+        if knowledge_time is not None:
+            df = knowledge_time.apply(df)
         replay_bound = _replay_knowledge_time()
         if dataset is None:
             if replay_bound is not None:

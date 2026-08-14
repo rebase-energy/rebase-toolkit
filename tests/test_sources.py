@@ -637,3 +637,57 @@ def test_knowledge_time_at_stamps_a_scalar() -> None:
 
 def test_knowledge_time_is_exported() -> None:
     assert rb.sources.KnowledgeTime is KnowledgeTime
+
+
+class _CapturingSource(_FakeSource):
+    """A fake source that keeps the frame it was handed, so stamping is observable."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.written = None
+
+    def _write(self, df, table, mode):
+        self.written = df
+        return super()._write(df, table, mode)
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_write_stamps_declared_knowledge_time() -> None:
+    import pandas as pd
+
+    source = _CapturingSource()
+    df = pd.DataFrame({"issued_at": pd.to_datetime(["2026-01-01T00:05Z", "2026-01-01T01:05Z"]), "v": [1.0, 2.0]})
+    source.write(df, "t", knowledge_time=KnowledgeTime.from_source("issued_at"))
+    assert list(source.written["knowledge_time"]) == list(
+        pd.to_datetime(["2026-01-01T00:05Z", "2026-01-01T01:05Z"])
+    )
+    assert "knowledge_time" not in df.columns
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_write_without_knowledge_time_leaves_the_frame_alone() -> None:
+    import pandas as pd
+
+    source = _CapturingSource()
+    df = pd.DataFrame({"v": [1.0, 2.0]})
+    source.write(df, "t")
+    assert list(source.written.columns) == ["v"]
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_knowledge_time_stamp_is_visible_to_validation() -> None:
+    import pandas as pd
+
+    contract = rb.Contract(
+        [
+            rb.Column("v", "float", not_null=True),
+            rb.Column("knowledge_time", "timestamp", not_null=True),
+        ]
+    ).to_dict()
+    dataset = _RecordingDataset(contract=contract)
+    source = _CapturingSource()
+    df = pd.DataFrame({"issued_at": pd.to_datetime(["2026-01-01T00:05Z"]), "v": [1.0]})
+    # Without the stamp the contract's required knowledge_time column is missing, so this
+    # passing proves the stamp landed before validation ran.
+    result = source.write(df, "t", dataset=dataset, knowledge_time=KnowledgeTime.from_source("issued_at"))
+    assert result.validation.passed
