@@ -540,3 +540,30 @@ def test_index_from_dict_ignores_unknown_keys() -> None:
     parsed = Index.from_dict({"column": "t", "monotonic": True, "x-future": 1})
     assert parsed.column == "t"
     assert parsed.monotonic is True
+
+
+# --- max_null_run -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        (0, "positive integer"),
+        (-1, "positive integer"),
+        (True, "positive integer"),
+        (1.5, "positive integer"),
+    ],
+)
+def test_column_max_null_run_rejects_bad_input(value, match) -> None:
+    with pytest.raises(ValueError, match=match):
+        Column("v", "float", max_null_run=value)
+
+
+def test_column_max_null_run_serialises() -> None:
+    assert Column("v", "float", max_null_run=3).to_property() == {"type": "number", "x-max-null-run": 3}
+    assert "x-max-null-run" not in Column("v", "float").to_property()
+
+
+def test_column_max_null_run_round_trips() -> None:
+    prop = Column("v", "float", max_null_run=3).to_property()
+    assert Column.from_property("v", prop).max_null_run == 3

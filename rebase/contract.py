@@ -70,6 +70,7 @@ class Column:
         not_null: bool = False,
         between: tuple[Any, Any] | list[Any] | None = None,
         isin: list[Any] | None = None,
+        max_null_run: int | None = None,
     ) -> None:
         if not isinstance(name, str) or not name.strip():
             raise ValueError("Column requires a non-empty name")
@@ -91,11 +92,16 @@ class Column:
             if not isinstance(isin, (tuple, list)) or not len(isin):
                 raise ValueError(f"Column {name!r}: isin= must be a non-empty list")
             isin = list(isin)
+        if max_null_run is not None and (
+            isinstance(max_null_run, bool) or not isinstance(max_null_run, int) or max_null_run < 1
+        ):
+            raise ValueError(f"Column {name!r}: max_null_run must be a positive integer or None")
         self.name = name.strip()
         self.dtype = dtype
         self.not_null = bool(not_null)
         self.between = between
         self.isin = isin
+        self.max_null_run = max_null_run
 
     def to_property(self) -> dict[str, Any]:
         prop: dict[str, Any] = dict(_DTYPE_TO_PROPERTY[self.dtype])
@@ -109,6 +115,8 @@ class Column:
             prop["enum"] = list(self.isin)
         if self.not_null:
             prop["x-not-null"] = True
+        if self.max_null_run is not None:
+            prop["x-max-null-run"] = self.max_null_run
         return prop
 
     @classmethod
@@ -140,6 +148,7 @@ class Column:
             not_null=bool(required or prop.get("x-not-null")),
             between=between,
             isin=isin,
+            max_null_run=prop.get("x-max-null-run"),
         )
 
 
