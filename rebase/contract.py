@@ -362,9 +362,7 @@ class Freshness:
             else:
                 duration = Duration.coerce(max_age, field_name="Freshness max_age")
                 if duration.months:
-                    raise ValueError(
-                        "Freshness max_age cannot be a calendar duration; a month has no fixed length"
-                    )
+                    raise ValueError("Freshness max_age cannot be a calendar duration; a month has no fixed length")
                 total = duration.days * 86400 + duration.seconds
                 if total <= 0:
                     raise ValueError("Freshness max_age must be positive")

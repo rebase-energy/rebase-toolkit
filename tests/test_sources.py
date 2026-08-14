@@ -658,9 +658,7 @@ def test_write_stamps_declared_knowledge_time() -> None:
     source = _CapturingSource()
     df = pd.DataFrame({"issued_at": pd.to_datetime(["2026-01-01T00:05Z", "2026-01-01T01:05Z"]), "v": [1.0, 2.0]})
     source.write(df, "t", knowledge_time=KnowledgeTime.from_source("issued_at"))
-    assert list(source.written["knowledge_time"]) == list(
-        pd.to_datetime(["2026-01-01T00:05Z", "2026-01-01T01:05Z"])
-    )
+    assert list(source.written["knowledge_time"]) == list(pd.to_datetime(["2026-01-01T00:05Z", "2026-01-01T01:05Z"]))
     assert "knowledge_time" not in df.columns
 
 

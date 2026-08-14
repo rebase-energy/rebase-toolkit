@@ -19,6 +19,23 @@
   both duration grammars (`"PT1H"` and `"1h"`), and `rb.Freshness` now accepts ISO-8601
   durations too, so the two duration fields on a contract no longer disagree.
 
+- **A write's `knowledge_time` can now be declared rather than assumed.**
+  `rb.sources.KnowledgeTime.from_source("issued_at")` takes the knowledge axis from the
+  upstream's publication-time column, and `rb.sources.KnowledgeTime.from_inputs(a, b)` gives a
+  derived series `max(knowledge_time)` of the frames it was computed from — anything earlier
+  would claim the derived value was knowable before its inputs were, and a backtest reading
+  through it would leak. `KnowledgeTime.at(...)` covers the explicit case. The stamp is applied
+  before validation, so a contract can require the column, and the caller's frame is never
+  mutated. There is deliberately no `now()`: stamping wall-clock records when you *fetched*,
+  which makes an upstream revision indistinguishable from a re-fetch of unchanged data —
+  precisely the signal a data-quality layer needs. Resolution is strict, so a missing
+  publication column or a null publication time is an error rather than a silent fallback, and a
+  timezone-naive publication column warns before being assumed UTC — if its true zone is not UTC,
+  every knowledge time would otherwise be silently wrong by the offset. Relatedly,
+  `build_values_rows` in the canonical energy layout now stamps `knowledge_time`/`change_time`
+  from the replay-aware batch clock instead of wall-clock, so a replay records the original run's
+  knowledge bound.
+
 - **First-class environments now combine Modal-style Python ergonomics with GitOps.**
   Workspaces seed `dev`, `staging`, and `prod` and can create arbitrary additional names.
   Projects, compute, runs, routes, schedules, models, secrets, volumes, and buckets are
