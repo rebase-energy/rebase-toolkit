@@ -49,6 +49,7 @@ from rebase.contract import (
     Contract,
     ContractViolation,
     Freshness,
+    Index,
     ValidationReport,
 )
 from rebase.public import (
@@ -90,6 +91,7 @@ __all__ = [
     "Exclude",
     "ForecastWindow",
     "Freshness",
+    "Index",
     "Layer",
     "StitchError",
     "ValidationReport",

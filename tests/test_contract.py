@@ -567,3 +567,64 @@ def test_column_max_null_run_serialises() -> None:
 def test_column_max_null_run_round_trips() -> None:
     prop = Column("v", "float", max_null_run=3).to_property()
     assert Column.from_property("v", prop).max_null_run == 3
+
+
+# --- Contract(index=...) -----------------------------------------------------------------
+
+
+def _indexed_contract() -> Contract:
+    return Contract(
+        [
+            Column("valid_time", "timestamp", not_null=True),
+            Column("value", "float", between=(0, 40_000), max_null_run=3),
+            Column("backup", "float", max_null_run=12),
+        ],
+        primary_key=("valid_time",),
+        index=Index(column="valid_time", monotonic=True, max_gap="PT1H"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"index": Index("nope", monotonic=True)}, "not a declared column"),
+        ({"index": Index("label", max_gap="PT1H")}, "max_gap requires"),
+        ({"index": Index("label", monotonic=True)}, "monotonic requires"),
+    ],
+)
+def test_contract_index_validation(kwargs, match) -> None:
+    columns = [Column("valid_time", "timestamp"), Column("label", "string")]
+    with pytest.raises(ValueError, match=match):
+        Contract(columns, **kwargs)
+
+
+def test_contract_rejects_index_that_is_not_an_index() -> None:
+    with pytest.raises(TypeError, match="rebase.Index"):
+        Contract([Column("valid_time", "timestamp")], index={"column": "valid_time"})
+
+
+def test_max_null_run_requires_a_declared_index() -> None:
+    with pytest.raises(ValueError, match="max_null_run requires"):
+        Contract([Column("valid_time", "timestamp"), Column("v", "float", max_null_run=3)])
+
+
+def test_contract_index_to_dict_shape() -> None:
+    assert _indexed_contract().to_dict()["x-rebase"]["index"] == {
+        "column": "valid_time",
+        "monotonic": True,
+        "max_gap": "PT1H",
+    }
+    assert _indexed_contract().to_dict()["properties"]["value"]["x-max-null-run"] == 3
+
+
+def test_contract_index_round_trips() -> None:
+    stored = _indexed_contract().to_dict()
+    assert Contract.from_dict(stored).to_dict() == stored
+
+
+def test_contract_without_index_omits_the_key() -> None:
+    assert "index" not in _example_contract().to_dict()["x-rebase"]
+
+
+def test_index_is_exported() -> None:
+    assert rb.Index is Index

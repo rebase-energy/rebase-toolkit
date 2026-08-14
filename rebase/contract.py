@@ -37,6 +37,8 @@ CONTRACT_SCHEMA = "rebase/contract-v1"
 _DTYPES = ("timestamp", "date", "float", "int", "string", "bool")
 _BETWEEN_DTYPES = {"timestamp", "date", "float", "int"}
 _ISIN_DTYPES = {"string", "int"}
+_GAP_DTYPES = {"timestamp", "date"}
+_MONOTONIC_DTYPES = {"timestamp", "date", "float", "int"}
 _DTYPE_TO_PROPERTY: dict[str, dict[str, str]] = {
     "timestamp": {"type": "string", "format": "date-time"},
     "date": {"type": "string", "format": "date"},
@@ -234,6 +236,7 @@ class Contract:
         extra: str = "ignore",
         on_violation: str = "fail",
         watermark_column: str | None = None,
+        index: Index | None = None,
         require_contract: bool = False,
     ) -> None:
         if not isinstance(columns, (list, tuple)) or not columns:
@@ -251,6 +254,28 @@ class Contract:
             raise ValueError(f"Contract primary_key references undeclared column(s) {missing_pk}")
         if watermark_column is not None and watermark_column not in known:
             raise ValueError(f"Contract watermark_column {watermark_column!r} is not a declared column")
+        if index is not None:
+            if not isinstance(index, Index):
+                raise TypeError("Contract index must be a rebase.Index instance")
+            if index.column not in known:
+                raise ValueError(f"Contract index column {index.column!r} is not a declared column")
+            index_dtype = next(column.dtype for column in columns if column.name == index.column)
+            if index.max_gap is not None and index_dtype not in _GAP_DTYPES:
+                raise ValueError(
+                    f"Contract index {index.column!r}: max_gap requires a {' or '.join(sorted(_GAP_DTYPES))} "
+                    f"column; got {index_dtype}"
+                )
+            if index.monotonic and index_dtype not in _MONOTONIC_DTYPES:
+                raise ValueError(
+                    f"Contract index {index.column!r}: monotonic requires one of "
+                    f"{sorted(_MONOTONIC_DTYPES)}; got {index_dtype}"
+                )
+        null_run_columns = [column.name for column in columns if column.max_null_run is not None]
+        if null_run_columns and index is None:
+            raise ValueError(
+                f"Contract column(s) {null_run_columns} declare max_null_run; max_null_run requires an index= "
+                "declaration — without one, row order and therefore 'consecutive' are undefined"
+            )
         if extra not in {"ignore", "forbid"}:
             raise ValueError("Contract extra must be 'ignore' or 'forbid'")
         if on_violation not in {"fail", "warn"}:
@@ -263,6 +288,7 @@ class Contract:
         self.extra = extra
         self.on_violation = on_violation
         self.watermark_column = watermark_column
+        self.index = index
         self.require_contract = bool(require_contract)
 
     def to_dict(self) -> dict[str, Any]:
@@ -276,6 +302,8 @@ class Contract:
             x_rebase["min_rows"] = self.min_rows
         if self.watermark_column is not None:
             x_rebase["watermark_column"] = self.watermark_column
+        if self.index is not None:
+            x_rebase["index"] = self.index.to_dict()
         return {
             "$schema": CONTRACT_SCHEMA,
             "properties": {column.name: column.to_property() for column in self.columns},
@@ -302,6 +330,7 @@ class Contract:
             extra=x_rebase.get("extra", "ignore"),
             on_violation=x_rebase.get("on_violation", "fail"),
             watermark_column=x_rebase.get("watermark_column"),
+            index=Index.from_dict(x_rebase["index"]) if x_rebase.get("index") else None,
             require_contract=bool(x_rebase.get("require_contract", False)),
         )
 
