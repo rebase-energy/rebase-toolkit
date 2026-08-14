@@ -4,6 +4,21 @@
 
 ### Added
 
+- **`rb.Contract` can now constrain row order and spacing, not just column values.** An
+  `index=rb.Index(column=..., monotonic=True, max_gap="PT1H")` declaration asserts that the
+  index is strictly increasing and that no two consecutive rows sit further apart than the
+  given duration, and `rb.Column(..., max_null_run=3)` bounds the run of consecutive nulls in
+  one column. For time-series datasets that covers the most common failure class — a missing
+  publication, a duplicated or out-of-order timestamp, a stretch of nulls where a feed dropped
+  out — which previously had to be checked in a separate pass after the data had already
+  landed. Because these compile into the same engine as the existing checks, they run
+  before the write: a batch arriving with a six-hour hole in it fails validation, so
+  `on_violation="fail"` refuses the write and `OnUpdate(only_valid=True)` never fires
+  downstream work. Gaps are measured between consecutive rows as delivered, since sorting
+  first would quietly repair a frame that failed the monotonicity assertion. `max_gap` accepts
+  both duration grammars (`"PT1H"` and `"1h"`), and `rb.Freshness` now accepts ISO-8601
+  durations too, so the two duration fields on a contract no longer disagree.
+
 - **First-class environments now combine Modal-style Python ergonomics with GitOps.**
   Workspaces seed `dev`, `staging`, and `prod` and can create arbitrary additional names.
   Projects, compute, runs, routes, schedules, models, secrets, volumes, and buckets are
