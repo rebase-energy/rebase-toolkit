@@ -813,3 +813,41 @@ def test_null_run_check_counts_the_longest_run_in_the_detail() -> None:
 def test_null_run_check_skips_when_column_missing() -> None:
     report = validate_frame(_frame(t=[1], other=[1.0]), _null_run_contract(v=3))
     assert not [failure for failure in report.failures if failure.check == "null_run"]
+
+
+def test_freshness_preserves_todays_stored_representation() -> None:
+    # config_diff compares stored contracts, so a changed representation would show up as
+    # phantom drift on datasets nobody touched.
+    assert Freshness("45m").to_dict() == {"max_age": "45m"}
+    assert Freshness("2h").to_dict() == {"max_age": "2h"}
+    assert Freshness("1d").to_dict() == {"max_age": "1d"}
+    assert Freshness("90s").to_dict() == {"max_age": "90s"}
+    assert Freshness("300").to_dict() == {"max_age": "300"}  # unitless: stored verbatim, as today
+    assert Freshness(90).to_dict() == {"max_age": "90s"}
+    assert Freshness(90.7).to_dict() == {"max_age": "90s"}
+    assert Freshness(timedelta(hours=2)).to_dict() == {"max_age": "7200s"}
+
+
+def test_freshness_now_accepts_iso_durations() -> None:
+    assert Freshness("PT1H").to_dict() == {"max_age": "3600s"}
+    assert Freshness("PT15M").to_dict() == {"max_age": "900s"}
+    assert Freshness("P1D").to_dict() == {"max_age": "86400s"}
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        ("P1M", "calendar"),
+        ("-PT1H", "positive"),
+        ("PT0S", "positive"),
+        ("banana", "max_age must be"),
+    ],
+)
+def test_freshness_rejects_bad_durations(value, match) -> None:
+    with pytest.raises(ValueError, match=match):
+        Freshness(value)
+
+
+def test_freshness_still_rejects_bools() -> None:
+    with pytest.raises(TypeError, match="max_age must be"):
+        Freshness(True)

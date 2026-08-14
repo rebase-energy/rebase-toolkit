@@ -338,21 +338,37 @@ class Contract:
 class Freshness:
     """How recently a dataset must have been signalled, and when to check."""
 
-    _MAX_AGE_PATTERN = r"^\d+\s*(s|m|h|d)?$"
+    # Strings already accepted before Freshness delegated to the Duration grammar. These keep
+    # their exact stored representation — including a unitless "300" — because config_diff
+    # compares stored contracts and a changed representation reads as drift on datasets nobody
+    # touched. Unchanged from the pattern this class has always used.
+    _LEGACY_PATTERN = r"^\d+\s*(s|m|h|d)?$"
 
-    def __init__(self, max_age: str | int | float | timedelta, *, check_at: Any = None) -> None:
+    def __init__(self, max_age: str | int | float | timedelta | Any, *, check_at: Any = None) -> None:
         import re
 
-        if isinstance(max_age, timedelta):
-            max_age = f"{int(max_age.total_seconds())}s"
-        elif isinstance(max_age, bool):
+        from rebase.timing import Duration
+
+        if isinstance(max_age, bool):
             raise TypeError("Freshness max_age must be a duration string, seconds, or timedelta")
+        elif isinstance(max_age, timedelta):
+            max_age = f"{int(max_age.total_seconds())}s"
         elif isinstance(max_age, (int, float)):
             max_age = f"{int(max_age)}s"
         elif isinstance(max_age, str):
             max_age = max_age.strip()
-            if not re.match(self._MAX_AGE_PATTERN, max_age):
-                raise ValueError("Freshness max_age must look like '45m', '2h', '1d' or '90s'")
+            if re.match(self._LEGACY_PATTERN, max_age):
+                pass  # already in the stored form; leave it byte-identical
+            else:
+                duration = Duration.coerce(max_age, field_name="Freshness max_age")
+                if duration.months:
+                    raise ValueError(
+                        "Freshness max_age cannot be a calendar duration; a month has no fixed length"
+                    )
+                total = duration.days * 86400 + duration.seconds
+                if total <= 0:
+                    raise ValueError("Freshness max_age must be positive")
+                max_age = f"{int(total)}s"
         else:
             raise TypeError("Freshness max_age must be a duration string, seconds, or timedelta")
 
