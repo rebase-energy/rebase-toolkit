@@ -6,6 +6,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import sys
 import time
 from collections.abc import Callable, Iterable, Sequence
@@ -5968,6 +5969,31 @@ def run_list_command(
     console.print(_runs_table(runs, project_names=project_names))
 
 
+def _resolve_run_ref(client: Client, run_ref: str | None) -> str:
+    """A full run id, from nothing (the latest run) or a unique prefix.
+
+    The runs table squeezes ids to fit the terminal, so what a user can copy
+    is usually a truncated fragment — resolve it the way git resolves short
+    hashes. No argument at all means "the run I just made": the newest one.
+    """
+    if run_ref and len(run_ref) >= 36:
+        return run_ref
+    if run_ref and not re.fullmatch(r"[0-9a-fA-F][0-9a-fA-F-]*", run_ref):
+        # Not a UUID fragment — pass it through and let the server answer.
+        return run_ref
+    runs = client.list_runs()
+    if not run_ref:
+        if not runs:
+            raise RebaseWorkflowError("no runs found in this workspace")
+        return str(runs[0]["id"])
+    matches = [str(run["id"]) for run in runs if str(run["id"]).startswith(run_ref)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise RebaseWorkflowError(f"no recent run id starts with {run_ref!r}; pass more of it or the full id")
+    raise RebaseWorkflowError(f"{len(matches)} recent runs start with {run_ref!r}; add more characters")
+
+
 def _parse_timeline_timestamp(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -6020,11 +6046,15 @@ def _timeline_table(run: dict[str, Any], events: list[dict[str, Any]], steps: li
 
 @run_app.command("get")
 def run_get_command(
-    run_id: Annotated[str, typer.Argument(help="Run ID.")],
+    run_id: Annotated[
+        str | None,
+        typer.Argument(help="Run ID or unique prefix; omit for the latest run."),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show run metadata."""
     client = Client()
+    run_id = _resolve_run_ref(client, run_id)
     run = client.get_run(run_id)
     if json_output:
         _print_json(run)
@@ -6087,7 +6117,10 @@ def run_get_command(
 
 @run_app.command("logs")
 def run_logs_command(
-    run_id: Annotated[str, typer.Argument(help="Run ID.")],
+    run_id: Annotated[
+        str | None,
+        typer.Argument(help="Run ID or unique prefix; omit for the latest run."),
+    ] = None,
     follow: Annotated[
         bool,
         typer.Option("--follow/--no-follow", "-f", help="Follow until the run reaches a terminal state."),
@@ -6101,6 +6134,7 @@ def run_logs_command(
 ) -> None:
     """Show run events, workflow step state, and captured stdout/stderr logs."""
     client = Client()
+    run_id = _resolve_run_ref(client, run_id)
     run_data = client.get_run(run_id)
     events = client.list_run_events(run_id)
     steps = client.list_run_steps(run_id) if run_data.get("target_type") == "workflow" else []
