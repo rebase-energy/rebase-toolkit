@@ -7,10 +7,12 @@ from rebase.sources.base import DataSourceError
 from rebase.sources.energy import (
     SERIES_VALUES_COLUMNS,
     SeriesKey,
+    build_values_rows,
     series_values_select,
 )
 
 _HAS_PANDAS = importlib.util.find_spec("pandas") is not None
+_REPLAY_BOUND = "2026-07-10T09:00:00+00:00"
 
 
 def test_series_key_id_is_deterministic_and_63bit() -> None:
@@ -115,6 +117,46 @@ def test_build_values_rows_rejects_audit_shape() -> None:
     )
     with pytest.raises(DataSourceError, match="read-only"):
         build_values_rows(df, key)
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_build_values_rows_stamps_the_replay_bound(monkeypatch) -> None:
+    import pandas as pd
+
+    monkeypatch.setenv("REBASE_REPLAY_KNOWLEDGE_TIME", _REPLAY_BOUND)
+    frame = pd.DataFrame({"valid_time": pd.to_datetime(["2026-07-10T00:00Z"]), "value": [1.0]})
+    rows = build_values_rows(frame, SeriesKey("p", "actual", "electricity.load"))
+    assert rows["knowledge_time"].iloc[0] == pd.Timestamp(_REPLAY_BOUND)
+    assert rows["change_time"].iloc[0] == pd.Timestamp(_REPLAY_BOUND)
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_build_values_rows_honours_a_passed_knowledge_time() -> None:
+    import pandas as pd
+
+    frame = pd.DataFrame({"valid_time": pd.to_datetime(["2026-07-10T00:00Z"]), "value": [1.0]})
+    moment = datetime(2026, 7, 9, 18, 0, tzinfo=UTC)
+    rows = build_values_rows(frame, SeriesKey("p", "actual", "electricity.load"), knowledge_time=moment)
+    assert rows["knowledge_time"].iloc[0] == pd.Timestamp(moment)
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_frame_knowledge_time_wins_over_the_argument() -> None:
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime(["2026-07-10T00:00Z"]),
+            "knowledge_time": pd.to_datetime(["2026-07-09T12:00Z"]),
+            "value": [1.0],
+        }
+    )
+    rows = build_values_rows(
+        frame,
+        SeriesKey("p", "actual", "electricity.load"),
+        knowledge_time=datetime(2026, 7, 9, 18, 0, tzinfo=UTC),
+    )
+    assert rows["knowledge_time"].iloc[0] == pd.Timestamp("2026-07-09T12:00Z")
 
 
 @pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed")

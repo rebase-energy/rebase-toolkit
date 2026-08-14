@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from rebase.sources.base import DataSourceError, Frame, _replay_knowledge_time
+from rebase.sources.base import DataSourceError, Frame, _replay_knowledge_time, _resolve_now
 
 VALID_TIME_END_SENTINEL = datetime(2200, 1, 1, tzinfo=UTC)
 
@@ -158,25 +158,41 @@ def build_values_rows(
     changed_by: str = "",
     annotation: str = "",
     run_id: int | None = None,
+    knowledge_time: Any | None = None,
 ) -> Frame:
     """Expand a normalized series frame into full ``series_values`` insert rows.
 
-    Stamps ``knowledge_time`` (batch now, if absent — SIMPLE shape), ``change_time``
-    (batch now, always: corrections are new rows) and one ``run_id`` per batch, matching
-    timedb's write defaults.
+    Stamps ``knowledge_time`` (from the frame if present, else ``knowledge_time=``, else the
+    batch clock — SIMPLE shape), ``change_time`` (batch clock, always: corrections are new
+    rows) and one ``run_id`` per batch, matching timedb's write defaults.
+
+    The batch clock is :func:`_resolve_now`, not wall-clock, so a replay stamps the replay's
+    knowledge-time bound. Stamping wall-clock here would record when you *fetched* rather than
+    when the data became knowable, which is the one signal that distinguishes a genuine
+    upstream correction from a re-fetch of unchanged data.
     """
     import pandas as pd
 
     if retention not in RETENTION_TIERS:
         raise DataSourceError(f"retention must be one of {RETENTION_TIERS}")
     df = normalize_series_frame(data)
-    now = pd.Timestamp(datetime.now(UTC)).as_unit("us")
+    now = pd.Timestamp(_resolve_now()).as_unit("us")
+    if knowledge_time is not None:
+        declared = pd.Timestamp(knowledge_time)
+        if declared.tz is None:
+            warnings.warn("knowledge_time is timezone-naive; assuming UTC", stacklevel=2)
+            declared = declared.tz_localize("UTC")
+        else:
+            declared = declared.tz_convert("UTC")
+        declared = declared.as_unit("us")
+    else:
+        declared = now
 
     out = pd.DataFrame(
         {
             "series_id": key.series_id,
             "valid_time": df["valid_time"],
-            "knowledge_time": df["knowledge_time"] if "knowledge_time" in df.columns else now,
+            "knowledge_time": df["knowledge_time"] if "knowledge_time" in df.columns else declared,
             "change_time": now,
             "value": df["value"],
             "valid_time_end": df["valid_time_end"]
