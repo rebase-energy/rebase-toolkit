@@ -152,7 +152,12 @@ class KnowledgeTime:
                     f"KnowledgeTime.from_source({self._column!r}): column not found in frame columns "
                     f"{list(out.columns)}."
                 )
-            values = pd.to_datetime(out[self._column], utc=True)
+            raw = pd.to_datetime(out[self._column])
+            if getattr(raw.dt, "tz", None) is None:
+                warnings.warn(f"{self._column} is timezone-naive; assuming UTC", stacklevel=2)
+                values = raw.dt.tz_localize("UTC")
+            else:
+                values = raw.dt.tz_convert("UTC")
             missing = int(values.isna().sum())
             if missing:
                 raise DataSourceError(

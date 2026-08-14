@@ -1,4 +1,5 @@
 import importlib.util
+import warnings
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -567,6 +568,27 @@ def test_knowledge_time_from_source_rejects_missing_column_and_nulls() -> None:
     df = pd.DataFrame({"issued_at": pd.to_datetime(["2026-01-01T00:05Z", None]), "value": [1.0, 2.0]})
     with pytest.raises(DataSourceError, match="1 rows have no publication time"):
         KnowledgeTime.from_source("issued_at").apply(df)
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_knowledge_time_from_source_warns_on_naive_column() -> None:
+    import pandas as pd
+
+    df = pd.DataFrame({"issued_at": pd.to_datetime(["2026-01-01T00:05", "2026-01-01T01:05"]), "value": [1.0, 2.0]})
+    with pytest.warns(UserWarning, match="timezone-naive"):
+        out = KnowledgeTime.from_source("issued_at").apply(df)
+    assert list(out["knowledge_time"]) == list(pd.to_datetime(["2026-01-01T00:05Z", "2026-01-01T01:05Z"]))
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_knowledge_time_from_source_does_not_warn_on_tz_aware_column() -> None:
+    import pandas as pd
+
+    df = pd.DataFrame({"issued_at": pd.to_datetime(["2026-01-01T00:05Z", "2026-01-01T01:05Z"]), "value": [1.0, 2.0]})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = KnowledgeTime.from_source("issued_at").apply(df)
+    assert list(out["knowledge_time"]) == list(pd.to_datetime(["2026-01-01T00:05Z", "2026-01-01T01:05Z"]))
 
 
 @pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
