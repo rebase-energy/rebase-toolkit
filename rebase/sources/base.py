@@ -152,7 +152,14 @@ class KnowledgeTime:
                     f"KnowledgeTime.from_source({self._column!r}): column not found in frame columns "
                     f"{list(out.columns)}."
                 )
-            raw = pd.to_datetime(out[self._column])
+            try:
+                raw = pd.to_datetime(out[self._column])
+            except Exception as exc:  # noqa: BLE001 - normalise every parse failure to DataSourceError
+                raise DataSourceError(
+                    f"KnowledgeTime.from_source({self._column!r}): could not parse column as datetimes ({exc}). "
+                    "This usually means the column mixes timezone-aware and timezone-naive values — "
+                    "normalise it to a single timezone awareness upstream before writing."
+                ) from exc
             if getattr(raw.dt, "tz", None) is None:
                 warnings.warn(f"{self._column} is timezone-naive; assuming UTC", stacklevel=2)
                 values = raw.dt.tz_localize("UTC")

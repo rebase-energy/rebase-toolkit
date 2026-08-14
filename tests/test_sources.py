@@ -571,6 +571,20 @@ def test_knowledge_time_from_source_rejects_missing_column_and_nulls() -> None:
 
 
 @pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_knowledge_time_from_source_rejects_mixed_tz_awareness() -> None:
+    import pandas as pd
+
+    df = pd.DataFrame(
+        {
+            "issued_at": [datetime(2026, 1, 1, 0, 5), datetime(2026, 1, 1, 1, 5, tzinfo=UTC)],
+            "value": [1.0, 2.0],
+        }
+    )
+    with pytest.raises(DataSourceError, match="could not parse column as datetimes"):
+        KnowledgeTime.from_source("issued_at").apply(df)
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
 def test_knowledge_time_from_source_warns_on_naive_column() -> None:
     import pandas as pd
 
