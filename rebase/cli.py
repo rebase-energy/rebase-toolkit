@@ -4967,6 +4967,7 @@ def workflow_schedule_trigger_command(
             started_at=time.monotonic(),
             timeout=timeout,
             poll_interval=1.0,
+            log_follower=_RunLogFollower(run),
         )
     console.print_json(data=result)
 
@@ -5425,6 +5426,7 @@ def model_run_command(
             started_at=time.monotonic(),
             timeout=timeout,
             poll_interval=poll_interval,
+            log_follower=_RunLogFollower(run),
         )
     if json_output:
         _print_json(result)
@@ -5924,6 +5926,7 @@ def run_command(
                 started_at=started_at,
                 timeout=timeout,
                 poll_interval=poll_interval,
+                log_follower=_RunLogFollower(run),
             )
 
     if run is None:
