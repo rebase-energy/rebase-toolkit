@@ -677,6 +677,33 @@ def test_monotonic_check_skips_when_index_column_missing() -> None:
     assert [failure.check for failure in report.failures if failure.column == "t"] == ["missing_column"]
 
 
+@pandas_only
+def test_monotonic_check_flags_a_backwards_date_index() -> None:
+    from datetime import date
+
+    contract = Contract(
+        [Column("t", "date", not_null=True), Column("v", "float")],
+        index=Index("t", monotonic=True),
+    ).to_dict()
+    frame = _frame(t=[date(2026, 1, 1), date(2026, 1, 5), date(2026, 1, 1)], v=[1.0, 2.0, 3.0])
+    failure = _failure(validate_frame(frame, contract), "index_monotonic")
+    assert failure.column == "t"
+    assert failure.count == 1
+    assert failure.sample_rows == [2]
+
+
+@pandas_only
+def test_monotonic_check_works_for_a_numeric_index() -> None:
+    contract = Contract(
+        [Column("t", "int", not_null=True), Column("v", "float")],
+        index=Index("t", monotonic=True),
+    ).to_dict()
+    assert validate_frame(_frame(t=[1, 2, 3], v=[1.0, 2.0, 3.0]), contract).passed
+    failure = _failure(validate_frame(_frame(t=[1, 3, 2], v=[1.0, 2.0, 3.0]), contract), "index_monotonic")
+    assert failure.count == 1
+    assert failure.sample_rows == [2]
+
+
 # --- index_max_gap check -----------------------------------------------------------------
 
 

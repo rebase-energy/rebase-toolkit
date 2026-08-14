@@ -496,12 +496,19 @@ def _coerce_bound(series: Any, value: Any) -> Any:
     return value
 
 
-def _zero_like(series: Any) -> Any:
-    """The zero appropriate to ``series.diff()`` — Timedelta for temporal, 0 for numeric."""
-    import pandas as pd
+def _zero_like(diffs: Any) -> Any:
+    """The zero appropriate to a ``series.diff()`` result — Timedelta for durations, 0 for numeric.
+
+    Branches on the diff's own dtype rather than the source series' dtype: an object-dtype column
+    of ``datetime.date`` values (a supported monotonic dtype) still yields a ``timedelta64`` diff,
+    so checking the diff itself covers that case along with plain ``datetime64`` without having to
+    special-case "object dtype that happens to hold dates".
+    """
     from pandas.api import types as pdt
 
-    if pdt.is_datetime64_any_dtype(series):
+    if pdt.is_timedelta64_dtype(diffs):
+        import pandas as pd
+
         return pd.Timedelta(0)
     return 0
 
@@ -679,10 +686,10 @@ def _make_monotonic_check(name: str) -> Callable[[Any], CheckFailure | None]:
         if name not in df.columns:
             return None  # the missing_column check reports the root cause
         try:
-            series = df[name]
+            diffs = df[name].diff()
             # The first row has no predecessor and can never be a violation; positions where the
             # diff is non-positive are the offending row, not its predecessor.
-            mask = series.diff() <= _zero_like(series)
+            mask = diffs <= _zero_like(diffs)
             mask.iloc[0] = False
             count = int(mask.sum())
             if not count:
