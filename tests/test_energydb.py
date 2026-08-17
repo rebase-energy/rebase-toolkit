@@ -108,3 +108,150 @@ def test_parquet_round_trip_preserves_dtypes() -> None:
     assert str(back["value"].dtype) == "float64"
     assert str(back["run_id"].dtype) == "int64"
     assert back["value"].iloc[0] == 1.5
+
+
+def _write_raw(store, bucket, key, rows, *, month=None):
+    """Put one parquet object directly, bypassing write_series."""
+    import pandas as pd
+
+    from rebase.sources.energy import SERIES_VALUES_COLUMNS
+    from rebase.sources.energydb import _encode_parquet, _object_key
+
+    records = [
+        {
+            "series_id": key.series_id,
+            "valid_time": pd.Timestamp(valid_time),
+            "knowledge_time": pd.Timestamp(knowledge_time),
+            "change_time": pd.Timestamp(change_time),
+            "value": value,
+            "valid_time_end": pd.Timestamp("2200-01-01T00:00Z"),
+            "run_id": 1,
+            "changed_by": "",
+            "annotation": "",
+            "retention": "forever",
+        }
+        for valid_time, knowledge_time, change_time, value in rows
+    ]
+    frame = pd.DataFrame.from_records(records, columns=list(SERIES_VALUES_COLUMNS))
+    partition = month or pd.Timestamp(rows[0][0]).strftime("%Y-%m")
+    object_key = _object_key(store.prefix, key.series_id, partition, frame["change_time"].iloc[0], 1)
+    bucket.put(object_key, _encode_parquet(frame))
+    return object_key
+
+
+@pandas_only
+def test_read_series_projection_and_winner() -> None:
+    store, bucket = _store()
+    _write_raw(
+        store,
+        bucket,
+        KEY,
+        [
+            ("2026-01-01T00:00Z", "2026-01-01T06:00Z", "2026-01-01T06:00Z", 1.0),
+            ("2026-01-01T00:00Z", "2026-01-01T09:00Z", "2026-01-01T09:00Z", 2.0),
+        ],
+    )
+    out = store.read_series(KEY)
+    assert list(out.columns) == ["path", "data_type", "name", "valid_time", "value"]
+    assert list(out["value"]) == [2.0]
+    assert out["path"].iloc[0] == KEY.path
+    assert "series_id" not in out.columns
+
+
+@pandas_only
+def test_read_series_overlapping_projection() -> None:
+    store, bucket = _store()
+    _write_raw(
+        store,
+        bucket,
+        KEY,
+        [
+            ("2026-01-01T00:00Z", "2026-01-01T06:00Z", "2026-01-01T06:00Z", 1.0),
+            ("2026-01-01T00:00Z", "2026-01-01T09:00Z", "2026-01-01T09:00Z", 2.0),
+        ],
+    )
+    out = store.read_series(KEY, overlapping=True)
+    assert list(out.columns) == ["path", "data_type", "name", "valid_time", "knowledge_time", "value"]
+    assert sorted(out["value"]) == [1.0, 2.0]
+
+
+@pandas_only
+def test_read_series_include_updates_projection() -> None:
+    store, bucket = _store()
+    _write_raw(store, bucket, KEY, [("2026-01-01T00:00Z", "2026-01-01T06:00Z", "2026-01-01T06:00Z", 1.0)])
+    out = store.read_series(KEY, include_updates=True)
+    assert list(out.columns) == [
+        "path",
+        "data_type",
+        "name",
+        "valid_time",
+        "knowledge_time",
+        "change_time",
+        "value",
+        "changed_by",
+        "annotation",
+    ]
+
+
+@pandas_only
+def test_read_series_prunes_by_month() -> None:
+    store, bucket = _store()
+    _write_raw(store, bucket, KEY, [("2026-07-15T00:00Z", "2026-07-15T00:00Z", "2026-07-15T00:00Z", 1.0)])
+    _write_raw(store, bucket, KEY, [("2026-08-15T00:00Z", "2026-08-15T00:00Z", "2026-08-15T00:00Z", 2.0)])
+    bucket.fetched.clear()
+    out = store.read_series(
+        KEY, start_valid=datetime(2026, 8, 1, tzinfo=UTC), end_valid=datetime(2026, 8, 31, tzinfo=UTC)
+    )
+    assert list(out["value"]) == [2.0]
+    assert all("valid_month=2026-08" in key for key in bucket.fetched), bucket.fetched
+
+
+@pandas_only
+def test_read_series_without_bounds_reads_every_month() -> None:
+    store, bucket = _store()
+    _write_raw(store, bucket, KEY, [("2026-07-15T00:00Z", "2026-07-15T00:00Z", "2026-07-15T00:00Z", 1.0)])
+    _write_raw(store, bucket, KEY, [("2026-08-15T00:00Z", "2026-08-15T00:00Z", "2026-08-15T00:00Z", 2.0)])
+    out = store.read_series(KEY)
+    assert sorted(out["value"]) == [1.0, 2.0]
+
+
+@pandas_only
+def test_read_series_applies_valid_time_bounds_half_open() -> None:
+    store, bucket = _store()
+    _write_raw(
+        store,
+        bucket,
+        KEY,
+        [
+            ("2026-08-01T00:00Z", "2026-08-01T00:00Z", "2026-08-01T00:00Z", 1.0),
+            ("2026-08-02T00:00Z", "2026-08-02T00:00Z", "2026-08-02T00:00Z", 2.0),
+        ],
+    )
+    out = store.read_series(
+        KEY, start_valid=datetime(2026, 8, 1, tzinfo=UTC), end_valid=datetime(2026, 8, 2, tzinfo=UTC)
+    )
+    assert list(out["value"]) == [1.0]
+
+
+@pandas_only
+def test_read_series_empty_returns_the_projection_columns() -> None:
+    store, _bucket = _store()
+    out = store.read_series(KEY)
+    assert list(out.columns) == ["path", "data_type", "name", "valid_time", "value"]
+    assert len(out) == 0
+
+
+@pandas_only
+def test_read_series_defaults_as_of_to_the_replay_bound(monkeypatch) -> None:
+    store, bucket = _store()
+    _write_raw(
+        store,
+        bucket,
+        KEY,
+        [
+            ("2026-01-01T00:00Z", "2026-01-01T06:00Z", "2026-01-01T06:00Z", 1.0),
+            ("2026-01-01T00:00Z", "2026-01-01T09:00Z", "2026-01-01T09:00Z", 2.0),
+        ],
+    )
+    monkeypatch.setenv("REBASE_REPLAY_KNOWLEDGE_TIME", "2026-01-01T07:00:00+00:00")
+    assert list(store.read_series(KEY)["value"]) == [1.0]

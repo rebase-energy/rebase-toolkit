@@ -42,6 +42,9 @@ from rebase.sources.energy import (
     SERIES_CATALOG_COLUMNS,
     TIMESERIES_TYPES,
     SeriesKey,
+    attach_series_keys,
+    select_series_winners,
+    series_keys,
 )
 
 _logger = logging.getLogger("rebase.sources")
@@ -178,3 +181,58 @@ class EnergyDBStore:
     def _is_overlapping(self, series_id: int) -> bool:
         record = self._read_catalog(series_id)
         return bool(record and record.get("timeseries_type") == "OVERLAPPING")
+
+    def _raw_rows(self, series_ids: list[int], months: list[str] | None) -> Frame:
+        """Concatenate every stored object for these series, pruned to ``months`` when known."""
+        import pandas as pd
+
+        from rebase.sources.energy import SERIES_VALUES_COLUMNS
+
+        frames: list[Frame] = []
+        for series_id in series_ids:
+            prefixes = (
+                [_month_prefix(self.prefix, series_id, month) for month in months]
+                if months is not None
+                else [_series_prefix(self.prefix, series_id)]
+            )
+            for prefix in prefixes:
+                for entry in self.bucket.iter_all(prefix=prefix):
+                    frames.append(_decode_parquet(self.bucket.get(entry.key)))
+        if not frames:
+            return pd.DataFrame(columns=list(SERIES_VALUES_COLUMNS))
+        return pd.concat(frames, ignore_index=True)
+
+    def read_series(
+        self,
+        keys: Any,
+        *,
+        start_valid: datetime | None = None,
+        end_valid: datetime | None = None,
+        as_of: datetime | None = None,
+        overlapping: bool = False,
+        include_updates: bool = False,
+    ) -> Frame:
+        """Point-in-time read with EnergyDB semantics, in the shape a real query returns.
+
+        - default: the latest view — one row per ``valid_time`` (latest issue, latest
+          correction within it),
+        - ``as_of``: only what was knowable then (bounds ``knowledge_time``); defaults to the
+          replay bound during a replay,
+        - ``overlapping=True``: every forecast issue (adds ``knowledge_time``),
+        - ``include_updates=True``: the full AUDIT trail.
+
+        ``keys`` is one ``(path, data_type, name)`` tuple / :class:`SeriesKey` or a list of
+        them. Results carry ``path``/``data_type``/``name`` — never raw ids.
+        """
+        import pandas as pd
+
+        resolved = series_keys(keys)
+        by_id = {key.series_id: key for key in resolved}
+        months = _months_in_range(start_valid, end_valid)
+        raw = self._raw_rows(list(by_id), months)
+        if start_valid is not None and len(raw):
+            raw = raw[raw["valid_time"] >= pd.Timestamp(start_valid)]
+        if end_valid is not None and len(raw):
+            raw = raw[raw["valid_time"] < pd.Timestamp(end_valid)]
+        winners = select_series_winners(raw, overlapping=overlapping, include_updates=include_updates, as_of=as_of)
+        return attach_series_keys(winners, by_id)
