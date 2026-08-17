@@ -112,12 +112,17 @@ class EnergyDBStore:
         retention: str = "forever",
         changed_by: str = "",
         annotation: str = "",
-        run_id: int | None = None,
+        run_id: int | str | None = None,
         knowledge_time: KnowledgeTime | None = None,
         skip_unchanged: bool = False,
         unchanged_scope: str = "auto",
         change: Change | None = None,
         on_null: OnNull = OnNull.KEEP_STORED,
+        dataset: Dataset | str | None = None,
+        contract: Contract | dict | None = None,
+        on_violation: str | None = None,
+        validate: bool = True,
+        watermark: Any = _UNSET,
     ) -> SeriesWriteResult
 
     def read_series(
@@ -129,6 +134,7 @@ class EnergyDBStore:
         as_of: datetime | None = None,
         overlapping: bool = False,
         include_updates: bool = False,
+        with_provenance: bool = False,
     ) -> Frame
 ```
 
@@ -162,7 +168,7 @@ Two helpers currently trapped in `bigquery.py` move to `energy.py` because both 
 
 ```
 {prefix}/catalog/{series_id}.json
-{prefix}/series/{series_id}/valid_month=2026-08/{change_time}-{run_id}-{digest}.parquet
+{prefix}/series/{series_id}/valid_month=2026-08/{change_time}-{run_id}-{vt_min}-{vt_max}-{digest}.parquet
 ```
 
 - `series_id` is the deterministic 63-bit `sha256(path\x1fdata_type\x1fname)` id. Because it is
@@ -184,6 +190,21 @@ Two helpers currently trapped in `bigquery.py` move to `energy.py` because both 
   always maps to a different key, so nothing is lost. Probing with `exists()` and bumping a counter
   was rejected because `exists()` is deliberately not part of the duck-typed bucket contract the
   store requires (`put`/`get`/`iter_all` only).
+- **The key also advertises the object's `valid_time` span**, `{vt_min}-{vt_max}` in whole seconds,
+  so a read can tell from the *listing* whether an object could hold a wanted row. Without it the
+  only pruning available is by month, and since every write appends an object and nothing is ever
+  rewritten, the cost of a read — including the read-before-write behind `skip_unchanged` — grows
+  with every write ever made into that month. Measured on one series with one object per write:
+  240 writes cost 28,920 object fetches and 79 s, growing as `n²/2`, because each write re-read
+  every object already in the month. With span pruning the same 240 writes of a *moving* window
+  cost 717 fetches and 9.9 s, growing linearly. The bounds are rounded **outward** (floor the min,
+  ceil the max) so the advertised span is never narrower than the rows inside, and an object whose
+  key carries no span is always read — pruning may drop an object it can prove irrelevant, and must
+  never guess. The span is derived from the content, so it cannot weaken the idempotency the digest
+  provides: identical bytes yield an identical span and therefore an identical key.
+  A batch that re-delivers the *same* window every time (a nightly blanket refetch) is unaffected,
+  because every object genuinely overlaps; that case wants server-side suppression, i.e. the real
+  connector below.
 - Each parquet object holds exactly `SERIES_VALUES_COLUMNS`, in that order, as
   `build_values_rows` already returns.
 - The catalog object holds one `SERIES_CATALOG_COLUMNS` record as JSON. JSON rather than parquet
@@ -523,6 +544,48 @@ Recorded so they are choices rather than accidents.
 3. **`timeseries_type` is validated.** `TIMESERIES_TYPES` exists but is dead code, and
    `bigquery.register_series` accepts an unvalidated string. This store validates it, because
    suppression behaviour depends on it.
+
+## Round two: gaps found by building a collection/ingestion layer on this
+
+Found by taking the store through the first real consumer — the `rebase-grid` backend rebuild,
+where `collect` normalises an upstream fetch and `ingest` is the only writer. Each gap was a thing
+that design needed and this one could not express; all six are in the same branch.
+
+1. **`annotation` and `changed_by` are per row, not per call.** Equality already compares both
+   (rule 6, the provenance upgrade), but the write path broadcast a single keyword over the whole
+   batch and *silently ignored* a column of that name — so a per-point quality flag, the reason
+   the column exists, could only be written by splitting the batch into one call per distinct flag
+   value. The frame now wins and the keyword is the per-row default, exactly as `knowledge_time`
+   already behaved. Silently dropping caller data was the worse half of this: it looked like it
+   worked.
+2. **`read_series(with_provenance=True)`.** Once flags are writable per point they must be
+   readable per point. The default projection drops `annotation`/`changed_by`, and
+   `include_updates=True` returns *every* revision of every row — so "which stored points are
+   flagged" meant pulling the whole audit trail and re-deriving the winners by hand.
+   `select_current_state` already computed exactly the right frame for the write path; this exposes
+   it.
+3. **`run_id` accepts the platform's own run id.** The column is a 63-bit int, but
+   `RunContext.run_id` is a string, so `run_id=ctx.run_id` — the obvious way to make a stored row
+   traceable to the run that wrote it — raised `ValueError: invalid literal for int()` from inside
+   key construction, four frames below anything mentioning `run_id`. `coerce_run_id` hashes a
+   string the same way `SeriesKey.series_id` is hashed; anything else is a `DataSourceError`.
+4. **`dataset=` / `contract=` run the same `validate → write → signal` pipeline as
+   `DataSource.write`.** The store had the `knowledge_time` half of that pipeline and none of the
+   rest, so a bucket-backed write was the one write path in the toolkit with no contract
+   enforcement and no dataset signal — which also means `OnUpdate(only_valid=True)` never fires,
+   so a downstream quality pass or derived series simply never runs. Validation happens on the
+   expanded rows, after the `knowledge_time` stamp so a contract may require that column, and
+   **before** suppression: a contract describes what the upstream delivered, while suppression
+   removes rows precisely because they are already stored, so validating afterwards would measure
+   row order and gaps in a frame dedup had punched holes in.
+5. **`rb.LocalBucket`.** `Bucket` reads and writes through capability URLs issued by Rebase, so
+   bucket-backed code could not run at all without a workspace, credentials and a network — and
+   this store's whole purpose is to let a project produce EnergyDB-shaped data *before* it has any
+   of that. Same key/object surface over a directory; swapping in a real `Bucket` later is one
+   constructor call. Deliberately not a `Bucket`: nothing is shared or reachable from deployed
+   code, and `uri` is `file://`.
+6. **Objects advertise their `valid_time` span in the key** — see [Storage
+   layout](#storage-layout) for the measurement and the rounding rule.
 
 ## Out of scope
 

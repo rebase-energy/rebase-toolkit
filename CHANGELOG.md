@@ -29,10 +29,43 @@
   timestamps, so "we saw a revision and declined it" is a number rather than an emergent
   property.
 
+  `annotation` and `changed_by` are **per row** when the frame carries a column of that name,
+  with the keyword supplying the default for rows where it is null — so a per-point quality flag
+  travels beside the value it judges instead of forcing one write call per distinct flag. Read
+  them back with `read_series(..., with_provenance=True)`, which returns the same winners as the
+  default view plus both columns; without it, asking "which stored points are flagged" means
+  pulling every revision of every row. `run_id` accepts the platform's own string run id
+  (`run_id=ctx.run_id`) and hashes it to the 63-bit column, so a stored row is traceable to the
+  run that wrote it.
+
+  Passing `dataset=` and/or `contract=` runs the same `validate → write → signal` pipeline
+  `DataSource.write` runs, so a bucket-backed write is governed like a warehouse one: the contract
+  fails the write under `on_violation="fail"`, lands it flagged under `"warn"`, and the dataset is
+  signalled with the validation report so `OnUpdate(only_valid=True)` does not fire downstream work
+  on a batch that failed. Validation runs on the expanded rows, after the `knowledge_time` stamp so
+  a contract may require that column, and **before** suppression — a contract describes what the
+  upstream delivered, while suppression removes rows precisely because they are already stored, so
+  validating afterwards would measure row order and gaps in a frame dedup had punched holes in.
+
+  Every object's key now also carries its `valid_time` span, so a read prunes by the *listing*
+  rather than by decoding. Nothing is ever rewritten, so without this the cost of a read — the
+  read-before-write behind `skip_unchanged` included — grew with every write ever made into that
+  month: 240 writes of a moving window cost 28,920 object fetches, now 717. Spans are rounded
+  outward and an object whose key carries no span is always read, so pruning can drop an object it
+  can prove irrelevant and never guesses.
+
   **This bucket backing is transitional.** It is intended to be replaced by proper EnergyDB
   database support shaped like the other connectors, and the option names mirror
   `energydb`/`timedb` precisely so call sites survive that change. Requires
   `rebase-toolkit[energydb]`.
+
+- **`rb.LocalBucket` is a directory on disk with `rb.Bucket`'s key/object surface.** `Bucket`
+  reads and writes through short-lived capability URLs issued by Rebase, so bucket-backed code —
+  `rb.sources.energydb` in particular — could not run at all without a workspace, credentials and
+  a network. `rb.sources.energydb(bucket=rb.LocalBucket("./data"))` runs the whole store offline,
+  and swapping in a real `Bucket` later changes one constructor call because every method means
+  the same thing. It is deliberately not a `Bucket`: nothing about it is shared, versioned or
+  reachable from deployed code, and `uri` is a `file://` URL rather than `gs://`.
 
 - **`rb.Contract` can now constrain row order and spacing, not just column values.** An
   `index=rb.Index(column=..., monotonic=True, max_gap="PT1H")` declaration asserts that the

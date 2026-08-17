@@ -197,6 +197,41 @@ def test_read_series_include_updates_projection() -> None:
 
 
 @pandas_only
+def test_read_series_with_provenance_keeps_annotation_and_changed_by() -> None:
+    import pandas as pd
+
+    store, _bucket = _store()
+    frame = pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime(["2026-01-01T00:00Z", "2026-01-01T01:00Z"]),
+            "value": [1.0, 999.0],
+            "annotation": ["", "gross_range"],
+        }
+    )
+    store.write_series(frame, KEY, changed_by="quality")
+    out = store.read_series(KEY, with_provenance=True)
+    assert list(out.columns) == ["path", "data_type", "name", "valid_time", "value", "annotation", "changed_by"]
+    assert list(out["annotation"]) == ["", "gross_range"]
+    assert list(out["changed_by"]) == ["quality", "quality"]
+
+
+@pandas_only
+def test_read_series_with_provenance_returns_only_the_winner() -> None:
+    store, bucket = _store()
+    _write_raw(
+        store,
+        bucket,
+        KEY,
+        [
+            ("2026-01-01T00:00Z", "2026-01-01T06:00Z", "2026-01-01T06:00Z", 1.0),
+            ("2026-01-01T00:00Z", "2026-01-01T09:00Z", "2026-01-01T09:00Z", 2.0),
+        ],
+    )
+    out = store.read_series(KEY, with_provenance=True)
+    assert list(out["value"]) == [2.0]
+
+
+@pandas_only
 def test_read_series_prunes_by_month() -> None:
     store, bucket = _store()
     _write_raw(store, bucket, KEY, [("2026-07-15T00:00Z", "2026-07-15T00:00Z", "2026-07-15T00:00Z", 1.0)])
@@ -639,9 +674,12 @@ def test_object_key_matches_the_documented_grammar() -> None:
     prefix = f"{store.prefix}/series/{KEY.series_id}/valid_month=2026-01/"
     assert object_key.startswith(prefix), object_key
     suffix = object_key[len(prefix) :]
-    match = re.fullmatch(r"\d{8}T\d{12}Z-42-([0-9a-f]{12})\.parquet", suffix)
+    # {change_time}Z-{run_id}-{valid_time_min}-{valid_time_max}-{digest}.parquet
+    match = re.fullmatch(r"\d{8}T\d{12}Z-42-(\d{8}T\d{6})-(\d{8}T\d{6})-([0-9a-f]{12})\.parquet", suffix)
     assert match, suffix
-    digest = match.group(1)
+    assert match.group(1) == "20260101T000000"
+    assert match.group(2) == "20260101T000000"
+    digest = match.group(3)
     assert digest == hashlib.sha256(bucket.objects[object_key]).hexdigest()[:12]
 
 
@@ -670,3 +708,207 @@ def test_factory_rejects_a_bucket_without_the_needed_methods() -> None:
 
     with pytest.raises(Exception, match="must provide a callable"):
         rb.sources.energydb(bucket=object())
+
+
+# --- Contract validation and the dataset signal ----------------------------------------------
+
+
+class _FakeDataset:
+    """Stand-in for rb.Dataset: carries a contract and records what it was signalled with."""
+
+    def __init__(self, name="se_se1_consumption", contract=None, fail=False) -> None:
+        self.name = name
+        self.contract = contract
+        self.signals: list[dict] = []
+        self._fail = fail
+
+    def mark_updated(self, **kwargs):
+        self.signals.append(kwargs)
+        if self._fail:
+            raise RuntimeError("signal endpoint down")
+        return {"fired": ["tier1_checks"]}
+
+
+def _consumption_contract(**overrides):
+    import rebase as rb
+
+    kwargs = {
+        "columns": [
+            rb.Column("valid_time", "timestamp", not_null=True),
+            rb.Column("value", "float", between=(0, 40_000)),
+        ],
+        "index": rb.Index(column="valid_time", monotonic=True, max_gap="PT1H"),
+    }
+    kwargs.update(overrides)
+    return rb.Contract(**kwargs).to_dict()
+
+
+@pandas_only
+def test_write_series_refuses_the_write_when_a_contract_fails() -> None:
+    from rebase.contract import ContractViolation
+
+    store, bucket = _store()
+    with pytest.raises(ContractViolation):
+        store.write_series(
+            _frame([("2026-01-01T00:00Z", 1.0), ("2026-01-01T01:00Z", 99_999.0)]),
+            KEY,
+            contract=_consumption_contract(on_violation="fail"),
+        )
+    assert not [key for key in bucket.objects if key.endswith(".parquet")]
+
+
+@pandas_only
+def test_write_series_lands_a_flagged_batch_on_warn() -> None:
+    store, _bucket = _store()
+    result = store.write_series(
+        _frame([("2026-01-01T00:00Z", 1.0), ("2026-01-01T01:00Z", 99_999.0)]),
+        KEY,
+        contract=_consumption_contract(on_violation="warn"),
+    )
+    assert result.rows_written == 2
+    assert result.validation is not None
+    assert result.validation.passed is False
+
+
+@pandas_only
+def test_write_series_signals_the_dataset_with_the_validation_report() -> None:
+    store, _bucket = _store()
+    dataset = _FakeDataset(contract=_consumption_contract())
+    result = store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, dataset=dataset)
+    assert len(dataset.signals) == 1
+    assert dataset.signals[0]["validation"]["passed"] is True
+    assert result.signal.sent is True
+    assert result.signal.fired == ["tier1_checks"]
+
+
+@pandas_only
+def test_write_series_resolves_the_contract_from_the_dataset() -> None:
+    from rebase.contract import ContractViolation
+
+    store, _bucket = _store()
+    dataset = _FakeDataset(contract=_consumption_contract(on_violation="fail"))
+    with pytest.raises(ContractViolation):
+        store.write_series(_frame([("2026-01-01T00:00Z", 99_999.0)]), KEY, dataset=dataset)
+
+
+@pandas_only
+def test_write_series_signal_failure_never_fails_the_write() -> None:
+    store, _bucket = _store()
+    dataset = _FakeDataset(contract=_consumption_contract(), fail=True)
+    with pytest.warns(UserWarning, match="dataset signal"):
+        result = store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, dataset=dataset)
+    assert result.rows_written == 1
+    assert result.signal.sent is False
+
+
+@pandas_only
+def test_write_series_validate_false_flags_the_report_as_skipped() -> None:
+    store, _bucket = _store()
+    dataset = _FakeDataset(contract=_consumption_contract(on_violation="fail"))
+    result = store.write_series(_frame([("2026-01-01T00:00Z", 99_999.0)]), KEY, dataset=dataset, validate=False)
+    assert result.rows_written == 1
+    assert result.validation.skipped is True
+
+
+@pandas_only
+def test_write_series_validates_what_was_delivered_not_what_survived_suppression() -> None:
+    """Suppression punches holes in the batch; a gap check run after it would see them.
+
+    The first write stores 00:00 and 02:00. The refetch redelivers all three hours, so the
+    frame as delivered has no gap — but 00:00 and 02:00 are unchanged and get suppressed, so
+    the rows actually written are 01:00 alone. Validating after suppression would compare a
+    one-row frame (or, with more rows, a holed one) against max_gap and mis-report the feed.
+    """
+    store, _bucket = _store()
+    store.write_series(_frame([("2026-01-01T00:00Z", 1.0), ("2026-01-01T02:00Z", 3.0)]), KEY)
+    result = store.write_series(
+        _frame([("2026-01-01T00:00Z", 1.0), ("2026-01-01T01:00Z", 2.0), ("2026-01-01T02:00Z", 3.0)]),
+        KEY,
+        contract=_consumption_contract(on_violation="fail"),
+        skip_unchanged=True,
+    )
+    assert result.rows_written == 1
+    assert result.suppressed_unchanged == 2
+    assert result.validation.passed is True
+
+
+@pandas_only
+def test_write_series_contract_may_require_the_stamped_knowledge_time() -> None:
+    import pandas as pd
+
+    import rebase as rb
+    from rebase.sources.base import KnowledgeTime
+
+    store, _bucket = _store()
+    contract = rb.Contract(
+        columns=[
+            rb.Column("valid_time", "timestamp", not_null=True),
+            rb.Column("knowledge_time", "timestamp", not_null=True),
+            rb.Column("value", "float"),
+        ],
+    ).to_dict()
+    frame = pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime(["2026-01-01T00:00Z"]),
+            "issued_at": pd.to_datetime(["2026-01-01T06:00Z"]),
+            "value": [1.0],
+        }
+    )
+    result = store.write_series(frame, KEY, contract=contract, knowledge_time=KnowledgeTime.from_source("issued_at"))
+    assert result.validation.passed is True
+
+
+@pandas_only
+def test_write_series_derives_the_watermark_from_the_contract() -> None:
+    store, _bucket = _store()
+    dataset = _FakeDataset(contract=_consumption_contract(watermark_column="valid_time"))
+    store.write_series(_frame([("2026-01-01T00:00Z", 1.0), ("2026-01-01T01:00Z", 2.0)]), KEY, dataset=dataset)
+    assert dataset.signals[0]["watermark"].startswith("2026-01-01T01:00")
+
+
+# --- Bounding the read: an object advertises its valid_time span in its key -------------------
+
+
+@pandas_only
+def test_write_series_reads_only_the_objects_overlapping_the_batch() -> None:
+    store, bucket = _store()
+    early = store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY)
+    late = store.write_series(_frame([("2026-01-20T00:00Z", 2.0)]), KEY)
+    bucket.fetched.clear()
+    store.write_series(_frame([("2026-01-20T00:00Z", 2.0)]), KEY, skip_unchanged=True)
+    assert late.objects_written[0] in bucket.fetched
+    assert early.objects_written[0] not in bucket.fetched
+
+
+@pandas_only
+def test_write_series_still_suppresses_against_an_overlapping_object() -> None:
+    store, _bucket = _store()
+    store.write_series(_frame([("2026-01-20T00:00Z", 2.0)]), KEY)
+    result = store.write_series(_frame([("2026-01-20T00:00Z", 2.0)]), KEY, skip_unchanged=True)
+    assert result.rows_written == 0
+    assert result.suppressed_unchanged == 1
+
+
+@pandas_only
+def test_read_series_prunes_within_a_month_by_valid_time() -> None:
+    store, bucket = _store()
+    early = store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY)
+    late = store.write_series(_frame([("2026-01-20T00:00Z", 2.0)]), KEY)
+    bucket.fetched.clear()
+    out = store.read_series(
+        KEY, start_valid=datetime(2026, 1, 15, tzinfo=UTC), end_valid=datetime(2026, 1, 25, tzinfo=UTC)
+    )
+    assert list(out["value"]) == [2.0]
+    assert late.objects_written[0] in bucket.fetched
+    assert early.objects_written[0] not in bucket.fetched
+
+
+@pandas_only
+def test_a_key_without_a_span_is_read_rather_than_skipped() -> None:
+    """Pruning must never guess. An object whose key predates the span grammar is still read."""
+    store, bucket = _store()
+    _write_raw(store, bucket, KEY, [("2026-08-15T00:00Z", "2026-08-15T00:00Z", "2026-08-15T00:00Z", 7.0)])
+    out = store.read_series(
+        KEY, start_valid=datetime(2026, 8, 14, tzinfo=UTC), end_valid=datetime(2026, 8, 16, tzinfo=UTC)
+    )
+    assert list(out["value"]) == [7.0]

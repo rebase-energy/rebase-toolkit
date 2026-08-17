@@ -168,6 +168,100 @@ def test_frame_knowledge_time_wins_over_the_argument() -> None:
     assert rows["knowledge_time"].iloc[0] == pd.Timestamp("2026-07-09T12:00Z")
 
 
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_build_values_rows_takes_annotation_from_the_frame() -> None:
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime(["2026-07-10T00:00Z", "2026-07-10T01:00Z", "2026-07-10T02:00Z"]),
+            "value": [1.0, 999.0, 3.0],
+            "annotation": ["", "gross_range", ""],
+        }
+    )
+    rows = build_values_rows(frame, SeriesKey("p", "actual", "electricity.load"))
+    assert list(rows["annotation"]) == ["", "gross_range", ""]
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_build_values_rows_takes_changed_by_from_the_frame() -> None:
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime(["2026-07-10T00:00Z", "2026-07-10T01:00Z"]),
+            "value": [1.0, 2.0],
+            "changed_by": ["collect.entsoe", "derive.energy_balance"],
+        }
+    )
+    rows = build_values_rows(frame, SeriesKey("p", "actual", "electricity.load"))
+    assert list(rows["changed_by"]) == ["collect.entsoe", "derive.energy_balance"]
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_frame_annotation_wins_over_the_argument() -> None:
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime(["2026-07-10T00:00Z"]),
+            "value": [1.0],
+            "annotation": ["gross_range"],
+        }
+    )
+    rows = build_values_rows(frame, SeriesKey("p", "actual", "electricity.load"), annotation="batch")
+    assert list(rows["annotation"]) == ["gross_range"]
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_build_values_rows_fills_a_null_annotation_with_the_argument() -> None:
+    import pandas as pd
+
+    frame = pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime(["2026-07-10T00:00Z", "2026-07-10T01:00Z"]),
+            "value": [1.0, 2.0],
+            "annotation": [None, "gross_range"],
+        }
+    )
+    rows = build_values_rows(frame, SeriesKey("p", "actual", "electricity.load"), annotation="batch")
+    assert list(rows["annotation"]) == ["batch", "gross_range"]
+
+
+def test_coerce_run_id_hashes_a_platform_string_deterministically() -> None:
+    from rebase.sources.energy import coerce_run_id
+
+    first = coerce_run_id("run_01JQ8Z3P")
+    assert first == coerce_run_id("run_01JQ8Z3P")
+    assert first != coerce_run_id("run_01JQ8Z3Q")
+    assert 0 <= first < 2**63
+
+
+def test_coerce_run_id_passes_an_int_through() -> None:
+    from rebase.sources.energy import coerce_run_id
+
+    assert coerce_run_id(1234) == 1234
+
+
+def test_coerce_run_id_rejects_a_type_it_cannot_map() -> None:
+    from rebase.sources.energy import coerce_run_id
+
+    with pytest.raises(DataSourceError, match="run_id"):
+        coerce_run_id(1.5)
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_build_values_rows_accepts_a_platform_run_id_string() -> None:
+    import pandas as pd
+
+    from rebase.sources.energy import coerce_run_id
+
+    frame = pd.DataFrame({"valid_time": pd.to_datetime(["2026-07-10T00:00Z"]), "value": [1.0]})
+    rows = build_values_rows(frame, SeriesKey("p", "actual", "electricity.load"), run_id="run_01JQ8Z3P")
+    assert rows["run_id"].iloc[0] == coerce_run_id("run_01JQ8Z3P")
+    assert int(rows["run_id"].iloc[0]) == rows["run_id"].iloc[0]
+
+
 @pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed")
 def test_read_series_maps_ids_back_to_keys(monkeypatch) -> None:
     import pandas as pd

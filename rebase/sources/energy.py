@@ -97,6 +97,27 @@ def new_run_id() -> int:
     return uuid.uuid4().int >> 65
 
 
+def coerce_run_id(value: Any) -> int:
+    """A ``run_id`` for the values table: ints pass through, strings hash to 63 bits.
+
+    The column is a 63-bit int because that is what timedb's layout stores, but the platform's
+    own :attr:`~rebase.runtime.RunContext.run_id` is a *string* — so ``run_id=ctx.run_id``, the
+    obvious way to make a stored row traceable back to the run that wrote it, would otherwise
+    have to be hashed by every caller. Hashed the same way as :attr:`SeriesKey.series_id`, so
+    the mapping is deterministic across processes and one run id always names one batch.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise DataSourceError(f"run_id must be an int or a run-id string; got {type(value).__name__}")
+    if isinstance(value, int):
+        if not 0 <= value < (1 << 63):
+            raise DataSourceError(f"run_id must fit in 63 bits; got {value}")
+        return value
+    if not value.strip():
+        raise DataSourceError("run_id string must not be empty")
+    digest = hashlib.sha256(value.encode("utf-8")).digest()[:8]
+    return int.from_bytes(digest, "big") & ((1 << 63) - 1)
+
+
 def _utc(ts: Any, *, column: str) -> Any:
     import pandas as pd
 
@@ -172,7 +193,7 @@ def build_values_rows(
     retention: str = "forever",
     changed_by: str = "",
     annotation: str = "",
-    run_id: int | None = None,
+    run_id: int | str | None = None,
     knowledge_time: Any | None = None,
 ) -> Frame:
     """Expand a normalized series frame into full ``series_values`` insert rows.
@@ -180,6 +201,13 @@ def build_values_rows(
     Stamps ``knowledge_time`` (from the frame if present, else ``knowledge_time=``, else the
     batch clock — SIMPLE shape), ``change_time`` (batch clock, always: corrections are new
     rows) and one ``run_id`` per batch, matching timedb's write defaults.
+
+    ``annotation`` and ``changed_by`` are **per row** when the frame carries a column of that
+    name, and the keyword then supplies only the default for rows where it is null. The frame
+    wins, exactly as it already does for ``knowledge_time``. Per-row provenance is the point:
+    a quality flag describes the one value it judges, so a batch-wide string cannot express
+    "this point is out of range and its neighbours are fine" without splitting the write into
+    one call per distinct flag.
 
     The batch clock is :func:`_resolve_now`, not wall-clock, so a replay stamps the replay's
     knowledge-time bound. Stamping wall-clock here would record when you *fetched* rather than
@@ -203,6 +231,16 @@ def build_values_rows(
     else:
         declared = now
 
+    def metadata(column: str, default: str) -> Any:
+        """The frame's column with nulls defaulted, or the scalar when there is no column.
+
+        Cast to ``str`` after filling so the stored column is a string column whatever the
+        caller handed over — ``astype(str)`` before the fill would spell a null ``"None"``.
+        """
+        if column not in df.columns:
+            return default
+        return df[column].fillna(default).astype(str)
+
     out = pd.DataFrame(
         {
             "series_id": key.series_id,
@@ -213,9 +251,9 @@ def build_values_rows(
             "valid_time_end": df["valid_time_end"]
             if "valid_time_end" in df.columns
             else pd.Timestamp(VALID_TIME_END_SENTINEL).as_unit("us"),
-            "run_id": run_id if run_id is not None else new_run_id(),
-            "changed_by": changed_by,
-            "annotation": annotation,
+            "run_id": coerce_run_id(run_id) if run_id is not None else new_run_id(),
+            "changed_by": metadata("changed_by", changed_by),
+            "annotation": metadata("annotation", annotation),
             "retention": retention,
         }
     )
@@ -462,6 +500,9 @@ class SeriesWriteResult:
     suppressed_null: int = 0
     sample_valid_times: tuple[str, ...] = ()
     fail_open: bool = False
+    validation: Any = None  # rebase.ValidationReport | None
+    signal: Any = None  # rebase.sources.base.SignalOutcome | None
+    watermark: Any = None
 
 
 def select_current_state(df: Frame, *, overlapping: bool = False, as_of: datetime | None = None) -> Frame:
