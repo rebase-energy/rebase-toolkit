@@ -16,11 +16,13 @@ import datetime as _dt
 from typing import Any
 
 from rebase._optional import optional_module
-from rebase.sources.base import ConnectorSpec, DataSource, DataSourceError, Frame, WriteResult
+from rebase.sources.base import ConnectorSpec, DataSource, Frame, WriteResult
 from rebase.sources.energy import (
     SERIES_CATALOG_COLUMNS,
     SeriesKey,
+    attach_series_keys,
     build_values_rows,
+    series_keys,
     series_values_select,
 )
 
@@ -216,7 +218,7 @@ class BigQuerySource(DataSource):
         ``keys`` is one ``(path, data_type, name)`` tuple / ``SeriesKey`` or a list of
         them. Results carry ``path``/``data_type``/``name`` columns — never raw ids.
         """
-        resolved = _series_keys(keys)
+        resolved = series_keys(keys)
         by_id = {key.series_id: key for key in resolved}
         sql, params = series_values_select(
             f"`{dataset}.series_values`",
@@ -228,31 +230,12 @@ class BigQuerySource(DataSource):
             include_updates=include_updates,
         )
         df = self.read(sql, params=params)
-        df.insert(0, "name", df["series_id"].map(lambda sid: by_id[sid].name))
-        df.insert(0, "data_type", df["series_id"].map(lambda sid: by_id[sid].data_type))
-        df.insert(0, "path", df["series_id"].map(lambda sid: by_id[sid].path))
-        return df.drop(columns=["series_id"])
+        return attach_series_keys(df, by_id)
 
     def close(self) -> None:
         if self._client is not None:
             self._client.close()
             self._client = None
-
-
-def _series_keys(keys: Any) -> list[SeriesKey]:
-    if isinstance(keys, (SeriesKey, tuple)):
-        keys = [keys]
-    resolved: list[SeriesKey] = []
-    for key in keys:
-        if isinstance(key, SeriesKey):
-            resolved.append(key)
-        elif isinstance(key, tuple) and len(key) == 3:
-            resolved.append(SeriesKey(path=key[0], data_type=key[1], name=key[2]))
-        else:
-            raise DataSourceError(f"series keys must be SeriesKey or (path, data_type, name), got {key!r}")
-    if not resolved:
-        raise DataSourceError("read_series needs at least one series key")
-    return resolved
 
 
 def _bq_type(value: Any) -> str:

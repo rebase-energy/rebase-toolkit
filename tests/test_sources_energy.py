@@ -7,8 +7,10 @@ from rebase.sources.base import DataSourceError
 from rebase.sources.energy import (
     SERIES_VALUES_COLUMNS,
     SeriesKey,
+    attach_series_keys,
     build_values_rows,
     select_series_winners,
+    series_keys,
     series_values_select,
 )
 
@@ -294,3 +296,38 @@ def test_winners_default_as_of_to_the_replay_bound(monkeypatch) -> None:
         ]
     )
     assert list(select_series_winners(frame)["value"]) == [1.0]
+
+
+# --- series key helpers ---------------------------------------------------------------
+
+
+def test_series_keys_accepts_keys_tuples_and_lists() -> None:
+    key = SeriesKey("p", "actual", "electricity.load")
+    assert series_keys(key) == [key]
+    assert series_keys(("p", "actual", "electricity.load")) == [key]
+    assert series_keys([key, ("q", "forecast", "electricity.supply")])[1].path == "q"
+
+
+@pytest.mark.parametrize("bad", [42, "p", ("p", "actual"), [("p", "actual")]])
+def test_series_keys_rejects_bad_input(bad) -> None:
+    with pytest.raises(DataSourceError, match="series keys must be SeriesKey"):
+        series_keys(bad)
+
+
+def test_series_keys_rejects_an_empty_list() -> None:
+    with pytest.raises(DataSourceError, match="at least one series key"):
+        series_keys([])
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_attach_series_keys_replaces_the_id_column() -> None:
+    import pandas as pd
+
+    key = SeriesKey("p", "actual", "electricity.load")
+    frame = pd.DataFrame(
+        {"series_id": [key.series_id], "valid_time": [pd.Timestamp("2026-01-01T00:00Z")], "value": [1.0]}
+    )
+    out = attach_series_keys(frame, {key.series_id: key})
+    assert list(out.columns) == ["path", "data_type", "name", "valid_time", "value"]
+    assert out["path"].iloc[0] == "p"
+    assert "series_id" in frame.columns  # the caller's frame is untouched

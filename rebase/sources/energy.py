@@ -324,3 +324,29 @@ def select_series_winners(
     if len(winners):
         winners = winners.sort_values(["series_id", "valid_time"], kind="stable")
     return winners.reset_index(drop=True)
+
+
+def series_keys(keys: Any) -> list[SeriesKey]:
+    """Normalise one or many series keys into a list of :class:`SeriesKey`."""
+    if isinstance(keys, (SeriesKey, tuple)) or not isinstance(keys, list):
+        keys = [keys]
+    resolved: list[SeriesKey] = []
+    for key in keys:
+        if isinstance(key, SeriesKey):
+            resolved.append(key)
+        elif isinstance(key, tuple) and len(key) == 3:
+            resolved.append(SeriesKey(path=key[0], data_type=key[1], name=key[2]))
+        else:
+            raise DataSourceError(f"series keys must be SeriesKey or (path, data_type, name), got {key!r}")
+    if not resolved:
+        raise DataSourceError("read_series needs at least one series key")
+    return resolved
+
+
+def attach_series_keys(df: Frame, by_id: dict[int, SeriesKey]) -> Frame:
+    """Swap the raw ``series_id`` column for path/data_type/name — ids are never exposed."""
+    out = df.copy()
+    out.insert(0, "name", out["series_id"].map(lambda sid: by_id[sid].name))
+    out.insert(0, "data_type", out["series_id"].map(lambda sid: by_id[sid].data_type))
+    out.insert(0, "path", out["series_id"].map(lambda sid: by_id[sid].path))
+    return out.drop(columns=["series_id"])
