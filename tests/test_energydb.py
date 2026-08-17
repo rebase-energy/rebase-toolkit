@@ -264,9 +264,7 @@ def _frame(rows):
     """(valid_time, value) pairs -> a SIMPLE input frame."""
     import pandas as pd
 
-    return pd.DataFrame(
-        {"valid_time": pd.to_datetime([row[0] for row in rows]), "value": [row[1] for row in rows]}
-    )
+    return pd.DataFrame({"valid_time": pd.to_datetime([row[0] for row in rows]), "value": [row[1] for row in rows]})
 
 
 @pandas_only
@@ -539,9 +537,7 @@ def test_write_series_rejects_a_raw_timestamp_as_knowledge_time() -> None:
 
     store, _bucket = _store()
     with pytest.raises(Exception, match="KnowledgeTime"):
-        store.write_series(
-            _frame([("2026-01-01T00:00Z", 1.0)]), KEY, knowledge_time=pd.Timestamp("2026-01-01T00:00Z")
-        )
+        store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, knowledge_time=pd.Timestamp("2026-01-01T00:00Z"))
 
 
 @pandas_only

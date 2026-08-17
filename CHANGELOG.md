@@ -4,6 +4,36 @@
 
 ### Added
 
+- **`rb.sources.energydb(...)` produces, stores and reads Rebase's canonical EnergyDB
+  time-series layout through `rb.Bucket`.** A series is keyed the energydb way —
+  `(path, data_type, name)` with a deterministic 63-bit id, so registration is idempotent and
+  reads need no catalog lookup — and every write appends a new immutable parquet object under a
+  `series_id`/`valid_month` prefix, never rewriting one. Reads pick winners with the same
+  semantics a real query would: one row per `(series_id, valid_time)` by latest issue then
+  latest correction, `as_of` bounding what was knowable, `overlapping=True` keeping every
+  forecast issue, `include_updates=True` returning the full audit trail. Results carry
+  `path`/`data_type`/`name` and never a raw id. Because objects hold exactly the canonical
+  columns with parquet-preserved dtypes, what lands in the bucket could be loaded straight
+  into a real EnergyDB.
+
+  Write semantics are declared rather than implicit. `skip_unchanged=True` makes an
+  overlapping refetch window free, with `change=rb.sources.Change.exact()` (the default) or
+  `.tolerance(atol)` declaring what "unchanged" means — **absolute only, because a relative
+  band silently discards the corrections a refetch exists to capture**. `on_null` defaults to
+  `KEEP_STORED`, so a transient upstream gap never overwrites a real stored value, while a null
+  with nothing stored still records the gap. Equality compares `value`, `annotation` and
+  `changed_by`, with NaN equal to NaN, so a provenance upgrade is a real write. A series
+  registered `OVERLAPPING` bypasses suppression entirely, since every publication of a forecast
+  is meaningful. Suppression is fail-open — an error writes the batch unfiltered rather than
+  blocking it — and always reported: `SeriesWriteResult` carries the counts and sample
+  timestamps, so "we saw a revision and declined it" is a number rather than an emergent
+  property.
+
+  **This bucket backing is transitional.** It is intended to be replaced by proper EnergyDB
+  database support shaped like the other connectors, and the option names mirror
+  `energydb`/`timedb` precisely so call sites survive that change. Requires
+  `rebase-toolkit[energydb]`.
+
 - **`rb.Contract` can now constrain row order and spacing, not just column values.** An
   `index=rb.Index(column=..., monotonic=True, max_gap="PT1H")` declaration asserts that the
   index is strictly increasing and that no two consecutive rows sit further apart than the

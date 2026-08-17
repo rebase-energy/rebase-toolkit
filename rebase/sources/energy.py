@@ -548,9 +548,7 @@ def suppress_rows(
             decision, bucket = True, ""  # rules 5-7 disabled
         elif not comparer.values_equal(row.value, old_value):
             decision, bucket = True, ""  # rule 7
-        elif not _metadata_equal(row.annotation, old_annotation) or not _metadata_equal(
-            row.changed_by, old_changed_by
-        ):
+        elif not _metadata_equal(row.annotation, old_annotation) or not _metadata_equal(row.changed_by, old_changed_by):
             decision, bucket = True, ""  # rule 6
         else:
             decision, bucket = False, "unchanged"  # rule 5

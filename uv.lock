@@ -1838,9 +1838,9 @@ all = [
     { name = "db-dtypes" },
     { name = "emflow" },
     { name = "energydatamodel" },
-    { name = "google-cloud-bigquery", extra = ["pandas"], marker = "extra == 'extra-14-rebase-toolkit-all' or (extra == 'extra-14-rebase-toolkit-hillclimb' and extra == 'extra-14-rebase-toolkit-snowflake') or (extra == 'extra-14-rebase-toolkit-hillclimb' and extra == 'extra-14-rebase-toolkit-sources')" },
+    { name = "google-cloud-bigquery", extra = ["pandas"], marker = "extra == 'extra-14-rebase-toolkit-all' or extra == 'extra-14-rebase-toolkit-hillclimb' or (extra != 'extra-14-rebase-toolkit-snowflake' and extra != 'extra-14-rebase-toolkit-sources')" },
     { name = "google-cloud-storage" },
-    { name = "hillclimb", extra = ["emflow"], marker = "extra == 'extra-14-rebase-toolkit-all' or (extra == 'extra-14-rebase-toolkit-hillclimb' and extra == 'extra-14-rebase-toolkit-snowflake') or (extra == 'extra-14-rebase-toolkit-hillclimb' and extra == 'extra-14-rebase-toolkit-sources')" },
+    { name = "hillclimb", extra = ["emflow"], marker = "extra == 'extra-14-rebase-toolkit-all' or extra == 'extra-14-rebase-toolkit-hillclimb' or (extra != 'extra-14-rebase-toolkit-snowflake' and extra != 'extra-14-rebase-toolkit-sources')" },
     { name = "huggingface-hub" },
     { name = "pandas", version = "3.0.5", source = { registry = "https://pypi.org/simple" } },
     { name = "pyarrow" },
@@ -1857,6 +1857,11 @@ data = [
 ]
 databricks = [
     { name = "databricks-sql-connector" },
+    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-14-rebase-toolkit-snowflake' or extra == 'extra-14-rebase-toolkit-sources'" },
+    { name = "pandas", version = "3.0.5", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-14-rebase-toolkit-all' or extra == 'extra-14-rebase-toolkit-hillclimb' or (extra != 'extra-14-rebase-toolkit-snowflake' and extra != 'extra-14-rebase-toolkit-sources')" },
+    { name = "pyarrow" },
+]
+energydb = [
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-14-rebase-toolkit-snowflake' or extra == 'extra-14-rebase-toolkit-sources'" },
     { name = "pandas", version = "3.0.5", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-14-rebase-toolkit-all' or extra == 'extra-14-rebase-toolkit-hillclimb' or (extra != 'extra-14-rebase-toolkit-snowflake' and extra != 'extra-14-rebase-toolkit-sources')" },
     { name = "pyarrow" },
@@ -1920,15 +1925,19 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'huggingface'", specifier = ">=1.20.1" },
     { name = "pandas", marker = "extra == 'bigquery'", specifier = ">=2.0" },
     { name = "pandas", marker = "extra == 'databricks'", specifier = ">=2.0" },
+    { name = "pandas", marker = "extra == 'energydb'", specifier = ">=2.0" },
     { name = "pandas", marker = "extra == 'fabric'", specifier = ">=2.0" },
     { name = "pandas", marker = "extra == 'snowflake'", specifier = ">=2.0" },
     { name = "pyarrow", marker = "extra == 'databricks'", specifier = ">=14.0" },
+    { name = "pyarrow", marker = "extra == 'energydb'", specifier = ">=14.0" },
     { name = "pyarrow", marker = "extra == 'snowflake'", specifier = ">=14.0" },
     { name = "pyodbc", marker = "extra == 'fabric'", specifier = ">=5.1" },
     { name = "rebase-toolkit", extras = ["bigquery"], marker = "extra == 'all'" },
     { name = "rebase-toolkit", extras = ["bigquery"], marker = "extra == 'sources'" },
     { name = "rebase-toolkit", extras = ["databricks"], marker = "extra == 'all'" },
     { name = "rebase-toolkit", extras = ["databricks"], marker = "extra == 'sources'" },
+    { name = "rebase-toolkit", extras = ["energydb"], marker = "extra == 'all'" },
+    { name = "rebase-toolkit", extras = ["energydb"], marker = "extra == 'sources'" },
     { name = "rebase-toolkit", extras = ["fabric"], marker = "extra == 'all'" },
     { name = "rebase-toolkit", extras = ["fabric"], marker = "extra == 'sources'" },
     { name = "rebase-toolkit", extras = ["snowflake"], marker = "extra == 'sources'" },
@@ -1939,7 +1948,7 @@ requires-dist = [
     { name = "typer", specifier = ">=0.25.1" },
     { name = "websockets", specifier = ">=13" },
 ]
-provides-extras = ["data", "huggingface", "modeling", "hillclimb", "snowflake", "databricks", "bigquery", "fabric", "sources", "all"]
+provides-extras = ["data", "huggingface", "modeling", "hillclimb", "snowflake", "databricks", "bigquery", "fabric", "energydb", "sources", "all"]
 
 [package.metadata.requires-dev]
 dev = [

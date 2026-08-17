@@ -472,9 +472,7 @@ def _stored(rows):
         }
         for valid_time, value, annotation, changed_by in rows
     ]
-    return pd.DataFrame.from_records(
-        records, columns=["series_id", "valid_time", "value", "annotation", "changed_by"]
-    )
+    return pd.DataFrame.from_records(records, columns=["series_id", "valid_time", "value", "annotation", "changed_by"])
 
 
 _T0 = "2026-01-01T00:00Z"
@@ -658,3 +656,45 @@ def test_select_current_state_retains_annotation_and_changed_by() -> None:
     out = select_current_state(frame)
     assert list(out.columns) == ["series_id", "valid_time", "value", "annotation", "changed_by"]
     assert len(out) == 1
+
+
+# --- SQL / pandas parity --------------------------------------------------------------
+
+
+def test_sql_builder_still_matches_the_pandas_partitioning() -> None:
+    """Guard against the two winner-selection implementations drifting apart.
+
+    ``select_series_winners`` mirrors ``series_values_select``. There is no SQL engine here to
+    run the query against, so this asserts the SQL still declares the partitions and ordering
+    the pandas implementation reproduces. It is not equivalence — see the spec's stated
+    limitation — but a dialect change trips this test instead of drifting silently.
+    """
+    flat, _params = series_values_select("t", [1])
+    assert "PARTITION BY series_id, valid_time " in flat
+    assert "ORDER BY knowledge_time DESC, change_time DESC" in flat
+    assert "SELECT series_id, valid_time, value" in flat
+
+    overlapping, _params = series_values_select("t", [1], overlapping=True)
+    assert "PARTITION BY series_id, valid_time, knowledge_time" in overlapping
+    assert "ORDER BY change_time DESC" in overlapping
+    assert "SELECT series_id, valid_time, knowledge_time, value" in overlapping
+
+    audit, _params = series_values_select("t", [1], include_updates=True)
+    assert "QUALIFY" not in audit
+    assert "series_id, valid_time, knowledge_time, change_time, value, changed_by, annotation" in audit
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_pandas_selection_matches_the_documented_semantics_on_a_shared_fixture() -> None:
+    """The fixture both implementations are documented to agree on."""
+    frame = _values_frame(
+        [
+            ("2026-01-01T00:00Z", "2026-01-01T06:00Z", "2026-01-01T06:00Z", 1.0),
+            ("2026-01-01T00:00Z", "2026-01-01T09:00Z", "2026-01-01T09:00Z", 2.0),
+            ("2026-01-01T00:00Z", "2026-01-01T09:00Z", "2026-01-01T10:00Z", 3.0),
+            ("2026-01-01T01:00Z", "2026-01-01T09:00Z", "2026-01-01T09:00Z", 4.0),
+        ]
+    )
+    assert list(select_series_winners(frame)["value"]) == [3.0, 4.0]
+    assert sorted(select_series_winners(frame, overlapping=True)["value"]) == [1.0, 3.0, 4.0]
+    assert len(select_series_winners(frame, include_updates=True)) == 4
