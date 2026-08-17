@@ -115,7 +115,7 @@ def _write_raw(store, bucket, key, rows, *, month=None):
     import pandas as pd
 
     from rebase.sources.energy import SERIES_VALUES_COLUMNS
-    from rebase.sources.energydb import _encode_parquet, _object_key
+    from rebase.sources.energydb import _content_digest, _encode_parquet, _object_key
 
     records = [
         {
@@ -134,8 +134,11 @@ def _write_raw(store, bucket, key, rows, *, month=None):
     ]
     frame = pd.DataFrame.from_records(records, columns=list(SERIES_VALUES_COLUMNS))
     partition = month or pd.Timestamp(rows[0][0]).strftime("%Y-%m")
-    object_key = _object_key(store.prefix, key.series_id, partition, frame["change_time"].iloc[0], 1)
-    bucket.put(object_key, _encode_parquet(frame))
+    blob = _encode_parquet(frame)
+    object_key = _object_key(
+        store.prefix, key.series_id, partition, frame["change_time"].iloc[0], 1, _content_digest(blob)
+    )
+    bucket.put(object_key, blob)
     return object_key
 
 
@@ -452,3 +455,101 @@ def test_write_series_rejects_an_unknown_unchanged_scope() -> None:
     store, _bucket = _store()
     with pytest.raises(Exception, match="unchanged_scope"):
         store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, unchanged_scope="sideways")
+
+
+# --- Fix round 1: content-addressed keys survive a frozen replay clock -----------------------
+
+
+@pandas_only
+def test_write_series_content_addressing_survives_a_frozen_replay_clock(monkeypatch) -> None:
+    store, bucket = _store()
+    monkeypatch.setenv("REBASE_REPLAY_KNOWLEDGE_TIME", "2026-06-01T00:00:00+00:00")
+    first = store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, run_id=42)
+    second = store.write_series(_frame([("2026-01-01T00:00Z", 2.0)]), KEY, run_id=42)
+    # Same series, same month, same frozen change_time, same caller-supplied run_id: only the
+    # content digest can keep these two writes from landing on the same key.
+    assert first.objects_written != second.objects_written
+    assert len(bucket.objects) == 2
+    out = store.read_series(KEY, include_updates=True)
+    assert sorted(out["value"]) == [1.0, 2.0]
+
+
+@pandas_only
+def test_write_series_identical_content_under_a_frozen_clock_is_idempotent(monkeypatch) -> None:
+    store, bucket = _store()
+    monkeypatch.setenv("REBASE_REPLAY_KNOWLEDGE_TIME", "2026-06-01T00:00:00+00:00")
+    first = store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, run_id=42)
+    second = store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, run_id=42)
+    assert first.objects_written == second.objects_written
+    assert len(bucket.objects) == 1
+
+
+@pandas_only
+def test_write_series_first_object_bytes_survive_a_later_differing_write(monkeypatch) -> None:
+    store, bucket = _store()
+    monkeypatch.setenv("REBASE_REPLAY_KNOWLEDGE_TIME", "2026-06-01T00:00:00+00:00")
+    first = store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, run_id=42)
+    first_key = first.objects_written[0]
+    first_bytes = bucket.objects[first_key]
+    store.write_series(_frame([("2026-01-01T00:00Z", 2.0)]), KEY, run_id=42)
+    assert bucket.objects[first_key] == first_bytes
+
+
+# --- Fix round 1: unchanged_scope must not switch off on_null protection ---------------------
+
+
+@pandas_only
+def test_write_series_knowledge_time_scope_still_protects_against_a_null() -> None:
+    from rebase.sources.energy import OnNull
+
+    store, _bucket = _store()  # unregistered -> FLAT
+    store.write_series(_frame([("2026-01-01T00:00Z", 5.0)]), KEY)
+    result = store.write_series(
+        _frame([("2026-01-01T00:00Z", float("nan"))]),
+        KEY,
+        unchanged_scope="knowledge_time",
+        on_null=OnNull.KEEP_STORED,
+    )
+    assert result.rows_written == 0
+    assert result.suppressed_null == 1
+    assert list(store.read_series(KEY)["value"]) == [5.0]
+
+
+# --- Fix round 1: on_null must be validated -------------------------------------------------
+
+
+@pandas_only
+def test_write_series_rejects_an_invalid_on_null() -> None:
+    store, _bucket = _store()
+    with pytest.raises(Exception, match="on_null"):
+        store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, on_null="keep_stored")
+
+
+# --- Fix round 1: DataSourceError, never a bare AttributeError -------------------------------
+
+
+@pandas_only
+def test_write_series_rejects_a_raw_timestamp_as_knowledge_time() -> None:
+    import pandas as pd
+
+    store, _bucket = _store()
+    with pytest.raises(Exception, match="KnowledgeTime"):
+        store.write_series(
+            _frame([("2026-01-01T00:00Z", 1.0)]), KEY, knowledge_time=pd.Timestamp("2026-01-01T00:00Z")
+        )
+
+
+@pandas_only
+def test_write_series_accepts_a_tuple_key() -> None:
+    store, _bucket = _store()
+    result = store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), (KEY.path, KEY.data_type, KEY.name))
+    assert result.rows_written == 1
+    assert list(store.read_series(KEY)["value"]) == [1.0]
+
+
+@pandas_only
+def test_write_series_rejects_multiple_keys() -> None:
+    store, _bucket = _store()
+    other = SeriesKey("portfolio/site-2/t02", "forecast", "electricity.supply")
+    with pytest.raises(Exception, match="one series"):
+        store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), [KEY, other])

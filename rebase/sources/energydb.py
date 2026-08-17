@@ -36,7 +36,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from rebase.sources.base import DataSourceError, Frame
+from rebase.sources.base import DataSourceError, Frame, KnowledgeTime
 from rebase.sources.energy import (
     RETENTION_TIERS,
     SERIES_CATALOG_COLUMNS,
@@ -73,9 +73,24 @@ def _month_prefix(prefix: str, series_id: int, month: str) -> str:
     return f"{_series_prefix(prefix, series_id)}valid_month={month}/"
 
 
-def _object_key(prefix: str, series_id: int, month: str, change_time: Any, run_id: int) -> str:
+def _object_key(prefix: str, series_id: int, month: str, change_time: Any, run_id: int, digest: str) -> str:
+    """The object key. Content-addressed by ``digest``, which is what makes it collision-free.
+
+    ``change_time`` and ``run_id`` alone are not enough: ``change_time`` comes from
+    ``_resolve_now()``, frozen to the replay bound during a replay, so a replay plus a
+    caller-supplied ``run_id`` would produce the same key twice and the second ``put`` would
+    silently replace the first — destroying an append-only object. With the digest, identical
+    content is idempotent and differing content can never collide.
+    """
     stamp = change_time.strftime(_CHANGE_TIME_FORMAT)
-    return f"{_month_prefix(prefix, series_id, month)}{stamp}Z-{run_id}.parquet"
+    return f"{_month_prefix(prefix, series_id, month)}{stamp}Z-{run_id}-{digest}.parquet"
+
+
+def _content_digest(blob: bytes) -> str:
+    """The first 12 hex chars of sha256 over the encoded object bytes."""
+    import hashlib
+
+    return hashlib.sha256(blob).hexdigest()[:12]
 
 
 def _months_in_range(start: datetime | None, end: datetime | None) -> list[str] | None:
@@ -264,34 +279,59 @@ class EnergyDBStore:
         ``skip_unchanged`` suppresses no-op rewrites; ``change`` declares what "unchanged"
         means (absolute tolerance only, defaulting to exact); ``on_null`` decides whether an
         incoming null may replace a stored value. ``unchanged_scope="auto"`` resolves per
-        series from the catalog, so an ``OVERLAPPING`` series bypasses suppression entirely —
-        every publication of a forecast is meaningful.
+        series from the catalog, so a *registered* ``OVERLAPPING`` series bypasses suppression
+        entirely — every publication of a forecast is meaningful. An explicit ``"valid_time"``/
+        ``"knowledge_time"`` override only widens the comparison partition below; it can never
+        switch off ``on_null=KEEP_STORED`` protection, which is decided by catalog truth alone.
 
         Suppression is fail-open: if anything in that path raises, the unfiltered batch is
         written and ``fail_open`` is set. Suppression is an optimisation, never a gate.
         """
         if unchanged_scope not in _UNCHANGED_SCOPES:
             raise DataSourceError(f"unchanged_scope must be one of {_UNCHANGED_SCOPES}; got {unchanged_scope!r}")
+        if not isinstance(on_null, OnNull):
+            raise DataSourceError(f"on_null must be an OnNull member; got {on_null!r}")
+        resolved_keys = series_keys(key)
+        if len(resolved_keys) != 1:
+            raise DataSourceError(f"write_series writes exactly one series; got {len(resolved_keys)}")
+        key = resolved_keys[0]
+
         if knowledge_time is not None:
+            if not isinstance(knowledge_time, KnowledgeTime):
+                raise DataSourceError(
+                    "knowledge_time must be a KnowledgeTime (e.g. KnowledgeTime.from_source(...), "
+                    f".from_inputs(...) or .at(...)); got {type(knowledge_time)!r}"
+                )
             data = knowledge_time.apply(data)
         rows = build_values_rows(
             data, key, retention=retention, changed_by=changed_by, annotation=annotation, run_id=run_id
         )
 
+        # Only a genuinely registered OVERLAPPING series may bypass suppression entirely — every
+        # publication is meaningful there. An explicit unchanged_scope override changes only the
+        # comparison partition passed to select_current_state below; it never overrides catalog
+        # truth for whether on_null=KEEP_STORED protection applies.
+        is_registered_overlapping = self._is_overlapping(key.series_id)
         if unchanged_scope == "auto":
-            overlapping = self._is_overlapping(key.series_id)
+            partition_overlapping = is_registered_overlapping
         else:
-            overlapping = unchanged_scope == "knowledge_time"
+            partition_overlapping = unchanged_scope == "knowledge_time"
 
         report: dict[str, Any] = {"suppressed_unchanged": 0, "suppressed_null": 0, "sample_valid_times": ()}
         fail_open = False
-        # The read is the write path's only added cost, so skip it when nothing could be
-        # suppressed anyway.
-        must_compare = not overlapping and (skip_unchanged or on_null is OnNull.KEEP_STORED)
+        # The read is the write path's only added cost, so it is skipped in two cases: (1) a
+        # genuinely registered OVERLAPPING series, where nothing is ever suppressed; and (2)
+        # skip_unchanged=False with on_null=WRITE_NULL, where the only rule this could miss is
+        # "stored null + incoming null -> skip" (rule 2) — skipping the read means that redundant
+        # null gets written as a harmless duplicate rather than suppressed, never a lost
+        # correction.
+        must_compare = not is_registered_overlapping and (skip_unchanged or on_null is OnNull.KEEP_STORED)
         if must_compare:
             try:
                 months = sorted({stamp.strftime(_MONTH_FORMAT) for stamp in rows["valid_time"]})
-                stored = select_current_state(self._raw_rows([key.series_id], months))
+                stored = select_current_state(
+                    self._raw_rows([key.series_id], months), overlapping=partition_overlapping
+                )
                 rows, report = suppress_rows(
                     rows, stored, on_null=on_null, skip_unchanged=skip_unchanged, change=change
                 )
@@ -308,10 +348,19 @@ class EnergyDBStore:
         written: list[str] = []
         if len(rows):
             for month, group in rows.groupby(rows["valid_time"].dt.strftime(_MONTH_FORMAT), sort=True):
+                # Encode first: the digest must be over the exact bytes being stored, so that
+                # identical content always resolves to the identical key (idempotent) and
+                # differing content never collides — even under a replay's frozen change_time.
+                blob = _encode_parquet(group)
                 object_key = _object_key(
-                    self.prefix, key.series_id, str(month), group["change_time"].iloc[0], int(group["run_id"].iloc[0])
+                    self.prefix,
+                    key.series_id,
+                    str(month),
+                    group["change_time"].iloc[0],
+                    int(group["run_id"].iloc[0]),
+                    _content_digest(blob),
                 )
-                self.bucket.put(object_key, _encode_parquet(group), content_type=_PARQUET_CONTENT_TYPE)
+                self.bucket.put(object_key, blob, content_type=_PARQUET_CONTENT_TYPE)
                 written.append(object_key)
 
         suppressed = int(report["suppressed_unchanged"]) + int(report["suppressed_null"])
