@@ -1246,6 +1246,92 @@ class Bucket:
 _SIGNED_URL_BATCH = 100
 
 
+class LocalBucket:
+    """A directory on disk with :class:`Bucket`'s key/object surface, for offline work.
+
+    :class:`Bucket` reads and writes through short-lived capability URLs issued by Rebase, so
+    it needs a workspace, credentials and a network. That is right for deployed code and wrong
+    for the first hour of a project: bucket-backed code — notably
+    :func:`rebase.sources.energydb` — then cannot run at all until there is a platform to run
+    it against. This is the same surface over a local directory::
+
+        store = rb.sources.energydb(bucket=rb.LocalBucket("./data"))
+
+    Swapping in a real :class:`Bucket` later changes the one constructor call, because every
+    method here means what it means there.
+
+    It is deliberately **not** a Bucket: nothing about it is shared, versioned or reachable
+    from deployed code, and :attr:`uri` is a ``file://`` URL rather than ``gs://``. Use it to
+    develop and to test; use a Bucket to deploy.
+    """
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root).expanduser().resolve()
+
+    def __repr__(self) -> str:
+        return f"LocalBucket({str(self.root)!r})"
+
+    @property
+    def uri(self) -> str:
+        """A ``file://`` URL, for handing to pandas, polars or duckdb the way ``Bucket.uri`` is."""
+        return self.root.as_uri()
+
+    def _path(self, key: str) -> Path:
+        cleaned = key.strip().lstrip("/")
+        if not cleaned:
+            raise ValueError("LocalBucket key must be non-empty")
+        resolved = (self.root / cleaned).resolve()
+        # A key is a key, not a path: `../` would otherwise write outside the bucket entirely.
+        if resolved != self.root and self.root not in resolved.parents:
+            raise ValueError(f"key {key!r} escapes the bucket root {str(self.root)!r}")
+        return resolved
+
+    def put(self, key: str, data: bytes | str | Path, *, content_type: str | None = None) -> str:
+        """Write one object. ``content_type`` is accepted for parity and not stored."""
+        path = self._path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(data, Path):
+            data = data.read_bytes()
+        path.write_bytes(data if isinstance(data, bytes) else str(data).encode("utf-8"))
+        return key.lstrip("/")
+
+    def get(self, key: str) -> bytes:
+        """Read one object into memory."""
+        return self._path(key).read_bytes()
+
+    def exists(self, key: str) -> bool:
+        return self._path(key).is_file()
+
+    def iter_all(self, prefix: str = "") -> Iterator[BucketObject]:
+        """Every object under a prefix, in key order.
+
+        Walks the whole tree and filters on the key rather than descending into ``prefix`` as a
+        directory, because a prefix is not required to end at a path separator —
+        ``iter_all("2026/08")`` must find ``2026/08-recovered/1.parquet`` the way the real
+        bucket's prefix match does.
+        """
+        cleaned = prefix.lstrip("/")
+        if not self.root.is_dir():
+            return
+        for path in sorted(self.root.rglob("*")):
+            if not path.is_file():
+                continue
+            key = path.relative_to(self.root).as_posix()
+            if key.startswith(cleaned):
+                yield BucketObject(key=key, size=path.stat().st_size)
+
+    def delete(self, key: str) -> None:
+        """Delete one object. Missing is not an error, matching the remote's idempotent delete."""
+        self._path(key).unlink(missing_ok=True)
+
+    def delete_prefix(self, prefix: str = "") -> int:
+        """Delete every object under a prefix. Returns the number deleted."""
+        keys = [entry.key for entry in self.iter_all(prefix)]
+        for key in keys:
+            self.delete(key)
+        return len(keys)
+
+
 def _bucket_object(item: dict[str, Any]) -> BucketObject:
     return BucketObject(
         key=str(item.get("path", "")),

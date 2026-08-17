@@ -304,3 +304,75 @@ def test_register_workflow_sends_logical_bucket_attachment(monkeypatch) -> None:
 
     assert observed["buckets"] == [{"bucket": "power-system-data"}]
     assert "gs://" not in str(observed)
+
+
+class TestLocalBucket:
+    """A filesystem bucket, so bucket-backed code runs with no platform and no network."""
+
+    def test_is_exported(self) -> None:
+        from rebase.client import LocalBucket
+
+        assert rb.LocalBucket is LocalBucket
+        assert "LocalBucket" in rb.__all__
+
+    def test_put_get_round_trip(self, tmp_path) -> None:
+        bucket = rb.LocalBucket(tmp_path)
+        bucket.put("2026/08/10.parquet", b"payload")
+        assert bucket.get("2026/08/10.parquet") == b"payload"
+
+    def test_put_accepts_text(self, tmp_path) -> None:
+        bucket = rb.LocalBucket(tmp_path)
+        bucket.put("note.json", '{"a": 1}')
+        assert bucket.get("note.json") == b'{"a": 1}'
+
+    def test_exists_reports_absence_without_raising(self, tmp_path) -> None:
+        bucket = rb.LocalBucket(tmp_path)
+        assert bucket.exists("nope") is False
+        bucket.put("yes", b"1")
+        assert bucket.exists("yes") is True
+
+    def test_iter_all_filters_by_prefix_and_returns_bucket_objects(self, tmp_path) -> None:
+        bucket = rb.LocalBucket(tmp_path)
+        bucket.put("a/1", b"x")
+        bucket.put("a/2", b"yy")
+        bucket.put("b/1", b"zzz")
+        entries = list(bucket.iter_all(prefix="a/"))
+        assert [entry.key for entry in entries] == ["a/1", "a/2"]
+        assert isinstance(entries[0], BucketObject)
+        assert entries[1].size == 2
+
+    def test_iter_all_on_a_missing_prefix_is_empty(self, tmp_path) -> None:
+        assert list(rb.LocalBucket(tmp_path).iter_all(prefix="nothing/here/")) == []
+
+    def test_delete_and_delete_prefix(self, tmp_path) -> None:
+        bucket = rb.LocalBucket(tmp_path)
+        bucket.put("a/1", b"x")
+        bucket.put("a/2", b"y")
+        bucket.delete("a/1")
+        assert bucket.exists("a/1") is False
+        assert bucket.delete_prefix("a/") == 1
+        assert list(bucket.iter_all()) == []
+
+    def test_uri_is_a_file_url_not_a_cloud_one(self, tmp_path) -> None:
+        uri = rb.LocalBucket(tmp_path).uri
+        assert uri.startswith("file://")
+        assert not uri.startswith("gs://")
+
+    def test_rejects_a_key_escaping_the_root(self, tmp_path) -> None:
+        bucket = rb.LocalBucket(tmp_path)
+        with pytest.raises(ValueError, match="escapes"):
+            bucket.put("../outside", b"x")
+
+    def test_backs_the_energydb_store_with_no_platform(self, tmp_path) -> None:
+        pytest.importorskip("pandas")
+        pytest.importorskip("pyarrow")
+        import pandas as pd
+
+        store = rb.sources.energydb(bucket=rb.LocalBucket(tmp_path / "store"))
+        key = rb.sources.SeriesKey("zone/SE-SE1", "observation", "electricity.consumption")
+        store.register_series(key, unit="MW")
+        frame = pd.DataFrame(
+            {"valid_time": pd.to_datetime(["2026-08-01T00:00Z", "2026-08-01T01:00Z"]), "value": [5000.0, 5001.0]}
+        )
+        store.write_series(frame, key, skip_unchanged=True)
+        assert list(store.read_series(key)["value"]) == [5000.0, 5001.0]
