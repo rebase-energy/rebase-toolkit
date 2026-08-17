@@ -63,11 +63,16 @@ fabric = [
     "pandas>=2.0",
     "pyodbc>=5.1",
 ]
+energydb = [
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+]
 sources = [
     "rebase-toolkit[bigquery]",
     "rebase-toolkit[databricks]",
     "rebase-toolkit[fabric]",
     "rebase-toolkit[snowflake]",
+    "rebase-toolkit[energydb]",
 ]
 # Every extra except [snowflake]: hillclimb needs pandas>=3 and no stable
 # snowflake-connector-python allows pandas 3 yet, so the two cannot coexist in
@@ -81,6 +86,7 @@ all = [
     "rebase-toolkit[bigquery]",
     "rebase-toolkit[databricks]",
     "rebase-toolkit[fabric]",
+    "rebase-toolkit[energydb]",
 ]
 
 [dependency-groups]

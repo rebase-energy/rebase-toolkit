@@ -45,6 +45,9 @@ bigquery = [
 fabric = [
     "rebase-toolkit[fabric]==0.7.0",
 ]
+energydb = [
+    "rebase-toolkit[energydb]==0.7.0",
+]
 sources = [
     "rebase-toolkit[sources]==0.7.0",
 ]

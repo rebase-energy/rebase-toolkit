@@ -395,7 +395,12 @@ def test_write_series_flat_suppresses_what_overlapping_keeps() -> None:
 
 @pandas_only
 def test_write_series_is_fail_open(monkeypatch) -> None:
-    import rebase.sources.energydb as energydb_module
+    import importlib
+
+    # importlib.import_module resolves the submodule by its fully-qualified name directly,
+    # unlike `import rebase.sources.energydb as ...`, which walks attribute access instead and
+    # would find `rb.sources.energydb` the factory function now that one is exported there.
+    energydb_module = importlib.import_module("rebase.sources.energydb")
 
     store, _bucket = _store()
     store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY)
@@ -553,3 +558,30 @@ def test_write_series_rejects_multiple_keys() -> None:
     other = SeriesKey("portfolio/site-2/t02", "forecast", "electricity.supply")
     with pytest.raises(Exception, match="one series"):
         store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), [KEY, other])
+
+
+# --- Task 8: factory, exports and packaging --------------------------------------------------
+
+
+def test_factory_is_exported_and_lazy() -> None:
+    import rebase as rb
+
+    assert callable(rb.sources.energydb)
+    for name in ("Change", "OnNull", "SeriesWriteResult", "EnergyDBStore"):
+        assert hasattr(rb.sources, name)
+
+
+def test_factory_builds_a_store_from_a_bucket_object() -> None:
+    import rebase as rb
+
+    bucket = _FakeBucket()
+    store = rb.sources.energydb(bucket=bucket, prefix="custom")
+    assert store.prefix == "custom"
+    assert store.bucket is bucket
+
+
+def test_factory_rejects_a_bucket_without_the_needed_methods() -> None:
+    import rebase as rb
+
+    with pytest.raises(Exception, match="must provide a callable"):
+        rb.sources.energydb(bucket=object())
