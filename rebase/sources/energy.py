@@ -266,3 +266,61 @@ def series_values_select(
         f"ORDER BY series_id, valid_time"
     )
     return sql, params
+
+
+_AUDIT_COLUMNS = ["series_id", "valid_time", "knowledge_time", "change_time", "value", "changed_by", "annotation"]
+
+
+def _winner_rows(df: Frame, *, partition: list[str], order: list[str]) -> Frame:
+    """One row per ``partition``, the greatest by ``order``.
+
+    Sorting ascending and taking the tail is the pandas spelling of the SQL builder's
+    ``ROW_NUMBER() OVER (PARTITION BY … ORDER BY … DESC) = 1``.
+    """
+    if not len(df):
+        return df
+    ranked = df.sort_values(partition + order, kind="stable")
+    return ranked.groupby(partition, as_index=False, sort=False).tail(1)
+
+
+def select_series_winners(
+    df: Frame,
+    *,
+    overlapping: bool = False,
+    include_updates: bool = False,
+    as_of: datetime | None = None,
+) -> Frame:
+    """Pick the winning rows from raw ``series_values`` rows, in pandas.
+
+    Mirrors :func:`series_values_select` clause for clause, for a backing that cannot run
+    SQL. Both answer to the same definition of "winner"; only the execution differs — so a
+    change to one is a change to both, and the parity test in the suite exists to catch a
+    drift between them.
+    """
+    import pandas as pd
+
+    if as_of is None:
+        as_of = _replay_knowledge_time()
+    out = df
+    if as_of is not None and len(out):
+        bound = pd.Timestamp(as_of)
+        if bound.tz is None:
+            bound = bound.tz_localize("UTC")
+        out = out[out["knowledge_time"] <= bound]
+
+    if include_updates:
+        ordered = out[_AUDIT_COLUMNS]
+        if len(ordered):
+            ordered = ordered.sort_values(["series_id", "valid_time", "knowledge_time", "change_time"], kind="stable")
+        return ordered.reset_index(drop=True)
+
+    partition = ["series_id", "valid_time", "knowledge_time"] if overlapping else ["series_id", "valid_time"]
+    order = ["change_time"] if overlapping else ["knowledge_time", "change_time"]
+    winners = _winner_rows(out, partition=partition, order=order)
+    columns = (
+        ["series_id", "valid_time", "knowledge_time", "value"] if overlapping else ["series_id", "valid_time", "value"]
+    )
+    winners = winners[columns]
+    if len(winners):
+        winners = winners.sort_values(["series_id", "valid_time"], kind="stable")
+    return winners.reset_index(drop=True)

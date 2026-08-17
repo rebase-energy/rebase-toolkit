@@ -8,6 +8,7 @@ from rebase.sources.energy import (
     SERIES_VALUES_COLUMNS,
     SeriesKey,
     build_values_rows,
+    select_series_winners,
     series_values_select,
 )
 
@@ -183,3 +184,113 @@ def test_read_series_maps_ids_back_to_keys(monkeypatch) -> None:
     assert list(out.columns) == ["path", "data_type", "name", "valid_time", "value"]
     assert out.loc[0, "name"] == "electricity.demand"
     assert "series_id" not in out.columns  # energydb convention: ids never exposed
+
+
+# --- winner selection ------------------------------------------------------------------
+
+_SV_COLUMNS = list(SERIES_VALUES_COLUMNS)
+
+
+def _values_frame(rows):
+    """Build a raw series_values frame from (valid_time, knowledge_time, change_time, value) tuples."""
+    import pandas as pd
+
+    records = []
+    for valid_time, knowledge_time, change_time, value in rows:
+        records.append(
+            {
+                "series_id": 7,
+                "valid_time": pd.Timestamp(valid_time),
+                "knowledge_time": pd.Timestamp(knowledge_time),
+                "change_time": pd.Timestamp(change_time),
+                "value": value,
+                "valid_time_end": pd.Timestamp("2200-01-01T00:00Z"),
+                "run_id": 1,
+                "changed_by": "",
+                "annotation": "",
+                "retention": "forever",
+            }
+        )
+    return pd.DataFrame.from_records(records, columns=_SV_COLUMNS)
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_winners_pick_the_latest_knowledge_then_change_time() -> None:
+    frame = _values_frame(
+        [
+            ("2026-01-01T00:00Z", "2026-01-01T06:00Z", "2026-01-01T06:00Z", 1.0),
+            ("2026-01-01T00:00Z", "2026-01-01T09:00Z", "2026-01-01T09:00Z", 2.0),
+            ("2026-01-01T00:00Z", "2026-01-01T09:00Z", "2026-01-01T10:00Z", 3.0),
+        ]
+    )
+    out = select_series_winners(frame)
+    assert list(out.columns) == ["series_id", "valid_time", "value"]
+    assert list(out["value"]) == [3.0]
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_winners_respect_as_of() -> None:
+    import pandas as pd
+
+    frame = _values_frame(
+        [
+            ("2026-01-01T00:00Z", "2026-01-01T06:00Z", "2026-01-01T06:00Z", 1.0),
+            ("2026-01-01T00:00Z", "2026-01-01T09:00Z", "2026-01-01T09:00Z", 2.0),
+        ]
+    )
+    out = select_series_winners(frame, as_of=pd.Timestamp("2026-01-01T07:00Z").to_pydatetime())
+    assert list(out["value"]) == [1.0]
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_winners_overlapping_keeps_every_issue() -> None:
+    frame = _values_frame(
+        [
+            ("2026-01-01T00:00Z", "2026-01-01T06:00Z", "2026-01-01T06:00Z", 1.0),
+            ("2026-01-01T00:00Z", "2026-01-01T09:00Z", "2026-01-01T09:00Z", 2.0),
+            ("2026-01-01T00:00Z", "2026-01-01T09:00Z", "2026-01-01T10:00Z", 3.0),
+        ]
+    )
+    out = select_series_winners(frame, overlapping=True)
+    assert list(out.columns) == ["series_id", "valid_time", "knowledge_time", "value"]
+    assert sorted(out["value"]) == [1.0, 3.0]
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_winners_include_updates_returns_the_audit_shape() -> None:
+    frame = _values_frame(
+        [
+            ("2026-01-01T00:00Z", "2026-01-01T09:00Z", "2026-01-01T10:00Z", 3.0),
+            ("2026-01-01T00:00Z", "2026-01-01T06:00Z", "2026-01-01T06:00Z", 1.0),
+        ]
+    )
+    out = select_series_winners(frame, include_updates=True)
+    assert list(out.columns) == [
+        "series_id",
+        "valid_time",
+        "knowledge_time",
+        "change_time",
+        "value",
+        "changed_by",
+        "annotation",
+    ]
+    assert list(out["value"]) == [1.0, 3.0]
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_winners_on_an_empty_frame_returns_empty_with_the_right_columns() -> None:
+    out = select_series_winners(_values_frame([]))
+    assert list(out.columns) == ["series_id", "valid_time", "value"]
+    assert len(out) == 0
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_winners_default_as_of_to_the_replay_bound(monkeypatch) -> None:
+    monkeypatch.setenv("REBASE_REPLAY_KNOWLEDGE_TIME", "2026-01-01T07:00:00+00:00")
+    frame = _values_frame(
+        [
+            ("2026-01-01T00:00Z", "2026-01-01T06:00Z", "2026-01-01T06:00Z", 1.0),
+            ("2026-01-01T00:00Z", "2026-01-01T09:00Z", "2026-01-01T09:00Z", 2.0),
+        ]
+    )
+    assert list(select_series_winners(frame)["value"]) == [1.0]
