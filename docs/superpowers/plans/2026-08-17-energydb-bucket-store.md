@@ -308,7 +308,12 @@ Append to `rebase/sources/energy.py`:
 ```python
 def series_keys(keys: Any) -> list[SeriesKey]:
     """Normalise one or many series keys into a list of :class:`SeriesKey`."""
-    if isinstance(keys, (SeriesKey, tuple)):
+    # Wrap single keys and non-iterables, so a scalar reaches the per-item check below and is
+    # rejected with DataSourceError rather than raising TypeError from being iterated. `tuple`
+    # must stay in the explicit set or a 3-tuple key would be iterated into three strings, and
+    # `str` is there so the error names the string rather than a character. Real iterables —
+    # list, set, generator — fall through and are treated as collections of keys.
+    if isinstance(keys, (SeriesKey, tuple, str)) or not hasattr(keys, "__iter__"):
         keys = [keys]
     resolved: list[SeriesKey] = []
     for key in keys:
@@ -325,6 +330,11 @@ def series_keys(keys: Any) -> list[SeriesKey]:
 
 def attach_series_keys(df: Frame, by_id: dict[int, SeriesKey]) -> Frame:
     """Swap the raw ``series_id`` column for path/data_type/name — ids are never exposed."""
+    unmapped = sorted({int(sid) for sid in df["series_id"].unique() if int(sid) not in by_id})
+    if unmapped:
+        # A bare KeyError from the .map() below would violate this package's contract that
+        # every failure surfaces as DataSourceError.
+        raise DataSourceError(f"by_id must cover every series_id in the frame; unmapped: {unmapped}")
     out = df.copy()
     out.insert(0, "name", out["series_id"].map(lambda sid: by_id[sid].name))
     out.insert(0, "data_type", out["series_id"].map(lambda sid: by_id[sid].data_type))
