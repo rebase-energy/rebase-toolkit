@@ -303,9 +303,12 @@ def test_winners_default_as_of_to_the_replay_bound(monkeypatch) -> None:
 
 def test_series_keys_accepts_keys_tuples_and_lists() -> None:
     key = SeriesKey("p", "actual", "electricity.load")
+    other = SeriesKey("q", "forecast", "electricity.supply")
     assert series_keys(key) == [key]
     assert series_keys(("p", "actual", "electricity.load")) == [key]
     assert series_keys([key, ("q", "forecast", "electricity.supply")])[1].path == "q"
+    assert series_keys({key}) == [key]  # a set of valid keys is iterated, not wrapped
+    assert sorted(k.path for k in series_keys(k for k in [key, other])) == ["p", "q"]  # generator likewise
 
 
 @pytest.mark.parametrize("bad", [42, "p", ("p", "actual"), [("p", "actual")]])
@@ -331,3 +334,15 @@ def test_attach_series_keys_replaces_the_id_column() -> None:
     assert list(out.columns) == ["path", "data_type", "name", "valid_time", "value"]
     assert out["path"].iloc[0] == "p"
     assert "series_id" in frame.columns  # the caller's frame is untouched
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_attach_series_keys_rejects_an_unmapped_id() -> None:
+    import pandas as pd
+
+    key = SeriesKey("p", "actual", "electricity.load")
+    frame = pd.DataFrame(
+        {"series_id": [key.series_id, 999], "valid_time": [pd.Timestamp("2026-01-01T00:00Z")] * 2, "value": [1.0, 2.0]}
+    )
+    with pytest.raises(DataSourceError, match="must cover every series_id"):
+        attach_series_keys(frame, {key.series_id: key})

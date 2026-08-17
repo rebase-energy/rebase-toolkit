@@ -328,7 +328,7 @@ def select_series_winners(
 
 def series_keys(keys: Any) -> list[SeriesKey]:
     """Normalise one or many series keys into a list of :class:`SeriesKey`."""
-    if isinstance(keys, (SeriesKey, tuple)) or not isinstance(keys, list):
+    if isinstance(keys, (SeriesKey, tuple, str)) or not hasattr(keys, "__iter__"):
         keys = [keys]
     resolved: list[SeriesKey] = []
     for key in keys:
@@ -345,6 +345,9 @@ def series_keys(keys: Any) -> list[SeriesKey]:
 
 def attach_series_keys(df: Frame, by_id: dict[int, SeriesKey]) -> Frame:
     """Swap the raw ``series_id`` column for path/data_type/name — ids are never exposed."""
+    missing = set(df["series_id"]) - set(by_id)
+    if missing:
+        raise DataSourceError(f"by_id must cover every series_id in the frame; missing {sorted(missing)!r}")
     out = df.copy()
     out.insert(0, "name", out["series_id"].map(lambda sid: by_id[sid].name))
     out.insert(0, "data_type", out["series_id"].map(lambda sid: by_id[sid].data_type))
