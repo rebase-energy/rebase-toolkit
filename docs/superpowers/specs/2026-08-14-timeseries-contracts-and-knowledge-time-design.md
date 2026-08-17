@@ -157,8 +157,15 @@ Shared semantics, inherited from the existing factories:
 - **Absent column returns `None`.** Only `missing_column` reports the root cause, as at
   `rebase/contract.py:438`, `450`, `462` and `512`.
 - **`sample_rows` are positional**, via `_sample_positions`, capped at `MAX_SAMPLE_ROWS`.
-- **`count` is the number of violating rows**, not the number of runs or gaps, so the
-  `violation_message` header arithmetic stays honest.
+- **`count` is the number of violating rows**, not the number of runs or gaps — that part of
+  `violation_message`'s header arithmetic is per-check-honest. But the header sums `count`
+  *across* failed checks, and `null_run` reports the same rows as `not_null`, and
+  `index_monotonic` reports the same rows as `primary_key`, so a frame with 5 rows can print
+  "13 of 5 rows" once several checks flag the same rows — routine now that these checks
+  overlap by construction, not just a hypothetical. This is pre-existing behaviour in
+  `violation_message` (it already double-counted whenever any two of the original eight
+  checks overlapped); it is deliberately left alone here, since fixing it would change the
+  message for all eleven checks and every existing user, not just the three added here.
 - **The body is wrapped in `except Exception: return None`**, as `range` and `isin` are at
   `rebase/contract.py:484` and `503`, so a dtype mismatch surfaces only as a `dtype` failure
   rather than as three cascading ones.
@@ -190,11 +197,14 @@ directly from `rebase.contract` as the tests already do.
 `Duration.parse("PT1H")` succeeds while `Freshness("PT1H")` is rejected — and once `max_gap="PT1H"`
 works, a contract can hold two duration fields that accept different grammars.
 
-`Freshness` will delegate to `Duration.coerce`, keeping its existing shortcuts as a pre-pass:
+`Freshness` delegates to the `Duration` grammar, keeping its existing shortcuts as a pre-pass:
 
 - `timedelta`, `int` and `float` continue to convert directly to seconds.
 - A bare-digit string continues to mean seconds, which `Duration.parse` alone rejects.
-- Anything else goes to `Duration.coerce`, so ISO-8601 and compact forms both work.
+- A `Duration` instance is accepted directly — normalised the same way a string is (rejected if
+  it carries a calendar `months` component or resolves to zero/negative seconds), so
+  `Freshness(rb.Duration(seconds=3600))` works the same as `rb.Index(max_gap=...)` already did.
+- Any other string goes to `Duration.coerce`, so ISO-8601 and compact forms both work.
 - Calendar durations are rejected, as for `max_gap`.
 
 **The stored representation must not change for any input accepted today.** `config_diff` compares

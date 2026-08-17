@@ -34,7 +34,9 @@
   every knowledge time would otherwise be silently wrong by the offset. Relatedly,
   `build_values_rows` in the canonical energy layout now stamps `knowledge_time`/`change_time`
   from the replay-aware batch clock instead of wall-clock, so a replay records the original run's
-  knowledge bound.
+  knowledge bound. A contract with `extra="forbid"` must declare the `knowledge_time` column
+  itself, since the stamp adds it before validation and `extra_columns` would otherwise flag the
+  toolkit's own column as unexpected.
 
 - **First-class environments now combine Modal-style Python ergonomics with GitOps.**
   Workspaces seed `dev`, `staging`, and `prod` and can create arbitrary additional names.
