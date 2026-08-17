@@ -162,7 +162,7 @@ Two helpers currently trapped in `bigquery.py` move to `energy.py` because both 
 
 ```
 {prefix}/catalog/{series_id}.json
-{prefix}/series/{series_id}/valid_month=2026-08/{change_time}-{run_id}.parquet
+{prefix}/series/{series_id}/valid_month=2026-08/{change_time}-{run_id}-{digest}.parquet
 ```
 
 - `series_id` is the deterministic 63-bit `sha256(path\x1fdata_type\x1fname)` id. Because it is
@@ -173,8 +173,17 @@ Two helpers currently trapped in `bigquery.py` move to `energy.py` because both 
   alike. A batch spanning months writes one object per month, which is what keeps pruning
   meaningful.
 - `change_time` is rendered in compact basic ISO form (`20260817T101500123456Z`) so keys sort
-  lexicographically in `Bucket.list()` order, and `run_id` disambiguates two writes in the same
-  microsecond. Together they make writes collision-free without any coordination.
+  lexicographically in `Bucket.list()` order, and `run_id` names the batch.
+- **The key ends with a content digest** — the first 12 hex chars of `sha256` over the encoded
+  parquet bytes — giving `{stamp}Z-{run_id}-{digest}.parquet`. `change_time` and `run_id` alone are
+  *not* collision-free: `change_time` comes from `_resolve_now()`, which during a replay is frozen to
+  `REBASE_REPLAY_KNOWLEDGE_TIME`, so a replay plus a caller-supplied `run_id` — the documented
+  per-batch usage — produces the identical key twice and the second `put` silently replaces the
+  first, destroying an append-only object. The digest closes that: identical content maps to an
+  identical key, so a duplicate write is idempotent rather than destructive, and differing content
+  always maps to a different key, so nothing is lost. Probing with `exists()` and bumping a counter
+  was rejected because `exists()` is deliberately not part of the duck-typed bucket contract the
+  store requires (`put`/`get`/`iter_all` only).
 - Each parquet object holds exactly `SERIES_VALUES_COLUMNS`, in that order, as
   `build_values_rows` already returns.
 - The catalog object holds one `SERIES_CATALOG_COLUMNS` record as JSON. JSON rather than parquet

@@ -1045,9 +1045,24 @@ def _month_prefix(prefix: str, series_id: int, month: str) -> str:
     return f"{_series_prefix(prefix, series_id)}valid_month={month}/"
 
 
-def _object_key(prefix: str, series_id: int, month: str, change_time: Any, run_id: int) -> str:
+def _object_key(prefix: str, series_id: int, month: str, change_time: Any, run_id: int, digest: str) -> str:
+    """The object key. Content-addressed by ``digest``, which is what makes it collision-free.
+
+    ``change_time`` and ``run_id`` alone are not enough: ``change_time`` comes from
+    ``_resolve_now()``, frozen to the replay bound during a replay, so a replay plus a
+    caller-supplied ``run_id`` would produce the same key twice and the second ``put`` would
+    silently replace the first — destroying an append-only object. With the digest, identical
+    content is idempotent and differing content can never collide.
+    """
     stamp = change_time.strftime(_CHANGE_TIME_FORMAT)
-    return f"{_month_prefix(prefix, series_id, month)}{stamp}Z-{run_id}.parquet"
+    return f"{_month_prefix(prefix, series_id, month)}{stamp}Z-{run_id}-{digest}.parquet"
+
+
+def _content_digest(blob: bytes) -> str:
+    """The first 12 hex chars of sha256 over the encoded object bytes."""
+    import hashlib
+
+    return hashlib.sha256(blob).hexdigest()[:12]
 
 
 def _months_in_range(start: datetime | None, end: datetime | None) -> list[str] | None:
@@ -1714,10 +1729,17 @@ _UNCHANGED_SCOPES = ("auto", "valid_time", "knowledge_time")
         written: list[str] = []
         if len(rows):
             for month, group in rows.groupby(rows["valid_time"].dt.strftime(_MONTH_FORMAT), sort=True):
+                # Encode first: the digest must be over the exact bytes being stored.
+                blob = _encode_parquet(group)
                 object_key = _object_key(
-                    self.prefix, key.series_id, str(month), group["change_time"].iloc[0], int(group["run_id"].iloc[0])
+                    self.prefix,
+                    key.series_id,
+                    str(month),
+                    group["change_time"].iloc[0],
+                    int(group["run_id"].iloc[0]),
+                    _content_digest(blob),
                 )
-                self.bucket.put(object_key, _encode_parquet(group), content_type=_PARQUET_CONTENT_TYPE)
+                self.bucket.put(object_key, blob, content_type=_PARQUET_CONTENT_TYPE)
                 written.append(object_key)
 
         suppressed = int(report["suppressed_unchanged"]) + int(report["suppressed_null"])
