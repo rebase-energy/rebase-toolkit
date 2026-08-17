@@ -17,11 +17,17 @@ from dataclasses import dataclass, field
 from datetime import date as _date
 from datetime import datetime as _datetime
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 # client.py never imports this module at module level (Dataset takes contracts as
 # duck-typed ``to_dict`` objects or plain dicts), so this import cannot cycle.
 from rebase.client import RebaseWorkflowError
+
+if TYPE_CHECKING:
+    # Only for annotations (evaluated lazily via ``from __future__ import annotations``);
+    # Index/Freshness import Duration lazily inside their bodies to keep this module's
+    # runtime imports pandas-free-adjacent and dodge any import-order surprises.
+    from rebase.timing import Duration
 
 
 class ContractViolation(RebaseWorkflowError):
@@ -168,7 +174,7 @@ class Index:
         column: str,
         *,
         monotonic: bool = False,
-        max_gap: str | int | float | timedelta | Any | None = None,
+        max_gap: str | int | float | timedelta | Duration | None = None,
     ) -> None:
         from rebase.timing import Duration
 
@@ -344,17 +350,24 @@ class Freshness:
     # touched. Unchanged from the pattern this class has always used.
     _LEGACY_PATTERN = r"^\d+\s*(s|m|h|d)?$"
 
-    def __init__(self, max_age: str | int | float | timedelta | Any, *, check_at: Any = None) -> None:
+    def __init__(self, max_age: str | int | float | timedelta | Duration, *, check_at: Any = None) -> None:
         import re
 
         from rebase.timing import Duration
 
         if isinstance(max_age, bool):
-            raise TypeError("Freshness max_age must be a duration string, seconds, or timedelta")
+            raise TypeError("Freshness max_age must be a duration string, seconds, timedelta or Duration")
         elif isinstance(max_age, timedelta):
             max_age = f"{int(max_age.total_seconds())}s"
         elif isinstance(max_age, (int, float)):
             max_age = f"{int(max_age)}s"
+        elif isinstance(max_age, Duration):
+            if max_age.months:
+                raise ValueError("Freshness max_age cannot be a calendar duration; a month has no fixed length")
+            total = max_age.days * 86400 + max_age.seconds
+            if total <= 0:
+                raise ValueError("Freshness max_age must be positive")
+            max_age = f"{int(total)}s"
         elif isinstance(max_age, str):
             max_age = max_age.strip()
             if re.match(self._LEGACY_PATTERN, max_age):
@@ -368,7 +381,7 @@ class Freshness:
                     raise ValueError("Freshness max_age must be positive")
                 max_age = f"{int(total)}s"
         else:
-            raise TypeError("Freshness max_age must be a duration string, seconds, or timedelta")
+            raise TypeError("Freshness max_age must be a duration string, seconds, timedelta or Duration")
 
         if check_at is not None:
             if hasattr(check_at, "to_dict"):
@@ -722,11 +735,16 @@ def _make_monotonic_check(name: str) -> Callable[[Any], CheckFailure | None]:
 
 
 def _make_max_gap_check(name: str, max_gap: str) -> Callable[[Any], CheckFailure | None]:
+    # Parsed once, at compile time: every other check captures its config the same way, and an
+    # unparseable stored max_gap must raise here (surfacing at compile_checks()/validate_frame())
+    # rather than being re-parsed inside the closure's blanket try/except, where it would be
+    # swallowed on every call and the check would silently never fail.
+    bound = Index(name, max_gap=max_gap).gap_timedelta()
+
     def run(df: Any) -> CheckFailure | None:
         if name not in df.columns:
             return None  # the missing_column check reports the root cause
         try:
-            bound = Index(name, max_gap=max_gap).gap_timedelta()
             diffs = df[name].diff()
             mask = diffs > bound
             mask = mask.fillna(False)  # the first row has no predecessor
@@ -734,7 +752,8 @@ def _make_max_gap_check(name: str, max_gap: str) -> Callable[[Any], CheckFailure
             if not count:
                 return None
             widest = diffs[mask].max()
-            detail = f"{count} gaps wider than {max_gap} (widest {widest})"
+            noun = "gap" if count == 1 else "gaps"
+            detail = f"{count} {noun} wider than {max_gap} (widest {widest})"
             return CheckFailure("index_max_gap", name, count, _sample_positions(mask), detail)
         except Exception:  # wrong dtype etc. — the dtype check reports the root cause
             return None

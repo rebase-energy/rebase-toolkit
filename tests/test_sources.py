@@ -1,6 +1,6 @@
 import importlib.util
 import warnings
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -541,6 +541,22 @@ def test_knowledge_time_constructors_validate() -> None:
 def test_knowledge_time_at_warns_on_naive_datetime() -> None:
     with pytest.warns(UserWarning, match="timezone-naive"):
         KnowledgeTime.at(datetime(2026, 1, 1, 9, 0))
+
+
+def test_knowledge_time_bare_constructor_raises() -> None:
+    with pytest.raises(DataSourceError, match="from_source"):
+        KnowledgeTime()
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_knowledge_time_at_normalises_to_utc() -> None:
+    import pandas as pd
+
+    moment = datetime(2026, 1, 1, 10, 0, tzinfo=timezone(timedelta(hours=2)))
+    out = KnowledgeTime.at(moment).apply(pd.DataFrame({"value": [1.0]}))
+    stamped = out["knowledge_time"].iloc[0]
+    assert str(stamped.tz) == "UTC"
+    assert stamped == pd.Timestamp("2026-01-01T08:00:00Z")
 
 
 @pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")

@@ -108,7 +108,16 @@ class KnowledgeTime:
     __slots__ = ("_column", "_inputs", "_moment")
 
     def __init__(self, *, column: str | None = None, inputs: tuple = (), moment: datetime | None = None) -> None:
-        # Construct through the classmethods below; they are the documented surface.
+        # Construct through the classmethods below; they are the documented surface. Guarded
+        # here (construction time) rather than in apply() so a bare KnowledgeTime() fails
+        # immediately at the call site instead of only once it is handed a frame — the three
+        # classmethods below always pass a real column/inputs/moment, so this only ever fires
+        # for a direct, argument-less KnowledgeTime() call.
+        if column is None and not inputs and moment is None:
+            raise DataSourceError(
+                "KnowledgeTime() requires a source: use KnowledgeTime.from_source(column), "
+                "KnowledgeTime.from_inputs(*frames) or KnowledgeTime.at(moment)."
+            )
         self._column = column
         self._inputs = tuple(inputs)
         self._moment = moment
@@ -139,6 +148,8 @@ class KnowledgeTime:
         if moment.tzinfo is None:
             warnings.warn("knowledge_time is timezone-naive; assuming UTC", stacklevel=2)
             moment = moment.replace(tzinfo=UTC)
+        else:
+            moment = moment.astimezone(UTC)
         return cls(moment=moment)
 
     def apply(self, df: Frame) -> Frame:

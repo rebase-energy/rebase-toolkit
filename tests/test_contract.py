@@ -851,3 +851,119 @@ def test_freshness_rejects_bad_durations(value, match) -> None:
 def test_freshness_still_rejects_bools() -> None:
     with pytest.raises(TypeError, match="max_age must be"):
         Freshness(True)
+
+
+# --- Freshness(Duration) ---------------------------------------------------------------
+
+
+def test_freshness_accepts_a_duration_instance() -> None:
+    assert Freshness(rb.Duration(seconds=3600)).to_dict() == {"max_age": "3600s"}
+    assert Freshness(rb.Duration(days=1)).to_dict() == {"max_age": "86400s"}
+
+
+def test_freshness_rejects_a_calendar_duration_instance() -> None:
+    with pytest.raises(ValueError, match="calendar"):
+        Freshness(rb.Duration(months=1))
+
+
+def test_freshness_rejects_a_non_positive_duration_instance() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        Freshness(rb.Duration(seconds=0))
+    with pytest.raises(ValueError, match="positive"):
+        Freshness(rb.Duration(seconds=-60))
+
+
+def test_freshness_existing_paths_are_unchanged_by_the_duration_branch() -> None:
+    # CRITICAL: config_diff compares stored contracts, so any of these representations
+    # changing shape would read as drift on datasets nobody touched.
+    assert Freshness("45m").to_dict() == {"max_age": "45m"}
+    assert Freshness("300").to_dict() == {"max_age": "300"}
+
+
+# --- contract dict with a malformed stored max_gap -------------------------------------
+
+
+def test_malformed_stored_max_gap_raises_at_compile_time_not_silently_passes() -> None:
+    contract = {
+        "$schema": "rebase/contract-v1",
+        "properties": {"t": {"type": "string", "format": "date-time"}},
+        "required": [],
+        "x-rebase": {"index": {"column": "t", "max_gap": "banana"}},
+    }
+    with pytest.raises(ValueError, match="max_gap must be"):
+        compile_checks(contract)
+    # compile_checks() runs before df is ever touched, so validate_frame() raises the same
+    # way without needing a real frame (and without needing pandas installed).
+    with pytest.raises(ValueError, match="max_gap must be"):
+        validate_frame(None, contract)
+
+
+# --- all eleven checks together (interaction coverage) ---------------------------------
+
+
+def _all_checks_contract() -> dict:
+    return Contract(
+        [
+            Column("t", "timestamp", not_null=True),
+            Column("req", "float", not_null=True),  # left out of the frame -> missing_column
+            Column("area", "string", not_null=True, isin=["SE1", "SE2"]),
+            Column("price", "float", between=(0, 100)),
+            Column("flag", "int"),
+            Column("value", "float", max_null_run=1),
+        ],
+        primary_key=("t",),
+        min_rows=100,
+        extra="forbid",
+        index=Index(column="t", monotonic=True, max_gap="PT1H"),
+    ).to_dict()
+
+
+@pandas_only
+def test_all_eleven_checks_fire_together_on_one_frame() -> None:
+    """No test previously exercised every check kind against one frame at once.
+
+    ``_indexed_contract`` (above) is only ever serialised, never validated — so cross-check
+    interactions (e.g. a duplicate row that is both a primary_key and an index_monotonic
+    violation) had no coverage. This builds a contract touching all eleven check kinds and a
+    frame that violates several of them simultaneously.
+    """
+    import pandas as pd
+
+    frame = _frame(
+        t=pd.to_datetime(
+            [
+                "2026-01-01T00:00Z",
+                "2026-01-01T01:00Z",
+                "2026-01-01T01:00Z",  # duplicate of the row before -> primary_key + index_monotonic
+                "2026-01-01T08:00Z",  # 7h after its predecessor -> index_max_gap
+                "2026-01-01T09:00Z",
+                "2026-01-01T10:00Z",
+            ]
+        ),
+        area=["SE1", "SE2", None, "XX", "SE1", "SE2"],  # null -> not_null; "XX" -> isin
+        price=[10.0, 20.0, 30.0, 200.0, 40.0, 50.0],  # 200.0 -> range
+        flag=[1.5, 2.5, 3.5, 4.5, 5.5, 6.5],  # float, declared int -> dtype
+        value=[1.0, None, None, 2.0, 3.0, 4.0],  # run of 2 nulls > max_null_run=1 -> null_run
+        oops=[0, 0, 0, 0, 0, 0],  # undeclared column, extra="forbid" -> extra_columns
+    )
+    # min_rows=100 against a 6-row frame -> min_rows; "req" is entirely absent -> missing_column.
+    report = validate_frame(frame, _all_checks_contract())
+    assert not report.passed
+    assert {failure.check for failure in report.failures} == {
+        "missing_column",
+        "not_null",
+        "dtype",
+        "range",
+        "isin",
+        "primary_key",
+        "min_rows",
+        "extra_columns",
+        "index_monotonic",
+        "index_max_gap",
+        "null_run",
+    }
+    assert _failure(report, "missing_column").column == "req"
+    assert _failure(report, "primary_key").count == 2
+    assert _failure(report, "index_monotonic").count == 1
+    assert _failure(report, "index_max_gap").count == 1
+    assert _failure(report, "null_run").column == "value"
