@@ -369,6 +369,29 @@ class OnNull(Enum):
     """Treat the null as a real observation and record the gap."""
 
 
+def _is_missing(value: Any) -> bool:
+    """True for any null-like scalar: ``None``, float ``NaN``, ``pandas.NA``, or ``NaT``.
+
+    Prefers ``pandas.isna`` because it recognises the nullable-dtype sentinels (``pd.NA``,
+    ``pd.NaT``) uniformly with plain ``None``/``NaN``, where a bare ``is None`` / ``math.isnan``
+    check misses them — ``pd.NA`` is neither ``None`` nor a ``float``, so it fell through as a
+    "real" value and ``==`` on it raised ``TypeError: boolean value of NA is ambiguous``.
+    Falls back to the ``None``/``NaN`` check when pandas is not installed, since
+    :meth:`Change.values_equal` must keep working without it.
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        import math
+
+        return value is None or (isinstance(value, float) and math.isnan(value))
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        # pd.isna returns an array for array-likes; a scalar value can't be missing that way.
+        return False
+
+
 class Change:
     """How a write decides whether an incoming value is unchanged.
 
@@ -399,11 +422,9 @@ class Change:
         return cls(atol=float(atol))
 
     def values_equal(self, new: Any, old: Any) -> bool:
-        """True when the two values count as unchanged. NaN equals NaN, matching timedb."""
-        import math
-
-        new_missing = new is None or (isinstance(new, float) and math.isnan(new))
-        old_missing = old is None or (isinstance(old, float) and math.isnan(old))
+        """True when the two values count as unchanged. Any null equals any null, matching timedb."""
+        new_missing = _is_missing(new)
+        old_missing = _is_missing(old)
         if new_missing or old_missing:
             return new_missing and old_missing
         if self._atol is None:
@@ -483,8 +504,6 @@ def suppress_rows(
     republication at a new knowledge_time with an unchanged value is a genuine observation
     and suppressing it loses information no later read can recover.
     """
-    import math
-
     empty_report: dict[str, Any] = {"suppressed_unchanged": 0, "suppressed_null": 0, "sample_valid_times": ()}
     if overlapping or not len(batch):
         # The store also skips the stored-state read for OVERLAPPING series, so in production
@@ -503,8 +522,12 @@ def suppress_rows(
     suppressed_null = 0
     samples: list[str] = []
 
-    def _missing(value: Any) -> bool:
-        return value is None or (isinstance(value, float) and math.isnan(value))
+    def _metadata_equal(new_meta: Any, old_meta: Any) -> bool:
+        # Any null and the empty string all count as "no annotation" — otherwise an all-null
+        # metadata column reads as "differs" on every row and skip_unchanged never suppresses.
+        new_norm = "" if _is_missing(new_meta) else new_meta
+        old_norm = "" if _is_missing(old_meta) else old_meta
+        return bool(new_norm == old_norm)
 
     for row in batch.itertuples(index=False):
         current = lookup.get(row.valid_time)
@@ -512,20 +535,22 @@ def suppress_rows(
             keep.append(True)  # rule 1
             continue
         old_value, old_annotation, old_changed_by = current
-        if _missing(row.value):
-            if _missing(old_value):
+        if _is_missing(row.value):
+            if _is_missing(old_value):
                 decision, bucket = False, "null"  # rule 2
             elif on_null is OnNull.KEEP_STORED:
                 decision, bucket = False, "null"  # rule 4, keep
             else:
                 decision, bucket = True, ""  # rule 4, write
-        elif _missing(old_value):
+        elif _is_missing(old_value):
             decision, bucket = True, ""  # rule 3
         elif not skip_unchanged:
             decision, bucket = True, ""  # rules 5-7 disabled
         elif not comparer.values_equal(row.value, old_value):
             decision, bucket = True, ""  # rule 7
-        elif row.annotation != old_annotation or row.changed_by != old_changed_by:
+        elif not _metadata_equal(row.annotation, old_annotation) or not _metadata_equal(
+            row.changed_by, old_changed_by
+        ):
             decision, bucket = True, ""  # rule 6
         else:
             decision, bucket = False, "unchanged"  # rule 5

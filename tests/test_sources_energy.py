@@ -377,12 +377,29 @@ def test_change_treats_nan_as_equal_to_nan() -> None:
     assert not Change.exact().values_equal(1.0, None)
 
 
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_change_treats_pandas_na_and_nat_as_missing() -> None:
+    import pandas as pd
+
+    assert Change.exact().values_equal(pd.NA, pd.NA)
+    assert Change.exact().values_equal(pd.NA, float("nan"))
+    assert Change.exact().values_equal(pd.NA, None)
+    assert Change.exact().values_equal(pd.NaT, pd.NaT)
+    assert not Change.exact().values_equal(pd.NA, 1.0)
+    assert not Change.exact().values_equal(1.0, pd.NA)
+
+
 def test_change_tolerance_is_absolute() -> None:
     change = Change.tolerance(1e-6)
     assert change.values_equal(1.0, 1.0000001)
     # The recorded production defect: a relative band would call this unchanged on a
     # 5000-magnitude series. An absolute 1e-6 must not.
     assert not change.values_equal(5000.0, 5000.5)
+    # (5000.0, 5000.5) only discriminates the relative band by 5e-5, and swapping the
+    # arguments makes the band exactly 0.5 -- too tight a margin for a regression guard.
+    # 5000.3 clears the relative band (0.50003) by ~0.2 in both directions.
+    assert not change.values_equal(5000.0, 5000.3)
+    assert not change.values_equal(5000.3, 5000.0)
 
 
 def test_change_tolerance_boundary_is_inclusive() -> None:
@@ -500,6 +517,101 @@ def test_suppression_still_protects_nulls_without_skip_unchanged() -> None:
     assert len(kept) == 0
     assert report["suppressed_null"] == 1
     assert report["suppressed_unchanged"] == 0
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_suppression_gap_fills_a_pandas_na_stored_value() -> None:
+    # rule 3, with pd.NA instead of float NaN as the stored sentinel: must write, not crash.
+    import pandas as pd
+
+    kept, report = suppress_rows(
+        _batch([(_T0, 5.0, "", "")]),
+        _stored([(_T0, pd.NA, "", "")]),
+        skip_unchanged=True,
+        change=Change.exact(),
+    )
+    assert list(kept["valid_time"]) == [pd.Timestamp(_T0)]
+    assert report["suppressed_null"] == 0
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_suppression_treats_pandas_na_over_na_as_rule_2() -> None:
+    import pandas as pd
+
+    kept, report = suppress_rows(
+        _batch([(_T0, pd.NA, "", "")]),
+        _stored([(_T0, pd.NA, "", "")]),
+        skip_unchanged=True,
+        change=Change.exact(),
+    )
+    assert len(kept) == 0
+    assert report["suppressed_null"] == 1
+    assert report["suppressed_unchanged"] == 0
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_suppression_null_annotation_column_still_suppresses() -> None:
+    # rule 6: a nan annotation must not read as "differs from itself" and defeat skip_unchanged.
+    kept, report = suppress_rows(
+        _batch([(_T0, 5.0, float("nan"), "u")]),
+        _stored([(_T0, 5.0, float("nan"), "u")]),
+        skip_unchanged=True,
+        change=Change.exact(),
+    )
+    assert len(kept) == 0
+    assert report["suppressed_unchanged"] == 1
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_suppression_null_object_annotation_column_still_suppresses() -> None:
+    # same as above with a None (object-dtype) annotation rather than a float nan.
+    kept, report = suppress_rows(
+        _batch([(_T0, 5.0, None, "u")]),
+        _stored([(_T0, 5.0, None, "u")]),
+        skip_unchanged=True,
+        change=Change.exact(),
+    )
+    assert len(kept) == 0
+    assert report["suppressed_unchanged"] == 1
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_suppression_none_and_empty_string_annotation_count_as_equal() -> None:
+    kept, report = suppress_rows(
+        _batch([(_T0, 5.0, "", "u")]),
+        _stored([(_T0, 5.0, None, "u")]),
+        skip_unchanged=True,
+        change=Change.exact(),
+    )
+    assert len(kept) == 0
+    assert report["suppressed_unchanged"] == 1
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_suppression_real_annotation_still_differs_from_empty_string() -> None:
+    # rule 6 must keep working: a genuine annotation differing from "" still writes.
+    kept, _report = suppress_rows(
+        _batch([(_T0, 5.0, "", "u")]),
+        _stored([(_T0, 5.0, "a", "u")]),
+        skip_unchanged=True,
+        change=Change.exact(),
+    )
+    assert len(kept) == 1
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_suppression_sample_cap_is_combined_across_categories() -> None:
+    # test_suppression_samples_are_capped uses one kind only, so a per-category cap would
+    # also pass it. Mix unchanged and null rows and assert the cap applies to the total.
+    unchanged_rows = [(f"2026-01-01T{hour:02d}:00Z", 1.0, "", "") for hour in range(6)]
+    null_rows = [(f"2026-01-02T{hour:02d}:00Z", float("nan"), "", "") for hour in range(6)]
+    stored_rows = unchanged_rows + [(valid_time, 5.0, "", "") for valid_time, _, _, _ in null_rows]
+    batch_rows = unchanged_rows + null_rows
+    kept, report = suppress_rows(_batch(batch_rows), _stored(stored_rows), skip_unchanged=True, change=Change.exact())
+    assert len(kept) == 0
+    assert report["suppressed_unchanged"] == 6
+    assert report["suppressed_null"] == 6
+    assert len(report["sample_valid_times"]) == MAX_SAMPLE_VALID_TIMES
 
 
 @pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
