@@ -330,11 +330,12 @@ def series_keys(keys: Any) -> list[SeriesKey]:
 
 def attach_series_keys(df: Frame, by_id: dict[int, SeriesKey]) -> Frame:
     """Swap the raw ``series_id`` column for path/data_type/name — ids are never exposed."""
-    unmapped = sorted({int(sid) for sid in df["series_id"].unique() if int(sid) not in by_id})
-    if unmapped:
-        # A bare KeyError from the .map() below would violate this package's contract that
-        # every failure surfaces as DataSourceError.
-        raise DataSourceError(f"by_id must cover every series_id in the frame; unmapped: {unmapped}")
+    # A bare KeyError from the .map() below would violate this package's contract that every
+    # failure surfaces as DataSourceError. An empty frame yields an empty set and so cannot
+    # raise here, which read_series against an empty store relies on.
+    missing = set(df["series_id"]) - set(by_id)
+    if missing:
+        raise DataSourceError(f"by_id must cover every series_id in the frame; missing {sorted(missing)!r}")
     out = df.copy()
     out.insert(0, "name", out["series_id"].map(lambda sid: by_id[sid].name))
     out.insert(0, "data_type", out["series_id"].map(lambda sid: by_id[sid].data_type))
