@@ -34,6 +34,7 @@ import uuid
 import warnings
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from typing import Any
 
 from rebase.sources.base import DataSourceError, Frame, _replay_knowledge_time, _resolve_now
@@ -353,3 +354,76 @@ def attach_series_keys(df: Frame, by_id: dict[int, SeriesKey]) -> Frame:
     out.insert(0, "data_type", out["series_id"].map(lambda sid: by_id[sid].data_type))
     out.insert(0, "path", out["series_id"].map(lambda sid: by_id[sid].path))
     return out.drop(columns=["series_id"])
+
+
+MAX_SAMPLE_VALID_TIMES = 10
+
+
+class OnNull(Enum):
+    """What a write does when the incoming value is null and a value is already stored."""
+
+    KEEP_STORED = "keep_stored"
+    """Never replace a stored real value with a null — a transient upstream gap must not destroy data."""
+
+    WRITE_NULL = "write_null"
+    """Treat the null as a real observation and record the gap."""
+
+
+class Change:
+    """How a write decides whether an incoming value is unchanged.
+
+    ``exact()`` is the default because over-suppression is the failure mode this vocabulary
+    exists to prevent: a tolerance that silently discards real corrections defeats the point
+    of re-fetching. ``tolerance()`` takes an **absolute** bound and there is deliberately no
+    relative variant — a relative band is the recorded defect, because on a 5,000-magnitude
+    series a 1e-4 relative band ignores every correction under 0.5.
+    """
+
+    __slots__ = ("_atol",)
+
+    def __init__(self, *, atol: float | None = None) -> None:
+        self._atol = atol
+
+    @classmethod
+    def exact(cls) -> Change:
+        """Any difference is a change. Suppresses only true no-op rewrites."""
+        return cls()
+
+    @classmethod
+    def tolerance(cls, atol: float) -> Change:
+        """Treat differences within ``atol`` (absolute) as unchanged. ``atol`` must be positive."""
+        if isinstance(atol, bool) or not isinstance(atol, (int, float)):
+            raise DataSourceError("Change.tolerance requires a number")
+        if atol <= 0:
+            raise DataSourceError("Change.tolerance requires atol > 0; use Change.exact() for no tolerance")
+        return cls(atol=float(atol))
+
+    def values_equal(self, new: Any, old: Any) -> bool:
+        """True when the two values count as unchanged. NaN equals NaN, matching timedb."""
+        import math
+
+        new_missing = new is None or (isinstance(new, float) and math.isnan(new))
+        old_missing = old is None or (isinstance(old, float) and math.isnan(old))
+        if new_missing or old_missing:
+            return new_missing and old_missing
+        if self._atol is None:
+            return bool(new == old)
+        return bool(abs(float(new) - float(old)) <= self._atol)
+
+
+@dataclass(frozen=True)
+class SeriesWriteResult:
+    """Outcome of one :meth:`EnergyDBStore.write_series` call, including what it declined.
+
+    Suppression counts are returned rather than logged-and-forgotten because an undeclared,
+    unreported threshold is exactly what made the original defect invisible until someone
+    went looking.
+    """
+
+    series: SeriesKey
+    rows_written: int
+    objects_written: tuple[str, ...] = ()
+    suppressed_unchanged: int = 0
+    suppressed_null: int = 0
+    sample_valid_times: tuple[str, ...] = ()
+    fail_open: bool = False

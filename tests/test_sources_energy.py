@@ -6,7 +6,10 @@ import pytest
 from rebase.sources.base import DataSourceError
 from rebase.sources.energy import (
     SERIES_VALUES_COLUMNS,
+    Change,
+    OnNull,
     SeriesKey,
+    SeriesWriteResult,
     attach_series_keys,
     build_values_rows,
     select_series_winners,
@@ -346,3 +349,65 @@ def test_attach_series_keys_rejects_an_unmapped_id() -> None:
     )
     with pytest.raises(DataSourceError, match="must cover every series_id"):
         attach_series_keys(frame, {key.series_id: key})
+
+
+# --- write-semantics declarations -----------------------------------------------------
+
+
+def test_on_null_members() -> None:
+    assert OnNull.KEEP_STORED.value == "keep_stored"
+    assert OnNull.WRITE_NULL.value == "write_null"
+
+
+def test_change_exact_compares_exactly() -> None:
+    change = Change.exact()
+    assert change.values_equal(1.0, 1.0)
+    assert not change.values_equal(1.0, 1.0000001)
+
+
+def test_change_treats_nan_as_equal_to_nan() -> None:
+    # timedb's native comparison does the same; the live application implementation does
+    # not, which is why it rewrites every null row on every pass.
+    assert Change.exact().values_equal(float("nan"), float("nan"))
+    assert Change.exact().values_equal(None, float("nan"))
+    assert not Change.exact().values_equal(float("nan"), 1.0)
+    assert not Change.exact().values_equal(1.0, None)
+
+
+def test_change_tolerance_is_absolute() -> None:
+    change = Change.tolerance(1e-6)
+    assert change.values_equal(1.0, 1.0000001)
+    # The recorded production defect: a relative band would call this unchanged on a
+    # 5000-magnitude series. An absolute 1e-6 must not.
+    assert not change.values_equal(5000.0, 5000.5)
+
+
+def test_change_tolerance_boundary_is_inclusive() -> None:
+    assert Change.tolerance(0.5).values_equal(10.0, 10.5)
+    assert not Change.tolerance(0.5).values_equal(10.0, 10.6)
+
+
+@pytest.mark.parametrize("bad", [0, -1, -0.5])
+def test_change_tolerance_rejects_non_positive(bad) -> None:
+    with pytest.raises(DataSourceError, match="atol > 0"):
+        Change.tolerance(bad)
+
+
+@pytest.mark.parametrize("bad", [True, "1e-6", None])
+def test_change_tolerance_rejects_non_numbers(bad) -> None:
+    with pytest.raises(DataSourceError, match="requires a number"):
+        Change.tolerance(bad)
+
+
+def test_series_write_result_shape() -> None:
+    key = SeriesKey("p", "actual", "electricity.load")
+    result = SeriesWriteResult(
+        series=key,
+        rows_written=3,
+        objects_written=("a.parquet",),
+        suppressed_unchanged=1,
+        suppressed_null=2,
+        sample_valid_times=("2026-01-01T00:00:00+00:00",),
+    )
+    assert result.fail_open is False
+    assert result.rows_written == 3
