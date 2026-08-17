@@ -255,3 +255,200 @@ def test_read_series_defaults_as_of_to_the_replay_bound(monkeypatch) -> None:
     )
     monkeypatch.setenv("REBASE_REPLAY_KNOWLEDGE_TIME", "2026-01-01T07:00:00+00:00")
     assert list(store.read_series(KEY)["value"]) == [1.0]
+
+
+def _frame(rows):
+    """(valid_time, value) pairs -> a SIMPLE input frame."""
+    import pandas as pd
+
+    return pd.DataFrame(
+        {"valid_time": pd.to_datetime([row[0] for row in rows]), "value": [row[1] for row in rows]}
+    )
+
+
+@pandas_only
+def test_write_series_round_trips() -> None:
+    store, _bucket = _store()
+    result = store.write_series(_frame([("2026-01-01T00:00Z", 1.5), ("2026-01-01T01:00Z", 2.5)]), KEY)
+    assert result.rows_written == 2
+    assert len(result.objects_written) == 1
+    back = store.read_series(KEY)
+    assert list(back["value"]) == [1.5, 2.5]
+
+
+@pandas_only
+def test_write_series_splits_objects_by_month() -> None:
+    store, _bucket = _store()
+    result = store.write_series(_frame([("2026-07-31T00:00Z", 1.0), ("2026-08-01T00:00Z", 2.0)]), KEY)
+    assert len(result.objects_written) == 2
+    assert any("valid_month=2026-07" in key for key in result.objects_written)
+    assert any("valid_month=2026-08" in key for key in result.objects_written)
+
+
+@pandas_only
+def test_write_series_never_rewrites_an_object() -> None:
+    store, bucket = _store()
+    store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, run_id=1)
+    first = set(bucket.objects)
+    store.write_series(_frame([("2026-01-01T00:00Z", 2.0)]), KEY, run_id=2)
+    assert first < set(bucket.objects)  # strictly grown; nothing replaced
+
+
+@pandas_only
+def test_write_series_suppresses_unchanged_and_reports() -> None:
+    store, _bucket = _store()
+    store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY)
+    result = store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, skip_unchanged=True)
+    assert result.rows_written == 0
+    assert result.suppressed_unchanged == 1
+    assert result.objects_written == ()
+    assert len(result.sample_valid_times) == 1
+
+
+@pandas_only
+def test_write_series_writes_a_correction_outside_the_tolerance() -> None:
+    from rebase.sources.energy import Change
+
+    store, _bucket = _store()
+    store.write_series(_frame([("2026-01-01T00:00Z", 5000.0)]), KEY)
+    # A relative band would call this unchanged; an absolute 1e-6 must not.
+    result = store.write_series(
+        _frame([("2026-01-01T00:00Z", 5000.5)]), KEY, skip_unchanged=True, change=Change.tolerance(1e-6)
+    )
+    assert result.rows_written == 1
+    assert result.suppressed_unchanged == 0
+    assert list(store.read_series(KEY)["value"]) == [5000.5]
+
+
+@pandas_only
+def test_write_series_keeps_a_stored_value_against_a_null() -> None:
+    store, _bucket = _store()
+    store.write_series(_frame([("2026-01-01T00:00Z", 5.0)]), KEY)
+    result = store.write_series(_frame([("2026-01-01T00:00Z", float("nan"))]), KEY)
+    assert result.rows_written == 0
+    assert result.suppressed_null == 1
+    assert list(store.read_series(KEY)["value"]) == [5.0]
+
+
+@pandas_only
+def test_write_series_write_null_records_the_gap() -> None:
+    from rebase.sources.energy import OnNull
+
+    store, _bucket = _store()
+    store.write_series(_frame([("2026-01-01T00:00Z", 5.0)]), KEY)
+    result = store.write_series(_frame([("2026-01-01T00:00Z", float("nan"))]), KEY, on_null=OnNull.WRITE_NULL)
+    assert result.rows_written == 1
+
+
+@pandas_only
+def test_write_series_overlapping_keeps_identical_republications() -> None:
+    import pandas as pd
+
+    store, _bucket = _store()
+    store.register_series(KEY, timeseries_type="OVERLAPPING")
+    first = pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime(["2026-01-01T00:00Z"]),
+            "knowledge_time": pd.to_datetime(["2026-01-01T06:00Z"]),
+            "value": [7.0],
+        }
+    )
+    second = pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime(["2026-01-01T00:00Z"]),
+            "knowledge_time": pd.to_datetime(["2026-01-01T09:00Z"]),
+            "value": [7.0],
+        }
+    )
+    store.write_series(first, KEY, skip_unchanged=True)
+    result = store.write_series(second, KEY, skip_unchanged=True)
+    assert result.rows_written == 1
+    assert result.suppressed_unchanged == 0
+    assert len(store.read_series(KEY, overlapping=True)) == 2
+
+
+@pandas_only
+def test_write_series_flat_suppresses_what_overlapping_keeps() -> None:
+    import pandas as pd
+
+    store, _bucket = _store()  # unregistered -> FLAT
+    first = pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime(["2026-01-01T00:00Z"]),
+            "knowledge_time": pd.to_datetime(["2026-01-01T06:00Z"]),
+            "value": [7.0],
+        }
+    )
+    second = pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime(["2026-01-01T00:00Z"]),
+            "knowledge_time": pd.to_datetime(["2026-01-01T09:00Z"]),
+            "value": [7.0],
+        }
+    )
+    store.write_series(first, KEY, skip_unchanged=True)
+    assert store.write_series(second, KEY, skip_unchanged=True).rows_written == 0
+
+
+@pandas_only
+def test_write_series_is_fail_open(monkeypatch) -> None:
+    import rebase.sources.energydb as energydb_module
+
+    store, _bucket = _store()
+    store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("comparison exploded")
+
+    monkeypatch.setattr(energydb_module, "suppress_rows", _boom)
+    result = store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, skip_unchanged=True)
+    assert result.fail_open is True
+    assert result.rows_written == 1  # the batch was written unfiltered
+
+
+@pandas_only
+def test_write_series_skips_the_read_when_no_suppression_is_possible() -> None:
+    from rebase.sources.energy import OnNull
+
+    store, bucket = _store()
+    store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY)
+    bucket.fetched.clear()
+    store.write_series(_frame([("2026-01-01T01:00Z", 2.0)]), KEY, skip_unchanged=False, on_null=OnNull.WRITE_NULL)
+    assert bucket.fetched == []
+
+
+@pandas_only
+def test_write_series_logs_a_summary_when_it_suppresses(caplog) -> None:
+    import logging
+
+    store, _bucket = _store()
+    store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY)
+    with caplog.at_level(logging.WARNING, logger="rebase.sources"):
+        store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, skip_unchanged=True)
+    assert any("suppressed" in record.getMessage() for record in caplog.records)
+
+
+@pandas_only
+def test_write_series_accepts_a_declared_knowledge_time() -> None:
+    import pandas as pd
+
+    from rebase.sources.base import KnowledgeTime
+
+    store, _bucket = _store()
+    frame = pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime(["2026-01-01T00:00Z"]),
+            "issued_at": pd.to_datetime(["2026-01-01T06:00Z"]),
+            "value": [1.0],
+        }
+    )
+    store.write_series(frame, KEY, knowledge_time=KnowledgeTime.from_source("issued_at"))
+    out = store.read_series(KEY, overlapping=True)
+    assert out["knowledge_time"].iloc[0] == pd.Timestamp("2026-01-01T06:00Z")
+
+
+@pandas_only
+def test_write_series_rejects_an_unknown_unchanged_scope() -> None:
+    store, _bucket = _store()
+    with pytest.raises(Exception, match="unchanged_scope"):
+        store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, unchanged_scope="sideways")

@@ -41,10 +41,16 @@ from rebase.sources.energy import (
     RETENTION_TIERS,
     SERIES_CATALOG_COLUMNS,
     TIMESERIES_TYPES,
+    Change,
+    OnNull,
     SeriesKey,
+    SeriesWriteResult,
     attach_series_keys,
+    build_values_rows,
+    select_current_state,
     select_series_winners,
     series_keys,
+    suppress_rows,
 )
 
 _logger = logging.getLogger("rebase.sources")
@@ -52,6 +58,7 @@ _logger = logging.getLogger("rebase.sources")
 _MONTH_FORMAT = "%Y-%m"
 _CHANGE_TIME_FORMAT = "%Y%m%dT%H%M%S%f"
 _PARQUET_CONTENT_TYPE = "application/vnd.apache.parquet"
+_UNCHANGED_SCOPES = ("auto", "valid_time", "knowledge_time")
 
 
 def _catalog_key(prefix: str, series_id: int) -> str:
@@ -236,3 +243,95 @@ class EnergyDBStore:
             raw = raw[raw["valid_time"] < pd.Timestamp(end_valid)]
         winners = select_series_winners(raw, overlapping=overlapping, include_updates=include_updates, as_of=as_of)
         return attach_series_keys(winners, by_id)
+
+    def write_series(
+        self,
+        data: Any,
+        key: SeriesKey,
+        *,
+        retention: str = "forever",
+        changed_by: str = "",
+        annotation: str = "",
+        run_id: int | None = None,
+        knowledge_time: Any | None = None,
+        skip_unchanged: bool = False,
+        unchanged_scope: str = "auto",
+        change: Change | None = None,
+        on_null: OnNull = OnNull.KEEP_STORED,
+    ) -> SeriesWriteResult:
+        """Append a SIMPLE or VERSIONED series, honouring the declared write semantics.
+
+        ``skip_unchanged`` suppresses no-op rewrites; ``change`` declares what "unchanged"
+        means (absolute tolerance only, defaulting to exact); ``on_null`` decides whether an
+        incoming null may replace a stored value. ``unchanged_scope="auto"`` resolves per
+        series from the catalog, so an ``OVERLAPPING`` series bypasses suppression entirely —
+        every publication of a forecast is meaningful.
+
+        Suppression is fail-open: if anything in that path raises, the unfiltered batch is
+        written and ``fail_open`` is set. Suppression is an optimisation, never a gate.
+        """
+        if unchanged_scope not in _UNCHANGED_SCOPES:
+            raise DataSourceError(f"unchanged_scope must be one of {_UNCHANGED_SCOPES}; got {unchanged_scope!r}")
+        if knowledge_time is not None:
+            data = knowledge_time.apply(data)
+        rows = build_values_rows(
+            data, key, retention=retention, changed_by=changed_by, annotation=annotation, run_id=run_id
+        )
+
+        if unchanged_scope == "auto":
+            overlapping = self._is_overlapping(key.series_id)
+        else:
+            overlapping = unchanged_scope == "knowledge_time"
+
+        report: dict[str, Any] = {"suppressed_unchanged": 0, "suppressed_null": 0, "sample_valid_times": ()}
+        fail_open = False
+        # The read is the write path's only added cost, so skip it when nothing could be
+        # suppressed anyway.
+        must_compare = not overlapping and (skip_unchanged or on_null is OnNull.KEEP_STORED)
+        if must_compare:
+            try:
+                months = sorted({stamp.strftime(_MONTH_FORMAT) for stamp in rows["valid_time"]})
+                stored = select_current_state(self._raw_rows([key.series_id], months))
+                rows, report = suppress_rows(
+                    rows, stored, on_null=on_null, skip_unchanged=skip_unchanged, change=change
+                )
+            except Exception as exc:  # noqa: BLE001 - fail-open: never block a write
+                fail_open = True
+                _logger.warning(
+                    "energydb: suppression failed for %s/%s/%s, writing the batch unfiltered: %s",
+                    key.path,
+                    key.data_type,
+                    key.name,
+                    exc,
+                )
+
+        written: list[str] = []
+        if len(rows):
+            for month, group in rows.groupby(rows["valid_time"].dt.strftime(_MONTH_FORMAT), sort=True):
+                object_key = _object_key(
+                    self.prefix, key.series_id, str(month), group["change_time"].iloc[0], int(group["run_id"].iloc[0])
+                )
+                self.bucket.put(object_key, _encode_parquet(group), content_type=_PARQUET_CONTENT_TYPE)
+                written.append(object_key)
+
+        suppressed = int(report["suppressed_unchanged"]) + int(report["suppressed_null"])
+        if suppressed or fail_open:
+            _logger.warning(
+                "energydb: wrote %d rows to %s/%s/%s; suppressed %d unchanged and %d null%s",
+                len(rows),
+                key.path,
+                key.data_type,
+                key.name,
+                report["suppressed_unchanged"],
+                report["suppressed_null"],
+                " (fail-open)" if fail_open else "",
+            )
+        return SeriesWriteResult(
+            series=key,
+            rows_written=int(len(rows)),
+            objects_written=tuple(written),
+            suppressed_unchanged=int(report["suppressed_unchanged"]),
+            suppressed_null=int(report["suppressed_null"]),
+            sample_valid_times=tuple(report["sample_valid_times"]),
+            fail_open=fail_open,
+        )
