@@ -24,6 +24,12 @@ That is not the intent. The intent, clarified directly:
 - **Out of scope** — talking to an EnergyDB instance. No ClickHouse driver, no connection
   credentials, no new REST endpoints. That is future work for the toolkit.
 
+**This is a deliberately transitional implementation.** It is intended to be replaced by proper
+EnergyDB database support, shaped like the other four connectors, once the toolkit can reach the
+store. See [Intended trajectory](#intended-trajectory-this-becomes-a-real-connector) for what is
+designed to survive that change and what is expected to be thrown away — and note that requirement
+is binding on the code, not just on this document.
+
 Two facts make the out-of-scope half impossible here anyway, and are worth recording so nobody
 re-derives them:
 
@@ -141,7 +147,7 @@ starts validating it, because the store's suppression behaviour now *depends* on
 | File | Responsibility |
 | :-- | :-- |
 | `rebase/sources/energy.py` | The dialect-neutral canonical-layout layer. Gains `select_series_winners`, the `OnNull` / `Change` declarations, `SeriesWriteResult`, and the suppression rules. Absorbs `_series_keys` and the id→key remap from `bigquery.py`. |
-| `rebase/sources/energydb.py` | **New.** The bucket-backed store: object layout, prefix listing and month pruning, parquet IO, read-before-write orchestration. |
+| `rebase/sources/energydb.py` | **New.** The bucket-backed store: object layout, prefix listing and month pruning, parquet IO, read-before-write orchestration. Its module docstring must state that the bucket backing is transitional and that a real connector is intended — see [Intended trajectory](#intended-trajectory-this-becomes-a-real-connector). |
 | `rebase/sources/__init__.py` | The `energydb` factory plus the new exports. |
 
 Declaring `OnNull` / `Change` in `energy.py` but *applying* them from `energydb.py` is deliberate:
@@ -450,6 +456,45 @@ decisions, which are more advanced than issue #7 conveys:
 - **Fail-open** — the carry-over rules: *"dedup is fail-open — an exception returns the unfiltered
   batch so dedup can never block an ingest."*
 
+## Intended trajectory: this becomes a real connector
+
+This store is a stepping stone, not a destination. When the toolkit can reach a real EnergyDB —
+whether over a ClickHouse driver or a platform endpoint — `rb.sources.energydb()` is expected to
+become a connector in the mould of `bigquery` / `snowflake` / `databricks` / `fabric`: a
+`DataSource` subclass with `read` / `read_bitemporal` / `write`, credentials resolved through
+`ConnectorSpec` and `REBASE_SOURCE_<CONN>_<FIELD>`, and the store's own `skip_unchanged` doing the
+suppression server-side.
+
+The design is arranged so that transition is a substitution rather than a rewrite. **What is built
+to survive it:**
+
+- **The vocabulary.** `skip_unchanged`, `unchanged_scope`, `Change`, `OnNull`, `KnowledgeTime` are
+  named to match upstream `energydb`/`timedb` precisely, so caller code does not change when the
+  backing does. This is the main reason the names were mirrored rather than invented.
+- **`SeriesKey` and its derived id**, the canonical column layout, `build_values_rows`,
+  `normalize_series_frame`, retention tiers, and the `FLAT`/`OVERLAPPING` distinction — all already
+  dialect-neutral and untouched by this work.
+- **The documented winner-selection semantics**, which the SQL builder and the pandas reader both
+  answer to. A real connector answers to the same definition; only the execution moves.
+- **`SeriesWriteResult`** as the reported outcome, including the suppression counts. A server-side
+  `skip_unchanged` still has to report what it declined, or the issue's central complaint returns.
+
+**What is expected to be thrown away:** the object-log storage layout, parquet IO, month-prefix
+pruning, the pandas implementation of winner selection, and the client-side read-before-write with
+its fail-open guard. All of it lives in `energydb.py`; none of it lives in `energy.py`. That split is
+the point of the module layout above — replacing the backing should mean replacing one file.
+
+**One thing the transition is not:** a data migration. Because the objects hold exactly
+`SERIES_VALUES_COLUMNS` in order, with the dtypes parquet preserves, everything written through this
+store can be loaded into a real EnergyDB as-is. That is the whole reason for the shape discipline,
+and it is the property to protect if any future change tempts a more convenient on-disk format.
+
+**This must be stated in the code, not only here.** `energydb.py`'s module docstring carries a short
+version — that the bucket backing is transitional, that a real connector is intended, and where the
+seam is — because a developer working in this repo reads the module, not `docs/superpowers/`. The
+`CHANGELOG` entry says it too, so the transitional status is visible to users choosing whether to
+depend on it.
+
 ## Deliberate divergences from today's upstream
 
 Recorded so they are choices rather than accidents.
@@ -472,7 +517,8 @@ Recorded so they are choices rather than accidents.
 
 ## Out of scope
 
-- Any connection to a real EnergyDB, ClickHouse, or platform endpoint.
+- Any connection to a real EnergyDB, ClickHouse, or platform endpoint. Intended as follow-up work,
+  scoped in [Intended trajectory](#intended-trajectory-this-becomes-a-real-connector).
 - A relative-tolerance comparison mode.
 - Migrating `bigquery.py`'s series methods onto the shared helpers beyond the two moved for reuse;
   its behaviour is unchanged.
