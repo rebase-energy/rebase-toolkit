@@ -33,10 +33,15 @@
   with the keyword supplying the default for rows where it is null — so a per-point quality flag
   travels beside the value it judges instead of forcing one write call per distinct flag. Read
   them back with `read_series(..., with_provenance=True)`, which returns the same winners as the
-  default view plus both columns; without it, asking "which stored points are flagged" means
-  pulling every revision of every row. `run_id` accepts the platform's own string run id
-  (`run_id=ctx.run_id`) and hashes it to the 63-bit column, so a stored row is traceable to the
-  run that wrote it.
+  default view plus `knowledge_time`, `annotation` and `changed_by` — where each value came from
+  and when it became knowable. Two things need that projection: "which stored points are flagged"
+  is otherwise a full audit-trail read re-derived by hand, and a derived series inherits
+  `max(knowledge_time)` of its inputs via `KnowledgeTime.from_inputs`, which the default view
+  cannot supply and `overlapping=True` supplies only alongside every superseded issue. `run_id`
+  accepts the platform's own string run id (`run_id=ctx.run_id`) and hashes it to the 63-bit
+  column, so a stored row is traceable to the run that wrote it. A `TimeSeries` input composes
+  with a declared `knowledge_time`: the frame is normalised before the stamp, so the two features
+  are not individually fine and jointly broken.
 
   Passing `dataset=` and/or `contract=` runs the same `validate → write → signal` pipeline
   `DataSource.write` runs, so a bucket-backed write is governed like a warehouse one: the contract

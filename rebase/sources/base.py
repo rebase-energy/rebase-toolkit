@@ -153,9 +153,17 @@ class KnowledgeTime:
         return cls(moment=moment)
 
     def apply(self, df: Frame) -> Frame:
-        """Return a copy of ``df`` with ``knowledge_time`` stamped. Never mutates ``df``."""
+        """Return a copy of ``df`` with ``knowledge_time`` stamped. Never mutates ``df``.
+
+        Takes a frame, not a ``TimeSeries``: callers that accept both must normalise first.
+        """
         import pandas as pd
 
+        if not isinstance(df, pd.DataFrame):
+            raise DataSourceError(
+                f"KnowledgeTime.apply expects a pandas DataFrame; got {type(df).__name__}. "
+                "Normalise a TimeSeries to a frame before stamping the knowledge axis."
+            )
         out = df.copy()
         if self._column is not None:
             if self._column not in out.columns:

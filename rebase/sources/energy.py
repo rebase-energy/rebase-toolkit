@@ -505,17 +505,28 @@ class SeriesWriteResult:
     watermark: Any = None
 
 
-def select_current_state(df: Frame, *, overlapping: bool = False, as_of: datetime | None = None) -> Frame:
+def select_current_state(
+    df: Frame,
+    *,
+    overlapping: bool = False,
+    as_of: datetime | None = None,
+    with_knowledge_time: bool = False,
+) -> Frame:
     """Winner rows with ``annotation`` and ``changed_by`` kept, for change detection.
 
     The public read projection drops both, but equality compares them, so the write path
     needs its own shape. Uses the same ranking as :func:`select_series_winners`, so the two
     agree on which row wins.
+
+    ``with_knowledge_time`` adds the knowledge axis to the *latest* view, which
+    ``overlapping`` already carries. Reads want that combination even though change detection
+    does not: a derived series inherits ``max(knowledge_time)`` of its inputs, and without it a
+    caller has to choose between the right rows and the axis that dates them.
     """
     import pandas as pd
 
     columns = ["series_id", "valid_time", "value", "annotation", "changed_by"]
-    if overlapping:
+    if overlapping or with_knowledge_time:
         columns.insert(2, "knowledge_time")
     if not len(df):
         return pd.DataFrame(columns=columns)

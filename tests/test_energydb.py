@@ -210,7 +210,16 @@ def test_read_series_with_provenance_keeps_annotation_and_changed_by() -> None:
     )
     store.write_series(frame, KEY, changed_by="quality")
     out = store.read_series(KEY, with_provenance=True)
-    assert list(out.columns) == ["path", "data_type", "name", "valid_time", "value", "annotation", "changed_by"]
+    assert list(out.columns) == [
+        "path",
+        "data_type",
+        "name",
+        "valid_time",
+        "knowledge_time",
+        "value",
+        "annotation",
+        "changed_by",
+    ]
     assert list(out["annotation"]) == ["", "gross_range"]
     assert list(out["changed_by"]) == ["quality", "quality"]
 
@@ -912,3 +921,104 @@ def test_a_key_without_a_span_is_read_rather_than_skipped() -> None:
         KEY, start_valid=datetime(2026, 8, 14, tzinfo=UTC), end_valid=datetime(2026, 8, 16, tzinfo=UTC)
     )
     assert list(out["value"]) == [7.0]
+
+
+# --- A TimeSeries-shaped input must compose with a declared knowledge_time -------------------
+
+
+class _FakeTimeSeries:
+    """Stand-in for timedatamodel.TimeSeries: the store documents SIMPLE/VERSIONED shapes as
+    writable and normalize_series_frame accepts anything exposing to_pandas()."""
+
+    def __init__(self, frame) -> None:
+        self._frame = frame
+
+    def to_pandas(self):
+        return self._frame
+
+
+@pandas_only
+def test_write_series_accepts_a_timeseries_with_a_declared_knowledge_time() -> None:
+    import pandas as pd
+
+    from rebase.sources.base import KnowledgeTime
+
+    store, _bucket = _store()
+    frame = pd.DataFrame(
+        {"value": [1.0, 2.0]},
+        index=pd.DatetimeIndex(["2026-01-01T00:00Z", "2026-01-01T01:00Z"], name="valid_time"),
+    )
+    result = store.write_series(
+        _FakeTimeSeries(frame),
+        KEY,
+        knowledge_time=KnowledgeTime.at(datetime(2026, 1, 2, tzinfo=UTC)),
+    )
+    assert result.rows_written == 2
+    back = store.read_series(KEY, overlapping=True)
+    assert list(back["knowledge_time"].unique()) == [pd.Timestamp("2026-01-02T00:00Z")]
+
+
+@pandas_only
+def test_write_series_accepts_a_timeseries_with_knowledge_time_from_a_column() -> None:
+    import pandas as pd
+
+    from rebase.sources.base import KnowledgeTime
+
+    store, _bucket = _store()
+    frame = pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime(["2026-01-01T00:00Z"]),
+            "issued_at": pd.to_datetime(["2026-01-01T06:00Z"]),
+            "value": [1.0],
+        }
+    )
+    store.write_series(_FakeTimeSeries(frame), KEY, knowledge_time=KnowledgeTime.from_source("issued_at"))
+    assert store.read_series(KEY, overlapping=True)["knowledge_time"].iloc[0] == pd.Timestamp("2026-01-01T06:00Z")
+
+
+def test_knowledge_time_apply_rejects_a_non_frame_with_a_clear_error() -> None:
+    from rebase.sources.base import KnowledgeTime
+
+    with pytest.raises(Exception, match="pandas DataFrame") as exc:
+        KnowledgeTime.at(datetime(2026, 1, 1, tzinfo=UTC)).apply(object())
+    assert not isinstance(exc.value, AttributeError)
+
+
+@pandas_only
+def test_read_series_with_provenance_carries_the_knowledge_axis() -> None:
+    """A derived series inherits max(knowledge_time) of its inputs, so a latest-view read has
+    to carry that axis. Without it the caller must choose between the right rows (no axis) and
+    the axis (every issue, so duplicate valid_times)."""
+    import pandas as pd
+
+    from rebase.sources.base import KnowledgeTime
+
+    store, _bucket = _store()
+    hours = pd.date_range("2026-01-01", periods=3, freq="h", tz="UTC")
+    store.write_series(
+        pd.DataFrame({"valid_time": hours, "value": [1.0, 2.0, 3.0]}),
+        KEY,
+        knowledge_time=KnowledgeTime.at(datetime(2026, 1, 2, tzinfo=UTC)),
+    )
+    store.write_series(
+        pd.DataFrame({"valid_time": hours, "value": [1.0, 2.5, 3.0]}),
+        KEY,
+        knowledge_time=KnowledgeTime.at(datetime(2026, 1, 5, tzinfo=UTC)),
+        skip_unchanged=True,
+    )
+
+    inputs = store.read_series(KEY, with_provenance=True)
+    assert len(inputs) == 3, "the latest view, not every issue"
+    assert "knowledge_time" in inputs.columns
+    # The revision at 01:00 was knowable on the 5th; the untouched rows on the 2nd.
+    assert inputs["knowledge_time"].max() == pd.Timestamp("2026-01-05T00:00Z")
+
+    derived = SeriesKey("portfolio/site-1/t01", "derived", "electricity.supply")
+    result = store.write_series(
+        inputs[["valid_time", "value"]],
+        derived,
+        knowledge_time=KnowledgeTime.from_inputs(inputs),
+    )
+    assert result.rows_written == 3
+    back = store.read_series(derived, overlapping=True)
+    assert list(back["knowledge_time"].unique()) == [pd.Timestamp("2026-01-05T00:00Z")]

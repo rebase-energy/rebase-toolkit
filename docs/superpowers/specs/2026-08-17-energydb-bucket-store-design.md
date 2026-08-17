@@ -134,7 +134,7 @@ class EnergyDBStore:
         as_of: datetime | None = None,
         overlapping: bool = False,
         include_updates: bool = False,
-        with_provenance: bool = False,
+        with_provenance: bool = False,   # winners + knowledge_time, annotation, changed_by
     ) -> Frame
 ```
 
@@ -563,7 +563,12 @@ that design needed and this one could not express; all six are in the same branc
    `include_updates=True` returns *every* revision of every row — so "which stored points are
    flagged" meant pulling the whole audit trail and re-deriving the winners by hand.
    `select_current_state` already computed exactly the right frame for the write path; this exposes
-   it.
+   it, **plus `knowledge_time`**. That last column is what makes a derived series expressible: it
+   inherits `max(knowledge_time)` of its inputs, and before this a caller had to choose between the
+   right rows (default view, no knowledge axis, so `from_inputs` raises) and the knowledge axis
+   (`overlapping=True`, which also returns every superseded issue, so the derivation duplicates
+   `valid_time`). Change detection does not want the column, so it stays behind
+   `with_knowledge_time=` on `select_current_state` rather than becoming unconditional.
 3. **`run_id` accepts the platform's own run id.** The column is a 63-bit int, but
    `RunContext.run_id` is a string, so `run_id=ctx.run_id` — the obvious way to make a stored row
    traceable to the run that wrote it — raised `ValueError: invalid literal for int()` from inside
@@ -586,6 +591,16 @@ that design needed and this one could not express; all six are in the same branc
    code, and `uri` is `file://`.
 6. **Objects advertise their `valid_time` span in the key** — see [Storage
    layout](#storage-layout) for the measurement and the rounding rule.
+
+7. **A `TimeSeries` input composes with a declared `knowledge_time`.** `write_series` accepts
+   anything with `to_pandas()` — the module documents SIMPLE/VERSIONED `DataShape`s as writable —
+   but it applied `KnowledgeTime` *before* normalising, and `KnowledgeTime.apply` calls
+   `df.copy()`. So each feature worked alone and the pair raised a bare
+   `AttributeError: 'TimeSeries' object has no attribute 'copy'` from two frames down. Normalise
+   first; `apply` now also rejects a non-frame with a `DataSourceError` naming the fix. This is the
+   headline path for a producer whose upstream layer hands over a `TimeSeries`, which is why it
+   surfaced immediately on the first real integration and not in the branch's own tests, whose
+   inputs are all frames.
 
 ## Out of scope
 

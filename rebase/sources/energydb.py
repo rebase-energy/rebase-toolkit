@@ -59,6 +59,7 @@ from rebase.sources.energy import (
     _as_utc_bound,
     attach_series_keys,
     build_values_rows,
+    normalize_series_frame,
     select_current_state,
     select_series_winners,
     series_keys,
@@ -328,11 +329,14 @@ class EnergyDBStore:
           replay bound during a replay,
         - ``overlapping=True``: every forecast issue (adds ``knowledge_time``),
         - ``include_updates=True``: the full AUDIT trail,
-        - ``with_provenance=True``: the same winners as the default view plus ``annotation``
-          and ``changed_by``. Those two are per-row, so a per-point quality flag is only
-          readable back through this (or the audit trail). Without it, asking "which stored
-          points are flagged" means pulling every revision of every row and re-deriving the
-          winners by hand. Ignored under ``include_updates``, whose shape already carries both.
+        - ``with_provenance=True``: the same winners as the default view plus ``knowledge_time``,
+          ``annotation`` and ``changed_by`` — where each value came from and when it became
+          knowable. Two things need it. A per-point quality flag lives in ``annotation``, so
+          "which stored points are flagged" is otherwise a full audit-trail read re-derived by
+          hand; and a derived series inherits ``max(knowledge_time)`` of its inputs
+          (:meth:`KnowledgeTime.from_inputs`), which the default projection cannot supply and
+          ``overlapping=True`` supplies only alongside every superseded issue. Ignored under
+          ``include_updates``, whose shape already carries all three.
 
         ``keys`` is one ``(path, data_type, name)`` tuple / :class:`SeriesKey` or a list of
         them. Results carry ``path``/``data_type``/``name`` — never raw ids.
@@ -347,7 +351,7 @@ class EnergyDBStore:
         if end_valid is not None and len(raw):
             raw = raw[raw["valid_time"] < _as_utc_bound(end_valid)]
         if with_provenance and not include_updates:
-            winners = select_current_state(raw, overlapping=overlapping, as_of=as_of)
+            winners = select_current_state(raw, overlapping=overlapping, as_of=as_of, with_knowledge_time=True)
         else:
             winners = select_series_winners(raw, overlapping=overlapping, include_updates=include_updates, as_of=as_of)
         return attach_series_keys(winners, by_id)
@@ -418,7 +422,10 @@ class EnergyDBStore:
                     "knowledge_time must be a KnowledgeTime (e.g. KnowledgeTime.from_source(...), "
                     f".from_inputs(...) or .at(...)); got {type(knowledge_time)!r}"
                 )
-            data = knowledge_time.apply(data)
+            # Normalise first: this store accepts a TimeSeries (anything with to_pandas()) as
+            # well as a frame, but KnowledgeTime.apply works on a frame. Applying before
+            # normalising would make the two features individually fine and jointly broken.
+            data = knowledge_time.apply(normalize_series_frame(data))
         rows = build_values_rows(
             data, key, retention=retention, changed_by=changed_by, annotation=annotation, run_id=run_id
         )
