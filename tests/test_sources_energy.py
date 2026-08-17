@@ -651,6 +651,55 @@ def test_suppression_with_empty_stored_state_keeps_everything() -> None:
 
 
 @pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_suppression_finds_a_naive_stored_timestamp() -> None:
+    # A tz-naive stored.valid_time must still be found by a tz-aware batch row's lookup key,
+    # rather than silently missing the lookup and falling through to "nothing stored".
+    stored = _stored([(_T0, 5.0, "", "")])
+    stored["valid_time"] = stored["valid_time"].dt.tz_localize(None)
+    kept, report = suppress_rows(_batch([(_T0, 5.0, "", "")]), stored, skip_unchanged=True, change=Change.exact())
+    assert len(kept) == 0
+    assert report["suppressed_unchanged"] == 1
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
+def test_suppression_partition_overlapping_keys_on_valid_time_and_knowledge_time() -> None:
+    # With partition_overlapping=True, the stored winner at (valid_time, knowledge_time) must be
+    # matched to the batch row sharing that exact pair, not to whichever row wins the bare
+    # valid_time -- otherwise every knowledge_time at a valid_time collapses onto one entry.
+    import pandas as pd
+
+    stored = pd.DataFrame.from_records(
+        [
+            {
+                "series_id": 7,
+                "valid_time": pd.Timestamp(_T0),
+                "knowledge_time": pd.Timestamp("2026-01-01T05:00Z"),
+                "value": 5.0,
+                "annotation": "",
+                "changed_by": "",
+            },
+            {
+                "series_id": 7,
+                "valid_time": pd.Timestamp(_T0),
+                "knowledge_time": pd.Timestamp("2026-01-01T09:00Z"),
+                "value": 7.0,
+                "annotation": "",
+                "changed_by": "",
+            },
+        ]
+    )
+    batch = _values_frame([(_T0, "2026-01-01T05:00Z", "2026-02-01T00:00Z", 5.0)])
+
+    without_scope, _ = suppress_rows(batch, stored, skip_unchanged=True, change=Change.exact())
+    with_scope, _ = suppress_rows(batch, stored, skip_unchanged=True, change=Change.exact(), partition_overlapping=True)
+    # Keyed on valid_time alone, the batch row is compared against whichever stored row a plain
+    # dict collapse happened to keep -- not necessarily its own issue -- so it is not suppressed.
+    assert len(without_scope) == 1
+    # Keyed on (valid_time, knowledge_time), the batch row matches its own issue (5.0) exactly.
+    assert len(with_scope) == 0
+
+
+@pytest.mark.skipif(not _HAS_PANDAS, reason="pandas not installed in this environment")
 def test_select_current_state_retains_annotation_and_changed_by() -> None:
     frame = _values_frame([(_T0, "2026-01-01T06:00Z", "2026-01-01T06:00Z", 1.0)])
     out = select_current_state(frame)

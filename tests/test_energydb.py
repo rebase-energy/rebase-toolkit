@@ -392,8 +392,9 @@ def test_write_series_flat_suppresses_what_overlapping_keeps() -> None:
 
 
 @pandas_only
-def test_write_series_is_fail_open(monkeypatch) -> None:
+def test_write_series_is_fail_open(monkeypatch, caplog) -> None:
     import importlib
+    import logging
 
     # importlib.import_module resolves the submodule by its fully-qualified name directly,
     # unlike `import rebase.sources.energydb as ...`, which walks attribute access instead and
@@ -407,9 +408,13 @@ def test_write_series_is_fail_open(monkeypatch) -> None:
         raise RuntimeError("comparison exploded")
 
     monkeypatch.setattr(energydb_module, "suppress_rows", _boom)
-    result = store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, skip_unchanged=True)
+    with caplog.at_level(logging.WARNING, logger="rebase.sources"):
+        result = store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, skip_unchanged=True)
     assert result.fail_open is True
     assert result.rows_written == 1  # the batch was written unfiltered
+    # Fail-open must be visible, not just returned: a warning naming the failure is on the logger.
+    assert any("suppression failed" in record.getMessage() for record in caplog.records)
+    assert any("comparison exploded" in record.getMessage() for record in caplog.records)
 
 
 @pandas_only
@@ -554,6 +559,90 @@ def test_write_series_rejects_multiple_keys() -> None:
     other = SeriesKey("portfolio/site-2/t02", "forecast", "electricity.supply")
     with pytest.raises(Exception, match="one series"):
         store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), [KEY, other])
+
+
+# --- Final fix wave: unchanged_scope="knowledge_time" must actually widen the lookup key -----
+
+
+def _issue(valid_time, knowledge_time, value):
+    import pandas as pd
+
+    return pd.DataFrame(
+        {
+            "valid_time": pd.to_datetime([valid_time]),
+            "knowledge_time": pd.to_datetime([knowledge_time]),
+            "value": [value],
+        }
+    )
+
+
+@pandas_only
+def test_write_series_unchanged_scope_discriminates_between_issues_at_one_valid_time() -> None:
+    # Two stored rows at the same valid_time, different knowledge_time, different values. A
+    # batch row matching the OLDER issue exactly must be suppressed under scope="knowledge_time"
+    # (compared against its own issue) but written under scope="valid_time" (compared against the
+    # widest winner, the newer issue, whose value differs) -- so a scope that was silently ignored
+    # would make both calls agree, and this test would catch that.
+    def _two_issues():
+        store, _bucket = _store()  # unregistered -> FLAT
+        store.write_series(_issue("2026-01-01T00:00Z", "2026-01-01T05:00Z", 5.0), KEY)
+        store.write_series(_issue("2026-01-01T00:00Z", "2026-01-01T09:00Z", 7.0), KEY)
+        return store
+
+    batch = _issue("2026-01-01T00:00Z", "2026-01-01T05:00Z", 5.0)  # matches the OLDER issue
+
+    under_valid_time = _two_issues().write_series(batch, KEY, skip_unchanged=True, unchanged_scope="valid_time")
+    under_knowledge_time = _two_issues().write_series(batch, KEY, skip_unchanged=True, unchanged_scope="knowledge_time")
+    assert under_valid_time.rows_written == 1
+    assert under_knowledge_time.rows_written == 0
+    assert under_valid_time.rows_written != under_knowledge_time.rows_written
+
+
+# --- Final fix wave: tz-naive bounds and stored timestamps must not raise or silently miss ---
+
+
+@pandas_only
+def test_read_series_accepts_naive_valid_bounds() -> None:
+    store, bucket = _store()
+    _write_raw(store, bucket, KEY, [("2026-08-15T00:00Z", "2026-08-15T00:00Z", "2026-08-15T00:00Z", 2.0)])
+    out = store.read_series(KEY, start_valid=datetime(2026, 8, 1), end_valid=datetime(2026, 8, 31))
+    assert list(out["value"]) == [2.0]
+
+
+# --- Final fix wave: the catalog get is also skipped when no suppression can occur -----------
+
+
+@pandas_only
+def test_write_series_skips_the_catalog_read_too_when_no_suppression_is_possible() -> None:
+    from rebase.sources.energy import OnNull
+
+    store, bucket = _store()
+    store.register_series(KEY, timeseries_type="FLAT")
+    store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY)
+    bucket.fetched.clear()
+    store.write_series(_frame([("2026-01-01T01:00Z", 2.0)]), KEY, skip_unchanged=False, on_null=OnNull.WRITE_NULL)
+    assert bucket.fetched == []
+
+
+# --- Final fix wave: the object key grammar is content-addressed, not just "has valid_month=" --
+
+
+@pandas_only
+def test_object_key_matches_the_documented_grammar() -> None:
+    import hashlib
+    import re
+
+    store, bucket = _store()
+    result = store.write_series(_frame([("2026-01-01T00:00Z", 1.0)]), KEY, run_id=42)
+    (object_key,) = result.objects_written
+
+    prefix = f"{store.prefix}/series/{KEY.series_id}/valid_month=2026-01/"
+    assert object_key.startswith(prefix), object_key
+    suffix = object_key[len(prefix) :]
+    match = re.fullmatch(r"\d{8}T\d{12}Z-42-([0-9a-f]{12})\.parquet", suffix)
+    assert match, suffix
+    digest = match.group(1)
+    assert digest == hashlib.sha256(bucket.objects[object_key]).hexdigest()[:12]
 
 
 # --- Task 8: factory, exports and packaging --------------------------------------------------

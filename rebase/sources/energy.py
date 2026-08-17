@@ -109,6 +109,20 @@ def _utc(ts: Any, *, column: str) -> Any:
     return series.astype("datetime64[us, UTC]")
 
 
+def _as_utc_bound(value: Any) -> Any:
+    """A ``pandas.Timestamp`` in UTC. A naive value is assumed UTC, matching ``as_of`` below.
+
+    Shared by every place that compares a caller-supplied bound or a stored timestamp against
+    the tz-aware ``datetime64[us, UTC]`` columns this module produces: a naive value would
+    otherwise raise ``TypeError`` (bounds) or silently fail to match (a lookup key), rather
+    than being treated the same way a naive ``as_of`` already is.
+    """
+    import pandas as pd
+
+    bound = pd.Timestamp(value)
+    return bound.tz_localize("UTC") if bound.tz is None else bound.tz_convert("UTC")
+
+
 def normalize_series_frame(data: Any) -> Frame:
     """Normalize input into a long frame with valid_time / knowledge_time / value columns.
 
@@ -486,6 +500,7 @@ def suppress_rows(
     skip_unchanged: bool = False,
     change: Change | None = None,
     overlapping: bool = False,
+    partition_overlapping: bool = False,
 ) -> tuple[Frame, dict[str, Any]]:
     """Drop the rows of ``batch`` that the declared semantics say not to write.
 
@@ -502,7 +517,26 @@ def suppress_rows(
     Rules 1-4 always apply; rules 5-7 only when ``skip_unchanged`` is set. An ``OVERLAPPING``
     series bypasses all of it: every publication of a forecast is meaningful, so a
     republication at a new knowledge_time with an unchanged value is a genuine observation
-    and suppressing it loses information no later read can recover.
+    and suppressing it loses information no later read can recover. That bypass is
+    ``overlapping`` — a different thing from ``partition_overlapping`` below.
+
+    ``partition_overlapping`` is ``unchanged_scope``'s effect, plumbed through by the caller,
+    and it widens only the **equality** comparison behind rules 3 and 5-7 (whether an incoming
+    *real* value repeats what is already stored): when ``False``
+    (``unchanged_scope="valid_time"``, the default), a batch row is compared to the stored
+    winner at its ``valid_time`` alone, as it always has been; when ``True``
+    (``unchanged_scope="knowledge_time"``), ``stored`` is expected to carry its own
+    ``knowledge_time`` column (the caller widened its read accordingly) and a batch row is
+    compared to the stored row at its own ``(valid_time, knowledge_time)`` pair, so each
+    forecast issue is judged against its own prior issue rather than collapsing every issue at
+    a ``valid_time`` onto one entry.
+
+    Null-overwrite protection (rules 1-2-4, an incoming *null* row) is **never** scoped by
+    ``unchanged_scope`` — it always asks "is any real value stored at this ``valid_time``, from
+    whichever issue currently wins there", matching the docstring guarantee that an explicit
+    scope can never switch off ``on_null=KEEP_STORED`` protection. Scoping that check too would
+    let a null at a knowledge_time nothing was ever stored under sail past protection even
+    though a real value already sits at the same ``valid_time`` under a different issue.
     """
     empty_report: dict[str, Any] = {"suppressed_unchanged": 0, "suppressed_null": 0, "sample_valid_times": ()}
     if overlapping or not len(batch):
@@ -512,10 +546,29 @@ def suppress_rows(
         return batch, empty_report
 
     comparer = change or Change.exact()
-    lookup: dict[Any, tuple[Any, Any, Any]] = {}
+
+    # `protection`: valid_time -> the winning (value, annotation, changed_by) across every
+    # knowledge_time stored at that valid_time -- always valid_time-keyed, feeding rules 1/2/4.
+    # `equality`: the unchanged_scope-scoped lookup -- valid_time, or (valid_time, knowledge_time)
+    # when partition_overlapping -- feeding rules 3 and 5-7.
+    protection: dict[Any, tuple[Any, Any, Any]] = {}
+    protection_knowledge_time: dict[Any, Any] = {}
+    equality: dict[Any, tuple[Any, Any, Any]] = {}
     if len(stored):
+        has_knowledge_time = "knowledge_time" in stored.columns
         for row in stored.itertuples(index=False):
-            lookup[row.valid_time] = (row.value, row.annotation, row.changed_by)
+            valid_time = _as_utc_bound(row.valid_time)
+            knowledge_time = _as_utc_bound(row.knowledge_time) if has_knowledge_time else None
+            candidate = (row.value, row.annotation, row.changed_by)
+            if (
+                valid_time not in protection
+                or knowledge_time is None
+                or knowledge_time > protection_knowledge_time[valid_time]
+            ):
+                protection[valid_time] = candidate
+                protection_knowledge_time[valid_time] = knowledge_time
+            equality_key = (valid_time, knowledge_time) if partition_overlapping else valid_time
+            equality[equality_key] = candidate
 
     keep: list[bool] = []
     suppressed_unchanged = 0
@@ -530,7 +583,13 @@ def suppress_rows(
         return bool(new_norm == old_norm)
 
     for row in batch.itertuples(index=False):
-        current = lookup.get(row.valid_time)
+        valid_time = _as_utc_bound(row.valid_time)
+        if _is_missing(row.value):
+            current = protection.get(valid_time)
+        else:
+            knowledge_time = _as_utc_bound(row.knowledge_time)
+            equality_key = (valid_time, knowledge_time) if partition_overlapping else valid_time
+            current = equality.get(equality_key)
         if current is None:
             keep.append(True)  # rule 1
             continue

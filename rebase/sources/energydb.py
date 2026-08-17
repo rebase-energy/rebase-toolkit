@@ -45,6 +45,7 @@ from rebase.sources.energy import (
     OnNull,
     SeriesKey,
     SeriesWriteResult,
+    _as_utc_bound,
     attach_series_keys,
     build_values_rows,
     select_current_state,
@@ -246,16 +247,14 @@ class EnergyDBStore:
         ``keys`` is one ``(path, data_type, name)`` tuple / :class:`SeriesKey` or a list of
         them. Results carry ``path``/``data_type``/``name`` — never raw ids.
         """
-        import pandas as pd
-
         resolved = series_keys(keys)
         by_id = {key.series_id: key for key in resolved}
         months = _months_in_range(start_valid, end_valid)
         raw = self._raw_rows(list(by_id), months)
         if start_valid is not None and len(raw):
-            raw = raw[raw["valid_time"] >= pd.Timestamp(start_valid)]
+            raw = raw[raw["valid_time"] >= _as_utc_bound(start_valid)]
         if end_valid is not None and len(raw):
-            raw = raw[raw["valid_time"] < pd.Timestamp(end_valid)]
+            raw = raw[raw["valid_time"] < _as_utc_bound(end_valid)]
         winners = select_series_winners(raw, overlapping=overlapping, include_updates=include_updates, as_of=as_of)
         return attach_series_keys(winners, by_id)
 
@@ -268,7 +267,7 @@ class EnergyDBStore:
         changed_by: str = "",
         annotation: str = "",
         run_id: int | None = None,
-        knowledge_time: Any | None = None,
+        knowledge_time: KnowledgeTime | None = None,
         skip_unchanged: bool = False,
         unchanged_scope: str = "auto",
         change: Change | None = None,
@@ -281,8 +280,11 @@ class EnergyDBStore:
         incoming null may replace a stored value. ``unchanged_scope="auto"`` resolves per
         series from the catalog, so a *registered* ``OVERLAPPING`` series bypasses suppression
         entirely — every publication of a forecast is meaningful. An explicit ``"valid_time"``/
-        ``"knowledge_time"`` override only widens the comparison partition below; it can never
-        switch off ``on_null=KEEP_STORED`` protection, which is decided by catalog truth alone.
+        ``"knowledge_time"`` override widens both the stored-state read below and the
+        suppression lookup key in :func:`~rebase.sources.energy.suppress_rows` to
+        ``(valid_time, knowledge_time)``, so each forecast issue is compared against its own
+        prior issue instead of one issue winning the whole ``valid_time``; it can never switch
+        off ``on_null=KEEP_STORED`` protection, which is decided by catalog truth alone.
 
         Suppression is fail-open: if anything in that path raises, the unfiltered batch is
         written and ``fail_open`` is set. Suppression is an optimisation, never a gate.
@@ -309,9 +311,15 @@ class EnergyDBStore:
 
         # Only a genuinely registered OVERLAPPING series may bypass suppression entirely — every
         # publication is meaningful there. An explicit unchanged_scope override changes only the
-        # comparison partition passed to select_current_state below; it never overrides catalog
-        # truth for whether on_null=KEEP_STORED protection applies.
-        is_registered_overlapping = self._is_overlapping(key.series_id)
+        # comparison partition passed to select_current_state and suppress_rows below; it never
+        # overrides catalog truth for whether on_null=KEEP_STORED protection applies.
+        #
+        # The catalog lookup itself is gated behind needs_overlap_check: when skip_unchanged is
+        # False and on_null is WRITE_NULL, must_compare is False no matter what the catalog says
+        # (see below), so a *registered* series must not still pay for a catalog get it will
+        # never use — that get is the other read this write path can skip.
+        needs_overlap_check = skip_unchanged or on_null is OnNull.KEEP_STORED
+        is_registered_overlapping = self._is_overlapping(key.series_id) if needs_overlap_check else False
         if unchanged_scope == "auto":
             partition_overlapping = is_registered_overlapping
         else:
@@ -325,7 +333,7 @@ class EnergyDBStore:
         # "stored null + incoming null -> skip" (rule 2) — skipping the read means that redundant
         # null gets written as a harmless duplicate rather than suppressed, never a lost
         # correction.
-        must_compare = not is_registered_overlapping and (skip_unchanged or on_null is OnNull.KEEP_STORED)
+        must_compare = not is_registered_overlapping and needs_overlap_check
         if must_compare:
             try:
                 months = sorted({stamp.strftime(_MONTH_FORMAT) for stamp in rows["valid_time"]})
@@ -333,7 +341,12 @@ class EnergyDBStore:
                     self._raw_rows([key.series_id], months), overlapping=partition_overlapping
                 )
                 rows, report = suppress_rows(
-                    rows, stored, on_null=on_null, skip_unchanged=skip_unchanged, change=change
+                    rows,
+                    stored,
+                    on_null=on_null,
+                    skip_unchanged=skip_unchanged,
+                    change=change,
+                    partition_overlapping=partition_overlapping,
                 )
             except Exception as exc:  # noqa: BLE001 - fail-open: never block a write
                 fail_open = True

@@ -47,7 +47,7 @@
   downstream work. Gaps are measured between consecutive rows as delivered, since sorting
   first would quietly repair a frame that failed the monotonicity assertion. `max_gap` accepts
   both duration grammars (`"PT1H"` and `"1h"`), and `rb.Freshness` now accepts ISO-8601
-  durations too, so the two duration fields on a contract no longer disagree.
+  durations too, so the two duration fields on a contract accept the same grammar.
 
 - **A write's `knowledge_time` can now be declared rather than assumed.**
   `rb.sources.KnowledgeTime.from_source("issued_at")` takes the knowledge axis from the
