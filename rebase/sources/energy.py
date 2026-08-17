@@ -427,3 +427,121 @@ class SeriesWriteResult:
     suppressed_null: int = 0
     sample_valid_times: tuple[str, ...] = ()
     fail_open: bool = False
+
+
+def select_current_state(df: Frame, *, overlapping: bool = False, as_of: datetime | None = None) -> Frame:
+    """Winner rows with ``annotation`` and ``changed_by`` kept, for change detection.
+
+    The public read projection drops both, but equality compares them, so the write path
+    needs its own shape. Uses the same ranking as :func:`select_series_winners`, so the two
+    agree on which row wins.
+    """
+    import pandas as pd
+
+    columns = ["series_id", "valid_time", "value", "annotation", "changed_by"]
+    if overlapping:
+        columns.insert(2, "knowledge_time")
+    if not len(df):
+        return pd.DataFrame(columns=columns)
+    out = df
+    if as_of is None:
+        as_of = _replay_knowledge_time()
+    if as_of is not None:
+        bound = pd.Timestamp(as_of)
+        if bound.tz is None:
+            bound = bound.tz_localize("UTC")
+        out = out[out["knowledge_time"] <= bound]
+    partition = ["series_id", "valid_time", "knowledge_time"] if overlapping else ["series_id", "valid_time"]
+    order = ["change_time"] if overlapping else ["knowledge_time", "change_time"]
+    winners = _winner_rows(out, partition=partition, order=order)
+    return winners[columns].reset_index(drop=True)
+
+
+def suppress_rows(
+    batch: Frame,
+    stored: Frame,
+    *,
+    on_null: OnNull = OnNull.KEEP_STORED,
+    skip_unchanged: bool = False,
+    change: Change | None = None,
+    overlapping: bool = False,
+) -> tuple[Frame, dict[str, Any]]:
+    """Drop the rows of ``batch`` that the declared semantics say not to write.
+
+    Seven rules, evaluated per row against the stored winner:
+
+    1. nothing stored -> write (a new point)
+    2. stored null, incoming null -> skip (nothing to say)
+    3. stored null, incoming real -> write (the gap fill — backfill's whole purpose)
+    4. stored real, incoming null -> ``on_null`` decides
+    5. equal value, annotation and changed_by -> skip (genuinely unchanged)
+    6. equal value, differing annotation or changed_by -> write (still meaningful)
+    7. differing value -> write (the revision)
+
+    Rules 1-4 always apply; rules 5-7 only when ``skip_unchanged`` is set. An ``OVERLAPPING``
+    series bypasses all of it: every publication of a forecast is meaningful, so a
+    republication at a new knowledge_time with an unchanged value is a genuine observation
+    and suppressing it loses information no later read can recover.
+    """
+    import math
+
+    empty_report: dict[str, Any] = {"suppressed_unchanged": 0, "suppressed_null": 0, "sample_valid_times": ()}
+    if overlapping or not len(batch):
+        # The store also skips the stored-state read for OVERLAPPING series, so in production
+        # this branch is never reached. It stays as defence in depth: a future caller that
+        # forgets the outer gate still cannot silently drop a forecast republication.
+        return batch, empty_report
+
+    comparer = change or Change.exact()
+    lookup: dict[Any, tuple[Any, Any, Any]] = {}
+    if len(stored):
+        for row in stored.itertuples(index=False):
+            lookup[row.valid_time] = (row.value, row.annotation, row.changed_by)
+
+    keep: list[bool] = []
+    suppressed_unchanged = 0
+    suppressed_null = 0
+    samples: list[str] = []
+
+    def _missing(value: Any) -> bool:
+        return value is None or (isinstance(value, float) and math.isnan(value))
+
+    for row in batch.itertuples(index=False):
+        current = lookup.get(row.valid_time)
+        if current is None:
+            keep.append(True)  # rule 1
+            continue
+        old_value, old_annotation, old_changed_by = current
+        if _missing(row.value):
+            if _missing(old_value):
+                decision, bucket = False, "null"  # rule 2
+            elif on_null is OnNull.KEEP_STORED:
+                decision, bucket = False, "null"  # rule 4, keep
+            else:
+                decision, bucket = True, ""  # rule 4, write
+        elif _missing(old_value):
+            decision, bucket = True, ""  # rule 3
+        elif not skip_unchanged:
+            decision, bucket = True, ""  # rules 5-7 disabled
+        elif not comparer.values_equal(row.value, old_value):
+            decision, bucket = True, ""  # rule 7
+        elif row.annotation != old_annotation or row.changed_by != old_changed_by:
+            decision, bucket = True, ""  # rule 6
+        else:
+            decision, bucket = False, "unchanged"  # rule 5
+        keep.append(decision)
+        if not decision:
+            if bucket == "null":
+                suppressed_null += 1
+            else:
+                suppressed_unchanged += 1
+            if len(samples) < MAX_SAMPLE_VALID_TIMES:
+                moment = row.valid_time
+                samples.append(moment.isoformat() if hasattr(moment, "isoformat") else str(moment))
+
+    report = {
+        "suppressed_unchanged": suppressed_unchanged,
+        "suppressed_null": suppressed_null,
+        "sample_valid_times": tuple(samples),
+    }
+    return batch[keep].reset_index(drop=True), report
