@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 import pytest
 from http_stub import patch_client_http
 
 import rebase as rb
-from rebase.client import Bucket, BucketObject, Client, RebaseWorkflowError, _resolve_buckets_payload, bucket_env_var
+from rebase.client import (
+    Bucket,
+    BucketObject,
+    Client,
+    RebaseWorkflowError,
+    Retention,
+    _resolve_buckets_payload,
+    bucket_env_var,
+)
 
 
 class FakeResponse:
@@ -40,6 +49,62 @@ def test_env_var_naming_matches_the_api() -> None:
 def test_requires_a_name() -> None:
     with pytest.raises(ValueError, match="non-empty name"):
         Bucket("")
+
+
+class TestRetention:
+    def test_is_exported(self) -> None:
+        assert rb.Retention is Retention
+        assert "Retention" in rb.__all__
+
+    def test_payload_uses_canonical_iso_days(self) -> None:
+        assert Retention(prefix="frequency/", max_age="P7D").to_payload() == {
+            "prefix": "frequency/",
+            "max_age": "P7D",
+        }
+
+    def test_compact_grammar_normalises_to_days(self) -> None:
+        # "7d" parses to seconds in the compact grammar; the payload must still
+        # render day-based ISO so the server sees one canonical form per age.
+        assert Retention(max_age="7d").to_payload() == {"prefix": "", "max_age": "P7D"}
+
+    def test_accepts_timedelta(self) -> None:
+        assert Retention(max_age=timedelta(days=30)).to_payload()["max_age"] == "P30D"
+
+    def test_equal_ages_are_equal_across_grammars(self) -> None:
+        assert Retention(max_age="7d") == Retention(max_age="P7D")
+
+    def test_rejects_sub_day_ages(self) -> None:
+        with pytest.raises(ValueError, match="whole number of days"):
+            Retention(max_age="PT36H")
+
+    def test_rejects_months(self) -> None:
+        # Calendar months are variable-length; provider lifecycle rules count days.
+        with pytest.raises(ValueError, match="whole number of days"):
+            Retention(max_age="P1M")
+
+    def test_rejects_non_positive_ages(self) -> None:
+        with pytest.raises(ValueError, match="at least one day"):
+            Retention(max_age="P0D")
+        with pytest.raises(ValueError, match="at least one day"):
+            Retention(max_age="-P1D")
+
+    def test_rejects_bad_grammar(self) -> None:
+        with pytest.raises(ValueError, match="max_age"):
+            Retention(max_age="7 fortnights")
+
+    def test_rejects_calendar_years(self) -> None:
+        with pytest.raises(ValueError, match="whole number of days"):
+            Retention(max_age="P1Y")
+
+    def test_rejects_non_string_prefix(self) -> None:
+        with pytest.raises(TypeError, match="prefix"):
+            Retention(prefix=123, max_age="7d")
+
+    def test_fields_are_keyword_only(self) -> None:
+        # Positional (prefix, max_age) reads ambiguously; the declaration form
+        # in bucket code should always name its fields.
+        with pytest.raises(TypeError):
+            Retention("frequency/", "P7D")
 
 
 class TestUri:
@@ -274,6 +339,115 @@ def test_create_if_missing_uses_the_logical_create_route(monkeypatch) -> None:
 
     assert value == {"name": "new-store"}
     assert calls == [("POST", "/buckets", {"json": {"name": "new-store"}})]
+
+
+class TestDeclaredRetention:
+    RULES = [Retention(prefix="frequency/", max_age="7d"), Retention(max_age="P90D")]
+    PAYLOAD = [{"prefix": "frequency/", "max_age": "P7D"}, {"prefix": "", "max_age": "P90D"}]
+
+    def _recording_client(self, monkeypatch, responses: list[dict[str, Any]]) -> tuple[Client, list[tuple]]:
+        client = Client(api_key="rb_test", api_url="https://api.example")
+        calls: list[tuple] = []
+
+        def request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+            calls.append((method, path, kwargs.get("json")))
+            return responses[len(calls) - 1]
+
+        monkeypatch.setattr(client, "request", request)
+        return client, calls
+
+    def test_from_name_keeps_rules_without_network(self) -> None:
+        bucket = Bucket.from_name("grid-archive", create_if_missing=True, retention=self.RULES)
+        assert bucket.retention == list(self.RULES)
+
+    def test_rejects_non_retention_entries(self) -> None:
+        with pytest.raises(ValueError, match="rebase.Retention"):
+            Bucket.from_name("grid-archive", retention=[{"prefix": "", "max_age": "P7D"}])
+
+    def test_rejects_duplicate_prefixes(self) -> None:
+        with pytest.raises(ValueError, match="unique"):
+            Bucket.from_name("grid-archive", retention=[Retention(max_age="7d"), Retention(max_age="P90D")])
+
+    def test_create_sends_declared_rules(self, monkeypatch) -> None:
+        client, calls = self._recording_client(monkeypatch, [{"name": "grid-archive", "retention": self.PAYLOAD}])
+        Bucket("grid-archive", create_if_missing=True, retention=self.RULES, client=client).ensure()
+        assert calls == [("POST", "/buckets", {"name": "grid-archive", "retention": self.PAYLOAD})]
+
+    def test_ensure_patches_when_active_rules_differ(self, monkeypatch) -> None:
+        client, calls = self._recording_client(
+            monkeypatch,
+            [
+                {"name": "grid-archive", "retention": []},
+                {"name": "grid-archive", "retention": self.PAYLOAD},
+            ],
+        )
+        data = Bucket("grid-archive", create_if_missing=True, retention=self.RULES, client=client).ensure()
+        assert calls[1] == ("PATCH", "/buckets/grid-archive", {"retention": self.PAYLOAD})
+        assert data["retention"] == self.PAYLOAD
+
+    def test_ensure_skips_patch_when_in_sync(self, monkeypatch) -> None:
+        client, calls = self._recording_client(monkeypatch, [{"name": "grid-archive", "retention": self.PAYLOAD}])
+        Bucket("grid-archive", create_if_missing=True, retention=self.RULES, client=client).ensure()
+        assert [method for method, _, _ in calls] == ["POST"]
+
+    def test_existing_bucket_converges_via_get_then_patch(self, monkeypatch) -> None:
+        # Declaring rules must not require create semantics: without
+        # create_if_missing the bucket is fetched, then patched on drift.
+        client, calls = self._recording_client(
+            monkeypatch,
+            [
+                {"name": "grid-archive", "retention": []},
+                {"name": "grid-archive", "retention": self.PAYLOAD},
+            ],
+        )
+        Bucket("grid-archive", retention=self.RULES, client=client).ensure()
+        assert [(method, path) for method, path, _ in calls] == [
+            ("GET", "/buckets/grid-archive"),
+            ("PATCH", "/buckets/grid-archive"),
+        ]
+
+    def test_no_retention_means_no_retention_traffic(self, monkeypatch) -> None:
+        client, calls = self._recording_client(monkeypatch, [{"name": "grid-archive"}])
+        Bucket("grid-archive", create_if_missing=True, client=client).ensure()
+        assert calls == [("POST", "/buckets", {"name": "grid-archive"})]
+
+    def test_empty_rules_clear_retention(self, monkeypatch) -> None:
+        # retention=[] is a declaration ("no rules"), distinct from None
+        # ("unmanaged"), so it must reach the server and converge drift.
+        client, calls = self._recording_client(
+            monkeypatch,
+            [
+                {"name": "grid-archive", "retention": self.PAYLOAD},
+                {"name": "grid-archive", "retention": []},
+            ],
+        )
+        Bucket("grid-archive", create_if_missing=True, retention=[], client=client).ensure()
+        assert calls[0] == ("POST", "/buckets", {"name": "grid-archive", "retention": []})
+        assert calls[1] == ("PATCH", "/buckets/grid-archive", {"retention": []})
+
+    def test_attachment_applies_declared_retention(self, monkeypatch) -> None:
+        # buckets=[...] on a function or workflow must not silently drop
+        # declared rules just because create_if_missing is off.
+        client, calls = self._recording_client(monkeypatch, [{"name": "grid-archive", "retention": self.PAYLOAD}])
+        payload = _resolve_buckets_payload([Bucket("grid-archive", retention=self.RULES)], client)
+        assert payload == [{"bucket": "grid-archive"}]
+        assert [(method, path) for method, path, _ in calls] == [("GET", "/buckets/grid-archive")]
+
+    def test_attachment_with_retention_requires_a_client(self) -> None:
+        with pytest.raises(RebaseWorkflowError, match="authenticated client"):
+            _resolve_buckets_payload([Bucket("grid-archive", retention=self.RULES)], None)
+
+    def test_first_object_op_converges_declared_retention(self, monkeypatch) -> None:
+        client, calls = self._recording_client(
+            monkeypatch,
+            [
+                {"name": "grid-archive", "retention": self.PAYLOAD},
+                {"urls": [{"path": "a.txt", "url": "https://signed/a.txt", "method": "PUT", "expires_seconds": 600}]},
+            ],
+        )
+        monkeypatch.setattr("requests.put", lambda url, data=None, headers=None, timeout=None: FakeResponse())
+        Bucket("grid-archive", retention=self.RULES, client=client).put("a.txt", b"x")
+        assert [(method, path) for method, path, _ in calls][0] == ("GET", "/buckets/grid-archive")
 
 
 def test_workflow_keeps_bucket_attachment_until_deploy() -> None:
