@@ -92,6 +92,20 @@ class TestRetention:
         with pytest.raises(ValueError, match="max_age"):
             Retention(max_age="7 fortnights")
 
+    def test_rejects_calendar_years(self) -> None:
+        with pytest.raises(ValueError, match="whole number of days"):
+            Retention(max_age="P1Y")
+
+    def test_rejects_non_string_prefix(self) -> None:
+        with pytest.raises(TypeError, match="prefix"):
+            Retention(prefix=123, max_age="7d")
+
+    def test_fields_are_keyword_only(self) -> None:
+        # Positional (prefix, max_age) reads ambiguously; the declaration form
+        # in bucket code should always name its fields.
+        with pytest.raises(TypeError):
+            Retention("frequency/", "P7D")
+
 
 class TestUri:
     def test_prefers_the_injected_environment(self, monkeypatch) -> None:
@@ -396,6 +410,44 @@ class TestDeclaredRetention:
         client, calls = self._recording_client(monkeypatch, [{"name": "grid-archive"}])
         Bucket("grid-archive", create_if_missing=True, client=client).ensure()
         assert calls == [("POST", "/buckets", {"name": "grid-archive"})]
+
+    def test_empty_rules_clear_retention(self, monkeypatch) -> None:
+        # retention=[] is a declaration ("no rules"), distinct from None
+        # ("unmanaged"), so it must reach the server and converge drift.
+        client, calls = self._recording_client(
+            monkeypatch,
+            [
+                {"name": "grid-archive", "retention": self.PAYLOAD},
+                {"name": "grid-archive", "retention": []},
+            ],
+        )
+        Bucket("grid-archive", create_if_missing=True, retention=[], client=client).ensure()
+        assert calls[0] == ("POST", "/buckets", {"name": "grid-archive", "retention": []})
+        assert calls[1] == ("PATCH", "/buckets/grid-archive", {"retention": []})
+
+    def test_attachment_applies_declared_retention(self, monkeypatch) -> None:
+        # buckets=[...] on a function or workflow must not silently drop
+        # declared rules just because create_if_missing is off.
+        client, calls = self._recording_client(monkeypatch, [{"name": "grid-archive", "retention": self.PAYLOAD}])
+        payload = _resolve_buckets_payload([Bucket("grid-archive", retention=self.RULES)], client)
+        assert payload == [{"bucket": "grid-archive"}]
+        assert [(method, path) for method, path, _ in calls] == [("GET", "/buckets/grid-archive")]
+
+    def test_attachment_with_retention_requires_a_client(self) -> None:
+        with pytest.raises(RebaseWorkflowError, match="authenticated client"):
+            _resolve_buckets_payload([Bucket("grid-archive", retention=self.RULES)], None)
+
+    def test_first_object_op_converges_declared_retention(self, monkeypatch) -> None:
+        client, calls = self._recording_client(
+            monkeypatch,
+            [
+                {"name": "grid-archive", "retention": self.PAYLOAD},
+                {"urls": [{"path": "a.txt", "url": "https://signed/a.txt", "method": "PUT", "expires_seconds": 600}]},
+            ],
+        )
+        monkeypatch.setattr("requests.put", lambda url, data=None, headers=None, timeout=None: FakeResponse())
+        Bucket("grid-archive", retention=self.RULES, client=client).put("a.txt", b"x")
+        assert [(method, path) for method, path, _ in calls][0] == ("GET", "/buckets/grid-archive")
 
 
 def test_workflow_keeps_bucket_attachment_until_deploy() -> None:

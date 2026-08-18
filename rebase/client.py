@@ -963,7 +963,7 @@ def bucket_env_var(name: str) -> str:
     return "REBASE_BUCKET_" + re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Retention:
     """One age-based expiry rule: objects under ``prefix`` expire after ``max_age``.
 
@@ -973,10 +973,12 @@ class Retention:
     calendar month, whose length varies) cannot mean what it says.
     """
 
+    max_age: str | timedelta | Duration
     prefix: str = ""
-    max_age: str | timedelta | Duration = ""
 
     def __post_init__(self) -> None:
+        if not isinstance(self.prefix, str):
+            raise TypeError(f"Retention prefix must be a string; got {self.prefix!r}")
         duration = Duration.coerce(self.max_age, field_name="max_age")
         days, remainder = divmod(duration.seconds, 86400)
         if duration.months or remainder:
@@ -987,8 +989,10 @@ class Retention:
         object.__setattr__(self, "max_age", Duration(days=total_days))
 
     def to_payload(self) -> dict[str, str]:
-        assert isinstance(self.max_age, Duration)
-        return {"prefix": self.prefix, "max_age": self.max_age.isoformat()}
+        max_age = self.max_age
+        if not isinstance(max_age, Duration):  # __post_init__ guarantees this
+            raise TypeError(f"Retention max_age was not normalised; got {max_age!r}")
+        return {"prefix": self.prefix, "max_age": max_age.isoformat()}
 
 
 def _validate_retention(retention: Sequence[Retention] | None) -> list[Retention] | None:
@@ -1124,7 +1128,7 @@ class Bucket:
         return data
 
     def _ensure_once(self) -> None:
-        if self.create_if_missing and not self._ensured:
+        if (self.create_if_missing or self.retention is not None) and not self._ensured:
             self.ensure()
 
     @property
@@ -1132,7 +1136,9 @@ class Bucket:
         """The ``gs://`` URI, for handing to pandas, polars, duckdb or fsspec.
 
         Inside a deployed run this comes from the injected environment, so it
-        costs nothing; elsewhere it is fetched once and cached.
+        costs nothing; elsewhere it is fetched once and cached. Resolving it
+        outside a run goes through :meth:`ensure`, so declared retention
+        rules converge as a side effect.
         """
         if self._uri is None:
             injected = os.environ.get(bucket_env_var(self.name))
@@ -1349,7 +1355,7 @@ def _resolve_buckets_payload(
         bucket = Bucket.from_name(item) if isinstance(item, str) else item
         if not isinstance(bucket, Bucket):
             raise RebaseWorkflowError(f"buckets entries must be rebase.Bucket or bucket names, got {type(item)!r}")
-        if bucket.create_if_missing:
+        if bucket.create_if_missing or bucket.retention is not None:
             if client is None:
                 raise RebaseWorkflowError("resolving buckets requires an authenticated client")
             bucket.ensure(client)
