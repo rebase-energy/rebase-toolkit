@@ -29,6 +29,7 @@ from rebase.config import DEFAULT_SERVER_URL, active_environment, load_profile, 
 from rebase.image import DEFAULT_PYTHON_VERSION, Image
 from rebase.runtime import current_run
 from rebase.source_bundle import SourceBundle, build_source_bundle
+from rebase.timing import Duration
 
 try:
     from emflow.models import Agent as _ImportedEmflowAgent
@@ -963,6 +964,45 @@ def bucket_env_var(name: str) -> str:
 
 
 @dataclass(frozen=True)
+class Retention:
+    """One age-based expiry rule: objects under ``prefix`` expire after ``max_age``.
+
+    ``max_age`` takes the toolkit duration grammar (``"7d"``, ``"P90D"``, a
+    ``timedelta``) and must be a whole number of days of at least one day —
+    provider lifecycle conditions are day-granular, so a finer age (or a
+    calendar month, whose length varies) cannot mean what it says.
+    """
+
+    prefix: str = ""
+    max_age: str | timedelta | Duration = ""
+
+    def __post_init__(self) -> None:
+        duration = Duration.coerce(self.max_age, field_name="max_age")
+        days, remainder = divmod(duration.seconds, 86400)
+        if duration.months or remainder:
+            raise ValueError(f"Retention max_age must be a whole number of days; got {self.max_age!r}")
+        total_days = duration.days + int(days)
+        if total_days < 1:
+            raise ValueError(f"Retention max_age must be at least one day; got {self.max_age!r}")
+        object.__setattr__(self, "max_age", Duration(days=total_days))
+
+    def to_payload(self) -> dict[str, str]:
+        assert isinstance(self.max_age, Duration)
+        return {"prefix": self.prefix, "max_age": self.max_age.isoformat()}
+
+
+def _validate_retention(retention: Sequence[Retention] | None) -> list[Retention] | None:
+    if retention is None:
+        return None
+    rules = list(retention)
+    if not all(isinstance(rule, Retention) for rule in rules):
+        raise ValueError("Bucket retention entries must be rebase.Retention rules")
+    if len({rule.prefix for rule in rules}) != len(rules):
+        raise ValueError("Bucket retention prefixes must be unique")
+    return rules
+
+
+@dataclass(frozen=True)
 class BucketObject:
     """One object in a bucket."""
 
@@ -992,6 +1032,20 @@ class Bucket:
         def train():
             pd.read_parquet(rb.Bucket.from_name("forecasts").uri + "/2026/08/10.parquet")
 
+    Declared :class:`Retention` rules expire objects by age, per key prefix,
+    enforced by the backing provider's lifecycle management — no sweeper on
+    either side. An object matched by several rules expires at the earliest
+    matching age::
+
+        b = rb.Bucket.from_name(
+            "grid-archive",
+            create_if_missing=True,
+            retention=[
+                rb.Retention(prefix="frequency/", max_age="7d"),
+                rb.Retention(prefix="", max_age="90d"),
+            ],
+        )
+
     Unlike :class:`Volume` this is never mounted, so nothing here pretends an
     object store is a filesystem: there is no ``commit``/``reload`` pair, and a
     write costs one request rather than a silent read-modify-write of the whole
@@ -1009,6 +1063,7 @@ class Bucket:
         create_if_missing: bool = False,
         client: Client | None = None,
         environment_name: str | None = None,
+        retention: Sequence[Retention] | None = None,
     ) -> None:
         if not isinstance(name, str) or not name.strip():
             raise ValueError("Bucket requires a non-empty name")
@@ -1016,6 +1071,7 @@ class Bucket:
         self.create_if_missing = create_if_missing
         self._client = client
         self.environment_name = environment_name
+        self.retention = _validate_retention(retention)
         self._ensured = False
         self._uri: str | None = None
 
@@ -1026,12 +1082,14 @@ class Bucket:
         *,
         create_if_missing: bool = False,
         environment_name: str | None = None,
+        retention: Sequence[Retention] | None = None,
     ) -> Bucket:
         """Reference a workspace bucket by name, optionally creating it lazily."""
         return cls(
             name,
             create_if_missing=create_if_missing,
             environment_name=environment_name,
+            retention=retention,
         )
 
     def __repr__(self) -> str:
@@ -1045,9 +1103,22 @@ class Bucket:
         return self._client
 
     def ensure(self, client: Client | None = None) -> dict[str, Any]:
-        """Make sure the bucket exists (creates it when ``create_if_missing``)."""
+        """Make sure the bucket exists (creates it when ``create_if_missing``).
+
+        Declared :class:`Retention` rules are part of the desired state: they
+        ride along on create, and when the bucket already exists with different
+        active rules the bucket is patched to match — so re-declaring is
+        idempotent and costs nothing when already in sync.
+        """
         resolved = client or self._resolved_client()
-        data = resolved.create_bucket(self.name) if self.create_if_missing else resolved.get_bucket(self.name)
+        declared = [rule.to_payload() for rule in self.retention] if self.retention is not None else None
+        data = (
+            resolved.create_bucket(self.name, retention=declared)
+            if self.create_if_missing
+            else resolved.get_bucket(self.name)
+        )
+        if declared is not None and data.get("retention") != declared:
+            data = resolved.update_bucket(self.name, retention=declared)
         self._ensured = True
         self._uri = str(data.get("uri") or "") or None
         return data
@@ -2736,8 +2807,19 @@ class Client:
     def delete_volume_object(self, name: str, path: str) -> None:
         self.request("DELETE", f"/volumes/{name}/objects", params={"path": path})
 
-    def create_bucket(self, name: str) -> dict[str, Any]:
-        response = self.request("POST", "/buckets", json={"name": name})
+    def create_bucket(self, name: str, *, retention: list[dict[str, str]] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"name": name}
+        # Omitted when unset: the API forbids unknown fields, so older servers
+        # would 422 every create if the client always sent it.
+        if retention is not None:
+            payload["retention"] = retention
+        response = self.request("POST", "/buckets", json=payload)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError("expected bucket response")
+        return response
+
+    def update_bucket(self, name: str, *, retention: list[dict[str, str]]) -> dict[str, Any]:
+        response = self.request("PATCH", f"/buckets/{name}", json={"retention": retention})
         if not isinstance(response, dict):
             raise RebaseWorkflowError("expected bucket response")
         return response
