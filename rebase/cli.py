@@ -371,6 +371,8 @@ KNOWN_PERMISSIONS = frozenset(
         "artifacts:write",
         "buckets:read",
         "buckets:write",
+        "secrets:read",
+        "secrets:write",
         "datasets:read",
         "datasets:write",
         "datasets:signal",
