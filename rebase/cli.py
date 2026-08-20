@@ -371,6 +371,8 @@ KNOWN_PERMISSIONS = frozenset(
         "artifacts:write",
         "buckets:read",
         "buckets:write",
+        "volumes:read",
+        "volumes:write",
         "secrets:read",
         "secrets:write",
         "datasets:read",
@@ -3443,7 +3445,7 @@ bucket_app = typer.Typer(
     rich_markup_mode="rich",
 )
 
-BUCKET_DETAIL_KEYS = ["name", "provider", "bucket", "uri", "location", "workspace_id", "created_at"]
+BUCKET_DETAIL_KEYS = ["name", "provider", "uri", "console_url", "workspace_id", "created_at"]
 
 
 @bucket_app.command("create")
