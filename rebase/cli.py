@@ -2642,6 +2642,7 @@ NOTIFICATION_DETAIL_KEYS = [
     "workspace_id",
     "notify_on_failure",
     "notify_on_stale",
+    "notify_owner_email",
     "webhook_url",
     "has_webhook_secret",
     "updated_at",
@@ -2677,6 +2678,14 @@ def workspace_notifications_set_command(
         bool | None,
         typer.Option("--on-stale/--no-on-stale", help="Enable or disable stale dataset notifications."),
     ] = None,
+    email: Annotated[
+        bool | None,
+        typer.Option(
+            "--email/--no-email",
+            "-e",
+            help="Email the owner of a scheduled workflow when it starts failing, and again when it recovers.",
+        ),
+    ] = None,
     clear_webhook: Annotated[
         bool, typer.Option("--clear-webhook", "-c", help="Remove the stored webhook URL and secret.")
     ] = False,
@@ -2685,15 +2694,25 @@ def workspace_notifications_set_command(
     """Update the workspace's failure notification settings."""
     if clear_webhook and (webhook_url is not None or webhook_secret is not None):
         raise RebaseWorkflowError("--clear-webhook cannot be combined with --webhook-url/--webhook-secret")
-    if not clear_webhook and webhook_url is None and webhook_secret is None and on_failure is None and on_stale is None:
+    if (
+        not clear_webhook
+        and webhook_url is None
+        and webhook_secret is None
+        and on_failure is None
+        and on_stale is None
+        and email is None
+    ):
         raise RebaseWorkflowError(
-            "nothing to update; pass --webhook-url, --webhook-secret, --on-failure, --on-stale, or --clear-webhook"
+            "nothing to update; pass --webhook-url, --webhook-secret, --on-failure, --on-stale, "
+            "--email/--no-email, or --clear-webhook"
         )
     kwargs: dict[str, Any] = {}
     if on_failure is not None:
         kwargs["notify_on_failure"] = on_failure
     if on_stale is not None:
         kwargs["notify_on_stale"] = on_stale
+    if email is not None:
+        kwargs["notify_owner_email"] = email
     if clear_webhook:
         kwargs["webhook_url"] = None
         kwargs["webhook_secret"] = None

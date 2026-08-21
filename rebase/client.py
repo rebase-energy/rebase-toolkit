@@ -4467,6 +4467,7 @@ class Client:
         *,
         notify_on_failure: bool | None = None,
         notify_on_stale: bool | None = None,
+        notify_owner_email: bool | None = None,
         webhook_url: str | None | object = _UNSET,
         webhook_secret: str | None | object = _UNSET,
     ) -> dict[str, Any]:
@@ -4475,6 +4476,8 @@ class Client:
             payload["notify_on_failure"] = notify_on_failure
         if notify_on_stale is not None:
             payload["notify_on_stale"] = notify_on_stale
+        if notify_owner_email is not None:
+            payload["notify_owner_email"] = notify_owner_email
         if webhook_url is not _UNSET:
             payload["webhook_url"] = "" if webhook_url is None else webhook_url
         if webhook_secret is not _UNSET:
