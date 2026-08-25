@@ -3443,6 +3443,70 @@ def test_workspace_invite_rejects_duplicate_identity(capsys) -> None:
     assert "email was given twice" in capsys.readouterr().err
 
 
+def _fake_invites(*invites: dict[str, Any]):
+    def fake_list_workspace_invites(self: Client) -> list[dict[str, Any]]:
+        return list(invites)
+
+    return fake_list_workspace_invites
+
+
+def test_workspace_uninvite_revokes_pending_invite_by_email(monkeypatch, capsys) -> None:
+    revoked: list[str] = []
+
+    def fake_revoke_workspace_invite(self: Client, invite_id: str) -> dict[str, Any]:
+        revoked.append(invite_id)
+        return {"id": invite_id, "email": "davide@rebase.energy", "status": "revoked"}
+
+    monkeypatch.setattr(
+        Client,
+        "list_workspace_invites",
+        _fake_invites(
+            {"id": "invite-1", "email": "davide@rebase.energy", "github_username": None, "status": "pending"},
+            {"id": "invite-2", "email": "other@rebase.energy", "github_username": None, "status": "accepted"},
+        ),
+    )
+    monkeypatch.setattr(Client, "revoke_workspace_invite", fake_revoke_workspace_invite)
+
+    assert main(["workspace", "uninvite", "davide@rebase.energy"]) == 0
+
+    assert revoked == ["invite-1"]
+    assert "davide@rebase.energy" in capsys.readouterr().out
+
+
+def test_workspace_uninvite_matches_github_username(monkeypatch, capsys) -> None:
+    revoked: list[str] = []
+
+    def fake_revoke_workspace_invite(self: Client, invite_id: str) -> dict[str, Any]:
+        revoked.append(invite_id)
+        return {"id": invite_id, "email": None, "github_username": "davide-github", "status": "revoked"}
+
+    monkeypatch.setattr(
+        Client,
+        "list_workspace_invites",
+        _fake_invites({"id": "invite-1", "email": None, "github_username": "davide-github", "status": "pending"}),
+    )
+    monkeypatch.setattr(Client, "revoke_workspace_invite", fake_revoke_workspace_invite)
+
+    assert main(["workspace", "uninvite", "@davide-github"]) == 0
+
+    assert revoked == ["invite-1"]
+    assert "@davide-github" in capsys.readouterr().out
+
+
+def test_workspace_uninvite_ignores_non_pending_invites(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "list_workspace_invites",
+        _fake_invites(
+            {"id": "invite-1", "email": "davide@rebase.energy", "github_username": None, "status": "accepted"}
+        ),
+    )
+
+    assert main(["workspace", "uninvite", "davide@rebase.energy"]) == 1
+
+    assert "no pending invite matches" in capsys.readouterr().err
+
+
 def _member(email: str, *, role: str, github_username: str | None = None) -> dict[str, Any]:
     return {
         "profile_id": f"profile-{email.split('@')[0]}",

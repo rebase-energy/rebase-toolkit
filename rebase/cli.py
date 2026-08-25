@@ -2579,6 +2579,50 @@ def workspace_invite_command(
     )
 
 
+def _resolve_workspace_invite(client: Client, target: str) -> dict[str, Any]:
+    """Find a pending workspace invite by email, GitHub username, or invite id."""
+    needle = target.strip().lstrip("@").lower()
+    if not needle:
+        raise RebaseWorkflowError("provide an invite email, GitHub username, or invite id")
+    pending = [invite for invite in client.list_workspace_invites() if invite.get("status") == "pending"]
+    matches = [
+        invite
+        for invite in pending
+        if needle
+        in {
+            str(invite.get("email") or "").lower(),
+            str(invite.get("github_username") or "").lower(),
+            str(invite.get("id") or "").lower(),
+        }
+    ]
+    if not matches:
+        known = ", ".join(sorted(_workspace_member_identity(invite) for invite in pending)) or "none"
+        raise RebaseWorkflowError(f"no pending invite matches {target!r}. Pending invites: {known}")
+    if len(matches) > 1:
+        raise RebaseWorkflowError(f"{target!r} matches more than one pending invite; use the invite id instead")
+    return matches[0]
+
+
+@workspace_app.command("uninvite")
+def workspace_uninvite_command(
+    target: Annotated[
+        str,
+        typer.Argument(help="Invite email, GitHub username, or invite id."),
+    ],
+) -> None:
+    """Revoke a pending invite to the active workspace.
+
+    The invite stops granting access; the person can be invited again later.
+    Only pending invites can be revoked — an accepted invite already became a
+    membership, which `rebase workspace set-role` manages.
+    """
+    client = Client()
+    invite = _resolve_workspace_invite(client, target)
+    revoked = client.revoke_workspace_invite(str(invite["id"]))
+    identity = _workspace_member_identity(revoked)
+    console.print(f"Revoked workspace invite for [rebase.value]{identity}[/rebase.value]")
+
+
 @workspace_app.command("set-role")
 def workspace_set_role_command(
     target: Annotated[
