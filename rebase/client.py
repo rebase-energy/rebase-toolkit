@@ -2619,6 +2619,9 @@ class Client:
     def list_my_workspaces(self) -> list[dict[str, Any]]:
         return self._request_list("GET", "/me/workspaces", expected="workspace list response")
 
+    def get_my_profile(self) -> dict[str, Any]:
+        return self._request_dict("GET", "/me/profile", expected="profile response")
+
     def create_workspace(self, workspace_id: str, *, name: str | None = None) -> dict[str, Any]:
         return self._request_dict(
             "POST", "/workspaces", json={"id": workspace_id, "name": name}, expected="workspace response"

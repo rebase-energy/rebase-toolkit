@@ -2293,6 +2293,52 @@ def profile_switch_command(profile: Annotated[str, typer.Argument(help="Profile 
     _switch_profile(profile)
 
 
+@profile_app.command("link")
+def profile_link_command(
+    provider: Annotated[str, typer.Argument(help="Social auth provider to link: google or github.")],
+    api_url: Annotated[
+        str | None,
+        typer.Option(
+            "--api-url",
+            "-a",
+            help="Rebase API URL to use when the stored session lacks Supabase connection details.",
+        ),
+    ] = None,
+    callback_port: Annotated[
+        int, typer.Option("--callback-port", "-c", help="Local Supabase OAuth callback port.")
+    ] = 17658,
+    auth_timeout: Annotated[
+        float,
+        typer.Option("--auth-timeout", help="Seconds to wait for the Supabase auth callback."),
+    ] = 300,
+    no_browser: Annotated[
+        bool,
+        typer.Option("--no-browser", "-n", help="Print auth URLs instead of opening the browser."),
+    ] = False,
+) -> None:
+    """Link another social login to the account you are signed in as.
+
+    Use this to connect GitHub after onboarding with Google (or the other way
+    round): it attaches the provider to your existing account instead of
+    creating a second one, so workspace memberships and invites carry over.
+    """
+    from rebase.setup import run_link_identity
+
+    try:
+        run_link_identity(
+            SimpleNamespace(
+                provider=provider,
+                api_url=api_url,
+                callback_port=callback_port,
+                auth_timeout=auth_timeout,
+                no_browser=no_browser,
+            )
+        )
+    except KeyboardInterrupt:
+        error_console.print("Aborted.", style="rebase.error")
+        raise SystemExit(130) from None
+
+
 @profile_app.command("logout")
 def profile_logout_command() -> None:
     """Clear the stored Supabase auth session without removing local profiles."""
@@ -2400,11 +2446,7 @@ def _switch_workspace(workspace: str) -> None:
     client = Client()
     memberships = client.list_my_workspaces()
     match = next(
-        (
-            item
-            for item in memberships
-            if workspace in {item.get("id"), item.get("workspace_id"), item.get("name")}
-        ),
+        (item for item in memberships if workspace in {item.get("id"), item.get("workspace_id"), item.get("name")}),
         None,
     )
     if match is None:
@@ -2478,16 +2520,18 @@ def _workspace_invite_identity(
     email: str | None,
     github_username: str | None,
 ) -> tuple[str | None, str | None]:
-    provided = [value for value in (target, email, github_username) if value]
-    if len(provided) != 1:
-        raise RebaseWorkflowError("provide exactly one invite target: TARGET, --email, or --github")
-    if email:
-        return email, None
-    if github_username:
-        return None, github_username
-    if target and "@" in target:
-        return target, None
-    return None, target
+    if target:
+        if "@" in target:
+            if email:
+                raise RebaseWorkflowError("email was given twice: as TARGET and as --email")
+            email = target
+        else:
+            if github_username:
+                raise RebaseWorkflowError("GitHub username was given twice: as TARGET and as --github")
+            github_username = target
+    if email is None and github_username is None:
+        raise RebaseWorkflowError("provide an invite target: an email address, a GitHub username, or both")
+    return email, github_username
 
 
 @workspace_app.command("invite")
@@ -2503,7 +2547,11 @@ def workspace_invite_command(
         typer.Option("--role", "-r", help="Workspace role: Viewer, Developer, Admin, or Owner."),
     ] = "Viewer",
 ) -> None:
-    """Invite a person to the active workspace."""
+    """Invite a person to the active workspace.
+
+    Giving both --email and --github puts both on one invite, so it binds to
+    whichever identity the person signs in with first.
+    """
     _validate_workspace_role(role)
     invite_email, invite_github_username = _workspace_invite_identity(
         target,
@@ -2515,7 +2563,15 @@ def workspace_invite_command(
         github_username=invite_github_username,
         role=role,
     )
-    identity = invite.get("email") or f"@{invite.get('github_username')}"
+    identities = [
+        identity
+        for identity in (
+            invite.get("email"),
+            f"@{invite['github_username']}" if invite.get("github_username") else None,
+        )
+        if identity
+    ]
+    identity = " / ".join(identities)
     status = invite.get("status", "pending")
     console.print(
         f"Invited [rebase.value]{identity}[/rebase.value] to workspace as "

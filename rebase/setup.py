@@ -22,10 +22,13 @@ from rebase.auth import (
     build_supabase_authorize_url,
     clear_session,
     exchange_pkce_code,
+    fetch_link_identity_url,
     generate_pkce_verifier,
+    github_username_from_jwt,
     load_access_token,
     load_session,
     pkce_challenge,
+    refresh_session,
     save_session,
 )
 from rebase.brand import BRAND_BRIGHT_GREEN, BRAND_MEDIUM_GRAY
@@ -537,6 +540,129 @@ def _prompt_existing_repo(args: Any) -> str:
     return _validate_github_repo_full_name(repo_full_name)
 
 
+def _await_authorize_code(
+    server: _CallbackServer,
+    *,
+    auth_url: str,
+    no_browser: bool,
+    auth_timeout: float,
+) -> str:
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    if no_browser:
+        _hint("Open this URL to authenticate:")
+        print(auth_url)
+    else:
+        webbrowser.open(auth_url)
+        _hint("Opened browser for Supabase login")
+    deadline = time.monotonic() + auth_timeout
+    while thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    server.shutdown()
+    thread.join(timeout=2)
+    params = server.callback_params
+    if params is None:
+        raise RebaseWorkflowError("timed out waiting for Supabase callback")
+    if params.get("error"):
+        raise RebaseWorkflowError(params.get("error_description") or params["error"])
+    code = params.get("code")
+    if not code:
+        raise RebaseWorkflowError("Supabase callback did not include code")
+    return code
+
+
+def run_link_identity(args: Any) -> None:
+    """Attach another social login to the account already signed in on this machine.
+
+    This is how someone who first onboarded with Google connects their GitHub
+    account afterwards: signing in with GitHub from scratch would mint a separate
+    Supabase user (unless the emails happen to match), while this flow adds the
+    identity to the existing user, so the profile keeps its memberships and gains
+    the GitHub username.
+    """
+    provider = args.provider
+    if provider not in {"google", "github"}:
+        raise RebaseWorkflowError("provider must be 'google' or 'github'")
+    try:
+        session = load_session()
+    except AuthError as exc:
+        raise RebaseWorkflowError(str(exc)) from exc
+    if session is None:
+        raise RebaseWorkflowError("no stored login session. Run `rebase setup` to sign in first")
+    if session.is_expired:
+        try:
+            session = refresh_session(session)
+        except AuthError as exc:
+            raise RebaseWorkflowError(
+                f"the stored session could not be refreshed ({exc}). Run `rebase setup --force-auth` and try again"
+            ) from exc
+
+    supabase_url = session.supabase_url
+    supabase_anon_key = session.supabase_anon_key
+    if not supabase_url or not supabase_anon_key:
+        config = Client(api_url=getattr(args, "api_url", None)).setup_config()
+        supabase_url = supabase_url or config.get("supabase_url")
+        supabase_anon_key = supabase_anon_key or config.get("supabase_anon_key")
+    if not isinstance(supabase_url, str) or not isinstance(supabase_anon_key, str):
+        raise RebaseWorkflowError("could not determine the Supabase URL and anon key for the link flow")
+
+    verifier = generate_pkce_verifier()
+    server = _CallbackServer(("127.0.0.1", args.callback_port), _CallbackHandler)
+    redirect_to = f"http://127.0.0.1:{server.server_port}/auth/callback"
+    try:
+        link_url = fetch_link_identity_url(
+            supabase_url=supabase_url,
+            supabase_anon_key=supabase_anon_key,
+            access_token=session.access_token,
+            provider=provider,
+            redirect_to=redirect_to,
+            code_challenge=pkce_challenge(verifier),
+        )
+    except AuthError as exc:
+        server.server_close()
+        raise RebaseWorkflowError(str(exc)) from exc
+    code = _await_authorize_code(
+        server,
+        auth_url=link_url,
+        no_browser=args.no_browser,
+        auth_timeout=args.auth_timeout,
+    )
+    try:
+        linked = exchange_pkce_code(
+            supabase_url=supabase_url,
+            supabase_anon_key=supabase_anon_key,
+            auth_code=code,
+            code_verifier=verifier,
+        )
+    except AuthError as exc:
+        raise RebaseWorkflowError(str(exc)) from exc
+    if session.user_id and linked.user_id and linked.user_id != session.user_id:
+        raise RebaseWorkflowError(
+            f"the link flow signed in a different user ({linked.email or linked.user_id}) instead of "
+            f"linking to {session.email or session.user_id}; the stored session was left untouched"
+        )
+    save_session(linked)
+    _success(f"Linked {provider} to {linked.email or 'your account'}")
+
+    # An authenticated request makes the backend re-read the token: it fills in
+    # profiles.github_username from the fresh claims and accepts any pending
+    # invites that name the newly linked identity.
+    profile: dict[str, Any] | None = None
+    try:
+        profile = Client(api_url=getattr(args, "api_url", None)).get_my_profile()
+    except Exception as exc:  # noqa: BLE001 - linking already succeeded; the sync retries on any later request
+        _hint(f"Could not refresh your Rebase profile right away ({exc}); it will sync on your next command.")
+    if provider == "github":
+        github_username = profile.get("github_username") if profile else None
+        if github_username:
+            _success(f"Your Rebase profile now carries GitHub username @{github_username}")
+        elif github_username_from_jwt(linked.access_token) is None:
+            _hint(
+                "GitHub is linked, but the session does not carry your GitHub username yet. "
+                "Sign in once with GitHub — `rebase setup --force-auth --provider github` — to finish the sync."
+            )
+
+
 def _oauth_session(args: Any, config: dict[str, Any]) -> str:
     supabase_url = config.get("supabase_url")
     supabase_anon_key = config.get("supabase_anon_key")
@@ -556,27 +682,7 @@ def _oauth_session(args: Any, config: dict[str, Any]) -> str:
         redirect_to=redirect_to,
         code_challenge=pkce_challenge(verifier),
     )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    if args.no_browser:
-        _hint("Open this URL to authenticate:")
-        print(auth_url)
-    else:
-        webbrowser.open(auth_url)
-        _hint("Opened browser for Supabase login")
-    deadline = time.monotonic() + args.auth_timeout
-    while thread.is_alive() and time.monotonic() < deadline:
-        time.sleep(0.1)
-    server.shutdown()
-    thread.join(timeout=2)
-    params = server.callback_params
-    if params is None:
-        raise RebaseWorkflowError("timed out waiting for Supabase callback")
-    if params.get("error"):
-        raise RebaseWorkflowError(params.get("error_description") or params["error"])
-    code = params.get("code")
-    if not code:
-        raise RebaseWorkflowError("Supabase callback did not include code")
+    code = _await_authorize_code(server, auth_url=auth_url, no_browser=args.no_browser, auth_timeout=args.auth_timeout)
     try:
         session = exchange_pkce_code(
             supabase_url=supabase_url,

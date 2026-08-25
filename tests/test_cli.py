@@ -3147,8 +3147,6 @@ def test_profile_show_unknown_profile_errors(monkeypatch, tmp_path: Path) -> Non
     assert main(["profile", "show", "prod"]) == 1
 
 
-
-
 def _config_with_profiles(tmp_path: Path, monkeypatch) -> Path:
     config_path = tmp_path / "config.json"
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(config_path))
@@ -3386,10 +3384,63 @@ def test_workspace_invite_github_target(monkeypatch, capsys) -> None:
     assert "@davide-github" in capsys.readouterr().out
 
 
-def test_workspace_invite_requires_one_target(capsys) -> None:
+def test_workspace_invite_email_and_github_together(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_create_workspace_invite(self: Client, **kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        return {
+            "email": kwargs["email"],
+            "github_username": kwargs["github_username"],
+            "role": kwargs["role"],
+            "status": "pending",
+        }
+
+    monkeypatch.setattr(Client, "create_workspace_invite", fake_create_workspace_invite)
+
+    assert main(["workspace", "invite", "--email", "davide@rebase.energy", "--github", "davide-github"]) == 0
+
+    assert observed == {
+        "email": "davide@rebase.energy",
+        "github_username": "davide-github",
+        "role": "Viewer",
+    }
+    output = capsys.readouterr().out
+    assert "davide@rebase.energy" in output
+    assert "@davide-github" in output
+
+
+def test_workspace_invite_target_combines_with_other_identity(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_create_workspace_invite(self: Client, **kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        return {
+            "email": kwargs["email"],
+            "github_username": kwargs["github_username"],
+            "role": kwargs["role"],
+            "status": "pending",
+        }
+
+    monkeypatch.setattr(Client, "create_workspace_invite", fake_create_workspace_invite)
+
+    assert main(["workspace", "invite", "davide-github", "--email", "davide@rebase.energy"]) == 0
+
+    assert observed["email"] == "davide@rebase.energy"
+    assert observed["github_username"] == "davide-github"
+    capsys.readouterr()
+
+
+def test_workspace_invite_requires_a_target(capsys) -> None:
     assert main(["workspace", "invite"]) == 1
 
-    assert "provide exactly one invite target" in capsys.readouterr().err
+    assert "provide an invite target" in capsys.readouterr().err
+
+
+def test_workspace_invite_rejects_duplicate_identity(capsys) -> None:
+    assert main(["workspace", "invite", "davide@rebase.energy", "--email", "other@rebase.energy"]) == 1
+
+    assert "email was given twice" in capsys.readouterr().err
 
 
 def _member(email: str, *, role: str, github_username: str | None = None) -> dict[str, Any]:
