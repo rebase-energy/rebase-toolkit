@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import webbrowser
+from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +24,7 @@ from rebase.auth import (
     clear_session,
     exchange_pkce_code,
     fetch_link_identity_url,
+    fetch_user_identities,
     generate_pkce_verifier,
     github_username_from_jwt,
     load_access_token,
@@ -69,21 +71,37 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         params = parse_qs(parsed.query)
         self.server.callback_params = {key: values[-1] for key, values in params.items() if values}
+        error = self.server.callback_params.get("error")
+        if error:
+            message = self.server.callback_params.get("error_description") or error
+            body = f"Authentication failed: {escape(message)}. You can close this tab and return to the terminal."
+        else:
+            body = "Authentication complete. You can close this tab."
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.end_headers()
+        close_script = (
+            ""
+            if error
+            else """
+    <script>
+      window.setTimeout(function () {
+        window.close();
+      }, 100);
+    </script>"""
+        )
         self.wfile.write(
-            b"""<!doctype html>
+            f"""<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8">
-    <title>Authentication complete</title>
+    <title>Authentication</title>
     <style>
-      html, body {
+      html, body {{
         height: 100%;
         margin: 0;
-      }
-      body {
+      }}
+      body {{
         align-items: center;
         background: #ffffff;
         color: #111111;
@@ -91,18 +109,13 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         font: 18px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
         justify-content: center;
         text-align: center;
-      }
+      }}
     </style>
   </head>
   <body>
-    <main>Authentication complete. You can close this tab.</main>
-    <script>
-      window.setTimeout(function () {
-        window.close();
-      }, 100);
-    </script>
+    <main>{body}</main>{close_script}
   </body>
-</html>"""
+</html>""".encode()
         )
         threading.Thread(target=self.server.shutdown, daemon=True).start()
 
@@ -606,6 +619,26 @@ def run_link_identity(args: Any) -> None:
     if not isinstance(supabase_url, str) or not isinstance(supabase_anon_key, str):
         raise RebaseWorkflowError("could not determine the Supabase URL and anon key for the link flow")
 
+    # Completing the browser round-trip for an identity that is already attached
+    # ends in GoTrue's "Identity is already linked" error, so look before leaping.
+    try:
+        identities = fetch_user_identities(
+            supabase_url=supabase_url,
+            supabase_anon_key=supabase_anon_key,
+            access_token=session.access_token,
+        )
+    except AuthError:
+        identities = []
+    for identity in identities:
+        if identity.get("provider") != provider:
+            continue
+        identity_data = identity.get("identity_data")
+        login = identity_data.get("user_name") if isinstance(identity_data, dict) else None
+        suffix = f" (@{login})" if isinstance(login, str) and login else ""
+        _success(f"{provider} is already linked to {session.email or 'your account'}{suffix} — nothing to do")
+        _sync_profile_after_link(args, provider=provider, access_token=session.access_token)
+        return
+
     verifier = generate_pkce_verifier()
     server = _CallbackServer(("127.0.0.1", args.callback_port), _CallbackHandler)
     redirect_to = f"http://127.0.0.1:{server.server_port}/auth/callback"
@@ -643,7 +676,10 @@ def run_link_identity(args: Any) -> None:
         )
     save_session(linked)
     _success(f"Linked {provider} to {linked.email or 'your account'}")
+    _sync_profile_after_link(args, provider=provider, access_token=linked.access_token)
 
+
+def _sync_profile_after_link(args: Any, *, provider: str, access_token: str) -> None:
     # An authenticated request makes the backend re-read the token: it fills in
     # profiles.github_username from the fresh claims and accepts any pending
     # invites that name the newly linked identity.
@@ -655,8 +691,8 @@ def run_link_identity(args: Any) -> None:
     if provider == "github":
         github_username = profile.get("github_username") if profile else None
         if github_username:
-            _success(f"Your Rebase profile now carries GitHub username @{github_username}")
-        elif github_username_from_jwt(linked.access_token) is None:
+            _success(f"Your Rebase profile carries GitHub username @{github_username}")
+        elif github_username_from_jwt(access_token) is None:
             _hint(
                 "GitHub is linked, but the session does not carry your GitHub username yet. "
                 "Sign in once with GitHub — `rebase setup --force-auth --provider github` — to finish the sync."

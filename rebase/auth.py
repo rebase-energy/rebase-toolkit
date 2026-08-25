@@ -213,6 +213,32 @@ def fetch_link_identity_url(
     return url
 
 
+def fetch_user_identities(
+    *,
+    supabase_url: str,
+    supabase_anon_key: str,
+    access_token: str,
+) -> list[dict[str, Any]]:
+    """The identities (login methods) already attached to the token's user."""
+    response = requests.get(
+        f"{supabase_url.rstrip('/')}/auth/v1/user",
+        headers={
+            "apikey": supabase_anon_key,
+            "Authorization": f"Bearer {access_token}",
+        },
+        timeout=30,
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise AuthError(f"could not read the signed-in user: {response.text}") from exc
+    payload = response.json()
+    identities = payload.get("identities") if isinstance(payload, dict) else None
+    if not isinstance(identities, list):
+        return []
+    return [identity for identity in identities if isinstance(identity, dict)]
+
+
 def github_username_from_jwt(access_token: str) -> str | None:
     """The GitHub login carried by this token, if any.
 
