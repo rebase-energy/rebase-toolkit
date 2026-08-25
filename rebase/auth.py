@@ -162,6 +162,75 @@ def build_supabase_authorize_url(
     return f"{supabase_url.rstrip('/')}/auth/v1/authorize?{query}"
 
 
+def fetch_link_identity_url(
+    *,
+    supabase_url: str,
+    supabase_anon_key: str,
+    access_token: str,
+    provider: str,
+    redirect_to: str,
+    code_challenge: str,
+) -> str:
+    """Ask Supabase for the provider URL that links `provider` to the signed-in user.
+
+    Unlike ``/authorize`` (anonymous sign-in, which creates or signs in a possibly
+    different user), ``/user/identities/authorize`` is authenticated: the OAuth flow
+    it starts attaches the new identity to the token's user. Requires manual
+    linking to be enabled on the Supabase project.
+    """
+    response = requests.get(
+        f"{supabase_url.rstrip('/')}/auth/v1/user/identities/authorize",
+        params={
+            "provider": provider,
+            "redirect_to": redirect_to,
+            "flow_type": "pkce",
+            "code_challenge": code_challenge,
+            "code_challenge_method": "s256",
+            "skip_http_redirect": "true",
+        },
+        headers={
+            "apikey": supabase_anon_key,
+            "Authorization": f"Bearer {access_token}",
+        },
+        timeout=30,
+    )
+    if not response.ok:
+        detail = response.text
+        with suppress(ValueError):
+            body = response.json()
+            if isinstance(body, dict):
+                if body.get("error_code") == "manual_linking_disabled":
+                    raise AuthError(
+                        "manual identity linking is disabled on the Supabase project — "
+                        "enable it under Authentication settings and try again"
+                    )
+                detail = body.get("msg") or body.get("message") or body.get("error_description") or detail
+        raise AuthError(f"could not start the identity link flow: {detail}")
+    payload = response.json()
+    url = payload.get("url") if isinstance(payload, dict) else None
+    if not isinstance(url, str) or not url:
+        raise AuthError("Supabase did not return a link URL")
+    return url
+
+
+def github_username_from_jwt(access_token: str) -> str | None:
+    """The GitHub login carried by this token, if any.
+
+    Mirrors the claim order the toolkit backend uses to fill
+    ``profiles.github_username``, so "the token carries a username" here means
+    the backend will see it too.
+    """
+    payload = _decode_jwt_payload(access_token)
+    candidates: list[Any] = [payload.get(key) for key in ("user_name", "preferred_username", "nickname")]
+    metadata = payload.get("user_metadata")
+    if isinstance(metadata, dict):
+        candidates.extend(metadata.get(key) for key in ("user_name", "preferred_username", "nickname", "login"))
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return None
+
+
 def _session_from_token_payload(
     payload: dict[str, Any],
     *,

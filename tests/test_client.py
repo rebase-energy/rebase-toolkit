@@ -3568,3 +3568,54 @@ def test_disk_token_cached_and_invalidated_on_401(monkeypatch) -> None:
     client.list_workflows()
     assert token_reads == [1, 1]  # 401 dropped the cache and re-read
     assert recovered.auth_header == "Bearer token-2"  # type: ignore[attr-defined]
+
+
+def test_env_workspace_outranks_marker_and_profile(tmp_path, monkeypatch) -> None:
+    """REBASE_WORKSPACE is a deliberate act; the directory marker is ambient."""
+    config = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config))
+    write_profile(api_key="rbw_key", workspace={"id": "agent-work"}, path=config)
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    monkeypatch.chdir(repo)
+    _mark(repo, "rebase-grid")
+    monkeypatch.setenv("REBASE_WORKSPACE", "other-workspace")
+
+    assert rb.Client().workspace_id == "other-workspace"
+
+
+def test_deliberate_workspace_override_drops_the_profile_api_key(tmp_path, monkeypatch) -> None:
+    """An rbw_ key is minted for one workspace, and the server reads the workspace
+    off the key row rather than the header -- so carrying it to another workspace
+    would quietly act on the wrong one. Fall through to the signed-in session.
+    """
+    config = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config))
+    write_profile(api_key="rbw_key", workspace={"id": "agent-work"}, path=config)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REBASE_WORKSPACE", "other-workspace")
+
+    client = rb.Client()
+
+    assert client.workspace_id == "other-workspace"
+    assert client.api_key is None
+
+
+def test_override_matching_the_profile_workspace_keeps_the_key(tmp_path, monkeypatch) -> None:
+    config = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config))
+    write_profile(api_key="rbw_key", workspace={"id": "agent-work"}, path=config)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REBASE_WORKSPACE", "agent-work")
+
+    assert rb.Client().api_key == "rbw_key"
+
+
+def test_explicit_api_key_survives_a_workspace_override(tmp_path, monkeypatch) -> None:
+    config = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config))
+    write_profile(api_key="rbw_key", workspace={"id": "agent-work"}, path=config)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REBASE_WORKSPACE", "other-workspace")
+
+    assert rb.Client(api_key="rb_explicit").api_key == "rb_explicit"

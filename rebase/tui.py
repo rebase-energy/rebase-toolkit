@@ -29,10 +29,12 @@ from textual.containers import Vertical, VerticalScroll
 from textual.content import Content
 from textual.coordinate import Coordinate
 from textual.css.query import NoMatches
+from textual.errors import NoWidget
 from textual.geometry import Offset
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.selection import SELECT_ALL, Selection
+from textual.widget import Widget
 from textual.widgets import (
     DataTable,
     Footer,
@@ -60,7 +62,7 @@ from rebase.brand import (
     BRAND_MEDIUM_GRAY,
     BRAND_SLATE_BLUE,
 )
-from rebase.client import Client, RebaseWorkflowError
+from rebase.client import Client, RebaseWorkflowError, run_timing_summary
 from rebase.config import (
     add_search_path,
     editor_settings,
@@ -127,7 +129,7 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "Created",
     ),
     "workspace-profiles-table": ("Active", "Profile", "Workspace", "Workspace ID", "API URL"),
-    "buckets-table": ("Bucket", "Created", "Updated"),
+    "buckets-table": ("Bucket", "URI", "Created", "Updated"),
     "volumes-table": ("Volume", "Provider", "Storage", "Prefix", "Created", "Updated"),
     "secrets-table": ("Secret", "Keys"),
     # `Origin` sits second in both: you read what a thing is called, then what kind of
@@ -209,7 +211,8 @@ PRESERVED_TABLE_IDS: tuple[str, ...] = (
     "timeline-table",
 )
 #: The project view's stacked boxes, top to bottom. One per reveal level. Each box below
-#: the first resizes the one above it by its own column header — see `DragHeaderTable`.
+#: the first resizes the one above it by its own column header — see `DragHeaderTable` —
+#: and the chip strips are handles too — see `DragStrip`.
 BOX_SELECTORS: tuple[str, ...] = ("#target-tabs", "#runs-table", "#timeline-pane")
 #: Prefixes a synthetic row's key so it cannot collide with a target's uuid, and so the
 #: selection handler can tell the two apart from the key alone.
@@ -976,6 +979,23 @@ def artifact_browser_url(uri: str) -> str | None:
     return f"https://console.cloud.google.com/storage/browser/_details/{bucket}/{object_name}"
 
 
+def bucket_console_url(bucket: dict[str, Any]) -> str | None:
+    """Where `o` sends the browser for a bucket row.
+
+    The API reports `console_url` outright, project query parameter and all.
+    `uri` is the fallback for a server that predates that field: the bucket
+    browser needs nothing but the name, and the console resolves the project
+    against whichever one the reader had open.
+    """
+    reported = str(bucket.get("console_url") or "").strip()
+    if reported.startswith("https://"):
+        return reported
+    parsed = urlsplit(str(bucket.get("uri") or "").strip())
+    if parsed.scheme != "gs" or not parsed.netloc:
+        return None
+    return f"https://console.cloud.google.com/storage/browser/{quote(parsed.netloc, safe='')}"
+
+
 def build_timeline(
     events: Sequence[dict[str, Any]],
     steps: Sequence[dict[str, Any]],
@@ -1557,6 +1577,97 @@ class TimelineTable(DragHeaderTable):
         Binding("left", "app.switch_timeline_filter(-1)", "Previous filter", show=False),
         Binding("right", "app.switch_timeline_filter(1)", "Next filter", show=False),
     ]
+
+
+class DragStrip(Widget):
+    """The mouse handlers that make a chip strip a splitter as well.
+
+    The chip strips sit on the pane boundaries just as the `DragHeaderTable` headers
+    under them do, so they take the same grab — anywhere along the row, chip or gap.
+    The complication is that a strip is also there to be *clicked*: capturing the mouse
+    on the press means the screen routes the release, and the `Click` Textual
+    synthesises from it, back here rather than to the chip under the pointer. So the
+    click is rebuilt by hand — a press that never left its row, released over the chip
+    it started on, posts the `Tab.Clicked` the capture swallowed.
+    """
+
+    #: The box a drag on this strip resizes, as a selector for `begin_box_drag`.
+    resizes: str = ""
+
+    _pressed_tab: Tab | None = None
+    _grab_row = 0
+    _strip_dragged = False
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        # Mouse events bubble up from everything inside a `TabbedContent` — the tables
+        # included — still carrying the child's own coordinates, so only the screen row
+        # can say whether the press was on the strip itself.
+        if self._screen_y(event) != self.region.y:
+            return
+        self._pressed_tab = self._tab_at(event)
+        self._grab_row = self._screen_y(event)
+        self._strip_dragged = False
+        self.app.begin_box_drag(self.resizes, self._grab_row)  # type: ignore[attr-defined]
+        self.capture_mouse()
+        # The screen armed a text selection before this handler saw the press — the
+        # strip's gaps, unlike a DataTable, allow selecting — and mid-drag that armed
+        # selection auto-scrolls whichever table the pointer crosses. A grab on a
+        # splitter is a resize, never a selection, so disarm it.
+        self.screen.clear_selection()
+        event.stop()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if self.app.mouse_captured is not self:
+            return
+        y = self._screen_y(event)
+        self._strip_dragged = self._strip_dragged or y != self._grab_row
+        self.app.drag_box_to(y)  # type: ignore[attr-defined]
+        event.stop()
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if self.app.mouse_captured is not self:
+            return
+        self.app.end_box_drag()  # type: ignore[attr-defined]
+        self.release_mouse()
+        event.stop()
+        pressed, self._pressed_tab = self._pressed_tab, None
+        if pressed is None or self._strip_dragged or pressed.disabled:
+            return
+        if self._tab_at(event) is pressed:
+            pressed.post_message(Tab.Clicked(pressed))
+
+    def _tab_at(self, event: events.MouseEvent) -> Tab | None:
+        try:
+            widget, _ = self.screen.get_widget_at(self._screen_x(event), self._screen_y(event))
+        except NoWidget:
+            return None
+        return widget if isinstance(widget, Tab) else None
+
+    def _screen_x(self, event: events.MouseEvent) -> int:
+        return int(getattr(event, "screen_x", self.region.x + event.x))
+
+    def _screen_y(self, event: events.MouseEvent) -> int:
+        # screen_y is what survives the widget moving under the pointer mid-drag.
+        return int(getattr(event, "screen_y", self.region.y + event.y))
+
+
+class DragTabs(DragStrip, Tabs):
+    """The timeline's chips: they share the runs/timeline boundary with the
+    `TimelineTable` header below them, and drag the same box."""
+
+    def __init__(self, *tabs: Tab, resizes: str, id: str) -> None:
+        super().__init__(*tabs, id=id)
+        self.resizes = resizes
+
+
+class DragTabbedContent(DragStrip, TabbedContent):
+    """The target chips: the top row of the top box, with nothing above to resize, so
+    the drag stretches the box itself — down grows it, and the runs-table header on its
+    far edge follows the pointer."""
+
+    def __init__(self, *, initial: str, id: str, resizes: str) -> None:
+        super().__init__(initial=initial, id=id)
+        self.resizes = resizes
 
 
 class SelectableDataTable(HeaderSafeDataTable):
@@ -2147,7 +2258,7 @@ class RebaseTuiApp(App[None]):
         # lists `show=False` bindings too. Ten hints did not fit the width, so the four
         # you move around with kept their places and the rest went one keystroke away.
         Binding("d", "delete_selection", "Delete", show=False),
-        Binding("o", "open_source", "Open source", show=False),
+        Binding("o", "open_source", "Open source, or a bucket in the cloud console", show=False),
         Binding("g", "open_github", "Open deployed code on GitHub", show=False),
         Binding("w", "switch_workspace", "Switch workspace", show=False),
         Binding("v", "choose_environment", "Switch environment", show=False),
@@ -2277,6 +2388,35 @@ class RebaseTuiApp(App[None]):
         display: none;
     }}
 
+    /* The project-view strips are splitters as well as chips (see `DragStrip`), and
+       they wear the same background as the column header row under them — `$panel`,
+       the DataTable header's own colour — so the two rows read as one grabbable band. */
+    #target-tabs Tabs,
+    #timeline-tabs {{
+        background: $panel;
+    }}
+
+    /* The chips sit centred in their strip rather than hugging the left edge. The
+       chip list inside `Tabs` is auto-width but pinned to `min-width: 100%` for the
+       sake of the underline bar these strips do not draw; freed of that, centring
+       the full-width `#tabs-scroll` around it is all it takes. The arrow keys that
+       step between chips live on the tables, untouched by layout. */
+    #workspace-resource-tabs Tabs #tabs-scroll,
+    #target-tabs Tabs #tabs-scroll,
+    #timeline-tabs #tabs-scroll {{
+        align-horizontal: center;
+    }}
+
+    #workspace-resource-tabs Tabs #tabs-list-bar,
+    #workspace-resource-tabs Tabs #tabs-list,
+    #target-tabs Tabs #tabs-list-bar,
+    #target-tabs Tabs #tabs-list,
+    #timeline-tabs #tabs-list-bar,
+    #timeline-tabs #tabs-list {{
+        width: auto;
+        min-width: 0;
+    }}
+
     #workspace-resource-tabs Tab,
     #target-tabs Tab,
     #timeline-tabs Tab {{
@@ -2353,6 +2493,13 @@ class RebaseTuiApp(App[None]):
     DataTable:focus {{
         background-tint: transparent;
     }}
+
+    /* Textual also tints the focused table's header 5% lighter, which drew a visible
+       seam between a chip strip and the header row it shares its band with. */
+    DataTable:focus > .datatable--header {{
+        background-tint: transparent;
+    }}
+
 
     /* Textual's toast is a grey `$panel` slab 60 cells wide whatever it has to say.
        This one is the app's own: a bordered card in the brand green, sized to its text,
@@ -2482,7 +2629,9 @@ class RebaseTuiApp(App[None]):
                 with TabPane(Content("[ Projects ]"), id="projects-resource-tab"):
                     yield SelectableDataTable(id="projects-table")
                 with TabPane(Content("[ Buckets ]"), id="buckets-resource-tab"):
-                    yield HeaderSafeDataTable(id="buckets-table")
+                    # Selectable, unlike its sibling resource tables: `o` opens every
+                    # marked bucket, so buckets need marks as well as a cursor.
+                    yield SelectableDataTable(id="buckets-table")
                 with TabPane(Content("[ Volumes ]"), id="volumes-resource-tab"):
                     yield HeaderSafeDataTable(id="volumes-table")
                 with TabPane(Content("[ Secrets ]"), id="secrets-resource-tab"):
@@ -2492,7 +2641,7 @@ class RebaseTuiApp(App[None]):
             yield HeaderSafeDataTable(id="workspace-profiles-table")
         with Vertical(id="project-view"):
             yield Static("", id="project-error", classes="panel")
-            with TabbedContent(initial="workflows-tab", id="target-tabs"):
+            with DragTabbedContent(initial="workflows-tab", id="target-tabs", resizes="#target-tabs"):
                 # The brackets are part of the label so an unselected chip still reads as
                 # something you can press, with no colour to say so. `Text`, not `str`:
                 # Textual parses a label as content markup and would read `[ Workflows ]`
@@ -2508,8 +2657,9 @@ class RebaseTuiApp(App[None]):
                 # Not focusable: `tab` walks panes, and a chip strip that could hold
                 # the focus would be a stop on that walk with nothing to navigate.
                 # The arrows on the table below drive it, and the mouse still clicks it.
-                chips = Tabs(
+                chips = DragTabs(
                     *(Tab(Content(label), id=tab_id) for tab_id, label, _ in TIMELINE_FILTERS),
+                    resizes="#runs-table",
                     id="timeline-tabs",
                 )
                 chips.can_focus = False
@@ -2679,7 +2829,9 @@ class RebaseTuiApp(App[None]):
     def _grow_box(self, selector: str, rows: int) -> None:
         """Give *rows* to a box, taking them from the others nearest-first."""
         selectors = self._box_selectors()
-        if selector not in selectors or rows == 0:
+        # A lone box already has the whole view: nothing to trade rows with. Reachable
+        # by dragging the target chips before a run is open, where `+`/`-` warns instead.
+        if selector not in selectors or rows == 0 or len(selectors) < 2:
             return
         self._maximised = None
         flexible = self._flexible_selector(selectors)
@@ -3220,8 +3372,67 @@ class RebaseTuiApp(App[None]):
             return None if summary is None else summary.project
         return None
 
+    def _open_console_buckets(self) -> list[dict[str, Any]] | None:
+        """The buckets `o` acts on: the marked rows, else the one under the cursor.
+
+        None means `o` is not about buckets here at all, which is different from
+        the empty list — that is the buckets tab with nothing chosen on it.
+        """
+        if self.current_view != "workspace":
+            return None
+        if self.query_one("#workspace-resource-tabs", TabbedContent).active != "buckets-resource-tab":
+            return None
+        table = self.query_one("#buckets-table", SelectableDataTable)
+        keys = table.marked_keys or [key for key in (table.cursor_key,) if key is not None]
+        rows = self._workspace_resource_rows.get("buckets-table", {})
+        return [item for key in keys if (item := rows.get(key)) is not None]
+
+    def _open_buckets_in_console(self, buckets: list[dict[str, Any]]) -> None:
+        if not buckets:
+            self.notify("No bucket selected.", severity="warning")
+            return
+        targets = [
+            (str(bucket.get("name") or "-"), url)
+            for bucket in buckets
+            if (url := bucket_console_url(bucket)) is not None
+        ]
+        if not targets:
+            self.notify(
+                "This Rebase deployment does not report where its buckets are stored, so there is nothing to open.",
+                severity="warning",
+            )
+            return
+        self.run_worker(
+            self._open_console(targets),
+            name="open-bucket",
+            group="tui-open",
+            exclusive=True,
+        )
+
+    async def _open_console(self, targets: list[tuple[str, str]]) -> None:
+        opened: list[str] = []
+        for name, url in targets:
+            try:
+                launched = await asyncio.to_thread(webbrowser.open, url)
+            except Exception as exc:
+                self.notify(f"Could not open {name}: {exc}", severity="error")
+                return
+            if not launched:
+                self.notify(f"Could not open a browser for {url}", severity="error")
+                return
+            opened.append(name)
+        self.notify(f"Opened {', '.join(opened)} in the Google Cloud console.")
+
     def action_open_source(self) -> None:
-        """Open the file that declares the selected project."""
+        """Open whatever `o` means where the reader is standing.
+
+        On the buckets tab that is the bucket's storage in the cloud console;
+        everywhere else it stays the file that declares the selected project.
+        """
+        buckets = self._open_console_buckets()
+        if buckets is not None:
+            self._open_buckets_in_console(buckets)
+            return
         project = self._open_source_target()
         name = str(project.get("name") or "") if project is not None else ""
         if not name:
@@ -3807,6 +4018,7 @@ class RebaseTuiApp(App[None]):
         for key, item in bucket_rows.items():
             buckets.add_row(
                 str(item.get("name", "-")),
+                str(item.get("uri") or "-"),
                 self._time(item.get("created_at")),
                 self._time(item.get("updated_at")),
                 key=key,
@@ -4259,13 +4471,22 @@ class RebaseTuiApp(App[None]):
         output: dict[str, Any] = {"result": run.get("result")}
         if run.get("error"):
             output["error"] = run["error"]
+        # The structured diagnosis, when the server produced one: why the run
+        # died and which knob to turn, in toolkit vocabulary.
+        reason = run.get("failure_reason")
+        if isinstance(reason, dict) and reason.get("message"):
+            output["diagnosis"] = {key: reason[key] for key in ("message", "hint") if reason.get(key)}
         sections: list[Any] = [{"parameters": run.get("parameters") or {}}, output]
         status = str(run.get("status", "unknown"))
+        fields = [
+            DetailField("Run ID", str(run.get("id", "-"))),
+            DetailField("Status", status, status_style(status)),
+        ]
+        timing = run_timing_summary(run)
+        if timing:
+            fields.append(DetailField("Timing", timing))
         return DetailDrawer(
-            fields=[
-                DetailField("Run ID", str(run.get("id", "-"))),
-                DetailField("Status", status, status_style(status)),
-            ],
+            fields=fields,
             sections=sections,
         )
 
@@ -4481,12 +4702,6 @@ class RebaseTuiApp(App[None]):
             self.run_worker(self._load_run_detail(row_id), name="run-detail", group="tui", exclusive=True)
         elif event.data_table.id == "workspace-profiles-table":
             self._select_workspace_profile(row_id)
-
-    def _project_name(self, item: dict[str, Any]) -> str:
-        if self.workspace_overview is None:
-            return str(item.get("project_id", "-"))
-        project_id = str(item.get("project_id", ""))
-        return self.workspace_overview.project_names.get(project_id, project_id or "-")
 
     def _workspace_label(self) -> str:
         """The workspace the data actually comes from, which a marker may have pinned.

@@ -17,7 +17,7 @@ from textual.coordinate import Coordinate
 from textual.events import MouseMove
 from textual.geometry import Offset
 from textual.selection import Selection
-from textual.widgets import DataTable, Footer, Header, Input, OptionList, Static, TabbedContent, Tabs
+from textual.widgets import DataTable, Footer, Header, Input, OptionList, Static, Tab, TabbedContent, Tabs
 from textual.widgets._toast import Toast
 
 from rebase import config as config_module
@@ -37,6 +37,7 @@ from rebase.tui import (
     SelectableDataTable,
     TimezoneChoiceScreen,
     artifact_browser_url,
+    bucket_console_url,
     collapse_message,
     compact_id,
     deployed_identities,
@@ -320,7 +321,16 @@ class EnvironmentClient(FakeClient):
         return [{"name": "dev"}, {"name": "staging"}, {"name": "prod"}]
 
     def list_buckets(self) -> list[dict[str, Any]]:
-        return [{"name": f"{self.environment_name}-data"}]
+        return [
+            {
+                "name": f"{self.environment_name}-data",
+                "uri": f"gs://rb-{self.environment_name}-data-abc123",
+                "console_url": (
+                    f"https://console.cloud.google.com/storage/browser/rb-{self.environment_name}-data-abc123"
+                    "?project=rebase-prod"
+                ),
+            }
+        ]
 
     def list_volumes(self) -> list[dict[str, Any]]:
         return [{"name": f"{self.environment_name}-cache", "provider": "gcs"}]
@@ -445,6 +455,9 @@ def test_tui_environment_resources_and_switcher() -> None:
 
             assert "Environment: dev" in str(app.query_one("#environment-context", Static).render())
             assert str(app.query_one("#buckets-table", DataTable).get_cell_at(Coordinate(0, 0))) == "dev-data"
+            assert str(app.query_one("#buckets-table", DataTable).get_cell_at(Coordinate(0, 1))) == (
+                "gs://rb-dev-data-abc123"
+            )
             assert str(app.query_one("#volumes-table", DataTable).get_cell_at(Coordinate(0, 0))) == "dev-cache"
             assert str(app.query_one("#secrets-table", DataTable).get_cell_at(Coordinate(0, 0))) == "dev-api"
 
@@ -2738,6 +2751,111 @@ def test_tui_dragging_a_column_header_resizes_the_box_above_it() -> None:
     asyncio.run(scenario())
 
 
+def test_tui_chip_strips_are_splitters_and_still_switch_on_a_click() -> None:
+    """The tab rows drag like the header rows under them, without giving up their chips."""
+
+    def assert_centred(strip: Tabs) -> None:
+        chip_list = strip.query_one("#tabs-list").region
+        lead = chip_list.x - strip.region.x
+        trail = strip.region.right - chip_list.right
+        assert lead > 0
+        assert abs(lead - trail) <= 1
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            # The workspace strip is centred too — checked here, before drilling into
+            # the project view hides it.
+            await pilot.pause(0.2)
+            assert_centred(app.query_one("#workspace-resource-tabs Tabs", Tabs))
+
+            await _open_run(app, pilot)
+
+            # The strips wear the header row's own background, so each two-row band
+            # reads as one piece of chrome — including while the table under a strip
+            # has the focus, when Textual would otherwise tint its header a shade
+            # lighter and draw a seam between the two rows.
+            timeline = app.query_one("#timeline-table", tui_module.TimelineTable)
+            timeline.focus()
+            await pilot.pause(0.1)
+            header = timeline.get_component_styles("datatable--header")
+            assert app.query_one("#timeline-tabs", tui_module.DragTabs).styles.background == header.background
+            assert app.query_one("#target-tabs Tabs", Tabs).styles.background == header.background
+            assert header.background_tint.a == 0
+
+            # And the chips sit centred in their strips, not against the left edge.
+            assert_centred(app.query_one("#timeline-tabs", Tabs))
+            assert_centred(app.query_one("#target-tabs Tabs", Tabs))
+
+            # The timeline chips sit on the runs/timeline boundary, same as the
+            # timeline's column header, and drag the same box.
+            chips = app.query_one("#timeline-tabs", tui_module.DragTabs)
+            assert chips.resizes == "#runs-table"
+            start = app.query_one("#runs-table").size.height
+            grabbed_at = chips.region.y
+            await pilot.mouse_down(chips, offset=(1, 0))
+            await pilot.pause(0.1)
+            assert app._drag_box is not None
+            app.drag_box_to(grabbed_at + 3)
+            app.end_box_drag()
+            await pilot.mouse_up(chips, offset=(1, 0))
+            await pilot.pause(0.2)
+            assert app._drag_box is None
+            assert app.query_one("#runs-table").size.height == start + 3
+
+            # A grab on the strip's empty stretch — past the chips, where the widget
+            # under the pointer allows text selection — must not arm one: mid-drag the
+            # pointer crosses the tables, and an armed selection auto-scrolls whichever
+            # it is over.
+            await pilot.mouse_down(chips, offset=(chips.size.width - 2, 0))
+            await pilot.pause(0.1)
+            assert app._drag_box is not None
+            assert app.screen._select_state is None
+            await pilot.mouse_up(chips, offset=(chips.size.width - 2, 0))
+            await pilot.pause(0.1)
+
+            # A press and release that never leaves its chip is still a click.
+            logs_chip = app.query_one("#timeline-logs", Tab)
+            await pilot.mouse_down(logs_chip, offset=(1, 0))
+            await pilot.pause(0.1)
+            await pilot.mouse_up(logs_chip, offset=(1, 0))
+            await pilot.pause(0.2)
+            assert app.query_one("#timeline-tabs", Tabs).active == "timeline-logs"
+
+            # The target chips have nothing above them, so their drag stretches their
+            # own box: the pointer's travel goes to the box's far edge.
+            target = app.query_one("#target-tabs", tui_module.DragTabbedContent)
+            assert target.resizes == "#target-tabs"
+            start = target.size.height
+            grabbed_at = target.region.y
+            await pilot.mouse_down(target, offset=(2, 0))
+            await pilot.pause(0.1)
+            assert app._drag_box is not None
+            app.drag_box_to(grabbed_at + 4)
+            app.end_box_drag()
+            await pilot.mouse_up(target, offset=(2, 0))
+            await pilot.pause(0.2)
+            assert target.size.height == start + 4
+
+            # And a chip click inside the tabbed box still switches the pane.
+            functions_chip = next(tab for tab in app.query("#target-tabs Tab") if "Functions" in str(tab.label))
+            await pilot.mouse_down(functions_chip, offset=(1, 0))
+            await pilot.pause(0.1)
+            await pilot.mouse_up(functions_chip, offset=(1, 0))
+            await pilot.pause(0.2)
+            assert app.query_one("#target-tabs", TabbedContent).active == "functions-tab"
+
+            # A press on the tables inside the tabbed box is not a grab on the strip.
+            functions = app.query_one("#functions-table", SelectableDataTable)
+            await pilot.mouse_down(functions, offset=(4, 2))
+            await pilot.pause(0.1)
+            assert app._drag_box is None
+            await pilot.mouse_up(functions, offset=(4, 2))
+
+    asyncio.run(scenario())
+
+
 def test_tui_p_opens_the_selected_row_as_json() -> None:
     async def scenario() -> None:
         app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
@@ -3552,6 +3670,73 @@ def test_tui_a_resolves_and_opens_the_selected_bucket_artifact(monkeypatch) -> N
 
     asyncio.run(scenario())
     assert opened == ["https://storage.example/signed-object"]
+
+
+def test_tui_o_opens_the_marked_bucket_in_the_cloud_console(monkeypatch) -> None:
+    """`o` reads as "open" on the buckets tab, where there is no source file to open."""
+    opened: list[str] = []
+    monkeypatch.setattr("rebase.tui.webbrowser.open", lambda url: opened.append(url) or True)
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(EnvironmentClient()), refresh_interval=0)
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            app.query_one("#workspace-resource-tabs", TabbedContent).active = "buckets-resource-tab"
+            await pilot.pause(0.2)
+            buckets = app.query_one("#buckets-table", SelectableDataTable)
+            buckets.focus()
+            buckets.move_cursor(row=0)
+            await pilot.press("o")
+            await pilot.pause(0.3)
+
+    asyncio.run(scenario())
+    assert opened == ["https://console.cloud.google.com/storage/browser/rb-dev-data-abc123?project=rebase-prod"]
+
+
+def test_tui_o_opens_every_marked_bucket(monkeypatch) -> None:
+    """Marking is why the buckets table is selectable at all — one `o`, every mark."""
+    opened: list[str] = []
+    monkeypatch.setattr("rebase.tui.webbrowser.open", lambda url: opened.append(url) or True)
+
+    class TwoBucketClient(EnvironmentClient):
+        def list_buckets(self) -> list[dict[str, Any]]:
+            return [
+                {"name": "agent-work", "uri": "gs://rb-agent-work-abc"},
+                {"name": "forecasts", "uri": "gs://rb-forecasts-def"},
+            ]
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(TwoBucketClient()), refresh_interval=0)
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            app.query_one("#workspace-resource-tabs", TabbedContent).active = "buckets-resource-tab"
+            await pilot.pause(0.2)
+            buckets = app.query_one("#buckets-table", SelectableDataTable)
+            buckets.focus()
+            buckets.move_cursor(row=0)
+            await pilot.press("shift+down")
+            await pilot.pause(0.1)
+            await pilot.press("o")
+            await pilot.pause(0.3)
+
+    asyncio.run(scenario())
+    assert opened == [
+        "https://console.cloud.google.com/storage/browser/rb-agent-work-abc",
+        "https://console.cloud.google.com/storage/browser/rb-forecasts-def",
+    ]
+
+
+def test_bucket_console_url_falls_back_to_the_gs_uri() -> None:
+    """A server predating `console_url` still reports `uri`, which is enough."""
+    assert bucket_console_url({"console_url": "https://console.cloud.google.com/x?project=p"}) == (
+        "https://console.cloud.google.com/x?project=p"
+    )
+    assert bucket_console_url({"uri": "gs://rb-agent-work-data-abc123"}) == (
+        "https://console.cloud.google.com/storage/browser/rb-agent-work-data-abc123"
+    )
+    assert bucket_console_url({"name": "agent-work"}) is None
 
 
 def test_tui_l_jumps_to_the_logs_chip_and_back() -> None:

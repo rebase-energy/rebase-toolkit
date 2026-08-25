@@ -6,9 +6,10 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import sys
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -60,6 +61,9 @@ from rebase.client import (
     _git,
     _parse_github_remote,
     _validate_execution,
+    run_failure_summary,
+    run_timing_summary,
+    set_build_log_consumer,
 )
 from rebase.config import (
     DEFAULT_PROFILE,
@@ -77,6 +81,7 @@ from rebase.config import (
     selected_profile_name,
     set_active_environment,
     set_default_profile,
+    set_profile_workspace,
     workspace_key,
     write_profile,
 )
@@ -217,6 +222,25 @@ app = typer.Typer(
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
+
+
+@app.callback()
+def main_callback(
+    workspace: Annotated[
+        str | None,
+        typer.Option("--workspace", "-W", help="Operate on this workspace id instead of the active one."),
+    ] = None,
+) -> None:
+    """Global options applied before any subcommand runs."""
+    # Exported rather than threaded through: there are ~100 bare Client()
+    # constructions across this module, and the SDK already resolves
+    # REBASE_WORKSPACE at the top of its precedence chain. Setting the variable
+    # means every one of them picks the override up with no further wiring, and
+    # the precedence rule stays defined in exactly one place.
+    if workspace:
+        os.environ["REBASE_WORKSPACE"] = workspace
+
+
 workspace_app = typer.Typer(
     add_completion=False,
     cls=AlphabeticalTyperGroup,
@@ -313,6 +337,13 @@ WORKSPACE_ROLES = ("Viewer", "Developer", "Admin", "Owner")
 
 KNOWN_PERMISSIONS = frozenset(
     {
+        # Must match app.permissions.ALL_PERMISSIONS on the server. This is
+        # validated client-side only to fail fast; the server validates too, so a
+        # list that drifts short does not protect anything — it just makes
+        # permissions the server supports impossible to request. That is exactly
+        # what happened: seven of these were missing, which blocked minting keys
+        # for tasks, artifacts, buckets and datasets entirely.
+        # tests/test_permissions_parity.py in the toolkit repo guards the match.
         "workspace:read",
         "workspace:update",
         "members:read",
@@ -336,6 +367,19 @@ KNOWN_PERMISSIONS = frozenset(
         "models:execute",
         "runs:read",
         "runs:write",
+        "tasks:write",
+        "artifacts:write",
+        "buckets:read",
+        "buckets:write",
+        "volumes:read",
+        "volumes:write",
+        "secrets:read",
+        "secrets:write",
+        "datasets:read",
+        "datasets:write",
+        "datasets:signal",
+        "shell:execute",
+        "asgi:source_token",
     }
 )
 
@@ -435,14 +479,6 @@ def _load_target_module(source_ref: str, *, as_module: bool) -> ModuleType:
 
 
 RunnableTarget = Function | Workflow | Model
-
-
-def _function_objects(module: ModuleType) -> list[tuple[str, Function]]:
-    return [
-        (name, function)
-        for name, function in _unique_named_objects(module, (Function,))
-        if not isinstance(function, Step)
-    ]
 
 
 def _runnable_objects(module: ModuleType) -> list[tuple[str, RunnableTarget]]:
@@ -638,7 +674,7 @@ def _render_run_snapshot(
         if status == "succeeded":
             reporter.finish("Run completed.")
         elif status == "failed":
-            reporter.fail(str(run.get("error") or "Run failed."))
+            reporter.fail(run_failure_summary(run) or "Run failed.")
         else:
             reporter.fail("Run cancelled.")
     else:
@@ -885,15 +921,19 @@ def _stream_run_result(
                 # Final fetch: log-store ingestion can lag the terminal status.
                 log_follower.poll(reporter)
             if status == "succeeded":
+                timing = run_timing_summary(data)
+                suffix = f" ({timing})" if timing else ""
                 if return_result:
-                    reporter.finish(f"Run completed in {_format_duration(time.monotonic() - started_at)} seconds.")
+                    reporter.finish(
+                        f"Run completed in {_format_duration(time.monotonic() - started_at)} seconds{suffix}."
+                    )
                 else:
-                    reporter.finish("Run completed.")
+                    reporter.finish(f"Run completed{suffix}.")
                 return data.get("result") if return_result else None
-            error = data.get("error") or f"run ended with status {status}"
-            reporter.fail(str(error))
+            error = run_failure_summary(data) or f"run ended with status {status}"
+            reporter.fail(error)
             if return_result:
-                raise RebaseWorkflowError(str(error))
+                raise RebaseWorkflowError(error)
             return None
         if status == "queued" and not seen_event_ids:
             reporter.update("Run queued.")
@@ -1923,6 +1963,31 @@ def _resolve_project_selector(client: Client, name: str | None, *, project_id: s
     return _resolve_project_by_name(client, name)
 
 
+def _resolve_target_selector(
+    client: Client,
+    name: str | None,
+    *,
+    target_id: str | None,
+    project_name: str | None,
+    target_type: str,
+    get_by_id: Callable[[str], dict[str, Any]],
+    list_by_project: Callable[..., list[dict[str, Any]]],
+) -> dict[str, Any]:
+    if target_id is not None:
+        if name is not None:
+            raise RebaseWorkflowError(f"provide either a {target_type} name or --id, not both")
+        return get_by_id(target_id)
+    if name is None:
+        raise RebaseWorkflowError(f"{target_type} name is required unless --id is provided")
+    if not project_name:
+        raise RebaseWorkflowError(f"--project is required when selecting a {target_type} by name")
+    project = _resolve_project_by_name(client, project_name)
+    for target in list_by_project(project_id=str(project["id"])):
+        if target.get("name") == name:
+            return target
+    raise RebaseWorkflowError(f"{target_type} not found: {project_name}/{name}")
+
+
 def _resolve_function_selector(
     client: Client,
     name: str | None,
@@ -1930,19 +1995,15 @@ def _resolve_function_selector(
     function_id: str | None = None,
     project_name: str | None = None,
 ) -> dict[str, Any]:
-    if function_id is not None:
-        if name is not None:
-            raise RebaseWorkflowError("provide either a function name or --id, not both")
-        return client.get_function(function_id)
-    if name is None:
-        raise RebaseWorkflowError("function name is required unless --id is provided")
-    if not project_name:
-        raise RebaseWorkflowError("--project is required when selecting a function by name")
-    project = _resolve_project_by_name(client, project_name)
-    for function in client.list_functions(project_id=str(project["id"])):
-        if function.get("name") == name:
-            return function
-    raise RebaseWorkflowError(f"function not found: {project_name}/{name}")
+    return _resolve_target_selector(
+        client,
+        name,
+        target_id=function_id,
+        project_name=project_name,
+        target_type="function",
+        get_by_id=client.get_function,
+        list_by_project=client.list_functions,
+    )
 
 
 def _resolve_workflow_selector(
@@ -1952,19 +2013,15 @@ def _resolve_workflow_selector(
     workflow_id: str | None = None,
     project_name: str | None = None,
 ) -> dict[str, Any]:
-    if workflow_id is not None:
-        if name is not None:
-            raise RebaseWorkflowError("provide either a workflow name or --id, not both")
-        return client.get_workflow(workflow_id)
-    if name is None:
-        raise RebaseWorkflowError("workflow name is required unless --id is provided")
-    if not project_name:
-        raise RebaseWorkflowError("--project is required when selecting a workflow by name")
-    project = _resolve_project_by_name(client, project_name)
-    for workflow in client.list_workflows(project_id=str(project["id"])):
-        if workflow.get("name") == name:
-            return workflow
-    raise RebaseWorkflowError(f"workflow not found: {project_name}/{name}")
+    return _resolve_target_selector(
+        client,
+        name,
+        target_id=workflow_id,
+        project_name=project_name,
+        target_type="workflow",
+        get_by_id=client.get_workflow,
+        list_by_project=client.list_workflows,
+    )
 
 
 def _resolve_model_selector(
@@ -1974,23 +2031,30 @@ def _resolve_model_selector(
     model_id: str | None = None,
     project_name: str | None = None,
 ) -> dict[str, Any]:
-    if model_id is not None:
-        if name is not None:
-            raise RebaseWorkflowError("provide either a model name or --id, not both")
-        return client.get_model(model_id)
-    if name is None:
-        raise RebaseWorkflowError("model name is required unless --id is provided")
-    if not project_name:
-        raise RebaseWorkflowError("--project is required when selecting a model by name")
-    project = _resolve_project_by_name(client, project_name)
-    for model in client.list_models(project_id=str(project["id"])):
-        if model.get("name") == name:
-            return model
-    raise RebaseWorkflowError(f"model not found: {project_name}/{name}")
+    return _resolve_target_selector(
+        client,
+        name,
+        target_id=model_id,
+        project_name=project_name,
+        target_type="model",
+        get_by_id=client.get_model,
+        list_by_project=client.list_models,
+    )
 
 
 def _project_name_map(projects: list[dict[str, Any]]) -> dict[str, str]:
     return {str(project.get("id", "")): str(project.get("name", "-")) for project in projects}
+
+
+def _list_project_targets(
+    client: Client,
+    project_name: str | None,
+    load: Callable[..., list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    if project_name is None:
+        return load(), _project_name_map(client.list_projects())
+    project = _resolve_project_by_name(client, project_name)
+    return load(project_id=str(project["id"])), {str(project["id"]): str(project["name"])}
 
 
 @app.command("setup")
@@ -2229,6 +2293,52 @@ def profile_switch_command(profile: Annotated[str, typer.Argument(help="Profile 
     _switch_profile(profile)
 
 
+@profile_app.command("link")
+def profile_link_command(
+    provider: Annotated[str, typer.Argument(help="Social auth provider to link: google or github.")],
+    api_url: Annotated[
+        str | None,
+        typer.Option(
+            "--api-url",
+            "-a",
+            help="Rebase API URL to use when the stored session lacks Supabase connection details.",
+        ),
+    ] = None,
+    callback_port: Annotated[
+        int, typer.Option("--callback-port", "-c", help="Local Supabase OAuth callback port.")
+    ] = 17658,
+    auth_timeout: Annotated[
+        float,
+        typer.Option("--auth-timeout", help="Seconds to wait for the Supabase auth callback."),
+    ] = 300,
+    no_browser: Annotated[
+        bool,
+        typer.Option("--no-browser", "-n", help="Print auth URLs instead of opening the browser."),
+    ] = False,
+) -> None:
+    """Link another social login to the account you are signed in as.
+
+    Use this to connect GitHub after onboarding with Google (or the other way
+    round): it attaches the provider to your existing account instead of
+    creating a second one, so workspace memberships and invites carry over.
+    """
+    from rebase.setup import run_link_identity
+
+    try:
+        run_link_identity(
+            SimpleNamespace(
+                provider=provider,
+                api_url=api_url,
+                callback_port=callback_port,
+                auth_timeout=auth_timeout,
+                no_browser=no_browser,
+            )
+        )
+    except KeyboardInterrupt:
+        error_console.print("Aborted.", style="rebase.error")
+        raise SystemExit(130) from None
+
+
 @profile_app.command("logout")
 def profile_logout_command() -> None:
     """Clear the stored Supabase auth session without removing local profiles."""
@@ -2325,20 +2435,54 @@ def workspace_create_command(
         raise SystemExit(130) from None
 
 
-def _switch_workspace(profile: str) -> None:
-    _switch_profile(profile, workspace_alias=True)
+def _switch_workspace(workspace: str) -> None:
+    """Point the active profile at one of the workspaces it can reach.
+
+    The profile is the identity and stays put; only the selection moves, since
+    the workspace travels per request in a header. Membership is checked against
+    the server rather than the local config so that a workspace joined on
+    another machine is switchable here without re-running setup.
+    """
+    client = Client()
+    memberships = client.list_my_workspaces()
+    match = next(
+        (item for item in memberships if workspace in {item.get("id"), item.get("workspace_id"), item.get("name")}),
+        None,
+    )
+    if match is None:
+        reachable = ", ".join(sorted(str(item.get("name") or item.get("id")) for item in memberships))
+        raise RebaseWorkflowError(
+            f"not a member of workspace {workspace!r}. This profile can reach: {reachable or '(none)'}"
+        )
+
+    workspace_id = str(match.get("id") or match.get("workspace_id") or workspace)
+    workspace_name = match.get("name") if isinstance(match.get("name"), str) else None
+    profile_name = selected_profile_name()
+    try:
+        set_profile_workspace(workspace_id, workspace_name, profile=profile_name)
+    except KeyError as exc:
+        raise RebaseWorkflowError(f"unknown profile: {profile_name}. Run `rebase setup` first.") from exc
+    label = workspace_name or workspace_id
+    console.print(
+        f"Profile '[rebase.value]{profile_name}[/rebase.value]' now uses workspace "
+        f"'[rebase.value]{label}[/rebase.value]'"
+    )
 
 
 @workspace_app.command("switch")
-def workspace_switch_command(profile: Annotated[str, typer.Argument(help="Profile name.")]) -> None:
-    """Switch the active workspace profile."""
-    _switch_workspace(profile)
+def workspace_switch_command(
+    workspace: Annotated[str, typer.Argument(help="Workspace name or id you belong to.")],
+) -> None:
+    """Switch the active workspace, keeping the current profile."""
+    _switch_workspace(workspace)
 
 
 @workspace_app.command("use", hidden=True)
-def workspace_use_command(profile: Annotated[str, typer.Argument(help="Profile name.")]) -> None:
+def workspace_use_command(
+    workspace: Annotated[str, typer.Argument(help="Workspace name or id you belong to.")],
+) -> None:
     """Alias for `rebase workspace switch`."""
-    _switch_workspace(profile)
+    _switch_workspace(workspace)
 
 
 def _validate_workspace_role(role: str) -> None:
@@ -2376,16 +2520,18 @@ def _workspace_invite_identity(
     email: str | None,
     github_username: str | None,
 ) -> tuple[str | None, str | None]:
-    provided = [value for value in (target, email, github_username) if value]
-    if len(provided) != 1:
-        raise RebaseWorkflowError("provide exactly one invite target: TARGET, --email, or --github")
-    if email:
-        return email, None
-    if github_username:
-        return None, github_username
-    if target and "@" in target:
-        return target, None
-    return None, target
+    if target:
+        if "@" in target:
+            if email:
+                raise RebaseWorkflowError("email was given twice: as TARGET and as --email")
+            email = target
+        else:
+            if github_username:
+                raise RebaseWorkflowError("GitHub username was given twice: as TARGET and as --github")
+            github_username = target
+    if email is None and github_username is None:
+        raise RebaseWorkflowError("provide an invite target: an email address, a GitHub username, or both")
+    return email, github_username
 
 
 @workspace_app.command("invite")
@@ -2401,7 +2547,11 @@ def workspace_invite_command(
         typer.Option("--role", "-r", help="Workspace role: Viewer, Developer, Admin, or Owner."),
     ] = "Viewer",
 ) -> None:
-    """Invite a person to the active workspace."""
+    """Invite a person to the active workspace.
+
+    Giving both --email and --github puts both on one invite, so it binds to
+    whichever identity the person signs in with first.
+    """
     _validate_workspace_role(role)
     invite_email, invite_github_username = _workspace_invite_identity(
         target,
@@ -2413,7 +2563,15 @@ def workspace_invite_command(
         github_username=invite_github_username,
         role=role,
     )
-    identity = invite.get("email") or f"@{invite.get('github_username')}"
+    identities = [
+        identity
+        for identity in (
+            invite.get("email"),
+            f"@{invite['github_username']}" if invite.get("github_username") else None,
+        )
+        if identity
+    ]
+    identity = " / ".join(identities)
     status = invite.get("status", "pending")
     console.print(
         f"Invited [rebase.value]{identity}[/rebase.value] to workspace as "
@@ -2467,16 +2625,65 @@ def workspace_members_command(
     console.print(_workspace_members_table(members, pending_invites))
 
 
+def _usage_breakdown_table(breakdown: dict[str, Any]) -> Table | None:
+    entries = breakdown.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return None
+    currency = str(breakdown.get("currency") or "EUR")
+    table = Table(
+        title="Spend by target",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Target", style="rebase.value")
+    table.add_column("Type", style="rebase.muted")
+    table.add_column("Runs", justify="right")
+    table.add_column("Charged", justify="right")
+    table.add_column("Reserved", justify="right", style="rebase.muted")
+    for entry in entries:
+        target_type = str(entry.get("target_type") or "-")
+        if entry.get("name"):
+            name = str(entry["name"])
+        elif entry.get("target_id"):
+            name = str(entry["target_id"])[:8]
+        elif target_type in {"function", "workflow", "model"}:
+            # Ephemeral runs have no registered target to name.
+            name = f"(ephemeral {target_type}s)"
+        else:
+            name = target_type
+        table.add_row(
+            str(name),
+            target_type,
+            str(entry.get("runs") or 0),
+            _format_cents(entry.get("charged_cents"), currency),
+            _format_cents(entry.get("reserved_cents"), currency),
+        )
+    return table
+
+
 @workspace_app.command("usage")
 def workspace_usage_command(
     json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
-    """Show monthly compute credits for the active workspace."""
-    usage = Client().get_workspace_usage()
+    """Show monthly compute credits for the active workspace, and where they went."""
+    client = Client()
+    usage = client.get_workspace_usage()
+    breakdown: dict[str, Any] | None
+    try:
+        breakdown = client.get_workspace_usage_breakdown()
+    except RebaseWorkflowError:
+        breakdown = None  # older API without the breakdown route
     if json_output:
-        _print_json(usage)
+        _print_json({**usage, "breakdown": (breakdown or {}).get("entries")})
         return
     console.print(_workspace_usage_table(usage))
+    if breakdown is not None:
+        table = _usage_breakdown_table(breakdown)
+        if table is not None:
+            console.print(table)
 
 
 notifications_app = typer.Typer(
@@ -2491,6 +2698,7 @@ NOTIFICATION_DETAIL_KEYS = [
     "workspace_id",
     "notify_on_failure",
     "notify_on_stale",
+    "notify_owner_email",
     "webhook_url",
     "has_webhook_secret",
     "updated_at",
@@ -2526,6 +2734,14 @@ def workspace_notifications_set_command(
         bool | None,
         typer.Option("--on-stale/--no-on-stale", help="Enable or disable stale dataset notifications."),
     ] = None,
+    email: Annotated[
+        bool | None,
+        typer.Option(
+            "--email/--no-email",
+            "-e",
+            help="Email the owner of a scheduled workflow when it starts failing, and again when it recovers.",
+        ),
+    ] = None,
     clear_webhook: Annotated[
         bool, typer.Option("--clear-webhook", "-c", help="Remove the stored webhook URL and secret.")
     ] = False,
@@ -2534,15 +2750,25 @@ def workspace_notifications_set_command(
     """Update the workspace's failure notification settings."""
     if clear_webhook and (webhook_url is not None or webhook_secret is not None):
         raise RebaseWorkflowError("--clear-webhook cannot be combined with --webhook-url/--webhook-secret")
-    if not clear_webhook and webhook_url is None and webhook_secret is None and on_failure is None and on_stale is None:
+    if (
+        not clear_webhook
+        and webhook_url is None
+        and webhook_secret is None
+        and on_failure is None
+        and on_stale is None
+        and email is None
+    ):
         raise RebaseWorkflowError(
-            "nothing to update; pass --webhook-url, --webhook-secret, --on-failure, --on-stale, or --clear-webhook"
+            "nothing to update; pass --webhook-url, --webhook-secret, --on-failure, --on-stale, "
+            "--email/--no-email, or --clear-webhook"
         )
     kwargs: dict[str, Any] = {}
     if on_failure is not None:
         kwargs["notify_on_failure"] = on_failure
     if on_stale is not None:
         kwargs["notify_on_stale"] = on_stale
+    if email is not None:
+        kwargs["notify_owner_email"] = email
     if clear_webhook:
         kwargs["webhook_url"] = None
         kwargs["webhook_secret"] = None
@@ -2559,6 +2785,94 @@ def workspace_notifications_set_command(
 
 
 workspace_app.add_typer(notifications_app, name="notifications")
+
+
+compute_policy_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Inspect and adjust the workspace's compute limits.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+COMPUTE_POLICY_DETAIL_KEYS = [
+    "workspace_id",
+    "max_run_timeout_seconds",
+    "max_concurrent_cloud_run_runs",
+    "max_cloud_run_instances",
+    "max_cloud_run_concurrency",
+    "cloud_run_enabled",
+    "gpu_allowed",
+    "updated_at",
+]
+
+
+@compute_policy_app.command("show")
+def workspace_compute_policy_show_command(
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show the workspace's compute limits."""
+    policy = Client().get_workspace_compute_policy()
+    if json_output:
+        _print_json(policy)
+        return
+    console.print(_detail_table("Compute Policy", policy, preferred_keys=COMPUTE_POLICY_DETAIL_KEYS))
+
+
+@compute_policy_app.command("set")
+def workspace_compute_policy_set_command(
+    max_run_timeout_seconds: Annotated[
+        int | None,
+        typer.Option(
+            "--max-run-timeout-seconds",
+            "-m",
+            help="Ceiling for a single request, in seconds (max 3600). Raising it requires superadmin.",
+        ),
+    ] = None,
+    max_concurrent_runs: Annotated[
+        int | None, typer.Option("--max-concurrent-runs", help="Cloud Run runs allowed in flight at once.")
+    ] = None,
+    max_instances: Annotated[
+        int | None, typer.Option("--max-instances", help="Ceiling for a service's max instance count.")
+    ] = None,
+    max_concurrency: Annotated[
+        int | None, typer.Option("--max-concurrency", help="Ceiling for a service's per-instance concurrency.")
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Update the workspace's compute limits.
+
+    The policy is a ceiling, not a default: an app still opts in to a longer timeout
+    through its own `cloud_run_timeout_seconds`. A longer timeout also costs
+    proportionally more credits, since ASGI traffic is charged on elapsed runtime.
+    """
+    if (
+        max_run_timeout_seconds is None
+        and max_concurrent_runs is None
+        and max_instances is None
+        and max_concurrency is None
+    ):
+        raise RebaseWorkflowError(
+            "nothing to update; pass --max-run-timeout-seconds, --max-concurrent-runs, "
+            "--max-instances, or --max-concurrency"
+        )
+    kwargs: dict[str, Any] = {}
+    if max_run_timeout_seconds is not None:
+        kwargs["max_run_timeout_seconds"] = max_run_timeout_seconds
+    if max_concurrent_runs is not None:
+        kwargs["max_concurrent_cloud_run_runs"] = max_concurrent_runs
+    if max_instances is not None:
+        kwargs["max_cloud_run_instances"] = max_instances
+    if max_concurrency is not None:
+        kwargs["max_cloud_run_concurrency"] = max_concurrency
+    policy = Client().update_workspace_compute_policy(**kwargs)
+    if json_output:
+        _print_json(policy)
+        return
+    console.print(_detail_table("Compute Policy", policy, preferred_keys=COMPUTE_POLICY_DETAIL_KEYS))
+
+
+workspace_app.add_typer(compute_policy_app, name="compute-policy")
 
 
 @environment_app.command("list")
@@ -3206,7 +3520,7 @@ bucket_app = typer.Typer(
     rich_markup_mode="rich",
 )
 
-BUCKET_DETAIL_KEYS = ["name", "provider", "bucket", "uri", "location", "workspace_id", "created_at"]
+BUCKET_DETAIL_KEYS = ["name", "provider", "uri", "console_url", "workspace_id", "created_at"]
 
 
 @bucket_app.command("create")
@@ -4361,13 +4675,7 @@ def function_list_command(
 ) -> None:
     """List functions in the active workspace."""
     client = Client()
-    if project is not None:
-        project_data = _resolve_project_by_name(client, project)
-        functions = client.list_functions(project_id=str(project_data["id"]))
-        project_names = {str(project_data["id"]): str(project_data["name"])}
-    else:
-        functions = client.list_functions()
-        project_names = _project_name_map(client.list_projects())
+    functions, project_names = _list_project_targets(client, project, client.list_functions)
     if json_output:
         _print_json(functions)
         return
@@ -4479,13 +4787,7 @@ def workflow_list_command(
 ) -> None:
     """List workflows in the active workspace."""
     client = Client()
-    if project is not None:
-        project_data = _resolve_project_by_name(client, project)
-        workflows = client.list_workflows(project_id=str(project_data["id"]))
-        project_names = {str(project_data["id"]): str(project_data["name"])}
-    else:
-        workflows = client.list_workflows()
-        project_names = _project_name_map(client.list_projects())
+    workflows, project_names = _list_project_targets(client, project, client.list_workflows)
     if json_output:
         _print_json(workflows)
         return
@@ -4744,6 +5046,7 @@ def workflow_schedule_trigger_command(
             started_at=time.monotonic(),
             timeout=timeout,
             poll_interval=1.0,
+            log_follower=_RunLogFollower(run),
         )
     console.print_json(data=result)
 
@@ -5091,13 +5394,7 @@ def model_list_command(
 ) -> None:
     """List models in the active workspace."""
     client = Client()
-    if project is not None:
-        project_data = _resolve_project_by_name(client, project)
-        models = client.list_models(project_id=str(project_data["id"]))
-        project_names = {str(project_data["id"]): str(project_data["name"])}
-    else:
-        models = client.list_models()
-        project_names = _project_name_map(client.list_projects())
+    models, project_names = _list_project_targets(client, project, client.list_models)
     if json_output:
         _print_json(models)
         return
@@ -5208,6 +5505,7 @@ def model_run_command(
             started_at=time.monotonic(),
             timeout=timeout,
             poll_interval=poll_interval,
+            log_follower=_RunLogFollower(run),
         )
     if json_output:
         _print_json(result)
@@ -5461,8 +5759,34 @@ def deploy_command(
             )
         )
         return
-    deployed = deploy_file(file, object_names=name, deploy_source=source, environment=environment)
+    # Stream raw build output while any image builds — without this a first
+    # deploy of a new image is a silent blocking call of up to 30 minutes.
+    set_build_log_consumer(_build_log_printer())
+    try:
+        deployed = deploy_file(file, object_names=name, deploy_source=source, environment=environment)
+    finally:
+        set_build_log_consumer(None)
     console.print(_deploy_table(deployed))
+
+
+def _build_log_printer() -> Callable[[str], None]:
+    """Raw build lines, Modal-style: announce once, then verbatim output.
+
+    markup=False matters — build output is arbitrary text and rich would
+    otherwise eat anything in square brackets; highlight=False keeps rich from
+    syntax-coloring it. The lines themselves stay full brightness: this is the
+    user's own toolchain talking, not decoration.
+    """
+    announced = False
+
+    def emit(line: str) -> None:
+        nonlocal announced
+        if not announced:
+            console.print("• Building image — streaming build output:", style="rebase.muted", highlight=False)
+            announced = True
+        console.print(line, markup=False, highlight=False)
+
+    return emit
 
 
 def _normalize_local_result(result: Any) -> dict[str, Any]:
@@ -5681,6 +6005,7 @@ def run_command(
                 started_at=started_at,
                 timeout=timeout,
                 poll_interval=poll_interval,
+                log_follower=_RunLogFollower(run),
             )
 
     if run is None:
@@ -5726,13 +6051,92 @@ def run_list_command(
     console.print(_runs_table(runs, project_names=project_names))
 
 
+def _resolve_run_ref(client: Client, run_ref: str | None) -> str:
+    """A full run id, from nothing (the latest run) or a unique prefix.
+
+    The runs table squeezes ids to fit the terminal, so what a user can copy
+    is usually a truncated fragment — resolve it the way git resolves short
+    hashes. No argument at all means "the run I just made": the newest one.
+    """
+    if run_ref and len(run_ref) >= 36:
+        return run_ref
+    if run_ref and not re.fullmatch(r"[0-9a-fA-F][0-9a-fA-F-]*", run_ref):
+        # Not a UUID fragment — pass it through and let the server answer.
+        return run_ref
+    runs = client.list_runs()
+    if not run_ref:
+        if not runs:
+            raise RebaseWorkflowError("no runs found in this workspace")
+        return str(runs[0]["id"])
+    matches = [str(run["id"]) for run in runs if str(run["id"]).startswith(run_ref)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise RebaseWorkflowError(f"no recent run id starts with {run_ref!r}; pass more of it or the full id")
+    raise RebaseWorkflowError(f"{len(matches)} recent runs start with {run_ref!r}; add more characters")
+
+
+def _parse_timeline_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _timeline_table(run: dict[str, Any], events: list[dict[str, Any]], steps: list[dict[str, Any]]) -> Table | None:
+    """The run's life as one chronological table with offsets from creation.
+
+    Composed entirely from data the platform already records — run
+    timestamps, staged events, workflow steps — so it works identically for
+    every execution mode and both providers.
+    """
+    entries: list[tuple[datetime, str]] = []
+    created = _parse_timeline_timestamp(run.get("created_at"))
+    if created is not None:
+        entries.append((created, "Run created"))
+    for event in events:
+        stamp = _parse_timeline_timestamp(event.get("created_at"))
+        message = str(event.get("message") or "").rstrip(".")
+        if stamp is not None and message:
+            entries.append((stamp, message))
+    for step in steps:
+        name = str(step.get("name") or "step")
+        started = _parse_timeline_timestamp(step.get("started_at"))
+        if started is not None:
+            entries.append((started, f"Step {name} started"))
+        finished = _parse_timeline_timestamp(step.get("finished_at"))
+        if finished is not None:
+            entries.append((finished, f"Step {name} {step.get('status') or 'finished'}"))
+    finished_at = _parse_timeline_timestamp(run.get("finished_at"))
+    if finished_at is not None:
+        entries.append((finished_at, f"Run {run.get('status') or 'finished'}"))
+    if len(entries) < 2:
+        return None
+    entries.sort(key=lambda item: item[0])
+    base = entries[0][0]
+    table = Table(title="Timeline", box=box.SIMPLE, title_justify="left")
+    table.add_column("Time", style="rebase.muted", no_wrap=True)
+    table.add_column("Offset", style="rebase.muted", justify="right", no_wrap=True)
+    table.add_column("Event")
+    for stamp, message in entries:
+        offset = (stamp - base).total_seconds()
+        table.add_row(stamp.strftime("%H:%M:%S"), f"+{offset:.1f}s", message)
+    return table
+
+
 @run_app.command("get")
 def run_get_command(
-    run_id: Annotated[str, typer.Argument(help="Run ID.")],
+    run_id: Annotated[
+        str | None,
+        typer.Argument(help="Run ID or unique prefix; omit for the latest run."),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Show run metadata."""
     client = Client()
+    run_id = _resolve_run_ref(client, run_id)
     run = client.get_run(run_id)
     if json_output:
         _print_json(run)
@@ -5763,11 +6167,42 @@ def run_get_command(
             ],
         )
     )
+    # The composed story: chronological timeline plus where the time went.
+    # Both degrade silently — an older API without events still shows the
+    # detail table above.
+    try:
+        events = client.list_run_events(run_id)
+        steps = client.list_run_steps(run_id) if run.get("target_type") == "workflow" else []
+    except RebaseWorkflowError:
+        events, steps = [], []
+    timeline = _timeline_table(run, events, steps)
+    if timeline is not None:
+        console.print(timeline)
+    timing = run_timing_summary(run)
+    if timing:
+        console.print(f"Where the time went: {timing}", style="rebase.muted", highlight=False)
+    try:
+        cost = client.get_run_cost(run_id)
+    except RebaseWorkflowError:
+        cost = None  # older API, or a backend that never touches credits
+    if cost is not None and (cost.get("charged_cents") or cost.get("reserved_cents")):
+        currency = str(cost.get("currency") or "EUR")
+        if cost.get("settled"):
+            line = f"Cost: {_format_cents(cost.get('charged_cents'), currency)}"
+            runtime = cost.get("runtime_seconds")
+            if isinstance(runtime, int | float) and runtime > 0:
+                line += f" for {runtime:.1f}s billed"
+        else:
+            line = f"Cost: {_format_cents(cost.get('reserved_cents'), currency)} reserved while the run is active"
+        console.print(line, style="rebase.muted", highlight=False)
 
 
 @run_app.command("logs")
 def run_logs_command(
-    run_id: Annotated[str, typer.Argument(help="Run ID.")],
+    run_id: Annotated[
+        str | None,
+        typer.Argument(help="Run ID or unique prefix; omit for the latest run."),
+    ] = None,
     follow: Annotated[
         bool,
         typer.Option("--follow/--no-follow", "-f", help="Follow until the run reaches a terminal state."),
@@ -5781,6 +6216,7 @@ def run_logs_command(
 ) -> None:
     """Show run events, workflow step state, and captured stdout/stderr logs."""
     client = Client()
+    run_id = _resolve_run_ref(client, run_id)
     run_data = client.get_run(run_id)
     events = client.list_run_events(run_id)
     steps = client.list_run_steps(run_id) if run_data.get("target_type") == "workflow" else []

@@ -257,11 +257,84 @@ def _batch_failure_message(failure: dict[str, Any]) -> str:
     return str(detail if detail is not None else failure.get("status", "failed"))
 
 
+def _find_named(items: Iterable[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    return next((item for item in items if item["name"] == name), None)
+
+
+# Receiver for raw image-build log lines while Client.build_image polls.
+# Module-level on purpose, mirroring how Modal gates output: deploy targets
+# construct their own Client instances internally, so a per-instance attribute
+# set by the CLI would never reach the client that actually builds.
+_build_log_consumer: Callable[[str], None] | None = None
+
+
+def set_build_log_consumer(consumer: Callable[[str], None] | None) -> None:
+    """Install (or with None remove) the receiver for raw build-log lines."""
+    global _build_log_consumer
+    _build_log_consumer = consumer
+
+
+def run_timing_summary(run: dict[str, Any]) -> str | None:
+    """One phrase decomposing where a run's time went: "startup 4.1s · execution 0.6s".
+
+    Startup (provisioning + cold start) is the number that tells a user their
+    import block — not their code — is what's slow. Dispatch stands in for it
+    on the shared fast path, where there is no provisioning. Only phases that
+    actually registered are mentioned.
+    """
+    timings = run.get("timings") or {}
+    if not isinstance(timings, dict):
+        return None
+
+    def seconds(key: str) -> float | None:
+        value = timings.get(key)
+        return float(value) if isinstance(value, int | float) else None
+
+    parts: list[str] = []
+    startup = seconds("infrastructure_provision_seconds")
+    if startup is not None and startup >= 0.05:
+        parts.append(f"startup {startup:.1f}s")
+    execution = seconds("backend_execution_seconds")
+    if execution is not None:
+        parts.append(f"execution {execution:.2f}s")
+    dispatch = seconds("api_dispatch_seconds")
+    if startup is None and dispatch is not None and dispatch >= 0.05:
+        parts.append(f"dispatch {dispatch:.2f}s")
+    attempts = timings.get("backend_attempts")
+    if isinstance(attempts, int) and attempts > 1:
+        parts.append(f"{attempts} attempts")
+    return " · ".join(parts) or None
+
+
+def run_failure_summary(run: dict[str, Any]) -> str | None:
+    """One human line for a failed run, preferring the structured diagnosis.
+
+    Servers that diagnose failures attach ``failure_reason``
+    ({code, message, hint, observed}) alongside the free-text ``error`` — the
+    diagnosis knows *why* the container died and which knob to turn (the hint),
+    so it wins. Older servers simply have no such key and fall back to
+    ``error``; returns None when the run carries neither.
+    """
+    reason = run.get("failure_reason")
+    if isinstance(reason, dict):
+        message = reason.get("message")
+        if isinstance(message, str) and message:
+            summary = message[0].upper() + message[1:]
+            hint = reason.get("hint")
+            if isinstance(hint, str) and hint:
+                return f"{summary}. {hint}"
+            return summary
+    error = run.get("error")
+    return str(error) if error else None
+
+
 def _response_error_message(response: requests.Response) -> str:
+    # The final fallbacks guard against empty bodies (a bare 500, a proxy 502):
+    # an empty message here surfaced to users as literally "Error: ".
     try:
         payload = response.json()
     except ValueError:
-        return response.text
+        return response.text or f"HTTP {response.status_code} with an empty response body"
     if isinstance(payload, dict):
         detail = payload.get("detail")
         if isinstance(detail, str):
@@ -281,7 +354,7 @@ def _response_error_message(response: requests.Response) -> str:
             return f"{message} (contains {contents})"
         if detail is not None:
             return json.dumps(detail)
-    return response.text
+    return response.text or f"HTTP {response.status_code} with an empty response body"
 
 
 class Cron:
@@ -540,20 +613,6 @@ def _normalize_path(path: str | None, *, field_name: str = "path") -> str:
     if len(value) > 1:
         value = value.rstrip("/")
     return value
-
-
-def _is_pinned_dependency(package: str) -> bool:
-    return "==" in package or re.search(r"git\+.*\.git@[a-f0-9]{7,40}(?:$|#)", package.strip().lower()) is not None
-
-
-def _warn_unpinned_dependencies(packages: list[str]) -> None:
-    unpinned = [package for package in packages if not _is_pinned_dependency(package)]
-    if unpinned:
-        warnings.warn(
-            "Unpinned Rebase function dependencies are allowed but make function versions less reproducible. "
-            f"Prefer exact pins for: {', '.join(unpinned)}",
-            stacklevel=3,
-        )
 
 
 class _EnvironmentObjects:
@@ -2340,6 +2399,23 @@ def _connected_source_mode(
     return workspace_mode if workspace_mode in {"workspace_repo", "project_repo"} else None
 
 
+def _target_source_metadata_for_deploy(target: Any, deploy_source: str | None) -> dict[str, Any]:
+    """Resolve the source metadata shared by functions, workflows, and ASGI apps."""
+    resolved_deploy_source = _validate_deploy_source(deploy_source) or target.deploy_source
+    project_source_mode = target.project_source_mode
+    if resolved_deploy_source == "github":
+        project_source_mode = _connected_source_mode(
+            target._client,
+            project=target.project,
+            project_source_mode=project_source_mode,
+        )
+    return _source_metadata_for_deploy(
+        target.source_metadata,
+        deploy_source=resolved_deploy_source,
+        project_source_mode=project_source_mode,
+    )
+
+
 class Client:
     def __init__(
         self,
@@ -2362,19 +2438,34 @@ class Client:
         configured_workspace_id = profile_data.get("workspace_id")
         self.access_token = access_token or env_access_token
         self.api_key = api_key or env_api_key
-        if self.api_key is None and self.access_token is None and isinstance(configured_api_key, str):
-            self.api_key = configured_api_key
         # A `.rebase/config.json` marker pins the workspace, not the credentials: the
         # workspace travels as one header and an API key reaches every workspace you
         # belong to, so a repo can override the globally active workspace without a
-        # second profile or another sign-in. Precedence: argument, marker, profile.
+        # second profile or another sign-in. Precedence: argument, REBASE_WORKSPACE,
+        # marker, profile -- the env var outranks the marker because setting it is a
+        # deliberate act where the marker is ambient.
         pinned_workspace_id = local_workspace_id()
+        env_workspace_id = os.getenv("REBASE_WORKSPACE")
         resolved_workspace_id = (
             workspace_id
+            or env_workspace_id
             or pinned_workspace_id
             or (configured_workspace_id if isinstance(configured_workspace_id, str) else None)
         )
         self.workspace_id = resolved_workspace_id or None
+        if self.api_key is None and self.access_token is None and isinstance(configured_api_key, str):
+            # A deliberate override -- an explicit argument or REBASE_WORKSPACE, as set
+            # by `--workspace` -- must not silently reuse the profile's stored API key.
+            # That key is minted for one workspace (api_keys.workspace_id is NOT NULL)
+            # and the server reads the workspace off the key row, ignoring the header,
+            # so carrying it would quietly act on the wrong workspace. Falling through
+            # to the signed-in session is also the only path on which superadmin works.
+            #
+            # The directory marker is deliberately exempt: it is ambient context, and
+            # keeping the key on that path is long-standing documented behaviour.
+            deliberate_override = workspace_id or env_workspace_id
+            if not deliberate_override or resolved_workspace_id == configured_workspace_id:
+                self.api_key = configured_api_key
         configured_environment = active_environment(self.workspace_id) if self.workspace_id else None
         self.environment_name = environment_name or os.getenv("REBASE_ENVIRONMENT") or configured_environment or "dev"
         profile_api_url = configured_api_url if isinstance(configured_api_url, str) else None
@@ -2452,6 +2543,10 @@ class Client:
     def request(
         self, method: str, path: str, *, auth: bool = True, **kwargs: Any
     ) -> dict[str, Any] | list[dict[str, Any]]:
+        return self._request_response(method, path, auth=auth, **kwargs).json()
+
+    def _request_response(self, method: str, path: str, *, auth: bool = True, **kwargs: Any) -> requests.Response:
+        """Send one authenticated request, including the disk-token retry and error mapping."""
         caller_headers = kwargs.pop("headers", {})
         headers = self._request_headers(auth=auth, headers=caller_headers)
         timeout = kwargs.pop("timeout", 30)
@@ -2465,26 +2560,26 @@ class Client:
             error = RebaseWorkflowError(_response_error_message(response))
             error.status_code = response.status_code
             raise error from exc
-        return response.json()
+        return response
+
+    def _request_dict(self, method: str, path: str, *, expected: str, **kwargs: Any) -> dict[str, Any]:
+        response = self.request(method, path, **kwargs)
+        if not isinstance(response, dict):
+            raise RebaseWorkflowError(f"expected {expected}")
+        return response
+
+    def _request_list(self, method: str, path: str, *, expected: str, **kwargs: Any) -> list[Any]:
+        response = self.request(method, path, **kwargs)
+        if not isinstance(response, list):
+            raise RebaseWorkflowError(f"expected {expected}")
+        return response
 
     def request_no_content(self, method: str, path: str, *, auth: bool = True, **kwargs: Any) -> None:
         """Like :meth:`request`, for endpoints that answer 204 with an empty body.
 
         ``request`` always parses the response as JSON, which a 204 has none of.
         """
-        caller_headers = kwargs.pop("headers", {})
-        headers = self._request_headers(auth=auth, headers=caller_headers)
-        timeout = kwargs.pop("timeout", 30)
-        response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
-        if getattr(response, "status_code", None) == 401 and auth and self._invalidate_cached_token():
-            headers = self._request_headers(auth=auth, headers=caller_headers)
-            response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            error = RebaseWorkflowError(_response_error_message(response))
-            error.status_code = response.status_code
-            raise error from exc
+        self._request_response(method, path, auth=auth, **kwargs)
 
     def stream_request(self, method: str, path: str, *, auth: bool = True, **kwargs: Any) -> Iterator[dict[str, Any]]:
         headers = self._request_headers(auth=auth, headers=kwargs.pop("headers", {}))
@@ -2519,34 +2614,35 @@ class Client:
                 close()
 
     def setup_config(self) -> dict[str, Any]:
-        response = self.request("GET", "/setup/config", auth=False)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected setup config response")
-        return response
+        return self._request_dict("GET", "/setup/config", auth=False, expected="setup config response")
 
     def list_my_workspaces(self) -> list[dict[str, Any]]:
-        response = self.request("GET", "/me/workspaces")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected workspace list response")
-        return response
+        return self._request_list("GET", "/me/workspaces", expected="workspace list response")
+
+    def get_my_profile(self) -> dict[str, Any]:
+        return self._request_dict("GET", "/me/profile", expected="profile response")
 
     def create_workspace(self, workspace_id: str, *, name: str | None = None) -> dict[str, Any]:
-        response = self.request("POST", "/workspaces", json={"id": workspace_id, "name": name})
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workspace response")
-        return response
+        return self._request_dict(
+            "POST", "/workspaces", json={"id": workspace_id, "name": name}, expected="workspace response"
+        )
 
     def get_workspace_usage(self) -> dict[str, Any]:
-        response = self.request("GET", "/workspace/usage")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workspace usage response")
-        return response
+        return self._request_dict("GET", "/workspace/usage", expected="workspace usage response")
+
+    def get_workspace_usage_breakdown(self, *, limit: int = 10) -> dict[str, Any]:
+        return self._request_dict(
+            "GET",
+            "/workspace/usage/breakdown",
+            params={"limit": limit},
+            expected="workspace usage breakdown response",
+        )
+
+    def get_run_cost(self, run_id: str) -> dict[str, Any]:
+        return self._request_dict("GET", f"/runs/{run_id}/cost", expected="run cost response")
 
     def list_platform_invites(self) -> list[dict[str, Any]]:
-        response = self.request("GET", "/platform/invites")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected platform invite list response")
-        return response
+        return self._request_list("GET", "/platform/invites", expected="platform invite list response")
 
     def create_platform_invite(
         self,
@@ -2555,36 +2651,21 @@ class Client:
         expires_at: str | None = None,
         workspace_creation_limit: int | None = 1,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "POST",
             "/platform/invites",
-            json={
-                "email": email,
-                "expires_at": expires_at,
-                "workspace_creation_limit": workspace_creation_limit,
-            },
+            json={"email": email, "expires_at": expires_at, "workspace_creation_limit": workspace_creation_limit},
+            expected="platform invite response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected platform invite response")
-        return response
 
     def revoke_platform_invite(self, invite_id: str) -> dict[str, Any]:
-        response = self.request("DELETE", f"/platform/invites/{invite_id}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected platform invite response")
-        return response
+        return self._request_dict("DELETE", f"/platform/invites/{invite_id}", expected="platform invite response")
 
     def list_workspace_invites(self) -> list[dict[str, Any]]:
-        response = self.request("GET", "/workspace/invites")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected workspace invite list response")
-        return response
+        return self._request_list("GET", "/workspace/invites", expected="workspace invite list response")
 
     def list_workspace_members(self) -> list[dict[str, Any]]:
-        response = self.request("GET", "/workspace/members")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected workspace member list response")
-        return response
+        return self._request_list("GET", "/workspace/members", expected="workspace member list response")
 
     def update_workspace_member(
         self,
@@ -2598,10 +2679,9 @@ class Client:
             payload["role"] = role
         if enabled is not None:
             payload["enabled"] = enabled
-        response = self.request("PATCH", f"/workspace/members/{profile_id}", json=payload)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workspace member response")
-        return response
+        return self._request_dict(
+            "PATCH", f"/workspace/members/{profile_id}", json=payload, expected="workspace member response"
+        )
 
     def create_workspace_invite(
         self,
@@ -2611,31 +2691,18 @@ class Client:
         role: str = "Viewer",
         expires_at: str | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "POST",
             "/workspace/invites",
-            json={
-                "email": email,
-                "github_username": github_username,
-                "role": role,
-                "expires_at": expires_at,
-            },
+            json={"email": email, "github_username": github_username, "role": role, "expires_at": expires_at},
+            expected="workspace invite response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workspace invite response")
-        return response
 
     def revoke_workspace_invite(self, invite_id: str) -> dict[str, Any]:
-        response = self.request("DELETE", f"/workspace/invites/{invite_id}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workspace invite response")
-        return response
+        return self._request_dict("DELETE", f"/workspace/invites/{invite_id}", expected="workspace invite response")
 
     def list_api_keys(self) -> list[dict[str, Any]]:
-        response = self.request("GET", "/workspace/api-keys")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected API key list response")
-        return response
+        return self._request_list("GET", "/workspace/api-keys", expected="API key list response")
 
     def create_api_key(
         self,
@@ -2645,7 +2712,7 @@ class Client:
         permissions: list[str] | None = None,
         expires_at: str | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "POST",
             "/workspace/api-keys",
             json={
@@ -2654,58 +2721,32 @@ class Client:
                 "permissions": permissions if permissions is not None else list(DEFAULT_API_KEY_PERMISSIONS),
                 "expires_at": expires_at,
             },
+            expected="API key response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected API key response")
-        return response
 
     def revoke_api_key(self, api_key_id: str) -> dict[str, Any]:
-        response = self.request("DELETE", f"/workspace/api-keys/{api_key_id}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected API key response")
-        return response
+        return self._request_dict("DELETE", f"/workspace/api-keys/{api_key_id}", expected="API key response")
 
     def set_secret(self, name: str, values: dict[str, str]) -> dict[str, Any]:
-        response = self.request("PUT", "/secrets", json={"name": name, "values": values})
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected secret response")
-        return response
+        return self._request_dict("PUT", "/secrets", json={"name": name, "values": values}, expected="secret response")
 
     def get_secret(self, name: str) -> dict[str, Any]:
-        response = self.request("GET", f"/secrets/{name}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected secret response")
-        return response
+        return self._request_dict("GET", f"/secrets/{name}", expected="secret response")
 
     def delete_secret(self, name: str) -> dict[str, Any]:
-        response = self.request("DELETE", f"/secrets/{name}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected secret response")
-        return response
+        return self._request_dict("DELETE", f"/secrets/{name}", expected="secret response")
 
     def list_secrets(self) -> list[dict[str, Any]]:
-        response = self.request("GET", "/secrets")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected secret list response")
-        return response
+        return self._request_list("GET", "/secrets", expected="secret list response")
 
     def create_volume(self, name: str) -> dict[str, Any]:
-        response = self.request("POST", "/volumes", json={"name": name})
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected volume response")
-        return response
+        return self._request_dict("POST", "/volumes", json={"name": name}, expected="volume response")
 
     def list_volumes(self) -> list[dict[str, Any]]:
-        response = self.request("GET", "/volumes")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected volume list response")
-        return response
+        return self._request_list("GET", "/volumes", expected="volume list response")
 
     def get_volume(self, name: str) -> dict[str, Any]:
-        response = self.request("GET", f"/volumes/{name}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected volume response")
-        return response
+        return self._request_dict("GET", f"/volumes/{name}", expected="volume response")
 
     def delete_volume(self, name: str) -> None:
         self.request("DELETE", f"/volumes/{name}")
@@ -2716,43 +2757,31 @@ class Client:
             params["prefix"] = prefix
         if limit is not None:
             params["limit"] = limit
-        response = self.request("GET", f"/volumes/{name}/objects", params=params or None)
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected volume object list response")
-        return response
+        return self._request_list(
+            "GET", f"/volumes/{name}/objects", params=params or None, expected="volume object list response"
+        )
 
     def create_volume_upload_url(self, name: str, path: str) -> dict[str, Any]:
-        response = self.request("POST", f"/volumes/{name}/upload-url", json={"path": path})
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected signed URL response")
-        return response
+        return self._request_dict(
+            "POST", f"/volumes/{name}/upload-url", json={"path": path}, expected="signed URL response"
+        )
 
     def create_volume_download_url(self, name: str, path: str) -> dict[str, Any]:
-        response = self.request("POST", f"/volumes/{name}/download-url", json={"path": path})
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected signed URL response")
-        return response
+        return self._request_dict(
+            "POST", f"/volumes/{name}/download-url", json={"path": path}, expected="signed URL response"
+        )
 
     def delete_volume_object(self, name: str, path: str) -> None:
         self.request("DELETE", f"/volumes/{name}/objects", params={"path": path})
 
     def create_bucket(self, name: str) -> dict[str, Any]:
-        response = self.request("POST", "/buckets", json={"name": name})
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected bucket response")
-        return response
+        return self._request_dict("POST", "/buckets", json={"name": name}, expected="bucket response")
 
     def list_buckets(self) -> list[dict[str, Any]]:
-        response = self.request("GET", "/buckets")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected bucket list response")
-        return response
+        return self._request_list("GET", "/buckets", expected="bucket list response")
 
     def get_bucket(self, name: str) -> dict[str, Any]:
-        response = self.request("GET", f"/buckets/{name}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected bucket response")
-        return response
+        return self._request_dict("GET", f"/buckets/{name}", expected="bucket response")
 
     def delete_bucket(self, name: str) -> None:
         self.request("DELETE", f"/buckets/{name}")
@@ -2775,16 +2804,14 @@ class Client:
             params["limit"] = limit
         if page_token:
             params["page_token"] = page_token
-        response = self.request("GET", f"/buckets/{name}/objects", params=params or None)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected bucket object list response")
-        return response
+        return self._request_dict(
+            "GET", f"/buckets/{name}/objects", params=params or None, expected="bucket object list response"
+        )
 
     def stat_bucket_object(self, name: str, path: str) -> dict[str, Any]:
-        response = self.request("GET", f"/buckets/{name}/objects/stat", params={"path": path})
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected bucket object stat response")
-        return response
+        return self._request_dict(
+            "GET", f"/buckets/{name}/objects/stat", params={"path": path}, expected="bucket object stat response"
+        )
 
     def delete_bucket_object(self, name: str, path: str) -> None:
         self.request("DELETE", f"/buckets/{name}/objects", params={"path": path})
@@ -2803,28 +2830,20 @@ class Client:
             payload["content_type"] = content_type
         if expires_seconds is not None:
             payload["expires_seconds"] = expires_seconds
-        response = self.request("POST", f"/buckets/{name}/signed-urls", json=payload)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected bucket signed URL response")
-        return response
+        return self._request_dict(
+            "POST", f"/buckets/{name}/signed-urls", json=payload, expected="bucket signed URL response"
+        )
 
     def create_dataset(self, name: str, description: str | None = None) -> dict[str, Any]:
-        response = self.request("POST", "/datasets", json={"name": name, "description": description})
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected dataset response")
-        return response
+        return self._request_dict(
+            "POST", "/datasets", json={"name": name, "description": description}, expected="dataset response"
+        )
 
     def list_datasets(self) -> list[dict[str, Any]]:
-        response = self.request("GET", "/datasets")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected dataset list response")
-        return response
+        return self._request_list("GET", "/datasets", expected="dataset list response")
 
     def get_dataset(self, name: str) -> dict[str, Any]:
-        response = self.request("GET", f"/datasets/{name}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected dataset response")
-        return response
+        return self._request_dict("GET", f"/datasets/{name}", expected="dataset response")
 
     def update_dataset(
         self,
@@ -2842,16 +2861,10 @@ class Client:
             payload["freshness"] = freshness
         if description is not _UNSET:
             payload["description"] = description
-        response = self.request("PATCH", f"/datasets/{name}", json=payload)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected dataset response")
-        return response
+        return self._request_dict("PATCH", f"/datasets/{name}", json=payload, expected="dataset response")
 
     def delete_dataset(self, name: str) -> dict[str, Any]:
-        response = self.request("DELETE", f"/datasets/{name}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected dataset response")
-        return response
+        return self._request_dict("DELETE", f"/datasets/{name}", expected="dataset response")
 
     def signal_dataset(
         self,
@@ -2865,19 +2878,10 @@ class Client:
         body: dict[str, Any] = {"watermark": watermark, "source": source, "run_id": run_id}
         if validation is not None:
             body["validation"] = validation
-        response = self.request(
-            "POST",
-            f"/datasets/{name}/signal",
-            json=body,
-        )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected dataset signal response")
-        return response
+        return self._request_dict("POST", f"/datasets/{name}/signal", json=body, expected="dataset signal response")
 
     def list_dataset_listeners(self, name: str) -> list[str]:
-        response = self.request("GET", f"/datasets/{name}/listeners")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected dataset listener list response")
+        response = self._request_list("GET", f"/datasets/{name}/listeners", expected="dataset listener list response")
         return [str(listener) for listener in response]
 
     def _with_endpoint_url(self, endpoint: dict[str, Any]) -> dict[str, Any]:
@@ -2888,33 +2892,26 @@ class Client:
 
     def list_endpoints(self, *, project_id: str | None = None) -> list[dict[str, Any]]:
         params = {"project_id": project_id} if project_id is not None else None
-        response = self.request("GET", "/endpoints", params=params)
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected endpoint list response")
+        response = self._request_list("GET", "/endpoints", params=params, expected="endpoint list response")
         return [self._with_endpoint_url(endpoint) for endpoint in response]
 
     def list_project_endpoints(self, project_id: str) -> list[dict[str, Any]]:
-        response = self.request("GET", f"/projects/{project_id}/endpoints")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected endpoint list response")
+        response = self._request_list("GET", f"/projects/{project_id}/endpoints", expected="endpoint list response")
         return [self._with_endpoint_url(endpoint) for endpoint in response]
 
     def get_endpoint(self, endpoint_id: str) -> dict[str, Any]:
-        response = self.request("GET", f"/endpoints/{endpoint_id}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected endpoint response")
+        response = self._request_dict("GET", f"/endpoints/{endpoint_id}", expected="endpoint response")
         return self._with_endpoint_url(response)
 
     def list_endpoint_versions(self, endpoint_id: str) -> list[dict[str, Any]]:
-        response = self.request("GET", f"/endpoints/{endpoint_id}/versions")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected endpoint version list response")
-        return response
+        return self._request_list(
+            "GET", f"/endpoints/{endpoint_id}/versions", expected="endpoint version list response"
+        )
 
     def disable_endpoint(self, endpoint_id: str) -> dict[str, Any]:
-        response = self.request("PATCH", f"/endpoints/{endpoint_id}", json={"enabled": False})
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected endpoint response")
+        response = self._request_dict(
+            "PATCH", f"/endpoints/{endpoint_id}", json={"enabled": False}, expected="endpoint response"
+        )
         return self._with_endpoint_url(response)
 
     def invoke_endpoint(self, endpoint: dict[str, Any], parameters: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2923,37 +2920,29 @@ class Client:
         if not isinstance(url_path, str):
             raise RebaseWorkflowError("endpoint response is missing url_path")
         kwargs: dict[str, Any] = {"params": parameters or {}} if method == "GET" else {"json": parameters or {}}
-        response = self.request(method, url_path, **kwargs)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected endpoint invoke response")
-        return response
+        return self._request_dict(method, url_path, **kwargs, expected="endpoint invoke response")
 
     def create_github_setup_session(self, *, workspace_id: str | None = None) -> dict[str, Any]:
-        response = self.request("POST", "/integrations/github/setup-sessions", json={"workspace_id": workspace_id})
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected GitHub setup response")
-        return response
+        return self._request_dict(
+            "POST",
+            "/integrations/github/setup-sessions",
+            json={"workspace_id": workspace_id},
+            expected="GitHub setup response",
+        )
 
     def list_environment_policies(self) -> list[dict[str, Any]]:
-        response = self.request("GET", "/workspace/environments")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected workspace environment policy list response")
-        return response
+        return self._request_list(
+            "GET", "/workspace/environments", expected="workspace environment policy list response"
+        )
 
     def list_environments(self) -> list[dict[str, Any]]:
         return self.list_environment_policies()
 
     def get_environment(self, name: str) -> dict[str, Any]:
-        response = self.request("GET", f"/environments/{name}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected environment response")
-        return response
+        return self._request_dict("GET", f"/environments/{name}", expected="environment response")
 
     def list_environment_grants(self, name: str) -> list[dict[str, Any]]:
-        response = self.request("GET", f"/environments/{name}/grants")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected environment grant list response")
-        return response
+        return self._request_list("GET", f"/environments/{name}/grants", expected="environment grant list response")
 
     def grant_environment_access(
         self,
@@ -2967,18 +2956,12 @@ class Client:
             raise ValueError("provide exactly one of profile_id or api_key_id")
         if access not in {"read", "write", "admin"}:
             raise ValueError("access must be read, write, or admin")
-        response = self.request(
+        return self._request_dict(
             "PUT",
             f"/environments/{name}/grants",
-            json={
-                "profile_id": profile_id,
-                "api_key_id": api_key_id,
-                "access": access,
-            },
+            json={"profile_id": profile_id, "api_key_id": api_key_id, "access": access},
+            expected="environment grant response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected environment grant response")
-        return response
 
     def revoke_environment_access(self, name: str, grant_id: str) -> None:
         self.request_no_content("DELETE", f"/environments/{name}/grants/{grant_id}")
@@ -2992,7 +2975,7 @@ class Client:
         require_pr: bool = False,
         allowed_branches: list[str] | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "POST",
             "/environments",
             json={
@@ -3002,10 +2985,8 @@ class Client:
                 "require_pr": require_pr,
                 "allowed_branches": allowed_branches or [],
             },
+            expected="environment response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected environment response")
-        return response
 
     def delete_environment(self, name: str) -> None:
         self.request_no_content("DELETE", f"/environments/{name}")
@@ -3019,7 +3000,7 @@ class Client:
         require_pr: bool | None = None,
         allowed_branches: list[str] | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "PATCH",
             f"/workspace/environments/{environment}",
             json={
@@ -3032,10 +3013,8 @@ class Client:
                 }.items()
                 if value is not None
             },
+            expected="workspace environment policy response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workspace environment policy response")
-        return response
 
     def create_gitops_deployment_intent(
         self,
@@ -3051,7 +3030,7 @@ class Client:
         project_id: str | None = None,
         plan: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "POST",
             "/gitops/deployment-intents",
             json={
@@ -3066,32 +3045,29 @@ class Client:
                 "project_id": project_id,
                 "plan": plan or {},
             },
+            expected="GitOps deployment intent response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected GitOps deployment intent response")
-        return response
 
     def get_github_setup_session(self, setup_session_id: str) -> dict[str, Any]:
-        response = self.request("GET", f"/integrations/github/setup-sessions/{setup_session_id}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected GitHub setup status response")
-        return response
+        return self._request_dict(
+            "GET", f"/integrations/github/setup-sessions/{setup_session_id}", expected="GitHub setup status response"
+        )
 
     def list_github_repositories(self, installation_id: int) -> list[dict[str, Any]]:
-        response = self.request("GET", "/integrations/github/repositories", params={"installation_id": installation_id})
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected GitHub repository list response")
-        return response
+        return self._request_list(
+            "GET",
+            "/integrations/github/repositories",
+            params={"installation_id": installation_id},
+            expected="GitHub repository list response",
+        )
 
     def find_github_repository_installation(self, repo_full_name: str) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "GET",
             "/integrations/github/repository-installation",
             params={"repo_full_name": repo_full_name},
+            expected="GitHub repository installation response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected GitHub repository installation response")
-        return response
 
     def connect_gitlab_repo(
         self,
@@ -3104,7 +3080,7 @@ class Client:
         default_branch: str | None = None,
         project_id: str | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "POST",
             "/integrations/gitlab/repo-connections",
             json={
@@ -3116,34 +3092,34 @@ class Client:
                 "default_branch": default_branch,
                 "project_id": project_id,
             },
+            expected="GitLab repo connection response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected GitLab repo connection response")
-        return response
 
     def list_gitlab_repo_connections(self, *, project_id: str | None = None) -> list[dict[str, Any]]:
         params = {"project_id": project_id} if project_id else {}
-        response = self.request("GET", "/integrations/gitlab/repo-connections", params=params)
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected GitLab repo connection list response")
-        return response
+        return self._request_list(
+            "GET",
+            "/integrations/gitlab/repo-connections",
+            params=params,
+            expected="GitLab repo connection list response",
+        )
 
     def get_gitlab_repo_file(self, connection_id: str, *, path: str) -> dict[str, Any]:
-        response = self.request(
-            "GET", f"/integrations/gitlab/repo-connections/{connection_id}/file", params={"path": path}
+        return self._request_dict(
+            "GET",
+            f"/integrations/gitlab/repo-connections/{connection_id}/file",
+            params={"path": path},
+            expected="GitLab repo file response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected GitLab repo file response")
-        return response
 
     def create_gitlab_starter_workflow(self, connection_id: str, *, path: str | None = None) -> dict[str, Any]:
         payload = {"path": path} if path else {}
-        response = self.request(
-            "POST", f"/integrations/gitlab/repo-connections/{connection_id}/starter-workflow", json=payload
+        return self._request_dict(
+            "POST",
+            f"/integrations/gitlab/repo-connections/{connection_id}/starter-workflow",
+            json=payload,
+            expected="GitLab starter workflow response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected GitLab starter workflow response")
-        return response
 
     def create_gitlab_promotion_mr(
         self,
@@ -3156,28 +3132,21 @@ class Client:
         branch: str | None = None,
         message: str | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "POST",
             f"/integrations/gitlab/repo-connections/{connection_id}/promotion-mr",
-            json={
-                "path": path,
-                "content": content,
-                "title": title,
-                "body": body,
-                "branch": branch,
-                "message": message,
-            },
+            json={"path": path, "content": content, "title": title, "body": body, "branch": branch, "message": message},
+            expected="GitLab promotion MR response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected GitLab promotion MR response")
-        return response
 
     def list_github_repo_connections(self, *, project_id: str | None = None) -> list[dict[str, Any]]:
         params = {"project_id": project_id} if project_id else {}
-        response = self.request("GET", "/integrations/github/repo-connections", params=params)
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected GitHub repo connection list response")
-        return response
+        return self._request_list(
+            "GET",
+            "/integrations/github/repo-connections",
+            params=params,
+            expected="GitHub repo connection list response",
+        )
 
     def connect_github_repo(
         self,
@@ -3191,7 +3160,7 @@ class Client:
         default_branch: str | None = None,
         project_id: str | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "POST",
             "/integrations/github/repo-connections",
             json={
@@ -3204,10 +3173,8 @@ class Client:
                 "default_branch": default_branch,
                 "project_id": project_id,
             },
+            expected="GitHub repo connection response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected GitHub repo connection response")
-        return response
 
     def create_github_starter_workflow(
         self,
@@ -3215,25 +3182,21 @@ class Client:
         *,
         path: str = ".rebase/starter_workflow.py",
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "POST",
             f"/integrations/github/repo-connections/{connection_id}/starter-workflow",
             json={"path": path},
+            expected="GitHub starter workflow response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected GitHub starter workflow response")
-        return response
 
     def get_github_repo_file(self, connection_id: str, *, path: str) -> dict[str, Any]:
         """Read one file from the connected repo: {path, exists, content}."""
-        response = self.request(
+        return self._request_dict(
             "GET",
             f"/integrations/github/repo-connections/{connection_id}/file",
             params={"path": path},
+            expected="GitHub repo file response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected GitHub repo file response")
-        return response
 
     def create_github_promotion_pr(
         self,
@@ -3255,33 +3218,22 @@ class Client:
         }
         if branch:
             payload["branch"] = branch
-        response = self.request(
+        return self._request_dict(
             "POST",
             f"/integrations/github/repo-connections/{connection_id}/promotion-pr",
             json=payload,
+            expected="GitHub promotion PR response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected GitHub promotion PR response")
-        return response
 
     def list_projects(self, *, environment_name: str | None = None) -> list[dict[str, Any]]:
         headers = {"X-Rebase-Environment": environment_name} if environment_name else None
-        response = self.request("GET", "/projects", headers=headers)
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected project list response")
-        return response
+        return self._request_list("GET", "/projects", headers=headers, expected="project list response")
 
     def get_project(self, project_id: str) -> dict[str, Any]:
-        response = self.request("GET", f"/projects/{project_id}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected project response")
-        return response
+        return self._request_dict("GET", f"/projects/{project_id}", expected="project response")
 
     def get_workspace(self) -> dict[str, Any]:
-        response = self.request("GET", "/workspace")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workspace response")
-        return response
+        return self._request_dict("GET", "/workspace", expected="workspace response")
 
     def update_workspace(
         self,
@@ -3303,10 +3255,7 @@ class Client:
             }.items()
             if value is not None
         }
-        response = self.request("PATCH", "/workspace", json=payload)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workspace response")
-        return response
+        return self._request_dict("PATCH", "/workspace", json=payload, expected="workspace response")
 
     def create_project(
         self,
@@ -3319,7 +3268,7 @@ class Client:
         repo_path: str | None = None,
         environment_name: str | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "POST",
             "/projects",
             json={
@@ -3331,10 +3280,8 @@ class Client:
                 "repo_path": repo_path,
             },
             headers={"X-Rebase-Environment": environment_name} if environment_name else None,
+            expected="project response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected project response")
-        return response
 
     def update_project(
         self,
@@ -3359,10 +3306,7 @@ class Client:
             }.items()
             if value is not None
         }
-        response = self.request("PATCH", f"/projects/{project_id}", json=payload)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected project response")
-        return response
+        return self._request_dict("PATCH", f"/projects/{project_id}", json=payload, expected="project response")
 
     def track_project(
         self,
@@ -3373,7 +3317,7 @@ class Client:
         entrypoint: str,
         repo_path: str | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "PUT",
             f"/projects/{project_id}/git-track",
             json={
@@ -3382,22 +3326,14 @@ class Client:
                 "entrypoint": entrypoint,
                 "repo_path": repo_path,
             },
+            expected="project Git track response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected project Git track response")
-        return response
 
     def get_project_git_track(self, project_id: str) -> dict[str, Any]:
-        response = self.request("GET", f"/projects/{project_id}/git-track")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected project Git track response")
-        return response
+        return self._request_dict("GET", f"/projects/{project_id}/git-track", expected="project Git track response")
 
     def list_project_releases(self, project_id: str) -> list[dict[str, Any]]:
-        response = self.request("GET", f"/projects/{project_id}/releases")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected project release list response")
-        return response
+        return self._request_list("GET", f"/projects/{project_id}/releases", expected="project release list response")
 
     def delete_project(self, project_id: str, *, force: bool = False) -> None:
         """Delete a project. Without *force* the API refuses a non-empty one."""
@@ -3423,14 +3359,17 @@ class Client:
         for start in range(0, len(project_ids), PROJECT_BATCH_DELETE_LIMIT):
             chunk = list(project_ids[start : start + PROJECT_BATCH_DELETE_LIMIT])
             try:
-                response = self.request("POST", "/projects/batch-delete", json={"project_ids": chunk, "force": force})
+                response = self._request_dict(
+                    "POST",
+                    "/projects/batch-delete",
+                    json={"project_ids": chunk, "force": force},
+                    expected="batch delete response",
+                )
             except RebaseWorkflowError as exc:
                 if exc.status_code not in ROUTE_ABSENT_STATUSES:
                     raise
                 failures.extend(self._delete_projects_one_by_one(chunk, force=force))
                 continue
-            if not isinstance(response, dict):
-                raise RebaseWorkflowError("expected batch delete response")
             failures.extend(
                 (str(failure.get("project_id", "-")), _batch_failure_message(failure))
                 for failure in response.get("failed", [])
@@ -3454,10 +3393,13 @@ class Client:
 
     def find_project(self, name: str, *, environment_name: str | None = None) -> dict[str, Any] | None:
         projects = self.list_projects(environment_name=environment_name) if environment_name else self.list_projects()
-        for project in projects:
-            if project["name"] == name:
-                return project
-        return None
+        return _find_named(projects, name)
+
+    def _resolve_project_id(self, project: str | None, project_id: str | None) -> str | None:
+        if project_id is not None or project is None:
+            return project_id
+        resolved = self.find_project(project)
+        return str(resolved["id"]) if resolved is not None else None
 
     def ensure_project(
         self,
@@ -3504,18 +3446,14 @@ class Client:
             _environment_context.reset(token)
 
     def list_functions(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
-        resolved_project_id = project_id
-        if resolved_project_id is None and project is not None:
-            resolved_project = self.find_project(project)
-            if resolved_project is None:
-                return []
-            resolved_project_id = resolved_project["id"]
+        resolved_project_id = self._resolve_project_id(project, project_id)
+        if project is not None and resolved_project_id is None:
+            return []
         if resolved_project_id is None:
             return self._list_workspace_functions()
-        response = self.request("GET", f"/projects/{resolved_project_id}/functions")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected function list response")
-        return response
+        return self._request_list(
+            "GET", f"/projects/{resolved_project_id}/functions", expected="function list response"
+        )
 
     def _list_workspace_functions(self) -> list[dict[str, Any]]:
         """Every function in the workspace, in one request where the API allows it.
@@ -3527,7 +3465,7 @@ class Client:
         ahead of its API loses the speed rather than the answer.
         """
         try:
-            response = self.request("GET", "/functions")
+            response = self._request_list("GET", "/functions", expected="function list response")
         except RebaseWorkflowError as exc:
             if exc.status_code != 404:
                 raise
@@ -3535,36 +3473,24 @@ class Client:
             for item in self.list_projects():
                 functions.extend(self.list_functions(project_id=item["id"]))
             return functions
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected function list response")
         return response
 
     def get_function(self, function_id: str) -> dict[str, Any]:
-        response = self.request("GET", f"/functions/{function_id}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected function response")
-        return response
+        return self._request_dict("GET", f"/functions/{function_id}", expected="function response")
 
     def find_function(self, name: str, *, project: str) -> dict[str, Any] | None:
-        for function in self.list_functions(project=project):
-            if function["name"] == name:
-                return function
-        return None
+        return _find_named(self.list_functions(project=project), name)
 
     def list_asgi_apps(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
         resolved_project_id = project_id
         if resolved_project_id is None:
             resolved_project_id = self.ensure_project(project or DEFAULT_PROJECT_NAME)["id"]
-        response = self.request("GET", f"/projects/{resolved_project_id}/asgi-apps")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected ASGI app list response")
-        return response
+        return self._request_list(
+            "GET", f"/projects/{resolved_project_id}/asgi-apps", expected="ASGI app list response"
+        )
 
     def find_asgi_app(self, name: str, *, project: str) -> dict[str, Any] | None:
-        for asgi_app in self.list_asgi_apps(project=project):
-            if asgi_app["name"] == name:
-                return asgi_app
-        return None
+        return _find_named(self.list_asgi_apps(project=project), name)
 
     def register_asgi_app(
         self,
@@ -3636,15 +3562,13 @@ class Client:
             payload["buckets"] = buckets
         if build:
             payload["build"] = build
-        response = self.request(
+        return self._request_dict(
             "POST",
             f"/projects/{project_id}/asgi-apps",
             timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
             json=payload,
+            expected="ASGI app response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected ASGI app response")
-        return response
 
     def update_asgi_app(
         self,
@@ -3719,15 +3643,13 @@ class Client:
         }
         if build:
             payload["build"] = build
-        response = self.request(
+        return self._request_dict(
             "PATCH",
             f"/asgi-apps/{asgi_app_id}",
             timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
             json=payload,
+            expected="ASGI app response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected ASGI app response")
-        return response
 
     def register_function(
         self,
@@ -3802,14 +3724,9 @@ class Client:
             payload["buckets"] = buckets
         if build:
             payload["build"] = build
-        response = self.request(
-            "POST",
-            f"/projects/{project_id}/functions",
-            json=payload,
+        return self._request_dict(
+            "POST", f"/projects/{project_id}/functions", json=payload, expected="function response"
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected function response")
-        return response
 
     def update_function(
         self,
@@ -3886,15 +3803,12 @@ class Client:
         payload.update(execution_payload)
         if build:
             payload["build"] = build
-        response = self.request("PATCH", f"/functions/{function_id}", json=payload)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected function response")
-        return response
+        return self._request_dict("PATCH", f"/functions/{function_id}", json=payload, expected="function response")
 
     def run_function(self, function_id: str, parameters: dict[str, Any] | None = None) -> Run:
-        response = self.request("POST", f"/functions/{function_id}/runs", json={"parameters": parameters or {}})
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected run response")
+        response = self._request_dict(
+            "POST", f"/functions/{function_id}/runs", json={"parameters": parameters or {}}, expected="run response"
+        )
         return Run(response["id"], client=self, data=response)
 
     def run_function_map(
@@ -3931,29 +3845,17 @@ class Client:
         yield from self.stream_request("POST", f"/functions/{function_id}/map", json=payload, timeout=None)
 
     def list_models(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
-        resolved_project_id = project_id
-        if resolved_project_id is None and project is not None:
-            resolved_project = self.find_project(project)
-            if resolved_project is None:
-                return []
-            resolved_project_id = resolved_project["id"]
+        resolved_project_id = self._resolve_project_id(project, project_id)
+        if project is not None and resolved_project_id is None:
+            return []
         path = f"/projects/{resolved_project_id}/models" if resolved_project_id is not None else "/models"
-        response = self.request("GET", path)
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected model list response")
-        return response
+        return self._request_list("GET", path, expected="model list response")
 
     def get_model(self, model_id: str) -> dict[str, Any]:
-        response = self.request("GET", f"/models/{model_id}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected model response")
-        return response
+        return self._request_dict("GET", f"/models/{model_id}", expected="model response")
 
     def find_model(self, name: str, *, project: str) -> dict[str, Any] | None:
-        for model in self.list_models(project=project):
-            if model["name"] == name:
-                return model
-        return None
+        return _find_named(self.list_models(project=project), name)
 
     def register_model(
         self,
@@ -3991,7 +3893,7 @@ class Client:
         environment = _resolve_environment(self, environment)
         project_id = self._ensure_project_in_environment(project, environment)["id"]
         resolved_mode, resolved_isolation = _validate_execution(mode, isolation, run_type=run_type)
-        response = self.request(
+        return self._request_dict(
             "POST",
             f"/projects/{project_id}/models",
             json={
@@ -4023,10 +3925,8 @@ class Client:
                 "git_tag": git_tag,
                 "git_dirty": git_dirty or False,
             },
+            expected="model response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected model response")
-        return response
 
     def update_model(
         self,
@@ -4097,10 +3997,7 @@ class Client:
             if value is not None
         }
         payload.update(execution_payload)
-        response = self.request("PATCH", f"/models/{model_id}", json=payload)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected model response")
-        return response
+        return self._request_dict("PATCH", f"/models/{model_id}", json=payload, expected="model response")
 
     def run_model(
         self,
@@ -4110,32 +4007,22 @@ class Client:
         environment: str | None = None,
     ) -> Run:
         environment = _resolve_environment(self, environment)
-        response = self.request(
+        response = self._request_dict(
             "POST",
             f"/models/{model_id}/runs",
             json={"parameters": parameters or {}, "environment": environment},
+            expected="run response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected run response")
         return Run(response["id"], client=self, data=response)
 
     def list_model_versions(self, model_id: str) -> list[dict[str, Any]]:
-        response = self.request("GET", f"/models/{model_id}/versions")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected model version list response")
-        return response
+        return self._request_list("GET", f"/models/{model_id}/versions", expected="model version list response")
 
     def get_model_version(self, model_id: str, version_id: str) -> dict[str, Any]:
-        response = self.request("GET", f"/models/{model_id}/versions/{version_id}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected model version response")
-        return response
+        return self._request_dict("GET", f"/models/{model_id}/versions/{version_id}", expected="model version response")
 
     def list_model_publications(self, model_id: str) -> list[dict[str, Any]]:
-        response = self.request("GET", f"/models/{model_id}/publications")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected model publication list response")
-        return response
+        return self._request_list("GET", f"/models/{model_id}/publications", expected="model publication list response")
 
     def record_model_publication(
         self,
@@ -4152,7 +4039,7 @@ class Client:
         source_git_commit_sha: str | None = None,
         publication_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "POST",
             f"/models/{model_id}/publications",
             json={
@@ -4167,16 +4054,11 @@ class Client:
                 "source_git_commit_sha": source_git_commit_sha,
                 "publication_metadata": publication_metadata or {},
             },
+            expected="model publication response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected model publication response")
-        return response
 
     def list_model_deployments(self, model_id: str) -> list[dict[str, Any]]:
-        response = self.request("GET", f"/models/{model_id}/deployments")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected model deployment list response")
-        return response
+        return self._request_list("GET", f"/models/{model_id}/deployments", expected="model deployment list response")
 
     def deploy_model_version(
         self,
@@ -4186,14 +4068,12 @@ class Client:
         model_version_id: str,
         promotion_request_id: str | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "POST",
             f"/models/{model_id}/deployments/{environment}",
             json={"model_version_id": model_version_id, "promotion_request_id": promotion_request_id},
+            expected="model deployment response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected model deployment response")
-        return response
 
     def create_model_promotion_request(
         self,
@@ -4204,7 +4084,7 @@ class Client:
         to_environment: str = "prod",
         reason: str | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "POST",
             f"/models/{model_id}/promotion-requests",
             json={
@@ -4213,22 +4093,24 @@ class Client:
                 "to_environment": to_environment,
                 "reason": reason,
             },
+            expected="model promotion request response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected model promotion request response")
-        return response
 
     def approve_model_promotion_request(self, request_id: str, *, reason: str | None = None) -> dict[str, Any]:
-        response = self.request("POST", f"/model-promotion-requests/{request_id}/approve", json={"reason": reason})
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected model promotion request response")
-        return response
+        return self._request_dict(
+            "POST",
+            f"/model-promotion-requests/{request_id}/approve",
+            json={"reason": reason},
+            expected="model promotion request response",
+        )
 
     def reject_model_promotion_request(self, request_id: str, *, reason: str | None = None) -> dict[str, Any]:
-        response = self.request("POST", f"/model-promotion-requests/{request_id}/reject", json={"reason": reason})
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected model promotion request response")
-        return response
+        return self._request_dict(
+            "POST",
+            f"/model-promotion-requests/{request_id}/reject",
+            json={"reason": reason},
+            expected="model promotion request response",
+        )
 
     def promote_model(
         self,
@@ -4239,7 +4121,7 @@ class Client:
         model_version_id: str | None = None,
         promotion_request_id: str | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "POST",
             f"/models/{model_id}/promote",
             json={
@@ -4248,10 +4130,8 @@ class Client:
                 "model_version_id": model_version_id,
                 "promotion_request_id": promotion_request_id,
             },
+            expected="model deployment response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected model deployment response")
-        return response
 
     def rollback_model(
         self,
@@ -4260,57 +4140,39 @@ class Client:
         environment: str = "prod",
         model_version_id: str | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
+        return self._request_dict(
             "POST",
             f"/models/{model_id}/rollback",
             json={"environment": environment, "model_version_id": model_version_id},
+            expected="model deployment response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected model deployment response")
-        return response
 
     def list_model_events(self, model_id: str) -> list[dict[str, Any]]:
-        response = self.request("GET", f"/models/{model_id}/events")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected model event list response")
-        return response
+        return self._request_list("GET", f"/models/{model_id}/events", expected="model event list response")
 
     def list_function_versions(self, function_id: str) -> list[dict[str, Any]]:
-        response = self.request("GET", f"/functions/{function_id}/versions")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected function version list response")
-        return response
+        return self._request_list(
+            "GET", f"/functions/{function_id}/versions", expected="function version list response"
+        )
 
     def get_function_version(self, function_id: str, version_id: str) -> dict[str, Any]:
-        response = self.request("GET", f"/functions/{function_id}/versions/{version_id}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected function version response")
-        return response
+        return self._request_dict(
+            "GET", f"/functions/{function_id}/versions/{version_id}", expected="function version response"
+        )
 
     def list_workflows(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
-        resolved_project_id = project_id
-        if resolved_project_id is None and project is not None:
-            resolved_project = self.find_project(project)
-            if resolved_project is None:
-                return []
-            resolved_project_id = resolved_project["id"]
+        resolved_project_id = self._resolve_project_id(project, project_id)
+        if project is not None and resolved_project_id is None:
+            return []
         path = f"/projects/{resolved_project_id}/workflows" if resolved_project_id is not None else "/workflows"
-        response = self.request("GET", path)
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected workflow list response")
-        return response
+        return self._request_list("GET", path, expected="workflow list response")
 
     def get_workflow(self, workflow_id: str) -> dict[str, Any]:
-        response = self.request("GET", f"/workflows/{workflow_id}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workflow response")
-        return response
+        return self._request_dict("GET", f"/workflows/{workflow_id}", expected="workflow response")
 
     def find_workflow(self, name: str, *, project: str | None = None) -> dict[str, Any] | None:
-        for workflow in self.list_workflows(project=project) if project is not None else self.list_workflows():
-            if workflow["name"] == name:
-                return workflow
-        return None
+        workflows = self.list_workflows(project=project) if project is not None else self.list_workflows()
+        return _find_named(workflows, name)
 
     def register_workflow(
         self,
@@ -4388,14 +4250,7 @@ class Client:
         }
         if build:
             payload["build"] = build
-        response = self.request(
-            "POST",
-            path,
-            json=payload,
-        )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workflow response")
-        return response
+        return self._request_dict("POST", path, json=payload, expected="workflow response")
 
     def update_workflow(
         self,
@@ -4478,15 +4333,12 @@ class Client:
             payload["buckets"] = buckets
         if build:
             payload["build"] = build
-        response = self.request("PATCH", f"/workflows/{workflow_id}", json=payload)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workflow response")
-        return response
+        return self._request_dict("PATCH", f"/workflows/{workflow_id}", json=payload, expected="workflow response")
 
     def run_workflow(self, workflow_id: str, parameters: dict[str, Any] | None = None) -> Run:
-        response = self.request("POST", f"/workflows/{workflow_id}/runs", json={"parameters": parameters or {}})
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected run response")
+        response = self._request_dict(
+            "POST", f"/workflows/{workflow_id}/runs", json={"parameters": parameters or {}}, expected="run response"
+        )
         return Run(response["id"], client=self, data=response)
 
     def replay_run(
@@ -4509,9 +4361,7 @@ class Client:
             payload["use_current_version"] = True
         elif version is not None:
             payload["target_version_id"] = version
-        response = self.request("POST", f"/runs/{run_id}/replay", json=payload)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected run response")
+        response = self._request_dict("POST", f"/runs/{run_id}/replay", json=payload, expected="run response")
         return Run(response["id"], client=self, data=response)
 
     def run_ephemeral(
@@ -4571,51 +4421,36 @@ class Client:
         if secrets:
             payload["secrets"] = dict(secrets)
 
-        response = self.request(
+        response = self._request_dict(
             "POST",
             "/runs/ephemeral",
             json=payload,
             timeout=EPHEMERAL_RUN_REQUEST_TIMEOUT_SECONDS,
+            expected="run response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected run response")
         return Run(response["id"], client=self, data=response)
 
     def list_workflow_versions(self, workflow_id: str) -> list[dict[str, Any]]:
-        response = self.request("GET", f"/workflows/{workflow_id}/versions")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected workflow version list response")
-        return response
+        return self._request_list(
+            "GET", f"/workflows/{workflow_id}/versions", expected="workflow version list response"
+        )
 
     def get_workflow_version(self, workflow_id: str, version_id: str) -> dict[str, Any]:
-        response = self.request("GET", f"/workflows/{workflow_id}/versions/{version_id}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workflow version response")
-        return response
+        return self._request_dict(
+            "GET", f"/workflows/{workflow_id}/versions/{version_id}", expected="workflow version response"
+        )
 
     def get_workflow_schedule(self, workflow_id: str) -> dict[str, Any]:
-        response = self.request("GET", f"/workflows/{workflow_id}/schedule")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workflow schedule response")
-        return response
+        return self._request_dict("GET", f"/workflows/{workflow_id}/schedule", expected="workflow schedule response")
 
     def get_workflow_trigger(self, workflow_id: str) -> dict[str, Any]:
-        response = self.request("GET", f"/workflows/{workflow_id}/trigger")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workflow trigger response")
-        return response
+        return self._request_dict("GET", f"/workflows/{workflow_id}/trigger", expected="workflow trigger response")
 
     def get_run(self, run_id: str) -> dict[str, Any]:
-        response = self.request("GET", f"/runs/{run_id}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected run response")
-        return response
+        return self._request_dict("GET", f"/runs/{run_id}", expected="run response")
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
-        response = self.request("POST", f"/runs/{run_id}/cancel")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected run response")
-        return response
+        return self._request_dict("POST", f"/runs/{run_id}/cancel", expected="run response")
 
     def get_run_logs(
         self,
@@ -4625,22 +4460,17 @@ class Client:
         limit: int | None = None,
     ) -> dict[str, Any]:
         params = {key: value for key, value in {"since": since, "limit": limit}.items() if value is not None}
-        response = self.request("GET", f"/runs/{run_id}/logs", params=params or None)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected run logs response")
-        return response
+        return self._request_dict("GET", f"/runs/{run_id}/logs", params=params or None, expected="run logs response")
 
     def get_workspace_notifications(self) -> dict[str, Any]:
-        response = self.request("GET", "/workspace/notifications")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workspace notification response")
-        return response
+        return self._request_dict("GET", "/workspace/notifications", expected="workspace notification response")
 
     def update_workspace_notifications(
         self,
         *,
         notify_on_failure: bool | None = None,
         notify_on_stale: bool | None = None,
+        notify_owner_email: bool | None = None,
         webhook_url: str | None | object = _UNSET,
         webhook_secret: str | None | object = _UNSET,
     ) -> dict[str, Any]:
@@ -4649,14 +4479,42 @@ class Client:
             payload["notify_on_failure"] = notify_on_failure
         if notify_on_stale is not None:
             payload["notify_on_stale"] = notify_on_stale
+        if notify_owner_email is not None:
+            payload["notify_owner_email"] = notify_owner_email
         if webhook_url is not _UNSET:
             payload["webhook_url"] = "" if webhook_url is None else webhook_url
         if webhook_secret is not _UNSET:
             payload["webhook_secret"] = "" if webhook_secret is None else webhook_secret
-        response = self.request("PATCH", "/workspace/notifications", json=payload)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected workspace notification response")
-        return response
+        return self._request_dict(
+            "PATCH", "/workspace/notifications", json=payload, expected="workspace notification response"
+        )
+
+    def get_workspace_compute_policy(self) -> dict[str, Any]:
+        return self._request_dict("GET", "/workspace/compute-policy", expected="workspace compute policy response")
+
+    def update_workspace_compute_policy(
+        self,
+        *,
+        max_run_timeout_seconds: int | None = None,
+        max_concurrent_cloud_run_runs: int | None = None,
+        max_cloud_run_instances: int | None = None,
+        max_cloud_run_concurrency: int | None = None,
+    ) -> dict[str, Any]:
+        # No _UNSET sentinel here, unlike update_workspace_notifications: these are
+        # NOT NULL integers with no clear-to-null semantics, so plain "None means not
+        # set" is the correct encoding rather than an omission the server must undo.
+        payload: dict[str, Any] = {}
+        if max_run_timeout_seconds is not None:
+            payload["max_run_timeout_seconds"] = max_run_timeout_seconds
+        if max_concurrent_cloud_run_runs is not None:
+            payload["max_concurrent_cloud_run_runs"] = max_concurrent_cloud_run_runs
+        if max_cloud_run_instances is not None:
+            payload["max_cloud_run_instances"] = max_cloud_run_instances
+        if max_cloud_run_concurrency is not None:
+            payload["max_cloud_run_concurrency"] = max_cloud_run_concurrency
+        return self._request_dict(
+            "PATCH", "/workspace/compute-policy", json=payload, expected="workspace compute policy response"
+        )
 
     def list_runs(
         self,
@@ -4701,10 +4559,7 @@ class Client:
             }.items()
             if value is not None
         }
-        response = self.request("GET", "/runs", params=params)
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected run list response")
-        return response
+        return self._request_list("GET", "/runs", params=params, expected="run list response")
 
     def list_latest_runs_by_project(self) -> list[dict[str, Any]]:
         """The newest run of each project, one row per project.
@@ -4725,22 +4580,17 @@ class Client:
         stays meaningful everywhere else.
         """
         try:
-            response = self.request("GET", "/runs/latest-by-project")
+            response = self._request_list("GET", "/runs/latest-by-project", expected="run list response")
         except RebaseWorkflowError as exc:
             if exc.status_code in ROUTE_ABSENT_STATUSES:
                 return []
             if exc.status_code == 422 and "uuid_parsing" in str(exc) and "run_id" in str(exc):
                 return []
             raise
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected run list response")
         return response
 
     def list_run_steps(self, run_id: str) -> list[dict[str, Any]]:
-        response = self.request("GET", f"/runs/{run_id}/steps")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected step run list response")
-        return response
+        return self._request_list("GET", f"/runs/{run_id}/steps", expected="step run list response")
 
     def list_run_tasks(self, run_id: str, *, step_run_id: str | None = None) -> list[dict[str, Any]]:
         """The named inline and Function.map tasks reported for a run.
@@ -4750,26 +4600,22 @@ class Client:
         """
         params = {"step_run_id": step_run_id} if step_run_id is not None else None
         try:
-            response = self.request("GET", f"/runs/{run_id}/tasks", params=params)
+            response = self._request_list(
+                "GET", f"/runs/{run_id}/tasks", params=params, expected="run task list response"
+            )
         except RebaseWorkflowError as exc:
             if exc.status_code in ROUTE_ABSENT_STATUSES:
                 return []
             raise
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected run task list response")
         return response
 
     def create_run_task(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        response = self.request("POST", f"/runs/{run_id}/tasks", json=payload)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected run task response")
-        return response
+        return self._request_dict("POST", f"/runs/{run_id}/tasks", json=payload, expected="run task response")
 
     def complete_run_task(self, run_id: str, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        response = self.request("PATCH", f"/runs/{run_id}/tasks/{task_id}", json=payload)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected run task response")
-        return response
+        return self._request_dict(
+            "PATCH", f"/runs/{run_id}/tasks/{task_id}", json=payload, expected="run task response"
+        )
 
     def list_run_artifacts(
         self,
@@ -4783,43 +4629,41 @@ class Client:
             key: value for key, value in {"step_run_id": step_run_id, "task_id": task_id}.items() if value is not None
         }
         try:
-            response = self.request("GET", f"/runs/{run_id}/artifacts", params=params or None)
+            response = self._request_list(
+                "GET",
+                f"/runs/{run_id}/artifacts",
+                params=params or None,
+                expected="run artifact list response",
+            )
         except RebaseWorkflowError as exc:
             if exc.status_code in ROUTE_ABSENT_STATUSES:
                 return []
             raise
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected run artifact list response")
         return response
 
     def create_run_artifact(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        response = self.request("POST", f"/runs/{run_id}/artifacts", json=payload)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected run artifact response")
-        return response
+        return self._request_dict("POST", f"/runs/{run_id}/artifacts", json=payload, expected="run artifact response")
 
     def open_run_artifact(self, run_id: str, artifact_id: str) -> str:
-        response = self.request("POST", f"/runs/{run_id}/artifacts/{artifact_id}/open")
-        if not isinstance(response, dict) or not isinstance(response.get("url"), str):
+        response = self._request_dict(
+            "POST", f"/runs/{run_id}/artifacts/{artifact_id}/open", expected="artifact open URL response"
+        )
+        if not isinstance(response.get("url"), str):
             raise RebaseWorkflowError("expected artifact open URL response")
         return response["url"]
 
     def list_run_events(self, run_id: str) -> list[dict[str, Any]]:
-        response = self.request("GET", f"/runs/{run_id}/events")
-        if not isinstance(response, list):
-            raise RebaseWorkflowError("expected run event list response")
-        return response
+        return self._request_list("GET", f"/runs/{run_id}/events", expected="run event list response")
 
     def create_shell_session(self, payload: dict[str, Any]) -> dict[str, Any]:
         # Creating a session deploys and starts the shell container's Cloud Run
         # job synchronously, which can take a couple of minutes on first use.
-        response = self.request("POST", "/shell-sessions", json=payload, timeout=300)
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected shell session response")
-        return response
+        return self._request_dict(
+            "POST", "/shell-sessions", json=payload, timeout=300, expected="shell session response"
+        )
 
     def prepare_source_bundle(self, bundle: SourceBundle) -> dict[str, Any]:
-        response = self.request(
+        response = self._request_dict(
             "POST",
             "/source-bundles/prepare",
             json={
@@ -4829,9 +4673,8 @@ class Client:
                 "file_count": bundle.file_count,
                 "manifest": bundle.manifest,
             },
+            expected="source bundle preparation response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected source bundle preparation response")
         upload_url = response.get("upload_url")
         if isinstance(upload_url, str):
             upload = requests.put(
@@ -4843,28 +4686,59 @@ class Client:
             if upload.status_code >= 400:
                 raise RebaseWorkflowError(f"source bundle upload failed: {upload.status_code} {upload.text[:200]}")
             bundle_id = response.get("id")
-            response = self.request(
+            response = self._request_dict(
                 "POST",
                 f"/source-bundles/{bundle_id}/finalize",
                 timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
+                expected="finalized source bundle response",
             )
-            if not isinstance(response, dict):
-                raise RebaseWorkflowError("expected finalized source bundle response")
         if response.get("status") != "ready":
             raise RebaseWorkflowError(str(response.get("error") or "source bundle did not become ready"))
         return response
 
+    def get_image_build_logs(
+        self, build_id: str, *, cursor: str | None = None, limit: int | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if cursor:
+            params["cursor"] = cursor
+        if limit:
+            params["limit"] = limit
+        return self._request_dict(
+            "GET", f"/image-builds/{build_id}/logs", params=params, expected="image build logs response"
+        )
+
+    def _stream_build_logs(self, build_id: str, cursor: str | None) -> tuple[str | None, bool]:
+        """Feed one increment of build output to the installed consumer.
+
+        Returns (cursor, still_streaming). Any failure disables streaming
+        rather than the build: older servers answer this route with a redirect
+        to a console URL, and a log hiccup must not kill a deploy.
+        """
+        consumer = _build_log_consumer
+        if consumer is None:
+            return cursor, False
+        try:
+            payload = self.get_image_build_logs(build_id, cursor=cursor)
+        except Exception:
+            return cursor, False
+        for line in payload.get("lines") or []:
+            consumer(str(line))
+        next_cursor = payload.get("cursor")
+        return (next_cursor if isinstance(next_cursor, str) else cursor), True
+
     def build_image(self, *, source_bundle_id: str, recipe: dict[str, Any]) -> dict[str, Any]:
-        response = self.request(
+        response = self._request_dict(
             "POST",
             "/image-builds",
             json={"source_bundle_id": source_bundle_id, "recipe": recipe},
             timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
+            expected="image build response",
         )
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected image build response")
         build_id = response.get("id")
         deadline = time.monotonic() + IMAGE_BUILD_TIMEOUT_SECONDS
+        log_cursor: str | None = None
+        streaming = _build_log_consumer is not None
         while response.get("status") in {"queued", "building"}:
             if not isinstance(build_id, str):
                 raise RebaseWorkflowError("image build response is missing an id")
@@ -4873,9 +4747,20 @@ class Client:
                 suffix = f" Logs: {logs_url}" if logs_url else ""
                 raise RebaseWorkflowError(f"image build did not finish within 30 minutes.{suffix}")
             time.sleep(IMAGE_BUILD_POLL_SECONDS)
-            response = self.request("GET", f"/image-builds/{build_id}")
-            if not isinstance(response, dict):
-                raise RebaseWorkflowError("expected image build status response")
+            response = self._request_dict("GET", f"/image-builds/{build_id}", expected="image build status response")
+            if streaming:
+                log_cursor, streaming = self._stream_build_logs(build_id, log_cursor)
+        if streaming and isinstance(build_id, str):
+            # Final drain: log ingestion lags the terminal status. On failure
+            # keep draining briefly — the trailing lines are the ones that
+            # explain it, and Cloud Logging can be seconds behind.
+            attempts = 1 if response.get("status") == "succeeded" else 4
+            for attempt in range(attempts):
+                log_cursor, streaming = self._stream_build_logs(build_id, log_cursor)
+                if not streaming:
+                    break
+                if attempt < attempts - 1:
+                    time.sleep(1.0)
         if response.get("status") != "succeeded" or not response.get("image_digest"):
             logs_url = response.get("logs_url")
             suffix = f" Logs: {logs_url}" if logs_url else ""
@@ -4900,10 +4785,7 @@ class Client:
         }
 
     def get_shell_session(self, session_id: str) -> dict[str, Any]:
-        response = self.request("GET", f"/shell-sessions/{session_id}")
-        if not isinstance(response, dict):
-            raise RebaseWorkflowError("expected shell session response")
-        return response
+        return self._request_dict("GET", f"/shell-sessions/{session_id}", expected="shell session response")
 
     def delete_shell_session(self, session_id: str) -> None:
         self.request_no_content("DELETE", f"/shell-sessions/{session_id}")
@@ -5275,21 +5157,7 @@ class ASGIApp:
         return self.client or default_client()
 
     def _source_metadata_for_deploy(self, deploy_source: str | None = None) -> dict[str, Any]:
-        resolved_deploy_source = _validate_deploy_source(deploy_source) or self.deploy_source
-        project_source_mode = (
-            _connected_source_mode(
-                self._client,
-                project=self.project,
-                project_source_mode=self.project_source_mode,
-            )
-            if resolved_deploy_source == "github"
-            else self.project_source_mode
-        )
-        return _source_metadata_for_deploy(
-            self.source_metadata,
-            deploy_source=resolved_deploy_source,
-            project_source_mode=project_source_mode,
-        )
+        return _target_source_metadata_for_deploy(self, deploy_source)
 
     @_environment_scoped_deploy
     def deploy(
@@ -5474,21 +5342,7 @@ class Function:
         return self.client or default_client()
 
     def _source_metadata_for_deploy(self, deploy_source: str | None = None) -> dict[str, Any]:
-        resolved_deploy_source = _validate_deploy_source(deploy_source) or self.deploy_source
-        project_source_mode = (
-            _connected_source_mode(
-                self._client,
-                project=self.project,
-                project_source_mode=self.project_source_mode,
-            )
-            if resolved_deploy_source == "github"
-            else self.project_source_mode
-        )
-        return _source_metadata_for_deploy(
-            self.source_metadata,
-            deploy_source=resolved_deploy_source,
-            project_source_mode=project_source_mode,
-        )
+        return _target_source_metadata_for_deploy(self, deploy_source)
 
     @_environment_scoped_deploy
     def deploy(
@@ -5738,11 +5592,6 @@ class ModelHandle:
     @property
     def _client(self) -> Client:
         return self.client or default_client()
-
-    def _operation(self) -> _RemoteModelOperation:
-        if self.operation_name is None:
-            raise RebaseWorkflowError("model handle does not expose a known remote operation")
-        return getattr(self, self.operation_name)
 
     def spawn(self, *, environment: str | None = None, **parameters: Any) -> Run:
         if self.id is None:
@@ -6563,21 +6412,7 @@ class Workflow:
         return self.client or default_client()
 
     def _source_metadata_for_deploy(self, deploy_source: str | None = None) -> dict[str, Any]:
-        resolved_deploy_source = _validate_deploy_source(deploy_source) or self.deploy_source
-        project_source_mode = (
-            _connected_source_mode(
-                self._client,
-                project=self.project,
-                project_source_mode=self.project_source_mode,
-            )
-            if resolved_deploy_source == "github"
-            else self.project_source_mode
-        )
-        return _source_metadata_for_deploy(
-            self.source_metadata,
-            deploy_source=resolved_deploy_source,
-            project_source_mode=project_source_mode,
-        )
+        return _target_source_metadata_for_deploy(self, deploy_source)
 
     def _collect_steps(self) -> list[Step]:
         if self.fn is None:
@@ -6627,6 +6462,16 @@ class Workflow:
         if inspect.iscoroutinefunction(self.fn):
             if self._references_step():
                 raise RebaseWorkflowError("Step workflows must be synchronous in the SDK graph compiler.")
+            return None
+        # Tracing works by CALLING the body and intercepting its step calls, so a
+        # body that references no steps has nothing to intercept and would simply
+        # run — which for a job-mode workflow means executing the user's real
+        # pipeline on their laptop at `rebase deploy` time. That is not
+        # hypothetical: deploying the accounting sync once ran a live financial
+        # sync locally. A step-free body could never produce trace nodes anyway
+        # (the no-nodes path below already returns None), so skipping the call is
+        # behaviour-preserving minus the side effects.
+        if not self._references_step():
             return None
         trace = _WorkflowTrace(ephemeral=ephemeral)
         _trace_stack.append(trace)
@@ -6861,7 +6706,7 @@ class Run:
             if status in terminal_statuses:
                 if status == "succeeded":
                     return data["result"]
-                raise RebaseWorkflowError(data.get("error") or f"run ended with status {status}")
+                raise RebaseWorkflowError(run_failure_summary(data) or f"run ended with status {status}")
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"run {self.id} did not finish within {timeout} seconds")
             time.sleep(poll_interval)

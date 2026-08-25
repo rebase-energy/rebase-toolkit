@@ -262,6 +262,41 @@ def write_profile(
     return _write_config(data, resolved_path)
 
 
+def set_profile_workspace(
+    workspace_id: str,
+    workspace_name: str | None = None,
+    *,
+    profile: str | None = None,
+    path: Path | None = None,
+) -> Path:
+    """Point a profile at a different workspace, keeping its credentials.
+
+    A profile is an identity on a backend; the workspace is a selection within
+    it, carried per request in the `X-Rebase-Workspace` header. Changing it is
+    therefore an edit to one field, not a reason for a second profile — which is
+    why this exists separately from `write_profile`, which rewrites the whole
+    entry and would drop the credentials it was not given.
+    """
+    resolved_path = path or config_path()
+    data = read_config(resolved_path)
+    profiles = data.get("profiles")
+    name = selected_profile_name(profile, path=resolved_path)
+    if not isinstance(profiles, dict) or name not in profiles:
+        raise KeyError(name)
+    profile_data = profiles[name]
+    if not isinstance(profile_data, dict):
+        raise KeyError(name)
+
+    profile_data["workspace_id"] = workspace_id
+    if workspace_name:
+        profile_data["workspace_name"] = workspace_name
+    else:
+        profile_data.pop("workspace_name", None)
+    profiles[name] = profile_data
+    data["profiles"] = profiles
+    return _write_config(data, resolved_path)
+
+
 def workspace_key(profile_data: Mapping[str, Any], profile_name: str) -> str:
     """Identify the workspace a profile points at, for per-workspace local settings.
 
