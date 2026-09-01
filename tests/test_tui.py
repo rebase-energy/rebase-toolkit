@@ -56,6 +56,7 @@ from rebase.tui import (
     group_ephemeral_runs,
     is_github_backed,
     status_style,
+    step_dependencies,
     target_ids_by_identity,
     workflow_definition_line,
     workflow_definition_line_at_commit,
@@ -453,7 +454,7 @@ def test_tui_environment_resources_and_switcher() -> None:
         async with app.run_test(size=(140, 42)) as pilot:
             await pilot.pause(0.3)
 
-            assert "Environment: dev" in str(app.query_one("#environment-context", Static).render())
+            assert app.title.endswith("(dev)")
             assert str(app.query_one("#buckets-table", DataTable).get_cell_at(Coordinate(0, 0))) == "dev-data"
             assert str(app.query_one("#buckets-table", DataTable).get_cell_at(Coordinate(0, 1))) == (
                 "gs://rb-dev-data-abc123"
@@ -470,7 +471,7 @@ def test_tui_environment_resources_and_switcher() -> None:
 
             assert app.environment_name == "prod"
             assert app.data.environment_name == "prod"
-            assert "Environment: prod" in str(app.query_one("#environment-context", Static).render())
+            assert app.title.endswith("(prod)")
             assert str(app.query_one("#buckets-table", DataTable).get_cell_at(Coordinate(0, 0))) == "prod-data"
 
     asyncio.run(scenario())
@@ -592,6 +593,54 @@ def test_tui_endpoint_column_counts_extra_endpoints_and_dims_disabled() -> None:
     assert format_endpoint([disabled]).style == BRAND_MEDIUM_GRAY
     assert format_endpoint([extra]).style == ""
     assert str(format_endpoint([extra, disabled])) == "GET /b (+1)"
+
+
+def test_tui_step_dependencies_resolve_node_keys_to_the_names_rows_show() -> None:
+    """The graph addresses nodes by key; a step row shows the node's name.
+
+    Left untranslated the column would say `count_to` beside a row reading `count-to`,
+    which is the same step spelled two ways. An upstream with no node of its own keeps
+    its raw key rather than being renamed into something that is not there.
+    """
+    graph = {
+        "nodes": [
+            {"node_key": "announce", "name": "announce", "upstream_node_keys": []},
+            {"node_key": "count_to", "name": "count-to", "upstream_node_keys": ["announce"]},
+            {"node_key": "sign_off", "name": "sign-off", "upstream_node_keys": ["count_to", "dropped"]},
+        ]
+    }
+
+    assert step_dependencies(graph) == {
+        "announce": [],
+        "count_to": ["announce"],
+        "sign_off": ["count-to", "dropped"],
+    }
+
+
+def test_tui_step_dependencies_tolerate_a_workflow_with_no_graph() -> None:
+    """A workflow whose body does the work itself has no nodes, and that is not a fault."""
+    assert step_dependencies(None) == {}
+    assert step_dependencies({}) == {}
+    assert step_dependencies({"nodes": "not-a-list"}) == {}
+
+
+def test_tui_step_dependencies_survive_a_workflow_version_it_cannot_read() -> None:
+    """A version the server will not serve costs the column, not the run view."""
+
+    class NoVersionClient(SteppedClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.runs[0]["target_id"] = "workflow-id"
+            self.runs[0]["target_version_id"] = "workflow-version-id-123456"
+
+        def get_workflow_version(self, workflow_id: str, version_id: str) -> dict[str, Any]:
+            raise RebaseWorkflowError("no such version")
+
+    detail = fake_tui_data(NoVersionClient()).load_run_detail("run-id", target_type="workflow")
+
+    assert detail.step_graph is None
+    assert step_dependencies(detail.step_graph) == {}
+    assert [step["name"] for step in detail.steps] == ["load_weather"]
 
 
 def test_tui_data_reads_the_step_graph_off_the_current_workflow_version() -> None:
@@ -1489,7 +1538,7 @@ def test_tui_workspace_title_opens_switcher_and_changes_profile(monkeypatch, tmp
             async with app.run_test(size=(140, 42)) as pilot:
                 await pilot.pause(0.2)
 
-                assert app.title == "Rebase TUI - Workspace: Production"
+                assert app.title == "Rebase TUI - Workspace: Production (dev)"
                 header = app.query_one(Header)
                 assert header.size.height == 1
                 assert header.tall is False
@@ -1510,7 +1559,7 @@ def test_tui_workspace_title_opens_switcher_and_changes_profile(monkeypatch, tmp
 
                 updated_config = json.loads(config_path.read_text(encoding="utf-8"))
                 assert updated_config["default_profile"] == "dev"
-                assert app.title == "Rebase TUI - Workspace: Development"
+                assert app.title == "Rebase TUI - Workspace: Development (dev)"
                 assert app.query_one("#workspace-view").styles.display == "block"
                 assert app.query_one("#projects-table", DataTable).row_count == 1
 
@@ -1537,7 +1586,7 @@ def test_tui_w_opens_switcher_and_changes_workspace(monkeypatch) -> None:
 
         async with app.run_test(size=(140, 42)) as pilot:
             await pilot.pause(0.2)
-            assert app.title == "Rebase TUI - Workspace: Production"
+            assert app.title == "Rebase TUI - Workspace: Production (dev)"
 
             await pilot.press("w")
             await pilot.pause(0.1)
@@ -1552,7 +1601,7 @@ def test_tui_w_opens_switcher_and_changes_workspace(monkeypatch) -> None:
             await pilot.pause(0.2)
 
             assert config_module.selected_profile_name() == "dev"
-            assert app.title == "Rebase TUI - Workspace: Development"
+            assert app.title == "Rebase TUI - Workspace: Development (dev)"
             assert app.current_view == "workspace"
 
     asyncio.run(scenario())
@@ -3590,15 +3639,30 @@ def test_tui_timeline_chips_filter_the_run_by_kind() -> None:
             await pilot.pause(0.2)
             assert app._timeline_filter == "timeline-steps"
             # A filtered view drops the Type column: every row would say the same word.
+            # Steps earn a `Depends on` column instead — the DAG edges are the reason
+            # this view is more than a chronological filter.
             assert [str(column.label) for column in timeline.columns.values()] == [
-                "Time",
-                "Stage",
+                "Step",
+                "Depends on",
                 "Status",
+                "Attempt",
+                "Started",
+                "Finished",
+                "Duration",
                 "Message",
             ]
-            assert [str(timeline.get_cell_at(Coordinate(row, 1))) for row in range(timeline.row_count)] == [
+            assert [str(timeline.get_cell_at(Coordinate(row, 0))) for row in range(timeline.row_count)] == [
                 "load_weather"
             ]
+            # Attempt, both timestamps and Duration are the step's own, read off the step
+            # run rather than composed into Message as `attempt 1 · finished ...` prose.
+            # A root step reads "-": blank would say "unknown" about a known fact.
+            assert [str(timeline.get_cell_at(Coordinate(0, column))) for column in (1, 3, 6)] == [
+                "-",
+                "1",
+                "15.0s",
+            ]
+            assert str(timeline.get_cell_at(Coordinate(0, 4))) != str(timeline.get_cell_at(Coordinate(0, 5)))
 
             await pilot.press("right")
             await pilot.pause(0.2)

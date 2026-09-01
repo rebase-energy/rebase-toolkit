@@ -175,6 +175,24 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "Artifacts",
         "Result / Error",
     ),
+    # `Depends on` sits next to the step it qualifies: the DAG is the reason the Steps
+    # view exists as something other than a filtered Activity, and the edges are what
+    # make an ordering readable rather than merely chronological. Attempt, the two
+    # timestamps and Duration were a `attempt 1 · finished 14:00:20` sentence crammed
+    # into Message; as columns they sort and scan, and Message is left to say the only
+    # thing that varies in shape — the error. Laid out like the Tasks view, which
+    # already answers the same "what ran, how did it go, how long" questions.
+    # There is no separate `Time`: a step row's time *is* its start.
+    "timeline-table-steps": (
+        "Step",
+        "Depends on",
+        "Status",
+        "Attempt",
+        "Started",
+        "Finished",
+        "Duration",
+        "Message",
+    ),
     "timeline-table-artifacts": ("Artifact", "Produced by", "Disposition", "Type", "Size", "URI"),
 }
 #: The tab each target table belongs to, in the order `left`/`right` cycle them.
@@ -402,6 +420,10 @@ class RunDetailData:
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     #: The runtime's own output, which the Logs chip shows alongside the events.
     logs: list[dict[str, Any]] = field(default_factory=list)
+    #: The workflow version's compiled DAG, which is where step *edges* live. A step run
+    #: records which node it is but not what it waited for, so the Steps view reads its
+    #: upstreams from here. None for a run with no reachable version.
+    step_graph: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -437,6 +459,37 @@ def _optional_list(load: Callable[[], list[dict[str, Any]]]) -> list[dict[str, A
         return load()
     except RebaseWorkflowError:
         return []
+
+
+def step_dependencies(step_graph: dict[str, Any] | None) -> dict[str, list[str]]:
+    """Each node's upstream steps, keyed by `node_key` and named the way rows are.
+
+    The graph addresses nodes by `node_key` (`count_to`) while a step row shows the
+    node's `name` (`count-to`), so the keys are translated here rather than leaving the
+    reader to match one spelling against the other. An upstream with no node of its own
+    keeps its raw key: naming it wrongly would be worse than showing it unresolved.
+
+    Separate from `workflow_steps`, which reads the same graph for the targets view:
+    that one keys by function and drops nodes without one, which is right for asking
+    "which workflow calls this function" and wrong for labelling a step run's edges.
+    """
+    nodes = (step_graph or {}).get("nodes")
+    if not isinstance(nodes, list):
+        return {}
+    names = {
+        str(node["node_key"]): str(node.get("name") or node["node_key"])
+        for node in nodes
+        if isinstance(node, dict) and node.get("node_key")
+    }
+    dependencies: dict[str, list[str]] = {}
+    for node in nodes:
+        if not isinstance(node, dict) or not node.get("node_key"):
+            continue
+        upstream = node.get("upstream_node_keys")
+        if not isinstance(upstream, list):
+            continue
+        dependencies[str(node["node_key"])] = [names.get(str(key), str(key)) for key in upstream]
+    return dependencies
 
 
 def _ephemeral_identity(run: dict[str, Any]) -> tuple[str, str] | None:
@@ -924,7 +977,28 @@ class RebaseTuiData:
                 tasks=tasks.result(),
                 artifacts=artifacts.result(),
                 logs=logs.result(),
+                step_graph=self.load_step_graph(resolved) if is_workflow else None,
             )
+
+    def load_step_graph(self, run: dict[str, Any]) -> dict[str, Any] | None:
+        """The compiled DAG behind a workflow run, for naming each step's dependencies.
+
+        Not part of the fan-out above, because it cannot be: the version id it needs is
+        an answer from the run request itself. That makes it one extra hop when a
+        workflow run is opened — and only then. Supplementary like the artifact list, so
+        a server that cannot answer costs the `Depends on` column and not the run view.
+        """
+        workflow_id = run.get("target_id")
+        version_id = run.get("target_version_id")
+        load = getattr(self.client, "get_workflow_version", None)
+        if not (workflow_id and version_id and callable(load)):
+            return None
+        try:
+            version = load(str(workflow_id), str(version_id))
+        except Exception:
+            return None
+        graph = version.get("step_graph") if isinstance(version, dict) else None
+        return graph if isinstance(graph, dict) else None
 
     def load_run_logs(self, run_id: str) -> list[dict[str, Any]]:
         entries = self.client.get_run_logs(run_id, limit=RUN_LOG_LIMIT).get("entries")
@@ -2349,12 +2423,6 @@ class RebaseTuiApp(App[None]):
         height: 1fr;
     }}
 
-    #environment-context {{
-        height: 1;
-        padding: 0 1;
-        color: {BRAND_BRIGHT_GREEN};
-    }}
-
     #workspace-resource-tabs {{
         height: 1fr;
     }}
@@ -2625,7 +2693,6 @@ class RebaseTuiApp(App[None]):
     def compose(self) -> ComposeResult:
         yield RebaseHeader(show_clock=True, icon="• Commands")
         with Vertical(id="workspace-view"):
-            yield Static("", id="environment-context")
             with TabbedContent(initial="projects-resource-tab", id="workspace-resource-tabs"):
                 with TabPane(Content("[ Projects ]"), id="projects-resource-tab"):
                     yield SelectableDataTable(id="projects-table")
@@ -4065,13 +4132,6 @@ class RebaseTuiApp(App[None]):
                 key=project_id,
             )
 
-        self.query_one("#environment-context", Static).update(
-            Text.assemble(
-                ("Environment: ", BRAND_MEDIUM_GRAY),
-                (self.environment_name, f"bold {BRAND_BRIGHT_GREEN}"),
-                ("  ·  press v to switch", BRAND_MEDIUM_GRAY),
-            )
-        )
         self._render_environment_resources(overview)
 
     def _render_environment_resources(self, overview: WorkspaceOverviewData) -> None:
@@ -4285,9 +4345,11 @@ class RebaseTuiApp(App[None]):
         kinds = dict((tab_id, kinds) for tab_id, _, kinds in TIMELINE_FILTERS)[self._timeline_filter]
         showing_all = self._timeline_filter == TIMELINE_FILTERS[0][0]
         table_name = {
+            "timeline-steps": "timeline-table-steps",
             "timeline-tasks": "timeline-table-tasks",
             "timeline-artifacts": "timeline-table-artifacts",
         }.get(self._timeline_filter, "timeline-table-all" if showing_all else "timeline-table")
+        dependencies = step_dependencies(detail.step_graph)
         table = self._fill_table(table_name, widget="timeline-table")
         message_width = self._timeline_message_width()
         self._timeline_rows = {}
@@ -4307,6 +4369,32 @@ class RebaseTuiApp(App[None]):
             message = textwrap.fill(row.message, message_width) if expanded else collapse_message(row.message)
             row_key = str(shown - 1)
             self._timeline_rows[row_key] = row
+
+            if row.kind == "step" and self._timeline_filter == "timeline-steps":
+                # A root step is shown with "-" rather than an empty cell: blank reads as
+                # "not known", and having no dependencies is a fact about the DAG.
+                step = row.record
+                upstream = dependencies.get(str(step.get("node_key") or ""))
+                depends_on = ", ".join(upstream) if upstream else "-"
+                # The error alone, not the composed summary the Activity view shows:
+                # attempt and finished have columns of their own here, and repeating
+                # them in Message would spend the widest column saying it twice.
+                outcome = format_json_summary(step.get("error"), max_length=160)
+                outcome = textwrap.fill(outcome, message_width) if expanded else collapse_message(outcome)
+                attempt = step.get("attempt")
+                table.add_row(
+                    Text(row.stage, style=MARK_STYLE),
+                    Text(depends_on, style=BRAND_MEDIUM_GRAY),
+                    status_text(row.status),
+                    Text(str(attempt) if attempt not in {None, ""} else "-", style=BRAND_MEDIUM_GRAY),
+                    self._time(step.get("started_at")),
+                    self._time(step.get("finished_at")),
+                    format_duration(step.get("started_at"), step.get("finished_at")),
+                    Text(outcome, style=BRAND_MEDIUM_GRAY),
+                    height=outcome.count("\n") + 1 if expanded else 1,
+                    key=row_key,
+                )
+                continue
 
             if row.kind == "task" and self._timeline_filter == "timeline-tasks":
                 task = row.record
@@ -4793,7 +4881,10 @@ class RebaseTuiApp(App[None]):
         return workspace_id if isinstance(workspace_id, str) and workspace_id else "-"
 
     def _update_workspace_title(self) -> None:
-        title = f"Rebase TUI - Workspace: {self._workspace_label()}"
+        # The environment rides along in the title rather than owning a row of its
+        # own: it is one short word, it qualifies the workspace rather than standing
+        # beside it, and this way it stays on screen in the project view too.
+        title = f"Rebase TUI - Workspace: {self._workspace_label()} ({self.environment_name})"
         if self.current_view == "project" and self.selected_project is not None:
             title = f"{title} / {self.selected_project.get('name', '-')}"
         if self._marked_count:
