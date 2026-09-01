@@ -4443,6 +4443,16 @@ class Client:
     def get_workflow_schedule(self, workflow_id: str) -> dict[str, Any]:
         return self._request_dict("GET", f"/workflows/{workflow_id}/schedule", expected="workflow schedule response")
 
+    def pause_workflow(self, workflow_id: str, *, until: str | None = None) -> dict[str, Any]:
+        """Pause a workflow's scheduled runs; ``until`` (ISO 8601) lifts the pause on its own."""
+        return self._request_dict(
+            "POST", f"/workflows/{workflow_id}/pause", json={"until": until}, expected="workflow response"
+        )
+
+    def resume_workflow(self, workflow_id: str) -> dict[str, Any]:
+        """Lift a workflow's pause so scheduled runs fire again."""
+        return self._request_dict("POST", f"/workflows/{workflow_id}/resume", expected="workflow response")
+
     def get_workflow_trigger(self, workflow_id: str) -> dict[str, Any]:
         return self._request_dict("GET", f"/workflows/{workflow_id}/trigger", expected="workflow trigger response")
 

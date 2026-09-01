@@ -798,6 +798,7 @@ def test_tui_project_row_puts_each_count_under_its_own_header() -> None:
                 "Workflows",
                 "Cron jobs",
                 "Endpoints",
+                "Status",
                 "Last run",
                 "Next run",
                 "Created",
@@ -809,17 +810,16 @@ def test_tui_project_row_puts_each_count_under_its_own_header() -> None:
     asyncio.run(scenario())
 
 
-def test_tui_counts_only_workflows_the_api_says_will_fire_as_cron_jobs() -> None:
-    """A schedule that cannot fire is not a cron job, and the API is the judge of that."""
+def test_tui_counts_configured_crons_and_rolls_their_states_into_status() -> None:
+    """A stopped or paused cron is still a cron job; the Status column carries its state."""
     client = FakeClient()
     client.workflows.append(
         {
-            "id": "paused-workflow-id",
+            "id": "stopped-workflow-id",
             "project_id": "project-id",
-            "name": "paused",
+            "name": "stopped",
             "enabled": True,
-            # A schedule the API refused to give a next_run_at: paused, disabled,
-            # or an unusable cron expression. Either way it is not a cron job.
+            # Deactivated in the schedule itself: configured, deliberately not firing.
             "schedule": {"type": "cron", "cron": "0 6 * * *", "active": False},
             "next_run_at": None,
         }
@@ -830,7 +830,34 @@ def test_tui_counts_only_workflows_the_api_says_will_fire_as_cron_jobs() -> None
 
     energy = overview.project_summaries[0]
     assert energy.workflow_count == 3
+    assert energy.cron_count == 2
+    # Any cron still due to fire makes the project active; run outcomes play no part.
+    assert energy.cron_status == "active"
+
+
+def test_tui_status_reads_paused_with_the_soonest_resume_when_nothing_fires() -> None:
+    """With every firing cron paused, Status says so and names the earliest resume."""
+    client = FakeClient()
+    client.workflows[0]["paused"] = True
+    client.workflows[0]["paused_until"] = "2099-09-15T10:00:00Z"
+
+    overview = fake_tui_data(client).load_workspace_overview()
+
+    energy = overview.project_summaries[0]
     assert energy.cron_count == 1
+    assert energy.cron_status == "paused"
+    assert energy.paused_until == "2099-09-15T10:00:00Z"
+
+
+def test_tui_status_treats_an_expired_pause_as_lifted() -> None:
+    """A pause whose expiry has passed no longer holds, whatever the row still says."""
+    client = FakeClient()
+    client.workflows[0]["paused"] = True
+    client.workflows[0]["paused_until"] = "2020-01-01T00:00:00Z"
+
+    overview = fake_tui_data(client).load_workspace_overview()
+
+    assert overview.project_summaries[0].cron_status == "active"
 
 
 def test_tui_overview_survives_an_api_without_the_endpoints_route() -> None:
@@ -2463,6 +2490,7 @@ def test_tui_tables_have_no_header_until_their_rows_arrive() -> None:
                 "Workflows",
                 "Cron jobs",
                 "Endpoints",
+                "Status",
                 "Last run",
                 "Next run",
                 "Created",

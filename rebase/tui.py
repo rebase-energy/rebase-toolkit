@@ -124,6 +124,7 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "Workflows",
         "Cron jobs",
         "Endpoints",
+        "Status",
         "Last run",
         "Next run",
         "Created",
@@ -312,6 +313,12 @@ class ProjectSummary:
     cron_count: int = 0
     last_run: dict[str, Any] | None = None
     next_run_at: str | None = None
+    #: Config-derived rollup of the project's cron states — "active", "paused" or
+    #: "stopped" — with None meaning the project has no crons at all. Run
+    #: outcomes never feed into this; those belong to `last_run`.
+    cron_status: str | None = None
+    #: Soonest automatic resume among the paused crons, when one is timed.
+    paused_until: str | None = None
 
 
 @dataclass(frozen=True)
@@ -322,6 +329,8 @@ class OverviewCounts:
     crons: dict[str, int]
     last_runs: dict[str, dict[str, Any]] = field(default_factory=dict)
     next_runs: dict[str, str] = field(default_factory=dict)
+    cron_statuses: dict[str, str] = field(default_factory=dict)
+    paused_untils: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -638,6 +647,8 @@ class RebaseTuiData:
                     cron_count=counts.crons.get(str(project["id"]), 0),
                     last_run=counts.last_runs.get(str(project["id"])),
                     next_run_at=counts.next_runs.get(str(project["id"])),
+                    cron_status=counts.cron_statuses.get(str(project["id"])),
+                    paused_until=counts.paused_untils.get(str(project["id"])),
                 )
                 for project in projects
             ],
@@ -670,7 +681,7 @@ class RebaseTuiData:
             # workspace, so a project on a 15-minute cron fills any page size and
             # the quiet projects — the ones worth checking — drop off the end.
             last_runs = executor.submit(self.client.list_latest_runs_by_project)
-        workflow_counts, cron_counts, next_runs = workflows.result()
+        workflow_counts, cron_counts, next_runs, cron_statuses, paused_untils = workflows.result()
         return OverviewCounts(
             functions=functions.result(),
             workflows=workflow_counts,
@@ -678,36 +689,60 @@ class RebaseTuiData:
             crons=cron_counts,
             last_runs={str(run["project_id"]): run for run in last_runs.result() if run.get("project_id")},
             next_runs=next_runs,
+            cron_statuses=cron_statuses,
+            paused_untils=paused_untils,
         )
 
-    def _workflow_and_cron_counts(self) -> tuple[dict[str, int], dict[str, int], dict[str, str]]:
-        """Workflows per project, and how many of them are on a live cron.
+    def _workflow_and_cron_counts(
+        self,
+    ) -> tuple[dict[str, int], dict[str, int], dict[str, str], dict[str, str], dict[str, str]]:
+        """Workflows per project, their cron count, and the config-level cron status.
 
-        Both come out of the one workspace-wide call, so the cron column costs no
-        request of its own. A workflow counts as a cron job when the API gives it a
-        `next_run_at`: that is the platform's own verdict, computed per read, and it
-        already accounts for a missing or paused schedule, a disabled workflow or
-        version, and an unusable cron expression. Re-deriving those rules here would
-        only give them somewhere to drift apart.
+        All of it comes out of the one workspace-wide call, so no column costs a
+        request of its own. A workflow counts as a cron job whenever it has a cron
+        schedule configured, in any state — a paused or stopped cron is still a cron
+        job; the Status column carries its liveness. That column is the config-only
+        rollup of `workflow_cron_state` (run outcomes stay with Last run): a project
+        is "active" while any cron will fire, "paused" when the best of them is
+        paused, "stopped" when every configured cron is switched off.
         """
         workflows = self.client.list_workflows()
         # The soonest fire time per project, out of the same read the counts come
         # from — so the column costs no request of its own. Earliest wins: with
         # several schedules in a project, the next thing to happen is the answer.
         next_runs: dict[str, str] = {}
+        states: dict[str, list[str]] = {}
+        resume_times: dict[str, list[str]] = {}
         for item in workflows:
-            project_id, next_run_at = str(item.get("project_id") or ""), item.get("next_run_at")
-            if not project_id or not next_run_at:
+            project_id = str(item.get("project_id") or "")
+            if not project_id:
                 continue
-            current = next_runs.get(project_id)
-            if current is None or str(next_run_at) < current:
-                next_runs[project_id] = str(next_run_at)
+            next_run_at = item.get("next_run_at")
+            if next_run_at:
+                current = next_runs.get(project_id)
+                if current is None or str(next_run_at) < current:
+                    next_runs[project_id] = str(next_run_at)
+            state = workflow_cron_state(item)
+            if state is None:
+                continue
+            states.setdefault(project_id, []).append(state)
+            if state == "paused" and item.get("paused_until"):
+                resume_times.setdefault(project_id, []).append(str(item["paused_until"]))
+        cron_statuses = {
+            project_id: next(state for state in ("active", "paused", "stopped") if state in project_states)
+            for project_id, project_states in states.items()
+        }
+        paused_untils = {
+            project_id: min(times)
+            for project_id, times in resume_times.items()
+            if cron_statuses.get(project_id) == "paused"
+        }
         return (
             Counter(str(item["project_id"]) for item in workflows if item.get("project_id")),
-            Counter(
-                str(item["project_id"]) for item in workflows if item.get("project_id") and item.get("next_run_at")
-            ),
+            {project_id: len(project_states) for project_id, project_states in states.items()},
             next_runs,
+            cron_statuses,
+            paused_untils,
         )
 
     @staticmethod
@@ -1425,13 +1460,56 @@ def format_execution(value: dict[str, Any]) -> str:
     return str(value.get("run_type") or "-")
 
 
-def format_schedule(value: Any) -> str:
+def format_schedule(value: Any, *, paused: bool = False) -> str:
     if not isinstance(value, dict):
         return "-"
     cron = str(value.get("cron") or "-")
-    if not value.get("active", True):
+    if not value.get("active", True) or paused:
         return f"{cron} ⏸"
     return cron
+
+
+def _pause_in_effect(paused_until: Any) -> bool:
+    """Whether a pause with this expiry still holds. No expiry means indefinite."""
+    if not paused_until:
+        return True
+    try:
+        until = datetime.fromisoformat(str(paused_until).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=UTC)
+    return datetime.now(UTC) < until
+
+
+def workflow_cron_state(workflow: dict[str, Any]) -> str | None:
+    """One workflow's cron state as the user configured it, or None without a cron.
+
+    Purely config-derived — "active", "paused" or "stopped" — so a cron that fires
+    and crashes every time is still active: nobody has stopped it. Run outcomes
+    belong to the Last run column, not here.
+    """
+    schedule = workflow.get("schedule")
+    if not isinstance(schedule, dict) or schedule.get("type", "cron") != "cron":
+        return None
+    if workflow.get("enabled") is False or not schedule.get("active", True):
+        return "stopped"
+    if workflow.get("paused") and _pause_in_effect(workflow.get("paused_until")):
+        return "paused"
+    # Active flags but no computed fire time means the platform cannot run it —
+    # a disabled version or an unusable cron expression: configured, not firing.
+    return "active" if workflow.get("next_run_at") else "stopped"
+
+
+def cron_status_text(status: str | None, paused_until: str | None = None) -> Text:
+    if status is None:
+        return Text("-")
+    if status == "active":
+        return Text("active", style=BRAND_MAIN_GREEN)
+    if status == "paused":
+        label = f"paused → {str(paused_until)[:10]}" if paused_until else "paused"
+        return Text(label, style=BRAND_AMBER)
+    return Text("stopped", style=BRAND_CORAL_RED)
 
 
 def format_json_summary(value: Any, *, max_length: int = 180) -> str:
@@ -4129,11 +4207,12 @@ class RebaseTuiApp(App[None]):
         for project_id, summary in self._project_rows.items():
             project = summary.project
             last_run = summary.last_run or {}
-            # Time carries the status colour rather than spending a column on the
-            # word: on a row of counts, whether the last run was green or red is
-            # the signal, and the timestamp is already there to hang it on.
+            # The outcome rides with the timestamp — "14:10:47 completed", coloured —
+            # so Last run answers "what happened when it ran?" on its own, while the
+            # Status column stays purely what the user configured.
+            last_run_time = self._time(last_run.get("created_at"))
             last_run_cell = Text(
-                self._time(last_run.get("created_at")),
+                f"{last_run_time} {last_run['status']}" if last_run.get("status") else last_run_time,
                 style=status_style(last_run["status"]) if last_run.get("status") else "",
             )
             projects.add_row(
@@ -4142,6 +4221,7 @@ class RebaseTuiApp(App[None]):
                 str(summary.workflow_count),
                 str(summary.cron_count),
                 str(summary.endpoint_count),
+                cron_status_text(summary.cron_status, summary.paused_until),
                 last_run_cell,
                 self._time(summary.next_run_at),
                 self._time(project.get("created_at")),
@@ -4259,7 +4339,10 @@ class RebaseTuiApp(App[None]):
                 format_execution(workflow),
                 format_bool(workflow.get("enabled")),
                 format_endpoint(self._target_endpoints("workflow", workflow_id)),
-                format_schedule(workflow.get("schedule")),
+                format_schedule(
+                    workflow.get("schedule"),
+                    paused=bool(workflow.get("paused")) and _pause_in_effect(workflow.get("paused_until")),
+                ),
                 self._time(workflow.get("next_run_at")),
                 self._time(self._last_runs.get(workflow_id)),
                 compact_id(workflow.get("current_version_id")),
