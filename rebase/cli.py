@@ -684,6 +684,21 @@ def _progress_prefix(status: str) -> tuple[str, str]:
     return "•", "rebase.muted"
 
 
+def _log_line(timestamp: str, message: str) -> Text:
+    """A log line whose message is literal text, not console markup.
+
+    Built as `Text` rather than interpolated into a markup string: a log message is
+    user output, and Rich reads `[...]` in it as a style tag. A workflow printing
+    `[my-workflow] tick` had the label silently eaten, and a message carrying an
+    unclosed or unknown tag can fail to render at all — losing the line the reader
+    asked for. The timestamp is still styled; only the message is protected.
+    """
+    line = Text(timestamp, style="rebase.muted")
+    line.append(" ")
+    line.append(message)
+    return line
+
+
 def _format_duration(seconds: float) -> str:
     return f"{seconds:.2f}"
 
@@ -719,7 +734,7 @@ class _LineRunProgressReporter:
 
     def log(self, timestamp: str, message: str, severity: str = "INFO") -> None:
         style = "rebase.error" if severity in {"ERROR", "CRITICAL", "WARNING"} else None
-        console.print(f"[rebase.muted]{timestamp}[/rebase.muted] {message}", style=style, highlight=False)
+        console.print(_log_line(timestamp, message), style=style, highlight=False)
 
     def step(self, name: str, status: str) -> None:
         if status == "running":
@@ -782,7 +797,7 @@ class _TerminalRunProgressReporter:
 
     def log(self, timestamp: str, message: str, severity: str = "INFO") -> None:
         style = "rebase.error" if severity in {"ERROR", "CRITICAL", "WARNING"} else None
-        self._live.console.print(f"[rebase.muted]{timestamp}[/rebase.muted] {message}", style=style, highlight=False)
+        self._live.console.print(_log_line(timestamp, message), style=style, highlight=False)
 
     def _workflow_steps_tree(self) -> Tree:
         if self._steps_tree is None:
