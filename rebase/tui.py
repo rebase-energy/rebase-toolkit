@@ -2264,6 +2264,7 @@ class RebaseTuiApp(App[None]):
         Binding("v", "choose_environment", "Switch environment", show=False),
         Binding("a", "open_artifact", "Open artifact", show=False),
         Binding("s", "toggle_terminal_select", "Select text", show=False),
+        Binding("c", "copy_row", "Copy ID", show=False),
         Binding("p", "show_details", "Details", show=False),
         Binding("l", "toggle_logs", "Logs", show=False),
         Binding("e", "toggle_events", "Events", show=False),
@@ -3332,6 +3333,68 @@ class RebaseTuiApp(App[None]):
         if new_x == end.x:
             return
         screen.selections = {widget: Selection(start, Offset(new_x, end.y))}
+
+    def action_copy_row(self) -> None:
+        """Copy the highlighted row's identifier — or the marked rows' — to the clipboard.
+
+        Every table keys its rows on the thing's API id (or its name, for things the
+        API identifies by name), which is exactly the handle to paste into a `rebase`
+        command or hand to an agent. Copied as `workflow_id=...` rather than the bare
+        value, so both the reader and whatever it is pasted into can tell what kind of
+        identifier it is. The clipboard write goes through the terminal (OSC 52), the
+        same channel Textual's own selection copy uses, so it works over SSH and
+        inside tmux wherever that copy does.
+        """
+        table = self.focused
+        if not isinstance(table, DataTable):
+            self.notify("Select a row first — c copies its ID.", severity="warning")
+            return
+        keys = table.marked_keys if isinstance(table, SelectableDataTable) else []
+        if not keys:
+            keys = [key for key in (self._cursor_key(table),) if key is not None]
+        table_id = str(table.id or "")
+        ids = [value for key in keys if (value := self._row_identifier(table_id, key)) is not None]
+        if not ids:
+            self.notify("Select a row first — c copies its ID.", severity="warning")
+            return
+        self.copy_to_clipboard("\n".join(ids))
+        self.notify(
+            f"Copied {ids[0]} to the clipboard." if len(ids) == 1 else f"Copied {len(ids)} IDs to the clipboard."
+        )
+
+    def _row_identifier(self, table_id: str, key: str) -> str | None:
+        """The copyable identity behind one row key, as a `label=value` pair.
+
+        The value is almost always the key itself. The two synthetic keys are
+        unwrapped: a one-off row registers no target, so the name it ran under is its
+        identity; a timeline row is keyed by position, so its record's own id is the
+        answer — and for the rows that have none (events, log lines), the run they
+        belong to is. The label says what the value identifies, in the vocabulary an
+        agent would search the API or codebase for — including whether a resource is
+        being named by id or, where its API reports none, by name.
+        """
+        if key.startswith(EPHEMERAL_ROW_PREFIX):
+            _, target_type, name = key.split(":", 2)
+            return f"{target_type}_name={name}"
+        if table_id == "timeline-table":
+            row = self._timeline_rows.get(key)
+            record_id = row.record.get("id") if row is not None else None
+            if record_id and row is not None:
+                return f"{row.kind}_id={record_id}"
+            run_id = self._run_detail.run.get("id") if self._run_detail is not None else None
+            return f"run_id={run_id}" if run_id else None
+        if table_id in self._workspace_resource_rows:
+            kind = table_id.removesuffix("-table").removesuffix("s")
+            item = self._workspace_resource_rows[table_id].get(key, {})
+            return f"{kind}_id={key}" if item.get("id") == key else f"{kind}_name={key}"
+        label = {
+            "projects-table": "project_id",
+            "workflows-table": "workflow_id",
+            "functions-table": "function_id",
+            "runs-table": "run_id",
+            "workspace-profiles-table": "profile",
+        }.get(table_id, "id")
+        return f"{label}={key}"
 
     def action_delete_selection(self) -> None:
         """Delete the marked rows, or the row under the cursor when nothing is marked."""

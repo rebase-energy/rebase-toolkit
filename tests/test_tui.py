@@ -1591,6 +1591,82 @@ def test_tui_shift_arrows_mark_a_range_and_plain_movement_drops_it() -> None:
     asyncio.run(scenario())
 
 
+def test_tui_c_copies_the_highlighted_rows_identifier() -> None:
+    class BucketClient(FakeClient):
+        def list_buckets(self) -> list[dict[str, Any]]:
+            # No id: the API identifies buckets by name, and the copy should say so.
+            return [{"name": "raw-data", "uri": "gs://rb-raw-data"}]
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(BucketClient(), limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("c")
+            await pilot.pause(0.1)
+            assert app.clipboard == "project_id=project-id"
+
+            # Marked rows go together, one id per line.
+            await pilot.press("shift+down")
+            await pilot.press("c")
+            await pilot.pause(0.1)
+            assert app.clipboard == "project_id=project-id\nproject_id=other-project-id"
+            await pilot.press("escape")
+
+            # A resource the API identifies by name says so, rather than passing the
+            # name off as an id.
+            app.query_one("#workspace-resource-tabs", TabbedContent).active = "buckets-resource-tab"
+            await pilot.pause(0.1)
+            buckets = app.query_one("#buckets-table", SelectableDataTable)
+            buckets.focus()
+            buckets.move_cursor(row=0)
+            await pilot.press("c")
+            await pilot.pause(0.1)
+            assert app.clipboard == "bucket_name=raw-data"
+
+            # Deeper rows copy their own ids: the workflow, then its run.
+            app.query_one("#workspace-resource-tabs", TabbedContent).active = "projects-resource-tab"
+            await pilot.pause(0.1)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            workflows.focus()
+            workflows.move_cursor(row=0)
+            await pilot.press("c")
+            await pilot.pause(0.1)
+            assert app.clipboard == "workflow_id=workflow-id"
+
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            runs = app.query_one("#runs-table", DataTable)
+            runs.focus()
+            runs.move_cursor(row=0)
+            await pilot.press("c")
+            await pilot.pause(0.1)
+            assert app.clipboard == "run_id=run-id"
+
+            # Timeline rows are keyed by position, so `c` reaches for the record's own
+            # id — and a log line, which has none, answers with the run it belongs to.
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            timeline = app.query_one("#timeline-table", DataTable)
+            timeline.focus()
+            copied = []
+            for row in range(3):
+                timeline.move_cursor(row=row)
+                await pilot.press("c")
+                await pilot.pause(0.1)
+                copied.append(app.clipboard)
+            assert copied == ["event_id=event-id", "run_id=run-id", "step_id=step-id"]
+
+    asyncio.run(scenario())
+
+
 def test_tui_delete_of_one_project_requires_its_name_typed_back() -> None:
     async def scenario() -> None:
         client = FakeClient()
