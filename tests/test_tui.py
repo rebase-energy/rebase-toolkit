@@ -1640,6 +1640,40 @@ def test_tui_shift_arrows_mark_a_range_and_plain_movement_drops_it() -> None:
     asyncio.run(scenario())
 
 
+def test_tui_escape_goes_back_like_b_but_clears_marks_first() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+            assert app.query_one("#project-view").styles.display == "block"
+
+            # With rows marked, escape spends itself on the marks and stays put.
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            workflows.focus()
+            workflows.move_cursor(row=0)
+            await pilot.press("shift+down")
+            await pilot.pause(0.1)
+            assert workflows.marked_keys == ["workflow-id"]
+            await pilot.press("escape")
+            await pilot.pause(0.1)
+            assert workflows.marked_keys == []
+            assert app.query_one("#project-view").styles.display == "block"
+
+            # With nothing marked it walks back, exactly like b.
+            await pilot.press("escape")
+            await pilot.pause(0.2)
+            assert app.query_one("#workspace-view").styles.display == "block"
+            assert app.query_one("#project-view").styles.display == "none"
+
+    asyncio.run(scenario())
+
+
 def test_tui_c_copies_the_highlighted_rows_identifier() -> None:
     class BucketClient(FakeClient):
         def list_buckets(self) -> list[dict[str, Any]]:

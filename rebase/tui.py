@@ -1840,6 +1840,18 @@ class SelectableDataTable(HeaderSafeDataTable):
         self._anchor = None
         self._apply_marks(set())
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
+        """Claim `escape` only while there are marks to clear.
+
+        `escape` is also the app's Back key, and the focused table's binding would
+        otherwise swallow it unconditionally. Declining the action when nothing is
+        marked lets the key fall through to the app, so escape clears marks first
+        and navigates back the press after — the same order `b` users expect.
+        """
+        if action == "clear_marks":
+            return bool(self._marked)
+        return True
+
     def restore_marks(self, keys: Iterable[str]) -> None:
         """Re-mark *keys*, ignoring any whose row is gone.
 
@@ -2328,6 +2340,10 @@ class RebaseTuiApp(App[None]):
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
         ("b", "back", "Back"),
+        # The same action `b` runs; hidden so the footer does not say Back twice.
+        # Tables bind escape to clear marks, but only claim it while marks exist
+        # (see SelectableDataTable.check_action), so it falls through to here.
+        Binding("escape", "back", "Back", show=False),
         # Everything below stays out of the footer and lives in the key panel, which
         # lists `show=False` bindings too. Ten hints did not fit the width, so the four
         # you move around with kept their places and the rest went one keystroke away.
