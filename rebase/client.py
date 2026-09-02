@@ -4585,6 +4585,62 @@ class Client:
             "PATCH", "/workspace/compute-policy", json=payload, expected="workspace compute policy response"
         )
 
+    # Vendor-side administration across every workspace. These routes are gated by
+    # the profile-level superadmin check, so they need a session credential -- an
+    # API key is refused -- and they name the target workspace in the path rather
+    # than through X-Rebase-Workspace, which is why none of them take a header
+    # override or care what workspace this client is configured for.
+
+    def list_admin_workspaces(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        return self._request_list(
+            "GET", "/admin/workspaces", params={"limit": limit}, expected="admin workspace list response"
+        )
+
+    def get_admin_workspace_usage(self, workspace_id: str) -> dict[str, Any]:
+        return self._request_dict(
+            "GET", f"/admin/workspaces/{workspace_id}/usage", expected="workspace usage response"
+        )
+
+    def update_admin_compute_policy(
+        self,
+        workspace_id: str,
+        *,
+        max_run_timeout_seconds: int | None = None,
+        max_concurrent_cloud_run_runs: int | None = None,
+        max_cloud_run_instances: int | None = None,
+        max_cloud_run_concurrency: int | None = None,
+        max_cloud_run_cpu_milli: int | None = None,
+        max_cloud_run_memory_mib: int | None = None,
+    ) -> dict[str, Any]:
+        # Same encoding as update_workspace_compute_policy above: NOT NULL integers,
+        # so None means "not set", never "clear".
+        payload: dict[str, Any] = {}
+        for key, value in (
+            ("max_run_timeout_seconds", max_run_timeout_seconds),
+            ("max_concurrent_cloud_run_runs", max_concurrent_cloud_run_runs),
+            ("max_cloud_run_instances", max_cloud_run_instances),
+            ("max_cloud_run_concurrency", max_cloud_run_concurrency),
+            ("max_cloud_run_cpu_milli", max_cloud_run_cpu_milli),
+            ("max_cloud_run_memory_mib", max_cloud_run_memory_mib),
+        ):
+            if value is not None:
+                payload[key] = value
+        return self._request_dict(
+            "PATCH",
+            f"/admin/workspaces/{workspace_id}/compute-policy",
+            json=payload,
+            expected="workspace compute policy response",
+        )
+
+    def update_admin_credit_grant(self, workspace_id: str, *, monthly_credit_cents: int) -> dict[str, Any]:
+        """Set the monthly grant for this month and the ones after; returns the resulting usage."""
+        return self._request_dict(
+            "PATCH",
+            f"/admin/workspaces/{workspace_id}/credit-grant",
+            json={"monthly_credit_cents": monthly_credit_cents},
+            expected="workspace usage response",
+        )
+
     def list_runs(
         self,
         *,

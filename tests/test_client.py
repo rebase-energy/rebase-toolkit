@@ -3766,3 +3766,28 @@ def test_update_workflow_can_clear_cpu_and_memory(monkeypatch) -> None:
     client.update_workflow("workflow-id", source_code="def sync(): pass")
     assert "cloud_run_cpu" not in observed
     assert "cloud_run_memory" not in observed
+
+
+def test_admin_client_methods_address_the_workspace_in_the_path(monkeypatch) -> None:
+    """Admin routes are profile-gated and cross-tenant, so the target rides in the
+    path and X-Rebase-Workspace is irrelevant -- whatever this client is configured for."""
+    calls: list[tuple[str, str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        calls.append((method, url, kwargs.get("json")))
+        return FakeResponse([] if url.endswith("/admin/workspaces") else {"workspace_id": "acme"})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com", workspace_id="somewhere-else")
+
+    client.list_admin_workspaces(limit=25)
+    client.get_admin_workspace_usage("acme")
+    client.update_admin_compute_policy("acme", max_cloud_run_memory_mib=4096)
+    client.update_admin_credit_grant("acme", monthly_credit_cents=500)
+
+    assert [(m, u.removeprefix("https://workflows.example.com"), j) for m, u, j in calls] == [
+        ("GET", "/admin/workspaces", None),
+        ("GET", "/admin/workspaces/acme/usage", None),
+        ("PATCH", "/admin/workspaces/acme/compute-policy", {"max_cloud_run_memory_mib": 4096}),
+        ("PATCH", "/admin/workspaces/acme/credit-grant", {"monthly_credit_cents": 500}),
+    ]

@@ -2221,6 +2221,138 @@ def tui_command(
     )
 
 
+admin_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help=(
+        "Superadmin view of every workspace, its members and its quota. "
+        "Bare [bold]rebase admin[/bold] opens the TUI; needs a session credential, not an API key."
+    ),
+    no_args_is_help=False,
+    rich_markup_mode="rich",
+)
+
+
+@admin_app.callback(invoke_without_command=True)
+def admin_callback(ctx: typer.Context) -> None:
+    """Open the admin TUI when no subcommand is given."""
+    if ctx.invoked_subcommand is not None:
+        return
+    # Deferred for the same reason `tui` defers it: importing textual at module
+    # scope taxes every other command's startup.
+    from rebase.admin_tui import run_admin_tui
+
+    run_admin_tui()
+
+
+def _admin_workspaces_table(workspaces: list[dict[str, Any]]) -> Table:
+    from rebase.admin_format import WORKSPACE_COLUMNS, workspace_row
+
+    table = Table(
+        title="Workspaces",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    styles = {"Name": "rebase.value", "ID": "rebase.muted", "Policy": "rebase.muted"}
+    for column in WORKSPACE_COLUMNS:
+        table.add_column(column, style=styles.get(column))
+    for workspace in workspaces:
+        table.add_row(*workspace_row(workspace))
+    return table
+
+
+@admin_app.command("workspaces")
+def admin_workspaces_command(
+    limit: Annotated[int, typer.Option("--limit", "-l", min=1, max=1000, help="Maximum workspaces to list.")] = 200,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List every workspace with its members and quota.
+
+    A workspace that has never run anything has no compute-policy row yet; it is
+    listed with the table defaults and marked [bold]defaults[/bold] in the Policy column.
+    """
+    workspaces = Client().list_admin_workspaces(limit=limit)
+    if json_output:
+        _print_json(workspaces)
+        return
+    console.print(_admin_workspaces_table(workspaces))
+
+
+@admin_app.command("set")
+def admin_set_command(
+    workspace: Annotated[str, typer.Argument(help="Workspace id to change.")],
+    max_memory_mib: Annotated[
+        int | None, typer.Option("--max-memory-mib", "-m", help="Ceiling for a target's memory, in MiB.")
+    ] = None,
+    max_cpu_milli: Annotated[
+        int | None, typer.Option("--max-cpu-milli", help="Ceiling for a target's vCPU, in milli-vCPU.")
+    ] = None,
+    max_run_timeout_seconds: Annotated[
+        int | None, typer.Option("--max-run-timeout-seconds", help="Ceiling for a single request, in seconds.")
+    ] = None,
+    max_concurrent_runs: Annotated[
+        int | None, typer.Option("--max-concurrent-runs", help="Cloud Run runs allowed in flight at once.")
+    ] = None,
+    max_instances: Annotated[
+        int | None, typer.Option("--max-instances", help="Ceiling for a service's max instance count.")
+    ] = None,
+    max_concurrency: Annotated[
+        int | None, typer.Option("--max-concurrency", help="Ceiling for a service's per-instance concurrency.")
+    ] = None,
+    monthly_credit_cents: Annotated[
+        int | None,
+        typer.Option(
+            "--monthly-credit-cents",
+            min=0,
+            help="Monthly credit grant, in cents. Takes effect this month, not just from the 1st.",
+        ),
+    ] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Change a workspace's quota as a superadmin.
+
+    Capacity ceilings and the credit grant are separate writes on the platform, so
+    passing both makes two requests; either may be refused on its own. Lowering the
+    grant below what the workspace has already spent blocks its compute immediately.
+    """
+    limits = {
+        key: value
+        for key, value in {
+            "max_cloud_run_memory_mib": max_memory_mib,
+            "max_cloud_run_cpu_milli": max_cpu_milli,
+            "max_run_timeout_seconds": max_run_timeout_seconds,
+            "max_concurrent_cloud_run_runs": max_concurrent_runs,
+            "max_cloud_run_instances": max_instances,
+            "max_cloud_run_concurrency": max_concurrency,
+        }.items()
+        if value is not None
+    }
+    if not limits and monthly_credit_cents is None:
+        raise RebaseWorkflowError("nothing to update; pass at least one --max-* flag or --monthly-credit-cents")
+    client = Client()
+    policy = client.update_admin_compute_policy(workspace, **limits) if limits else None
+    usage = (
+        client.update_admin_credit_grant(workspace, monthly_credit_cents=monthly_credit_cents)
+        if monthly_credit_cents is not None
+        else None
+    )
+    if json_output:
+        _print_json({"policy": policy, "usage": usage})
+        return
+    if policy is not None:
+        console.print(_detail_table(f"Compute Policy — {workspace}", policy, preferred_keys=COMPUTE_POLICY_DETAIL_KEYS))
+    if usage is not None:
+        console.print(_detail_table(f"Usage this month — {workspace}", usage))
+        if usage.get("compute_blocked"):
+            console.print(
+                f"Compute is now blocked in {workspace}: the grant is below what it has already spent this month.",
+                style="rebase.error",
+            )
+
+
 def _profile_list_data() -> dict[str, Any]:
     profiles = list_profiles()
     if not profiles:
@@ -3117,6 +3249,7 @@ def environment_unprotect_command(
 app.add_typer(profile_app, name="profile")
 app.add_typer(workspace_app, name="workspace")
 app.add_typer(environment_app, name="environment")
+app.add_typer(admin_app, name="admin")
 
 
 @connect_app.command("github")

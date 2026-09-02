@@ -4,6 +4,21 @@
 
 ### Added
 
+- **`rebase admin` is a superadmin TUI over every workspace.** One row per workspace with
+  its members, quota ceilings, and monthly credit; `enter` opens a drawer with the member
+  list and this month's spend, and `e` edits any of the seven quota fields in place. A
+  workspace that has never run anything is listed with the table defaults and flagged
+  `defaults` rather than dropped — its compute-policy row does not exist yet, and the
+  listing does not create one. `rebase admin workspaces [--json]` and
+  `rebase admin set <workspace> --max-memory-mib … --monthly-credit-cents …` are the
+  headless twins. Editing the credit grant updates both the policy and the current month's
+  grant row, so it takes effect immediately rather than on the 1st; lowering it below what
+  the workspace has already spent blocks its compute at once, and the TUI asks twice before
+  doing that. The commands are gated by a profile-level superadmin check, so they need a
+  session credential (not an API key) whose email is in the API's `SUPERADMIN_EMAILS` — and
+  they work on workspaces the superadmin is a member of, which the principal-level
+  `rebase workspace compute-policy set` refuses by design.
+
 - **Job workflows can size their own container with `cpu=` and `memory=`.** A `mode="job"`
   workflow gets its own Cloud Run Job, and can now say how big it is, the same way a function
   already could: `@project.workflow(mode="job", memory="2Gi")`. Both accept Modal-style

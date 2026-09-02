@@ -5493,3 +5493,105 @@ def test_stream_run_result_still_polls_non_terminal_submit(monkeypatch) -> None:
 
     assert result == {"value": 4}
     assert FakeRun.events_calls >= 1
+
+
+# --- rebase admin ------------------------------------------------------------------
+
+
+def _admin_workspace(workspace_id: str, *, defaulted: bool = False, memory: int = 512) -> dict[str, Any]:
+    return {
+        "id": workspace_id,
+        "name": workspace_id if not defaulted else None,
+        "created_at": "2026-09-01T00:00:00Z",
+        "members": [] if defaulted else [{"email": "sebastian@rebase.energy", "role": "Owner", "enabled": True}],
+        "policy": {
+            "currency": "EUR",
+            "monthly_credit_cents": 2000,
+            "max_concurrent_cloud_run_runs": 6,
+            "max_run_timeout_seconds": 300,
+            "max_cloud_run_cpu_milli": 1000,
+            "max_cloud_run_memory_mib": memory,
+        },
+        "policy_defaulted": defaulted,
+    }
+
+
+def test_admin_workspaces_prints_every_workspace_and_flags_defaults(monkeypatch, capsys) -> None:
+    # Nine columns do not fit an 80-column capture; rich reads COLUMNS on every render.
+    monkeypatch.setenv("COLUMNS", "200")
+    listing = [_admin_workspace("agent-work", memory=4096), _admin_workspace("fresh", defaulted=True)]
+    monkeypatch.setattr(Client, "list_admin_workspaces", lambda self, *, limit=200: listing)
+
+    assert main(["admin", "workspaces"]) == 0
+
+    output = capsys.readouterr().out
+    assert "Workspaces" in output
+    assert "agent-work" in output and "4 GiB" in output
+    assert "fresh" in output and "defaults" in output
+
+
+def test_admin_workspaces_json_round_trips(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(Client, "list_admin_workspaces", lambda self, *, limit=200: [_admin_workspace("acme")])
+
+    assert main(["admin", "workspaces", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["id"] == "acme"
+    assert payload[0]["policy_defaulted"] is False
+
+
+def test_admin_set_routes_ceilings_and_credit_to_their_own_writes(monkeypatch, capsys) -> None:
+    """Capacity and billing are separate routes on the platform; the CLI must not blur them."""
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    def fake_policy(self: Client, workspace_id: str, **limits: int) -> dict[str, Any]:
+        calls.append(("policy", workspace_id, limits))
+        return {"workspace_id": workspace_id, **limits}
+
+    def fake_credit(self: Client, workspace_id: str, *, monthly_credit_cents: int) -> dict[str, Any]:
+        calls.append(("credit", workspace_id, {"monthly_credit_cents": monthly_credit_cents}))
+        return {
+            "workspace_id": workspace_id,
+            "monthly_credit_cents": monthly_credit_cents,
+            "remaining_cents": 0,
+            "compute_blocked": True,
+        }
+
+    monkeypatch.setattr(Client, "update_admin_compute_policy", fake_policy)
+    monkeypatch.setattr(Client, "update_admin_credit_grant", fake_credit)
+
+    assert main(["admin", "set", "acme", "--max-memory-mib", "4096", "--monthly-credit-cents", "100"]) == 0
+
+    assert calls == [
+        ("policy", "acme", {"max_cloud_run_memory_mib": 4096}),
+        ("credit", "acme", {"monthly_credit_cents": 100}),
+    ]
+    output = capsys.readouterr().out
+    assert "Compute is now blocked in acme" in output
+
+
+def test_admin_set_with_no_flags_is_an_error(monkeypatch, capsys) -> None:
+    assert main(["admin", "set", "acme"]) == 1
+    assert "nothing to update" in capsys.readouterr().err
+
+
+def test_admin_set_surfaces_the_servers_409_verbatim(monkeypatch, capsys) -> None:
+    def refuse(self: Client, workspace_id: str, **limits: int) -> dict[str, Any]:
+        raise RebaseWorkflowError("max_cloud_run_memory_mib cannot exceed 32768 MiB, the platform maximum")
+
+    monkeypatch.setattr(Client, "update_admin_compute_policy", refuse)
+
+    assert main(["admin", "set", "acme", "--max-memory-mib", "99999"]) == 1
+    assert "cannot exceed 32768 MiB, the platform maximum" in capsys.readouterr().err
+
+
+def test_bare_admin_opens_the_tui_lazily(monkeypatch) -> None:
+    """The TUI import happens inside the command, so `rebase admin` can be tested by
+    patching the module it imports from, and no other command pays for textual."""
+    import rebase.admin_tui as admin_tui
+
+    opened: list[bool] = []
+    monkeypatch.setattr(admin_tui, "run_admin_tui", lambda **kwargs: opened.append(True))
+
+    assert main(["admin"]) == 0
+    assert opened == [True]
