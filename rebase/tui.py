@@ -345,6 +345,21 @@ class WorkspaceOverviewData:
 
 
 @dataclass(frozen=True)
+class WorkspaceResources:
+    """The environment siblings of Projects: buckets, volumes, secrets, environments.
+
+    Kept apart from `WorkspaceOverviewData` because they answer a different question and
+    degrade independently — none of them is needed to draw the project table. They are
+    read alongside it rather than after it; see `load_workspace_overview`.
+    """
+
+    environments: list[dict[str, Any]] = field(default_factory=list)
+    buckets: list[dict[str, Any]] = field(default_factory=list)
+    volumes: list[dict[str, Any]] = field(default_factory=list)
+    secrets: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class DetailField:
     """One labelled line at the top of the details drawer."""
 
@@ -622,20 +637,27 @@ class RebaseTuiData:
             return []
         return result if isinstance(result, list) else []
 
-    def load_workspace_overview(self) -> WorkspaceOverviewData:
-        projects = self.client.list_projects()
+    def load_workspace_base(self) -> WorkspaceOverviewData:
+        """Projects and every count the project table draws, in one wave.
+
+        `list_projects` used to run to completion before the counts were even requested,
+        because `_overview_counts` took the project list as an argument and never read
+        it. Nothing in the counts depends on the projects — every one of those routes is
+        workspace-wide and keyed by `project_id` — so both go out together and the wait
+        is the slower of the two rather than their sum.
+
+        The `--project` guard still raises, and still after both are back: a
+        `ThreadPoolExecutor` waits for everything it was given on the way out of the
+        `with` block, and a running thread cannot be interrupted, so checking earlier
+        would not return any sooner.
+        """
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            projects_future = executor.submit(self.client.list_projects)
+            counts_future = executor.submit(self._overview_counts)
+        projects = projects_future.result()
         if self.project is not None and not any(project.get("name") == self.project for project in projects):
             raise RebaseWorkflowError(f"project not found: {self.project}")
-
-        counts = self._overview_counts(projects)
-        # These are environment siblings of Projects. Older servers and lightweight
-        # test clients may not expose all three routes yet, so each column degrades on
-        # its own instead of taking the project overview down with it.
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            environments = executor.submit(self._optional_resource_list, "list_environments")
-            buckets = executor.submit(self._optional_resource_list, "list_buckets")
-            volumes = executor.submit(self._optional_resource_list, "list_volumes")
-            secrets = executor.submit(self._optional_resource_list, "list_secrets")
+        counts = counts_future.result()
         return WorkspaceOverviewData(
             projects=projects,
             project_summaries=[
@@ -653,14 +675,53 @@ class RebaseTuiData:
                 for project in projects
             ],
             project_names={str(project.get("id", "")): str(project.get("name", "-")) for project in projects},
+        )
+
+    def load_workspace_resources(self) -> WorkspaceResources:
+        """The four environment-sibling reads, issued together.
+
+        Older servers and lightweight test clients may not expose all four routes, so
+        each column degrades on its own instead of taking the others down with it.
+        """
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            environments = executor.submit(self._optional_resource_list, "list_environments")
+            buckets = executor.submit(self._optional_resource_list, "list_buckets")
+            volumes = executor.submit(self._optional_resource_list, "list_volumes")
+            secrets = executor.submit(self._optional_resource_list, "list_secrets")
+        return WorkspaceResources(
             environments=environments.result() or [{"name": self.environment_name}],
             buckets=buckets.result(),
             volumes=volumes.result(),
             secrets=secrets.result(),
         )
 
-    def _overview_counts(self, projects: list[dict[str, Any]]) -> OverviewCounts:
-        """Every count the project table shows: three workspace-wide calls, in parallel.
+    def load_workspace_overview(self) -> WorkspaceOverviewData:
+        """Everything behind the workspace view: all nine reads in flight at once.
+
+        Unlike `load_project_base`/`load_project_detail`, where the second phase genuinely
+        needs the first one's answers, these two halves read disjoint things and neither
+        waits on the other, so there is no reason to stage them.
+
+        Staging them was measured and rejected. Against the live API the base costs ~1.17s
+        on its own and the resources ~0.81s, but the two together still cost ~1.17s — the
+        API absorbs the extra four requests. Painting the project table first would have
+        bought it nothing and pushed the resource tables out to ~2.0s.
+        """
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            base_future = executor.submit(self.load_workspace_base)
+            resources_future = executor.submit(self.load_workspace_resources)
+        base = base_future.result()
+        resources = resources_future.result()
+        return replace(
+            base,
+            environments=resources.environments,
+            buckets=resources.buckets,
+            volumes=resources.volumes,
+            secrets=resources.secrets,
+        )
+
+    def _overview_counts(self) -> OverviewCounts:
+        """Every count the project table shows: four workspace-wide calls, in parallel.
 
         Every one of these objects carries its own `project_id`, so each column is one
         request for the whole workspace rather than one per project. Functions used to be

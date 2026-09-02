@@ -881,6 +881,94 @@ def test_tui_data_reports_missing_project() -> None:
         fake_tui_data(FakeClient(), project="missing").load_workspace_overview()
 
 
+class ConcurrentOverviewClient(FakeClient):
+    """Each read blocks until the other has started, so only true concurrency completes.
+
+    The reads the workspace view needs used to go out in three waves, because
+    `_overview_counts` took the project list as an argument it never read. Serialise them
+    again and this deadlocks until the timeout, rather than passing a little slower.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.projects_started = threading.Event()
+        self.counts_started = threading.Event()
+        self.resources_started = threading.Event()
+
+    def list_projects(self) -> list[dict[str, Any]]:
+        self.projects_started.set()
+        assert self.counts_started.wait(timeout=5), "the counts read waited on the project list"
+        return super().list_projects()
+
+    def list_workflows(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
+        self.counts_started.set()
+        assert self.projects_started.wait(timeout=5), "the project list waited on the counts read"
+        return super().list_workflows(project=project, project_id=project_id)
+
+    def list_buckets(self) -> list[dict[str, Any]]:
+        self.resources_started.set()
+        assert self.projects_started.wait(timeout=5), "the project list waited on the resource reads"
+        return []
+
+
+def test_workspace_base_reads_projects_and_counts_together() -> None:
+    base = fake_tui_data(ConcurrentOverviewClient()).load_workspace_base()
+
+    assert [project["name"] for project in base.projects] == ["energy", "trading"]
+    assert [summary.workflow_count for summary in base.project_summaries] == [1, 0]
+
+
+def test_workspace_overview_reads_the_base_and_the_resources_together() -> None:
+    client = ConcurrentOverviewClient()
+
+    overview = fake_tui_data(client).load_workspace_overview()
+
+    assert client.resources_started.is_set()
+    assert [project["name"] for project in overview.projects] == ["energy", "trading"]
+
+
+def test_workspace_base_holds_back_what_the_project_table_does_not_need() -> None:
+    base = fake_tui_data(EnvironmentClient()).load_workspace_base()
+
+    assert [project["name"] for project in base.projects] == ["energy"]
+    # The four environment-sibling reads belong to `load_workspace_resources`, not here.
+    assert base.environments == []
+    assert base.buckets == []
+    assert base.volumes == []
+    assert base.secrets == []
+
+
+def test_workspace_resources_fills_in_what_the_base_left_empty() -> None:
+    resources = fake_tui_data(EnvironmentClient()).load_workspace_resources()
+
+    assert [item["name"] for item in resources.environments] == ["dev", "staging", "prod"]
+    assert [item["name"] for item in resources.buckets] == ["dev-data"]
+    assert [item["name"] for item in resources.volumes] == ["dev-cache"]
+    assert [item["name"] for item in resources.secrets] == ["dev-api"]
+
+
+def test_workspace_resources_degrade_one_column_at_a_time() -> None:
+    class Unsupported(EnvironmentClient):
+        def list_buckets(self) -> list[dict[str, Any]]:
+            raise RebaseWorkflowError("404 Not Found")
+
+    resources = fake_tui_data(Unsupported()).load_workspace_resources()
+
+    assert resources.buckets == []
+    # The route that failed costs its own column and nothing else.
+    assert [item["name"] for item in resources.volumes] == ["dev-cache"]
+    assert [item["name"] for item in resources.secrets] == ["dev-api"]
+
+
+def test_workspace_resources_name_the_current_environment_when_the_route_is_absent() -> None:
+    # FakeClient defines none of the four resource routes, which is how a client too old
+    # to have them behaves.
+    resources = fake_tui_data(FakeClient()).load_workspace_resources()
+
+    assert resources.environments == [{"name": "dev"}]
+    assert resources.buckets == []
+
+
 def test_tui_app_mounts_and_renders_selected_workflow_run() -> None:
     async def scenario() -> None:
         client = FakeClient()
