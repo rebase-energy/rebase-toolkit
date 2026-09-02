@@ -4246,6 +4246,8 @@ class Client:
         git_tag: str | None = None,
         git_dirty: bool | None = None,
         build: dict[str, Any] | None = None,
+        cloud_run_cpu: str | None = None,
+        cloud_run_memory: str | None = None,
     ) -> dict[str, Any]:
         environment = _resolve_environment(self, environment)
         path = "/workflows"
@@ -4274,6 +4276,8 @@ class Client:
             "env": env or {},
             "secrets": secrets or {},
             "buckets": buckets or [],
+            "cloud_run_cpu": cloud_run_cpu,
+            "cloud_run_memory": cloud_run_memory,
             "enabled": enabled,
             "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
             "environment": environment,
@@ -4324,6 +4328,12 @@ class Client:
         git_tag: str | None = None,
         git_dirty: bool | None = None,
         build: dict[str, Any] | None = None,
+        # _UNSET, not None, for the same reason as buckets/schedule above: None
+        # is a meaningful value here ("back to the backend default"), so it has
+        # to survive the drop-None filter below. Deleting `memory=` from a
+        # decorator must actually clear the limit, not silently keep the old one.
+        cloud_run_cpu: str | None | object = _UNSET,
+        cloud_run_memory: str | None | object = _UNSET,
     ) -> dict[str, Any]:
         execution_payload: dict[str, Any] = {}
         if mode is not None or isolation is not None or run_type is not None:
@@ -4370,6 +4380,10 @@ class Client:
             payload["trigger"] = trigger
         if buckets is not _UNSET:
             payload["buckets"] = buckets
+        if cloud_run_cpu is not _UNSET:
+            payload["cloud_run_cpu"] = cloud_run_cpu
+        if cloud_run_memory is not _UNSET:
+            payload["cloud_run_memory"] = cloud_run_memory
         if build:
             payload["build"] = build
         return self._request_dict("PATCH", f"/workflows/{workflow_id}", json=payload, expected="workflow response")
@@ -4548,6 +4562,8 @@ class Client:
         max_concurrent_cloud_run_runs: int | None = None,
         max_cloud_run_instances: int | None = None,
         max_cloud_run_concurrency: int | None = None,
+        max_cloud_run_cpu_milli: int | None = None,
+        max_cloud_run_memory_mib: int | None = None,
     ) -> dict[str, Any]:
         # No _UNSET sentinel here, unlike update_workspace_notifications: these are
         # NOT NULL integers with no clear-to-null semantics, so plain "None means not
@@ -4561,6 +4577,10 @@ class Client:
             payload["max_cloud_run_instances"] = max_cloud_run_instances
         if max_cloud_run_concurrency is not None:
             payload["max_cloud_run_concurrency"] = max_cloud_run_concurrency
+        if max_cloud_run_cpu_milli is not None:
+            payload["max_cloud_run_cpu_milli"] = max_cloud_run_cpu_milli
+        if max_cloud_run_memory_mib is not None:
+            payload["max_cloud_run_memory_mib"] = max_cloud_run_memory_mib
         return self._request_dict(
             "PATCH", "/workspace/compute-policy", json=payload, expected="workspace compute policy response"
         )
@@ -5068,6 +5088,8 @@ class Project:
         buckets: list[Bucket | str] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
+        cpu: float | int | str | None = None,
+        memory: int | float | str | None = None,
         resources: dict[str, Any] | None = None,
         backend: str | None = None,
     ) -> Callable[[Callable[..., Any]], Workflow]:
@@ -5097,6 +5119,8 @@ class Project:
                 buckets=buckets,
                 min_instances=min_instances,
                 concurrency=concurrency,
+                cpu=cpu,
+                memory=memory,
                 resources=resources,
             )
             self._workflows.append(workflow)
@@ -6373,6 +6397,8 @@ class Workflow:
         buckets: list[Bucket | str] | list[dict[str, Any]] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
+        cpu: float | int | str | None = None,
+        memory: int | float | str | None = None,
         resources: dict[str, Any] | None = None,
         backend: str | None = None,
     ) -> None:
@@ -6416,6 +6442,13 @@ class Workflow:
         self.image: Image | None = image if isinstance(image, Image) else None
         self.cloud_run_min_instances: int | None = None
         self.cloud_run_concurrency: int | None = None
+        # The workflow's OWN container, distinct from `resource_policy` below,
+        # which annotates its steps. Normalized eagerly, as Function does, so
+        # "2Gi" and a bare MiB int both become the Cloud Run spelling.
+        self.cloud_run_cpu: str | None = _cloud_run_cpu_value(cpu) or (data.get("cloud_run_cpu") if data else None)
+        self.cloud_run_memory: str | None = _cloud_run_memory_value(memory) or (
+            data.get("cloud_run_memory") if data else None
+        )
         self.resource_policy: dict[str, Any] = {}
 
         if fn is not None:
@@ -6618,6 +6651,8 @@ class Workflow:
                 env=self.env,
                 secrets=secrets_payload,
                 buckets=buckets_payload,
+                cloud_run_cpu=self.cloud_run_cpu,
+                cloud_run_memory=self.cloud_run_memory,
                 enabled=self.enabled,
                 endpoint=self.endpoint,
                 build=build,
@@ -6646,6 +6681,8 @@ class Workflow:
             env=self.env,
             secrets=secrets_payload,
             buckets=buckets_payload,
+            cloud_run_cpu=self.cloud_run_cpu,
+            cloud_run_memory=self.cloud_run_memory,
             enabled=self.enabled,
             endpoint=self.endpoint,
             build=build,

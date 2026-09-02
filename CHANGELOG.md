@@ -4,6 +4,19 @@
 
 ### Added
 
+- **Job workflows can size their own container with `cpu=` and `memory=`.** A `mode="job"`
+  workflow gets its own Cloud Run Job, and can now say how big it is, the same way a function
+  already could: `@project.workflow(mode="job", memory="2Gi")`. Both accept Modal-style
+  numbers (`memory=2048`) or Cloud Run strings (`"2Gi"`), and both require `mode="job"` — an
+  interactive workflow shares the Prefect worker's container, so a limit there is refused at
+  deploy time rather than accepted and ignored. This is distinct from `resources=`, which
+  annotates steps and never sized the workflow's own container. Requests are validated
+  against the workspace's `max_cloud_run_cpu_milli` / `max_cloud_run_memory_mib` at deploy
+  time, so asking for too much fails with a clear message instead of being silently shrunk
+  and OOM-killed at run time. A superadmin sets those ceilings with the new
+  `--max-memory-mib` and `--max-cpu-milli` flags on `rebase workspace compute-policy set`,
+  and both now appear in `compute-policy show`.
+
 - **First-class environments now combine Modal-style Python ergonomics with GitOps.**
   Workspaces seed `dev`, `staging`, and `prod` and can create arbitrary additional names.
   Projects, compute, runs, routes, schedules, models, secrets, volumes, and buckets are

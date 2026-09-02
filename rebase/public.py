@@ -381,6 +381,8 @@ def workflow(
     buckets: list[Bucket | str] | None = None,
     min_instances: int | None = None,
     concurrency: int | None = None,
+    cpu: float | int | str | None = None,
+    memory: int | float | str | None = None,
     resources: dict[str, Any] | None = None,
     backend: str | None = None,
 ) -> Callable[[Callable[..., Any]], Workflow]: ...
@@ -407,6 +409,8 @@ def workflow(
     buckets: list[Bucket | str] | None = None,
     min_instances: int | None = None,
     concurrency: int | None = None,
+    cpu: float | int | str | None = None,
+    memory: int | float | str | None = None,
     resources: dict[str, Any] | None = None,
     backend: str | None = None,
 ) -> Workflow: ...
@@ -432,6 +436,8 @@ def workflow(
     buckets: list[Bucket | str] | None = None,
     min_instances: int | None = None,
     concurrency: int | None = None,
+    cpu: float | int | str | None = None,
+    memory: int | float | str | None = None,
     resources: dict[str, Any] | None = None,
     backend: str | None = None,
 ) -> Callable[[Callable[..., Any]], Workflow] | Workflow:
@@ -456,6 +462,8 @@ def workflow(
             buckets=buckets,
             min_instances=min_instances,
             concurrency=concurrency,
+            cpu=cpu,
+            memory=memory,
             resources=resources,
         )
 

@@ -2860,6 +2860,8 @@ COMPUTE_POLICY_DETAIL_KEYS = [
     "max_concurrent_cloud_run_runs",
     "max_cloud_run_instances",
     "max_cloud_run_concurrency",
+    "max_cloud_run_cpu_milli",
+    "max_cloud_run_memory_mib",
     "cloud_run_enabled",
     "gpu_allowed",
     "updated_at",
@@ -2897,23 +2899,35 @@ def workspace_compute_policy_set_command(
     max_concurrency: Annotated[
         int | None, typer.Option("--max-concurrency", help="Ceiling for a service's per-instance concurrency.")
     ] = None,
+    max_cpu_milli: Annotated[
+        int | None,
+        typer.Option("--max-cpu-milli", help="Ceiling for a target's vCPU, in milli-vCPU (1000 = 1 vCPU)."),
+    ] = None,
+    max_memory_mib: Annotated[
+        int | None,
+        typer.Option("--max-memory-mib", help="Ceiling for a target's memory, in MiB (1024 = 1 GiB)."),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Update the workspace's compute limits.
 
     The policy is a ceiling, not a default: an app still opts in to a longer timeout
-    through its own `cloud_run_timeout_seconds`. A longer timeout also costs
-    proportionally more credits, since ASGI traffic is charged on elapsed runtime.
+    through its own `cloud_run_timeout_seconds`, and a workflow to more memory through
+    its own `memory=`. A longer timeout also costs proportionally more credits, since
+    ASGI traffic is charged on elapsed runtime -- as does more memory, which is charged
+    per GiB-second of whatever the container actually reserves.
     """
     if (
         max_run_timeout_seconds is None
         and max_concurrent_runs is None
         and max_instances is None
         and max_concurrency is None
+        and max_cpu_milli is None
+        and max_memory_mib is None
     ):
         raise RebaseWorkflowError(
             "nothing to update; pass --max-run-timeout-seconds, --max-concurrent-runs, "
-            "--max-instances, or --max-concurrency"
+            "--max-instances, --max-concurrency, --max-cpu-milli, or --max-memory-mib"
         )
     kwargs: dict[str, Any] = {}
     if max_run_timeout_seconds is not None:
@@ -2924,6 +2938,10 @@ def workspace_compute_policy_set_command(
         kwargs["max_cloud_run_instances"] = max_instances
     if max_concurrency is not None:
         kwargs["max_cloud_run_concurrency"] = max_concurrency
+    if max_cpu_milli is not None:
+        kwargs["max_cloud_run_cpu_milli"] = max_cpu_milli
+    if max_memory_mib is not None:
+        kwargs["max_cloud_run_memory_mib"] = max_memory_mib
     policy = Client().update_workspace_compute_policy(**kwargs)
     if json_output:
         _print_json(policy)

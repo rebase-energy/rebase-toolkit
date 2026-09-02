@@ -3722,3 +3722,47 @@ def test_explicit_api_key_survives_a_workspace_override(tmp_path, monkeypatch) -
     monkeypatch.setenv("REBASE_WORKSPACE", "other-workspace")
 
     assert rb.Client(api_key="rb_explicit").api_key == "rb_explicit"
+
+
+def test_register_workflow_sends_cpu_and_memory(monkeypatch) -> None:
+    """The workflow's own container size has to reach the wire.
+
+    It previously could not: `resources=` was handed to steps only, and
+    register/update_workflow had no cpu/memory parameter at all, so a stepless
+    job workflow had no way to ask for more than the backend default.
+    """
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed.update(kwargs["json"])
+        return FakeResponse({"id": "workflow-id", "name": "sync"})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.register_workflow(name="sync", source_code="def sync(): pass", cloud_run_memory="2Gi", cloud_run_cpu="1")
+
+    assert observed["cloud_run_cpu"] == "1"
+    assert observed["cloud_run_memory"] == "2Gi"
+
+
+def test_update_workflow_can_clear_cpu_and_memory(monkeypatch) -> None:
+    """None must survive the drop-None filter, or removing `memory=` is a no-op."""
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed.clear()
+        observed.update(kwargs["json"])
+        return FakeResponse({"id": "workflow-id", "name": "sync"})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.update_workflow("workflow-id", cloud_run_cpu=None, cloud_run_memory=None)
+    assert observed["cloud_run_cpu"] is None
+    assert observed["cloud_run_memory"] is None
+
+    # Not passing them at all leaves the stored values alone.
+    client.update_workflow("workflow-id", source_code="def sync(): pass")
+    assert "cloud_run_cpu" not in observed
+    assert "cloud_run_memory" not in observed
