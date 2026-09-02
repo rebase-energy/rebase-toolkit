@@ -660,20 +660,7 @@ class RebaseTuiData:
         counts = counts_future.result()
         return WorkspaceOverviewData(
             projects=projects,
-            project_summaries=[
-                ProjectSummary(
-                    project=project,
-                    function_count=counts.functions.get(str(project["id"]), 0),
-                    workflow_count=counts.workflows.get(str(project["id"]), 0),
-                    endpoint_count=counts.endpoints.get(str(project["id"]), 0),
-                    cron_count=counts.crons.get(str(project["id"]), 0),
-                    last_run=counts.last_runs.get(str(project["id"])),
-                    next_run_at=counts.next_runs.get(str(project["id"])),
-                    cron_status=counts.cron_statuses.get(str(project["id"])),
-                    paused_until=counts.paused_untils.get(str(project["id"])),
-                )
-                for project in projects
-            ],
+            project_summaries=self._summaries(projects, counts),
             project_names={str(project.get("id", "")): str(project.get("name", "-")) for project in projects},
         )
 
@@ -695,18 +682,75 @@ class RebaseTuiData:
             secrets=secrets.result(),
         )
 
+    def _summaries(self, projects: list[dict[str, Any]], counts: OverviewCounts) -> list[ProjectSummary]:
+        return [
+            ProjectSummary(
+                project=project,
+                function_count=counts.functions.get(str(project["id"]), 0),
+                workflow_count=counts.workflows.get(str(project["id"]), 0),
+                endpoint_count=counts.endpoints.get(str(project["id"]), 0),
+                cron_count=counts.crons.get(str(project["id"]), 0),
+                last_run=counts.last_runs.get(str(project["id"])),
+                next_run_at=counts.next_runs.get(str(project["id"])),
+                cron_status=counts.cron_statuses.get(str(project["id"])),
+                paused_until=counts.paused_untils.get(str(project["id"])),
+            )
+            for project in projects
+        ]
+
+    def load_workspace_composite(self) -> WorkspaceOverviewData | None:
+        """The whole workspace view in one request, where the platform offers the route.
+
+        `None` when this client has no such method (an older pairing, or a test double)
+        or the platform has no such route, so the caller falls back to the fan-out. That
+        is the common case against a platform behind the toolkit, not a rare one.
+
+        The payload is the raw lists rather than per-project counts, and the counts come
+        from the same `_counts_from_rows` the fan-out uses — the cron-status rollup is
+        real logic and belongs in one place.
+        """
+        load = getattr(self.client, "get_workspace_overview", None)
+        if not callable(load):
+            return None
+        payload = load()
+        if payload is None:
+            return None
+        projects = payload.get("projects") or []
+        if self.project is not None and not any(project.get("name") == self.project for project in projects):
+            raise RebaseWorkflowError(f"project not found: {self.project}")
+        counts = self._counts_from_rows(
+            workflows=payload.get("workflows") or [],
+            functions=payload.get("functions") or [],
+            endpoints=payload.get("endpoints") or [],
+            latest_runs=payload.get("latest_runs_by_project") or [],
+        )
+        return WorkspaceOverviewData(
+            projects=projects,
+            project_summaries=self._summaries(projects, counts),
+            project_names={str(project.get("id", "")): str(project.get("name", "-")) for project in projects},
+            environments=payload.get("environments") or [{"name": self.environment_name}],
+            buckets=payload.get("buckets") or [],
+            volumes=payload.get("volumes") or [],
+            secrets=payload.get("secrets") or [],
+        )
+
     def load_workspace_overview(self) -> WorkspaceOverviewData:
-        """Everything behind the workspace view: all nine reads in flight at once.
+        """Everything behind the workspace view: one request where the route exists.
+
+        Falls back to all nine reads in flight at once where it does not.
 
         Unlike `load_project_base`/`load_project_detail`, where the second phase genuinely
         needs the first one's answers, these two halves read disjoint things and neither
         waits on the other, so there is no reason to stage them.
 
-        Staging them was measured and rejected. Against the live API the base costs ~1.17s
-        on its own and the resources ~0.81s, but the two together still cost ~1.17s — the
-        API absorbs the extra four requests. Painting the project table first would have
-        bought it nothing and pushed the resource tables out to ~2.0s.
+        Staging the two halves was measured and rejected. Against the live API the base
+        costs ~1.17s on its own and the resources ~0.81s, but the two together still cost
+        ~1.17s — the API absorbs the extra four requests. Painting the project table
+        first would have bought it nothing and pushed the resource tables out to ~2.0s.
         """
+        composite = self.load_workspace_composite()
+        if composite is not None:
+            return composite
         with ThreadPoolExecutor(max_workers=2) as executor:
             base_future = executor.submit(self.load_workspace_base)
             resources_future = executor.submit(self.load_workspace_resources)
@@ -732,34 +776,57 @@ class RebaseTuiData:
         platform loses the speed rather than the column.
         """
         with ThreadPoolExecutor(max_workers=OVERVIEW_FANOUT_WORKERS) as executor:
-            workflows = executor.submit(self._workflow_and_cron_counts)
+            workflows = executor.submit(self.client.list_workflows)
             # Endpoints are supplementary here, as they are in load_project_targets: an API
             # without the route should cost the column, not the whole overview.
-            endpoints = executor.submit(self._counts_by_project, lambda: _optional_list(self.client.list_endpoints))
-            functions = executor.submit(self._counts_by_project, self.client.list_functions)
+            endpoints = executor.submit(lambda: _optional_list(self.client.list_endpoints))
+            functions = executor.submit(self.client.list_functions)
             # One row per project from the server. Assembling this client-side from
             # `list_runs` does not work: runs come back newest-first across the
             # workspace, so a project on a 15-minute cron fills any page size and
             # the quiet projects — the ones worth checking — drop off the end.
             last_runs = executor.submit(self.client.list_latest_runs_by_project)
-        workflow_counts, cron_counts, next_runs, cron_statuses, paused_untils = workflows.result()
-        return OverviewCounts(
+        return self._counts_from_rows(
+            workflows=workflows.result(),
             functions=functions.result(),
-            workflows=workflow_counts,
             endpoints=endpoints.result(),
+            latest_runs=last_runs.result(),
+        )
+
+    @classmethod
+    def _counts_from_rows(
+        cls,
+        *,
+        workflows: list[dict[str, Any]],
+        functions: list[dict[str, Any]],
+        endpoints: list[dict[str, Any]],
+        latest_runs: list[dict[str, Any]],
+    ) -> OverviewCounts:
+        """The counts themselves, over rows someone else read.
+
+        Separate from the reads so the composite route and the per-route fan-out produce
+        the same table from the same arithmetic. The cron-status rollup in particular is
+        real logic, and having it in one place is the point.
+        """
+        workflow_counts, cron_counts, next_runs, cron_statuses, paused_untils = cls._workflow_and_cron_counts(workflows)
+        return OverviewCounts(
+            functions=cls._counts_by_project(functions),
+            workflows=workflow_counts,
+            endpoints=cls._counts_by_project(endpoints),
             crons=cron_counts,
-            last_runs={str(run["project_id"]): run for run in last_runs.result() if run.get("project_id")},
+            last_runs={str(run["project_id"]): run for run in latest_runs if run.get("project_id")},
             next_runs=next_runs,
             cron_statuses=cron_statuses,
             paused_untils=paused_untils,
         )
 
+    @staticmethod
     def _workflow_and_cron_counts(
-        self,
+        workflows: list[dict[str, Any]],
     ) -> tuple[dict[str, int], dict[str, int], dict[str, str], dict[str, str], dict[str, str]]:
         """Workflows per project, their cron count, and the config-level cron status.
 
-        All of it comes out of the one workspace-wide call, so no column costs a
+        All of it comes out of the one workspace-wide read, so no column costs a
         request of its own. A workflow counts as a cron job whenever it has a cron
         schedule configured, in any state — a paused or stopped cron is still a cron
         job; the Status column carries its liveness. That column is the config-only
@@ -767,7 +834,6 @@ class RebaseTuiData:
         is "active" while any cron will fire, "paused" when the best of them is
         paused, "stopped" when every configured cron is switched off.
         """
-        workflows = self.client.list_workflows()
         # The soonest fire time per project, out of the same read the counts come
         # from — so the column costs no request of its own. Earliest wins: with
         # several schedules in a project, the next thing to happen is the answer.
@@ -807,11 +873,54 @@ class RebaseTuiData:
         )
 
     @staticmethod
-    def _counts_by_project(load: Callable[[], list[dict[str, Any]]]) -> dict[str, int]:
-        return Counter(str(item["project_id"]) for item in load() if item.get("project_id"))
+    def _counts_by_project(rows: list[dict[str, Any]]) -> dict[str, int]:
+        return Counter(str(item["project_id"]) for item in rows if item.get("project_id"))
+
+    def load_project_composite(self, project: dict[str, Any]) -> ProjectTargetsData | None:
+        """Everything behind opening a project in one request, where the route exists.
+
+        `None` when the client or the platform predates the route, so the caller falls
+        back to the two-phase fan-out.
+
+        This is where the composite route earns the most. Read separately, the current
+        version of every workflow is a request each and the step rows behind Last run are
+        a request per scanned run, so opening a project cost a round trip for every
+        target in it.
+        """
+        load = getattr(self.client, "get_project_overview", None)
+        if not callable(load):
+            return None
+        payload = load(str(project["id"]))
+        if payload is None:
+            return None
+        workflows = payload.get("workflows") or []
+        functions = payload.get("functions") or []
+        runs = payload.get("runs") or []
+        versions = {
+            str(workflow_id): version
+            for workflow_id, version in (payload.get("current_workflow_versions") or {}).items()
+        }
+        return ProjectTargetsData(
+            project=payload.get("project") or project,
+            functions=functions,
+            workflows=workflows,
+            endpoints=payload.get("endpoints") or [],
+            steps=self._workflow_steps_from_versions(workflows, versions),
+            workflow_versions=versions,
+            last_runs=self.load_last_runs(
+                str(project["id"]),
+                runs,
+                target_ids_by_identity(workflows, functions),
+                step_runs=payload.get("step_runs") or [],
+            ),
+            ephemeral=group_ephemeral_runs(runs, deployed_identities(workflows, functions)),
+        )
 
     def load_project_targets(self, project: dict[str, Any]) -> ProjectTargetsData:
         """Everything behind opening a project, for callers that want it in one piece."""
+        composite = self.load_project_composite(project)
+        if composite is not None:
+            return composite
         base, runs = self.load_project_base(project)
         return self.load_project_detail(base, runs)
 
@@ -893,6 +1002,7 @@ class RebaseTuiData:
         project_id: str,
         runs: list[dict[str, Any]] | None = None,
         target_ids: dict[tuple[str, str], str] | None = None,
+        step_runs: list[dict[str, Any]] | None = None,
     ) -> dict[str, str]:
         """When each workflow and function last executed, by target id.
 
@@ -918,7 +1028,9 @@ class RebaseTuiData:
         `group_ephemeral_runs`.
 
         Takes `runs` when the caller has already read them, so the project view pays for
-        the project's run list once rather than once per thing derived from it.
+        the project's run list once rather than once per thing derived from it. Takes
+        `step_runs` on the same terms: the composite route returns them with everything
+        else, and reading them here would undo the point of asking once.
         """
         if runs is None:
             runs = _optional_list(lambda: self.client.list_runs(project_id=project_id, limit=LAST_RUN_SCAN_LIMIT))
@@ -948,14 +1060,17 @@ class RebaseTuiData:
             if run.get("target_type") == "workflow" and isinstance(run.get("id"), str):
                 workflow_run_ids.append(str(run["id"]))
 
-        scanned = workflow_run_ids[:LAST_RUN_STEP_SCAN]
-        if scanned:
-            with ThreadPoolExecutor(max_workers=min(OVERVIEW_FANOUT_WORKERS, len(scanned))) as executor:
-                for steps in executor.map(
-                    lambda run_id: _optional_list(lambda: self.client.list_run_steps(run_id)), scanned
-                ):
-                    for step in steps:
-                        record(step.get("function_id"), step.get("started_at") or step.get("created_at"))
+        if step_runs is None:
+            scanned = workflow_run_ids[:LAST_RUN_STEP_SCAN]
+            step_runs = []
+            if scanned:
+                with ThreadPoolExecutor(max_workers=min(OVERVIEW_FANOUT_WORKERS, len(scanned))) as executor:
+                    for steps in executor.map(
+                        lambda run_id: _optional_list(lambda: self.client.list_run_steps(run_id)), scanned
+                    ):
+                        step_runs.extend(steps)
+        for step in step_runs:
+            record(step.get("function_id"), step.get("started_at") or step.get("created_at"))
         return latest
 
     def load_workflow_versions(self, workflows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -4051,7 +4166,23 @@ class RebaseTuiApp(App[None]):
         phase would temporarily replace those details with dashes and resize the columns,
         then reverse both changes when the version reads finished. Under *preserve*, keep
         the last complete frame until its complete replacement is ready.
+
+        Where the platform has the composite route none of that applies: one request
+        answers everything, so there is no second phase to stage and the table is painted
+        complete the first time.
         """
+        try:
+            composite = await asyncio.to_thread(self.data.load_project_composite, project)
+        except Exception as exc:
+            self._set_error(exc, announce=announce)
+            return
+        if composite is not None:
+            self._refresh_failures = 0
+            self.project_targets = composite
+            with self._preserve_view() if preserve else nullcontext():
+                self._render_project_targets(composite, preserve=preserve)
+            return
+
         try:
             base, runs = await asyncio.to_thread(self.data.load_project_base, project)
         except Exception as exc:

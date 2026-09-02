@@ -969,6 +969,96 @@ def test_workspace_resources_name_the_current_environment_when_the_route_is_abse
     assert resources.buckets == []
 
 
+#: The one latest-run row both overview paths are given, so they can be compared.
+LATEST_RUN = {"project_id": "project-id", "id": "run-id", "created_at": "2026-06-16T14:00:00Z"}
+
+
+class CompositeClient(FakeClient):
+    """A platform that has the composite route, and fails loudly if the fan-out is used."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.overview_calls = 0
+
+    def get_workspace_overview(self) -> dict[str, Any]:
+        self.overview_calls += 1
+        return {
+            "environment": "dev",
+            "projects": self.projects,
+            "workflows": self.workflows,
+            "functions": self.functions,
+            "endpoints": self.endpoints,
+            "latest_runs_by_project": [LATEST_RUN],
+            "environments": [{"name": "dev"}, {"name": "prod"}],
+            "buckets": [{"name": "data"}],
+            "volumes": [],
+            "secrets": [{"name": "api", "keys": ["TOKEN"]}],
+        }
+
+    def _refuse(self, *_a: Any, **_k: Any) -> Any:
+        raise AssertionError("the fan-out ran even though the composite route answered")
+
+    list_projects = _refuse
+    list_workflows = _refuse
+    list_functions = _refuse
+    list_endpoints = _refuse
+    list_latest_runs_by_project = _refuse
+
+
+def test_workspace_overview_prefers_the_composite_route() -> None:
+    client = CompositeClient()
+
+    overview = fake_tui_data(client).load_workspace_overview()
+
+    assert client.overview_calls == 1
+    assert [project["name"] for project in overview.projects] == ["energy", "trading"]
+    # The counts come off the payload's raw lists, through the same arithmetic the
+    # fan-out uses — including the cron rollup.
+    assert [summary.workflow_count for summary in overview.project_summaries] == [1, 0]
+    assert [summary.function_count for summary in overview.project_summaries] == [1, 0]
+    assert overview.project_summaries[0].cron_status == "active"
+    assert overview.project_summaries[0].last_run == LATEST_RUN
+    assert [item["name"] for item in overview.buckets] == ["data"]
+    assert [item["name"] for item in overview.secrets] == ["api"]
+
+
+def test_workspace_overview_falls_back_when_the_platform_lacks_the_route() -> None:
+    """The deployed platform routinely lags the toolkit, so this is the common path."""
+
+    class NoRoute(FakeClient):
+        def get_workspace_overview(self) -> dict[str, Any] | None:
+            return None
+
+    overview = fake_tui_data(NoRoute()).load_workspace_overview()
+
+    assert [project["name"] for project in overview.projects] == ["energy", "trading"]
+    assert [summary.workflow_count for summary in overview.project_summaries] == [1, 0]
+
+
+def test_workspace_overview_falls_back_when_the_client_has_no_such_method() -> None:
+    # FakeClient predates the method entirely, which is how an older pairing behaves.
+    overview = fake_tui_data(FakeClient()).load_workspace_overview()
+
+    assert [project["name"] for project in overview.projects] == ["energy", "trading"]
+
+
+def test_composite_overview_still_reports_a_missing_project() -> None:
+    with pytest.raises(RebaseWorkflowError, match="project not found: missing"):
+        fake_tui_data(CompositeClient(), project="missing").load_workspace_overview()
+
+
+def test_composite_and_fanout_agree_on_the_project_table() -> None:
+    """The two paths must produce the same rows, or the table changes as platforms roll."""
+    fanout_client = FakeClient()
+    fanout_client.latest_runs_by_project = [LATEST_RUN]
+
+    composite = fake_tui_data(CompositeClient()).load_workspace_overview()
+    fanout = fake_tui_data(fanout_client).load_workspace_overview()
+
+    assert composite.project_summaries == fanout.project_summaries
+    assert composite.project_names == fanout.project_names
+
+
 def test_tui_app_mounts_and_renders_selected_workflow_run() -> None:
     async def scenario() -> None:
         client = FakeClient()
@@ -4487,6 +4577,82 @@ class EphemeralClient(FakeClient):
                 "started_at": "2026-08-09T17:00:05Z",
             },
         ]
+
+
+class CompositeProjectClient(EphemeralClient):
+    """A platform with the project composite route, serving the same rows in one answer.
+
+    The fan-out methods refuse, so any of them being reached is a test failure rather
+    than a slower pass.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.overview_calls: list[str] = []
+
+    def get_project_overview(self, project_id: str) -> dict[str, Any]:
+        self.overview_calls.append(project_id)
+        runs = EphemeralClient.list_runs(self, limit=200)
+        return {
+            "project": {"id": project_id, "name": "energy"},
+            "workflows": self.workflows,
+            "functions": self.functions,
+            "endpoints": self.endpoints,
+            "runs": runs,
+            "current_workflow_versions": {
+                str(workflow["id"]): FakeClient.get_workflow_version(
+                    self, str(workflow["id"]), str(workflow["current_version_id"])
+                )
+                for workflow in self.workflows
+                if workflow.get("current_version_id")
+            },
+            "step_runs": FakeClient.list_run_steps(self, "run-id"),
+        }
+
+    def _refuse(self, *_a: Any, **_k: Any) -> Any:
+        raise AssertionError("the fan-out ran even though the composite route answered")
+
+    list_workflows = _refuse
+    list_functions = _refuse
+    list_endpoints = _refuse
+    list_runs = _refuse
+    get_workflow_version = _refuse
+    list_run_steps = _refuse
+
+
+def test_project_targets_prefer_the_composite_route() -> None:
+    client = CompositeProjectClient()
+
+    targets = fake_tui_data(client).load_project_targets({"id": "project-id", "name": "energy"})
+
+    assert client.overview_calls == ["project-id"]
+    assert [workflow["name"] for workflow in targets.workflows] == ["forecast"]
+    # The two things that used to cost a request each are filled from the same answer.
+    assert targets.workflow_versions
+    assert targets.last_runs == {"workflow-id": "2026-08-09T17:00:05Z"}
+    assert [group.name for group in targets.ephemeral] == ["collect"]
+
+
+def test_project_targets_fall_back_without_the_composite_route() -> None:
+    targets = fake_tui_data(EphemeralClient()).load_project_targets({"id": "project-id", "name": "energy"})
+
+    assert [workflow["name"] for workflow in targets.workflows] == ["forecast"]
+    assert targets.last_runs == {"workflow-id": "2026-08-09T17:00:05Z"}
+
+
+def test_composite_and_fanout_agree_on_the_project_view() -> None:
+    """One request and many must draw the same table, or it changes as platforms roll."""
+    project = {"id": "project-id", "name": "energy"}
+
+    composite = fake_tui_data(CompositeProjectClient()).load_project_targets(project)
+    fanout = fake_tui_data(EphemeralClient()).load_project_targets(project)
+
+    assert composite.workflows == fanout.workflows
+    assert composite.functions == fanout.functions
+    assert composite.last_runs == fanout.last_runs
+    assert composite.steps == fanout.steps
+    assert composite.workflow_versions == fanout.workflow_versions
+    assert composite.ephemeral == fanout.ephemeral
 
 
 def test_ephemeral_runs_filter_to_the_name_they_ran_as() -> None:

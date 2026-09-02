@@ -3409,6 +3409,74 @@ def test_unfiltered_list_functions_falls_back_when_the_route_is_missing(monkeypa
     assert paths == ["/functions", "/projects", "/projects/p1/functions", "/projects/p2/functions"]
 
 
+class FakeMethodNotAllowedResponse(FakeMissingRouteResponse):
+    """A 405, which is how an absent route can present when a prefix already matches."""
+
+    status_code = 405
+
+    def raise_for_status(self) -> None:
+        raise requests.HTTPError("405")
+
+
+def test_get_workspace_overview_returns_the_payload(monkeypatch) -> None:
+    paths: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        paths.append(url.split("workflows.example.com")[-1])
+        return FakeResponse({"environment": "dev", "projects": [{"id": "p1", "name": "one"}]})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    overview = client.get_workspace_overview()
+
+    assert overview is not None
+    assert [project["name"] for project in overview["projects"]] == ["one"]
+    assert paths == ["/workspace/overview"]
+
+
+@pytest.mark.parametrize("response", [FakeMissingRouteResponse, FakeMethodNotAllowedResponse])
+def test_get_workspace_overview_reports_an_absent_route_as_none(monkeypatch, response) -> None:
+    """A toolkit ahead of its platform should lose the speed, not the answer."""
+    paths: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        paths.append(url.split("workflows.example.com")[-1])
+        return response()
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    assert client.get_workspace_overview() is None
+    # The client only detects the route; assembling the fallback is the caller's job.
+    assert paths == ["/workspace/overview"]
+
+
+def test_get_workspace_overview_reraises_a_real_error(monkeypatch) -> None:
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        return FakeErrorResponse({"detail": "nope"})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    with pytest.raises(rb.RebaseWorkflowError):
+        client.get_workspace_overview()
+
+
+def test_get_project_overview_reports_an_absent_route_as_none(monkeypatch) -> None:
+    paths: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        paths.append(url.split("workflows.example.com")[-1])
+        return FakeMissingRouteResponse()
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    assert client.get_project_overview("p1") is None
+    assert paths == ["/projects/p1/overview"]
+
+
 # --- inline-result contract & transport (ephemeral fast path) -----------------
 
 

@@ -3235,6 +3235,32 @@ class Client:
     def get_workspace(self) -> dict[str, Any]:
         return self._request_dict("GET", "/workspace", expected="workspace response")
 
+    def get_workspace_overview(self) -> dict[str, Any] | None:
+        """Everything the workspace view draws, in one request, where the API offers it.
+
+        `None` on an API old enough not to have the route, so the caller can fall back to
+        assembling the same answer from the individual list calls. That fallback is not
+        theoretical: a toolkit is routinely ahead of the platform it is pointed at.
+        """
+        try:
+            return self._request_dict("GET", "/workspace/overview", expected="workspace overview response")
+        except RebaseWorkflowError as exc:
+            if exc.status_code in ROUTE_ABSENT_STATUSES:
+                return None
+            raise
+
+    def get_project_overview(self, project_id: str) -> dict[str, Any] | None:
+        """Everything the project view draws, in one request, where the API offers it.
+
+        `None` when the route is absent, on the same terms as `get_workspace_overview`.
+        """
+        try:
+            return self._request_dict("GET", f"/projects/{project_id}/overview", expected="project overview response")
+        except RebaseWorkflowError as exc:
+            if exc.status_code in ROUTE_ABSENT_STATUSES:
+                return None
+            raise
+
     def update_workspace(
         self,
         *,
