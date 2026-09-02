@@ -3463,6 +3463,41 @@ def test_get_workspace_overview_reraises_a_real_error(monkeypatch) -> None:
         client.get_workspace_overview()
 
 
+def test_an_absent_overview_route_is_asked_for_once(monkeypatch) -> None:
+    """The TUI re-reads its view every few seconds; a wasted probe each time adds up."""
+    paths: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        paths.append(url.split("workflows.example.com")[-1])
+        return FakeMissingRouteResponse()
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    assert client.get_workspace_overview() is None
+    assert client.get_workspace_overview() is None
+    assert client.get_workspace_overview() is None
+
+    assert paths == ["/workspace/overview"]
+
+
+def test_an_absent_project_overview_route_is_asked_for_once_across_projects(monkeypatch) -> None:
+    """The route is absent, not that project's copy of it, so one 404 answers for all."""
+    paths: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        paths.append(url.split("workflows.example.com")[-1])
+        return FakeMissingRouteResponse()
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    assert client.get_project_overview("p1") is None
+    assert client.get_project_overview("p2") is None
+
+    assert paths == ["/projects/p1/overview"]
+
+
 def test_get_project_overview_reports_an_absent_route_as_none(monkeypatch) -> None:
     paths: list[str] = []
 

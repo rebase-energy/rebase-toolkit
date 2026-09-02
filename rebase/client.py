@@ -2480,6 +2480,12 @@ class Client:
         # Cache for tokens read from disk by load_access_token(); explicit
         # credentials (api_key/access_token) never go through this.
         self._cached_disk_token: str | None = None
+        # Routes this platform answered 404/405 for. Only the composite reads use it,
+        # and only to stop re-asking: the TUI re-reads its view every few seconds, so
+        # against a platform behind this package the wasted probe would be paid on every
+        # refresh rather than once. A platform upgraded mid-session is picked up on the
+        # next run, which is soon enough for a route whose absence only costs speed.
+        self._absent_routes: set[str] = set()
 
     def _http_session(self) -> requests.Session:
         pid = os.getpid()
@@ -2499,6 +2505,8 @@ class Client:
             environment_name=environment_name,
         )
         clone._cached_disk_token = self._cached_disk_token
+        # Same platform, so the same routes are missing from it.
+        clone._absent_routes = self._absent_routes
         return clone
 
     def _http_request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
@@ -3235,6 +3243,19 @@ class Client:
     def get_workspace(self) -> dict[str, Any]:
         return self._request_dict("GET", "/workspace", expected="workspace response")
 
+    def _composite_read(self, path: str, *, expected: str, route: str | None = None) -> dict[str, Any] | None:
+        """A whole-view read, or None where the platform has no such route."""
+        key = route or path
+        if key in self._absent_routes:
+            return None
+        try:
+            return self._request_dict("GET", path, expected=expected)
+        except RebaseWorkflowError as exc:
+            if exc.status_code in ROUTE_ABSENT_STATUSES:
+                self._absent_routes.add(key)
+                return None
+            raise
+
     def get_workspace_overview(self) -> dict[str, Any] | None:
         """Everything the workspace view draws, in one request, where the API offers it.
 
@@ -3242,24 +3263,16 @@ class Client:
         assembling the same answer from the individual list calls. That fallback is not
         theoretical: a toolkit is routinely ahead of the platform it is pointed at.
         """
-        try:
-            return self._request_dict("GET", "/workspace/overview", expected="workspace overview response")
-        except RebaseWorkflowError as exc:
-            if exc.status_code in ROUTE_ABSENT_STATUSES:
-                return None
-            raise
+        return self._composite_read("/workspace/overview", expected="workspace overview response")
 
     def get_project_overview(self, project_id: str) -> dict[str, Any] | None:
         """Everything the project view draws, in one request, where the API offers it.
 
         `None` when the route is absent, on the same terms as `get_workspace_overview`.
         """
-        try:
-            return self._request_dict("GET", f"/projects/{project_id}/overview", expected="project overview response")
-        except RebaseWorkflowError as exc:
-            if exc.status_code in ROUTE_ABSENT_STATUSES:
-                return None
-            raise
+        return self._composite_read(
+            f"/projects/{project_id}/overview", expected="project overview response", route="/projects/*/overview"
+        )
 
     def update_workspace(
         self,
