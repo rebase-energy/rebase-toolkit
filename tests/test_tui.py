@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import pytest
+from textual._xterm_parser import XTermParser
 from textual.coordinate import Coordinate
 from textual.events import MouseMove
 from textual.geometry import Offset
@@ -463,7 +464,6 @@ def test_tui_environment_resources_and_switcher() -> None:
             assert str(app.query_one("#buckets-table", DataTable).get_cell_at(Coordinate(0, 1))) == (
                 "gs://rb-dev-data-abc123"
             )
-            assert str(app.query_one("#volumes-table", DataTable).get_cell_at(Coordinate(0, 0))) == "dev-cache"
             assert str(app.query_one("#secrets-table", DataTable).get_cell_at(Coordinate(0, 0))) == "dev-api"
 
             await pilot.press("v")
@@ -3203,8 +3203,8 @@ def test_tui_dragging_a_column_header_resizes_the_box_above_it() -> None:
 
 
 def test_tui_arrows_step_the_workspace_resource_chips() -> None:
-    """`left`/`right` walk Projects/Buckets/Volumes/Secrets, wrapping either way round,
-    and the focus lands on the table the chip opened."""
+    """`left`/`right` walk Projects/Buckets/Secrets, wrapping either way round, and the
+    focus lands on the table the chip opened."""
 
     async def scenario() -> None:
         app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
@@ -3217,7 +3217,6 @@ def test_tui_arrows_step_the_workspace_resource_chips() -> None:
 
             for expected, table_id in (
                 ("buckets-resource-tab", "#buckets-table"),
-                ("volumes-resource-tab", "#volumes-table"),
                 ("secrets-resource-tab", "#secrets-table"),
                 ("projects-resource-tab", "#projects-table"),
             ):
@@ -3232,6 +3231,80 @@ def test_tui_arrows_step_the_workspace_resource_chips() -> None:
             await pilot.press("left")
             await pilot.pause(0.1)
             assert tabs.active == "secrets-resource-tab"
+
+    asyncio.run(scenario())
+
+
+def test_tui_two_finger_scroll_moves_a_table_sideways() -> None:
+    """A trackpad swipe — the bytes a terminal sends for it — drives the scrollbar."""
+
+    def wheel(sequence: str) -> list[Any]:
+        return list(XTermParser().feed(sequence))
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        # Narrow enough that the columns outgrow the width and the bar appears.
+        async with app.run_test(size=(60, 20)) as pilot:
+            await pilot.pause(0.3)
+            table = app.query_one("#projects-table", DataTable)
+            assert table.show_horizontal_scrollbar
+
+            # SGR buttons 66 and 67 are wheel-left and wheel-right: what a two-finger
+            # swipe reaches the app as.
+            for event in wheel("\x1b[<67;20;10M"):
+                app.screen._forward_event(event)
+            await pilot.pause(0.2)
+            assert table.scroll_x == tui_module.HeaderSafeDataTable.HORIZONTAL_SCROLL_CELLS
+
+            for event in wheel("\x1b[<66;20;10M"):
+                app.screen._forward_event(event)
+            await pilot.pause(0.2)
+            assert table.scroll_x == 0
+
+            # The tables of the project view that scroll take the same swipe; the ones of
+            # fixed-width fields still clip, and a swipe over them does nothing.
+            await _open_run(app, pilot)
+            for table_id in ("#workflows-table", "#functions-table", "#timeline-table"):
+                assert app.query_one(table_id, DataTable).styles.overflow_x == "auto"
+            assert app.query_one("#runs-table", DataTable).styles.overflow_x == "hidden"
+
+    asyncio.run(scenario())
+
+
+def test_tui_chrome_rows_share_one_background() -> None:
+    """Header, chip strip and column header are one band, in both views."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            band = tui_module.CHROME_GRAY
+
+            def background(selector: str) -> str:
+                # The painted colour, not the declared one: a `transparent` widget in
+                # the band — the clock — is right if what shows through is the band.
+                return app.query_one(selector).background_colors[1].hex
+
+            def header_background(selector: str) -> str:
+                table = app.query_one(selector, DataTable)
+                return table.get_component_styles("datatable--header").background.hex
+
+            # The workspace view: the top row, the resource chips, the columns.
+            assert background("RebaseHeader") == band
+            assert background("RebaseClock") == band
+            assert background("#workspace-resource-tabs Tabs") == band
+            assert header_background("#projects-table") == band
+
+            await _open_run(app, pilot)
+
+            # The project view: same three rows, plus the two strips further down that
+            # double as splitters.
+            assert background("#target-tabs Tabs") == band
+            assert background("#timeline-tabs") == band
+            for table in ("#workflows-table", "#runs-table", "#timeline-table"):
+                assert header_background(table) == band
 
     asyncio.run(scenario())
 

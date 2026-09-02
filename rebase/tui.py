@@ -131,7 +131,6 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
     "workspace-profiles-table": ("Active", "Profile", "Workspace", "Workspace ID", "API URL"),
     "buckets-table": ("Bucket", "URI", "Created", "Updated"),
-    "volumes-table": ("Volume", "Provider", "Storage", "Prefix", "Created", "Updated"),
     "secrets-table": ("Secret", "Keys"),
     # `Origin` sits second in both: you read what a thing is called, then what kind of
     # thing it is, and every column after it is one a one-off has no answer for.
@@ -205,6 +204,16 @@ COUNTDOWN_WIDTH = 11
 #: How often that countdown redraws. Local arithmetic on rows already in hand — no request
 #: is made, and nothing moves but the digits.
 COUNTDOWN_TICK_SECONDS = 1.0
+#: The background the three chrome rows share — the header, the chip strip under it and
+#: the column header under that. They are one band of furniture above the rows, so they
+#: are one colour: Textual would otherwise paint the header the app background, the
+#: strips and the column header its own `$panel` blue-grey, and draw two seams across a
+#: band that is a single thing. Grey rather than `$panel` because that blue appears
+#: nowhere else in the palette.
+CHROME_GRAY = "#232826"
+#: The same band under the pointer, for the column headers that are also splitters.
+CHROME_GRAY_HOVER = "#33403A"
+
 #: The tab each target table belongs to, in the order `left`/`right` cycle them.
 TARGET_TABS: tuple[tuple[str, str], ...] = (
     ("workflows-tab", "#workflows-table"),
@@ -214,7 +223,6 @@ TARGET_TABS: tuple[tuple[str, str], ...] = (
 RESOURCE_TABS: tuple[tuple[str, str], ...] = (
     ("projects-resource-tab", "#projects-table"),
     ("buckets-resource-tab", "#buckets-table"),
-    ("volumes-resource-tab", "#volumes-table"),
     ("secrets-resource-tab", "#secrets-table"),
 )
 #: The two tables a project's targets are drawn into, without their `#`.
@@ -239,7 +247,6 @@ TERMINAL_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 PRESERVED_TABLE_IDS: tuple[str, ...] = (
     "projects-table",
     "buckets-table",
-    "volumes-table",
     "secrets-table",
     *TARGET_TABLE_IDS,
     "runs-table",
@@ -363,6 +370,10 @@ class WorkspaceOverviewData:
 @dataclass(frozen=True)
 class WorkspaceResources:
     """The environment siblings of Projects: buckets, volumes, secrets, environments.
+
+    `volumes` is read but no longer drawn: the feature is experimental and its table came
+    out of the workspace view until it is settled. Kept on the model so putting the view
+    back is the tab, the columns and the render, and nothing else.
 
     Kept apart from `WorkspaceOverviewData` because they answer a different question and
     degrade independently — none of them is needed to draw the project table. They are
@@ -1919,6 +1930,11 @@ class HeaderSafeDataTable(DataTable):
     of a project. Clicking there is an ordinary thing to do, and it should do nothing.
     """
 
+    #: Cells one wheel-left/right notch moves. Textual's own 4 is a mouse wheel's tilt
+    #: switch, where notches arrive one at a time; a trackpad swipe arrives as a burst of
+    #: them and at 4 cells each it throws the table end to end.
+    HORIZONTAL_SCROLL_CELLS = 2
+
     def _on_click(self, event: events.Click) -> None:
         if self.ordered_columns:
             return
@@ -1927,6 +1943,33 @@ class HeaderSafeDataTable(DataTable):
         # is suppressed. `stop` only ends the bubble to parent widgets, which is not where
         # the crash is. No `super()` call for the same reason: Textual makes it itself.
         event.prevent_default()
+        event.stop()
+
+    def _on_mouse_scroll_left(self, event: events.MouseScrollLeft) -> None:
+        self._scroll_sideways(-self.HORIZONTAL_SCROLL_CELLS, event)
+
+    def _on_mouse_scroll_right(self, event: events.MouseScrollRight) -> None:
+        self._scroll_sideways(self.HORIZONTAL_SCROLL_CELLS, event)
+
+    def _scroll_sideways(self, cells: float, event: events.MouseEvent) -> None:
+        """Move a two-finger swipe (or a wheel tilt) along the table's own scrollbar.
+
+        Textual scrolls horizontally on these events already, but animated and four cells
+        a notch — fine for a wheel, and a slide that lags the fingers under a burst from a
+        trackpad. This is the rule it uses for the vertical wheel instead: a small step,
+        applied immediately. An event at the end of the travel is left to bubble, so the
+        swipe carries on to whatever is behind the table rather than dying on it.
+        """
+        if not self.allow_horizontal_scroll:
+            return
+        # `prevent_default` for the same reason as `_on_click` above: Textual runs the
+        # handler of every class in the MRO, so without it its own four-cell animated
+        # scroll happens as well and a notch moves the table six cells, not two.
+        event.prevent_default()
+        target = max(0.0, min(float(self.max_scroll_x), self.scroll_target_x + cells))
+        if target == self.scroll_target_x:
+            return
+        self.scroll_to(x=target, animate=False)
         event.stop()
 
 
@@ -2715,9 +2758,20 @@ class RebaseTuiApp(App[None]):
         color: #E8F0ED;
     }}
 
-    RebaseHeader, Header, Footer {{
+    RebaseHeader, Header {{
+        background: {CHROME_GRAY};
+        color: {BRAND_BRIGHT_GREEN};
+    }}
+
+    Footer {{
         background: #101412;
         color: {BRAND_BRIGHT_GREEN};
+    }}
+
+    /* Textual tints the clock a few percent lighter than the bar it sits in, which is
+       a seam across the top row on its own. */
+    RebaseClock {{
+        background: transparent;
     }}
 
     RebaseHeader.-tall, Header.-tall {{
@@ -2742,8 +2796,9 @@ class RebaseTuiApp(App[None]):
         height: 1fr;
     }}
 
+    /* Tables of fixed-width fields, sized to fit: they clip rather than scroll, and the
+       row a bar would cost goes to the rows. */
     #buckets-table,
-    #volumes-table,
     #secrets-table,
     #runs-table,
     #timeline-table {{
@@ -2758,7 +2813,8 @@ class RebaseTuiApp(App[None]):
        timestamps. They keep a horizontal scrollbar rather than clipping, so "Last run"
        is reachable on a narrow terminal instead of merely absent. The projects table is
        the same story a level up — five counts, a status and two times — and the last
-       column was falling off the right with no way back to it. */
+       column was falling off the right with no way back to it. A two-finger swipe drives
+       the bar, as do `shift`+wheel and dragging the bar itself. */
     #projects-table,
     #functions-table,
     #workflows-table {{
@@ -2780,7 +2836,6 @@ class RebaseTuiApp(App[None]):
 
     #projects-table,
     #buckets-table,
-    #volumes-table,
     #secrets-table {{
         height: 1fr;
     }}
@@ -2819,12 +2874,14 @@ class RebaseTuiApp(App[None]):
         display: none;
     }}
 
-    /* The project-view strips are splitters as well as chips (see `DragStrip`), and
-       they wear the same background as the column header row under them — `$panel`,
-       the DataTable header's own colour — so the two rows read as one grabbable band. */
+    /* Every strip wears the chrome band, so it reads as one piece with the column
+       header row below it and the app header above — and, in the project view where a
+       strip is a splitter as well as chips (see `DragStrip`), so the two rows you can
+       grab look like the one band they are. */
+    #workspace-resource-tabs Tabs,
     #target-tabs Tabs,
     #timeline-tabs {{
-        background: $panel;
+        background: {CHROME_GRAY};
     }}
 
     /* The chips sit centred in their strip rather than hugging the left edge. The
@@ -2879,7 +2936,7 @@ class RebaseTuiApp(App[None]):
        a terminal can offer for that — there is no cursor to change shape. */
     DragHeaderTable > .datatable--header-hover {{
         color: {BRAND_BRIGHT_GREEN};
-        background: #223029;
+        background: {CHROME_GRAY_HOVER};
     }}
 
     #project-error {{
@@ -2900,9 +2957,10 @@ class RebaseTuiApp(App[None]):
         height: 1fr;
     }}
 
-    /* The one table whose content is prose. It is allowed to run off the right and
-       be scrolled back — `^pgup`/`^pgdn`, the wheel, or the bar — where the others are
-       clipped, because a log line is not a column you can widen your way out of. */
+    /* The one table whose content is prose. It is allowed to run off the right and be
+       scrolled back — `^pgup`/`^pgdn`, a two-finger swipe, or the bar — where the tables
+       of fixed-width fields are clipped, because a log line is not a column you can
+       widen your way out of. */
     #timeline-table {{
         height: 1fr;
         overflow-x: auto;
@@ -2915,6 +2973,11 @@ class RebaseTuiApp(App[None]):
     DataTable {{
         background: #101412;
         scrollbar-size-vertical: 1;
+    }}
+
+    DataTable > .datatable--header {{
+        background: {CHROME_GRAY};
+        color: #E8F0ED;
     }}
 
     /* Textual tints the focused table 5% lighter, which turned the pane you were in a
@@ -3018,7 +3081,6 @@ class RebaseTuiApp(App[None]):
         self._project_rows: dict[str, ProjectSummary] = {}
         self._workspace_resource_rows: dict[str, dict[str, dict[str, Any]]] = {
             "buckets-table": {},
-            "volumes-table": {},
             "secrets-table": {},
         }
         self._profile_rows: dict[str, dict[str, Any]] = {}
@@ -3062,8 +3124,6 @@ class RebaseTuiApp(App[None]):
                     # Selectable, unlike its sibling resource tables: `o` opens every
                     # marked bucket, so buckets need marks as well as a cursor.
                     yield SelectableDataTable(id="buckets-table")
-                with TabPane(Content("[ Volumes ]"), id="volumes-resource-tab"):
-                    yield ChipSteppingTable(id="volumes-table")
                 with TabPane(Content("[ Secrets ]"), id="secrets-resource-tab"):
                     yield ChipSteppingTable(id="secrets-table")
             yield Static("", id="workspace-empty")
@@ -3438,7 +3498,7 @@ class RebaseTuiApp(App[None]):
         projects.cursor_type = "row"
         projects.zebra_stripes = False
 
-        for table_id in ("buckets-table", "volumes-table", "secrets-table"):
+        for table_id in ("buckets-table", "secrets-table"):
             resource = self.query_one(f"#{table_id}", DataTable)
             resource.cursor_type = "row"
             resource.zebra_stripes = True
@@ -3662,7 +3722,7 @@ class RebaseTuiApp(App[None]):
         """Step between the chips above the table that has the focus.
 
         Which strip that is follows the view: the workspace view's
-        Projects/Buckets/Volumes/Secrets, the project view's Workflows/Functions. Bound
+        Projects/Buckets/Secrets, the project view's Workflows/Functions. Bound
         to left/right on every table under a strip; see `ChipSteppingTable`.
         """
         if self.current_view == "workspace":
@@ -4580,20 +4640,6 @@ class RebaseTuiApp(App[None]):
             buckets.add_row(
                 str(item.get("name", "-")),
                 str(item.get("uri") or "-"),
-                self._time(item.get("created_at")),
-                self._time(item.get("updated_at")),
-                key=key,
-            )
-
-        volumes = self._fill_table("volumes-table")
-        volume_rows = {str(item.get("id") or item.get("name")): item for item in overview.volumes if item.get("name")}
-        self._workspace_resource_rows["volumes-table"] = volume_rows
-        for key, item in volume_rows.items():
-            volumes.add_row(
-                str(item.get("name", "-")),
-                str(item.get("provider", "-")),
-                str(item.get("bucket", "-")),
-                str(item.get("prefix", "-")),
                 self._time(item.get("created_at")),
                 self._time(item.get("updated_at")),
                 key=key,

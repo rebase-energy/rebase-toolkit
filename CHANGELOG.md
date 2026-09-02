@@ -12,7 +12,9 @@
   GitHub ref and Python entrypoint; signed pushes reconcile the exact commit in an isolated,
   release-authorized job, prune compute removed from Python only after a successful apply,
   and retain persistent resources. The TUI adds an environment switcher and sibling Projects,
-  Buckets, Volumes, and Secrets tabs.
+  Buckets, and Secrets tabs. Volumes are isolated by environment like everything else, but
+  have no tab yet: the feature is still experimental and the view will follow once its shape
+  is settled.
 
 - **Pressing `w` in the TUI opens the workspace switcher.** Workspace switching
   is now available from the keyboard and command panel as well as by clicking the
@@ -315,10 +317,25 @@
 
 ### Fixed
 
-- **`left` and `right` step the workspace's Projects / Buckets / Volumes / Secrets chips.**
+- **The three rows at the top of the screen are one band.** The header, the chip strip
+  under it and the column header under that were three colours — the app background, and
+  Textual's `$panel` blue-grey on the two below, with the workspace chip strip falling
+  through to the background and the clock a few percent lighter again. All of it is one
+  grey now (`#232826`), in both views — and so are the column headers further down the
+  project view, so the furniture around the rows reads as furniture rather than as
+  stacked bars in three colours.
+
+- **Two fingers scroll a table sideways.** A horizontal swipe now steps two cells and
+  lands immediately, where Textual's own handling animated four cells a notch: a trackpad
+  sends a burst of notches, and four animated cells apiece slid the table end to end
+  behind the fingers. It drives the same bar `shift`+wheel and dragging do, on the tables
+  that scroll — projects, workflows, functions and the timeline. The tables of
+  fixed-width fields are still clipped by design.
+
+- **`left` and `right` step the workspace's Projects / Buckets / Secrets chips.**
   The gesture was bound only on the project view's target tables, so on the workspace
   overview — the first screen `rebase tui` opens — the arrows did nothing at all and the
-  four tabs could only be reached with the mouse. They now step whichever chip strip sits
+  tabs could only be reached with the mouse. They now step whichever chip strip sits
   above the focused table, wrapping either way round and carrying the focus onto the table
   the chip opened, the same way they already worked for Workflows / Functions and the
   timeline filters.
