@@ -201,6 +201,13 @@ TARGET_TABS: tuple[tuple[str, str], ...] = (
     ("workflows-tab", "#workflows-table"),
     ("functions-tab", "#functions-table"),
 )
+#: The same for the workspace view's resource chips, in the order they are drawn.
+RESOURCE_TABS: tuple[tuple[str, str], ...] = (
+    ("projects-resource-tab", "#projects-table"),
+    ("buckets-resource-tab", "#buckets-table"),
+    ("volumes-resource-tab", "#volumes-table"),
+    ("secrets-resource-tab", "#secrets-table"),
+)
 #: The two tables a project's targets are drawn into, without their `#`.
 TARGET_TABLE_IDS: tuple[str, ...] = ("workflows-table", "functions-table")
 #: How often the screen refreshes itself. `rebase tui --refresh-interval 0` turns it off.
@@ -1853,6 +1860,23 @@ class HeaderSafeDataTable(DataTable):
         event.stop()
 
 
+class ChipSteppingTable(HeaderSafeDataTable):
+    """A table sitting under a chip strip, whose arrows step between those chips.
+
+    The gesture is the same wherever there are chips — `left`/`right` move the strip
+    above whichever table holds the focus — so it lives on one class the tables under a
+    strip share rather than being re-bound per table. Bound here rather than on the app
+    because an app-level binding would have to be `priority` to beat DataTable's own
+    inert cursor_left/cursor_right — and a priority binding on an arrow key takes it
+    away from every Input in every dialog too.
+    """
+
+    BINDINGS = [
+        Binding("left", "app.switch_chip_tab(-1)", "Previous tab", show=False),
+        Binding("right", "app.switch_chip_tab(1)", "Next tab", show=False),
+    ]
+
+
 class DragHeaderTable(HeaderSafeDataTable):
     """A table whose column header doubles as the splitter for the box above it.
 
@@ -1998,7 +2022,7 @@ class DragTabbedContent(DragStrip, TabbedContent):
         self.resizes = resizes
 
 
-class SelectableDataTable(HeaderSafeDataTable):
+class SelectableDataTable(ChipSteppingTable):
     """A DataTable whose rows can be *marked* in bulk, on top of the single-row cursor.
 
     Textual's DataTable has a cursor but no notion of a selection, so the marks live
@@ -2013,13 +2037,6 @@ class SelectableDataTable(HeaderSafeDataTable):
         Binding("shift+up", "extend_mark(-1)", "Mark up", show=False),
         Binding("shift+down", "extend_mark(1)", "Mark down", show=False),
         Binding("escape", "clear_marks", "Clear marks", show=False),
-        # The keys that step between the Workflows and Functions chips. Bound here rather
-        # than on the app because an app-level binding would have to be `priority` to beat
-        # DataTable's own inert cursor_left/cursor_right — and a priority binding on an
-        # arrow key takes it away from every Input in every dialog too. They no-op
-        # anywhere but the project view.
-        Binding("left", "app.switch_target_tab(-1)", "Previous target", show=False),
-        Binding("right", "app.switch_target_tab(1)", "Next target", show=False),
     ]
 
     class MarksChanged(Message):
@@ -2971,9 +2988,9 @@ class RebaseTuiApp(App[None]):
                     # marked bucket, so buckets need marks as well as a cursor.
                     yield SelectableDataTable(id="buckets-table")
                 with TabPane(Content("[ Volumes ]"), id="volumes-resource-tab"):
-                    yield HeaderSafeDataTable(id="volumes-table")
+                    yield ChipSteppingTable(id="volumes-table")
                 with TabPane(Content("[ Secrets ]"), id="secrets-resource-tab"):
-                    yield HeaderSafeDataTable(id="secrets-table")
+                    yield ChipSteppingTable(id="secrets-table")
             yield Static("", id="workspace-empty")
         with Vertical(id="workspace-switcher-view"):
             yield HeaderSafeDataTable(id="workspace-profiles-table")
@@ -3527,12 +3544,7 @@ class RebaseTuiApp(App[None]):
         """The tables `tab` moves between, top to bottom, as the screen currently stands."""
         if self.current_view == "workspace":
             active = self.query_one("#workspace-resource-tabs", TabbedContent).active
-            table = {
-                "projects-resource-tab": "#projects-table",
-                "buckets-resource-tab": "#buckets-table",
-                "volumes-resource-tab": "#volumes-table",
-                "secrets-resource-tab": "#secrets-table",
-            }.get(active, "#projects-table")
+            table = dict(RESOURCE_TABS).get(active, "#projects-table")
             return [self.query_one(table, DataTable)]
         if self.current_view == "workspace-switcher":
             return [self.query_one("#workspace-profiles-table", DataTable)]
@@ -3568,16 +3580,26 @@ class RebaseTuiApp(App[None]):
         current = boxes.index(focused) if isinstance(focused, DataTable) and focused in boxes else -1
         boxes[(current + 1) % len(boxes)].focus()
 
-    def action_switch_target_tab(self, delta: int) -> None:
-        """Step between the Workflows and Functions tabs. Bound to left/right."""
-        if self.current_view != "project":
-            return
-        tabs = self.query_one("#target-tabs", TabbedContent)
-        order = [tab_id for tab_id, _ in self._target_tab_order()]
+    def action_switch_chip_tab(self, delta: int) -> None:
+        """Step between the chips above the table that has the focus.
+
+        Which strip that is follows the view: the workspace view's
+        Projects/Buckets/Volumes/Secrets, the project view's Workflows/Functions. Bound
+        to left/right on every table under a strip; see `ChipSteppingTable`.
+        """
+        if self.current_view == "workspace":
+            self._step_tabs("#workspace-resource-tabs", list(RESOURCE_TABS), delta)
+        elif self.current_view == "project":
+            self._step_tabs("#target-tabs", self._target_tab_order(), delta)
+
+    def _step_tabs(self, strip: str, tabs_and_tables: list[tuple[str, str]], delta: int) -> None:
+        """Move one chip strip `delta` chips along, wrapping, and follow it with the focus."""
+        tabs = self.query_one(strip, TabbedContent)
+        order = [tab_id for tab_id, _ in tabs_and_tables]
         current = order.index(tabs.active) if tabs.active in order else 0
         tabs.active = order[(current + delta) % len(order)]
         # The focus follows, or `tab` would carry on from the box that is no longer there.
-        self.query_one(dict(TARGET_TABS)[tabs.active], DataTable).focus()
+        self.query_one(dict(tabs_and_tables)[tabs.active], DataTable).focus()
 
     @property
     def display_tzinfo(self) -> tzinfo | None:

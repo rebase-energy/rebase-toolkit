@@ -315,6 +315,14 @@
 
 ### Fixed
 
+- **`left` and `right` step the workspace's Projects / Buckets / Volumes / Secrets chips.**
+  The gesture was bound only on the project view's target tables, so on the workspace
+  overview — the first screen `rebase tui` opens — the arrows did nothing at all and the
+  four tabs could only be reached with the mouse. They now step whichever chip strip sits
+  above the focused table, wrapping either way round and carrying the focus onto the table
+  the chip opened, the same way they already worked for Workflows / Functions and the
+  timeline filters.
+
 - **Automatic refresh no longer makes the workflow table pulse between two widths.** The
   fast first paint used when opening a project contains names and schedules but not the
   version-backed Source, Commit, step graph or last-run time. Reusing that progressive

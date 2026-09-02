@@ -3116,6 +3116,40 @@ def test_tui_dragging_a_column_header_resizes_the_box_above_it() -> None:
     asyncio.run(scenario())
 
 
+def test_tui_arrows_step_the_workspace_resource_chips() -> None:
+    """`left`/`right` walk Projects/Buckets/Volumes/Secrets, wrapping either way round,
+    and the focus lands on the table the chip opened."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            tabs = app.query_one("#workspace-resource-tabs", TabbedContent)
+            assert tabs.active == "projects-resource-tab"
+            app.query_one("#projects-table", DataTable).focus()
+
+            for expected, table_id in (
+                ("buckets-resource-tab", "#buckets-table"),
+                ("volumes-resource-tab", "#volumes-table"),
+                ("secrets-resource-tab", "#secrets-table"),
+                ("projects-resource-tab", "#projects-table"),
+            ):
+                await pilot.press("right")
+                await pilot.pause(0.1)
+                assert tabs.active == expected
+                # The focus follows the chip, so `tab` and the arrows carry on from the
+                # table that is actually on screen.
+                assert app.focused is app.query_one(table_id, DataTable)
+
+            # And back the other way, wrapping off the first chip onto the last.
+            await pilot.press("left")
+            await pilot.pause(0.1)
+            assert tabs.active == "secrets-resource-tab"
+
+    asyncio.run(scenario())
+
+
 def test_tui_chip_strips_are_splitters_and_still_switch_on_a_click() -> None:
     """The tab rows drag like the header rows under them, without giving up their chips."""
 
