@@ -196,6 +196,15 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
     "timeline-table-artifacts": ("Artifact", "Produced by", "Disposition", "Type", "Size", "URI"),
 }
+#: Where the projects table's ticking countdown lives, and the width every value is padded
+#: to. A cell that redraws once a second must not resize its column under the reader, so
+#: the widest thing `format_countdown` produces ("in 364d 23h") sets the width once and
+#: every shorter value is padded out to it.
+NEXT_RUN_COLUMN = TABLE_COLUMNS["projects-table"].index("Next run")
+COUNTDOWN_WIDTH = 11
+#: How often that countdown redraws. Local arithmetic on rows already in hand — no request
+#: is made, and nothing moves but the digits.
+COUNTDOWN_TICK_SECONDS = 1.0
 #: The tab each target table belongs to, in the order `left`/`right` cycle them.
 TARGET_TABS: tuple[tuple[str, str], ...] = (
     ("workflows-tab", "#workflows-table"),
@@ -671,6 +680,24 @@ class RebaseTuiData:
             project_names={str(project.get("id", "")): str(project.get("name", "-")) for project in projects},
         )
 
+    def offers_secrets(self) -> bool:
+        """Whether asking for secrets could return anything at all.
+
+        A client older than the route, or a test double, simply has no `list_secrets`.
+        Knowing that here costs nothing; finding it out inside a worker thread costs a
+        thread on every load that will never have anything to show for it.
+        """
+        return callable(getattr(self.client, "list_secrets", None))
+
+    def load_workspace_secrets(self) -> list[dict[str, Any]]:
+        """The secrets table, on its own timeline.
+
+        Its own, because it is the only part of the workspace view that is not a database
+        query: Secret Manager answers in ~0.25s where everything else together takes
+        ~0.1s. Degrades to empty like every other supplementary column.
+        """
+        return self._optional_resource_list("list_secrets")
+
     def load_workspace_resources(self) -> WorkspaceResources:
         """The four environment-sibling reads, issued together.
 
@@ -738,7 +765,10 @@ class RebaseTuiData:
             environments=payload.get("environments") or [{"name": self.environment_name}],
             buckets=payload.get("buckets") or [],
             volumes=payload.get("volumes") or [],
-            secrets=payload.get("secrets") or [],
+            # Deliberately absent from the payload: secrets are a Secret Manager call
+            # rather than a query, and waiting on them would hold the project table back
+            # for the one box nobody opens the TUI to read. `load_workspace_secrets`
+            # fills them in after the paint.
         )
 
     def load_workspace_overview(self) -> WorkspaceOverviewData:
@@ -1625,6 +1655,46 @@ def format_timestamp(value: Any, tz: tzinfo | None = None) -> str:
     if tz is not None and parsed.tzinfo is not None:
         parsed = parsed.astimezone(tz)
     return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_countdown(value: Any, now: datetime | None = None) -> str:
+    """Render how long until *value*, as `in 2d 3h` / `in 3h 04m` / `in 4m 09s` / `in 12s`.
+
+    A wall-clock "next run" is a date you have to subtract today's from before it means
+    anything; the same fact as a countdown is read at a glance, and it ticks — see
+    `RebaseTuiApp._tick_countdowns`. Two units at most: past the hour, the seconds are
+    noise, and the whole thing has to stay inside `COUNTDOWN_WIDTH`.
+
+    A time that has passed reads `due` rather than a negative number: the schedule says a
+    run is owed, and the row will say so until the next refresh brings a later one.
+    """
+    if value in {None, ""}:
+        return "-"
+    if isinstance(value, datetime):
+        target = value
+    else:
+        raw = str(value)
+        try:
+            target = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return raw
+    # A timestamp with no offset is the API's UTC, the same assumption `_time` makes by
+    # rendering it unconverted.
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=UTC)
+    seconds = int((target - (now or datetime.now(UTC))).total_seconds())
+    if seconds <= 0:
+        return "due"
+    minutes, secs = divmod(seconds, 60)
+    hours, mins = divmod(minutes, 60)
+    days, hrs = divmod(hours, 24)
+    if days:
+        return f"in {days}d {hrs}h"
+    if hrs:
+        return f"in {hrs}h {mins:02d}m"
+    if mins:
+        return f"in {mins}m {secs:02d}s"
+    return f"in {secs}s"
 
 
 def format_bool(value: Any) -> str:
@@ -2672,7 +2742,6 @@ class RebaseTuiApp(App[None]):
         height: 1fr;
     }}
 
-    #projects-table,
     #buckets-table,
     #volumes-table,
     #secrets-table,
@@ -2687,7 +2756,10 @@ class RebaseTuiApp(App[None]):
 
     /* The target tables outgrow their width: nine columns each, three of them
        timestamps. They keep a horizontal scrollbar rather than clipping, so "Last run"
-       is reachable on a narrow terminal instead of merely absent. */
+       is reachable on a narrow terminal instead of merely absent. The projects table is
+       the same story a level up — five counts, a status and two times — and the last
+       column was falling off the right with no way back to it. */
+    #projects-table,
     #functions-table,
     #workflows-table {{
         overflow-x: auto;
@@ -2697,6 +2769,9 @@ class RebaseTuiApp(App[None]):
         scrollbar-background-active: #101412;
     }}
 
+    /* Green because Textual's default accent is a blue that appears nowhere else, and
+       this bar sits under the first table anyone sees. */
+    #projects-table,
     #workflows-table {{
         scrollbar-color: {BRAND_BRIGHT_GREEN};
         scrollbar-color-hover: {BRAND_BRIGHT_GREEN};
@@ -3033,6 +3108,9 @@ class RebaseTuiApp(App[None]):
         self.run_worker(self._bootstrap_search_path(), name="bootstrap", group="tui-bootstrap")
         if self._refresh_interval:
             self.set_interval(self._refresh_interval, self._refresh_tick)
+        # Not behind `--refresh-interval`: that switches off *requests*, and a countdown
+        # frozen at the value it was loaded with would be worse than a timestamp.
+        self.set_interval(COUNTDOWN_TICK_SECONDS, self._tick_countdowns)
 
     def _workspace_key(self) -> str:
         # A method rather than a cached attribute so switching workspace picks up the
@@ -3609,6 +3687,32 @@ class RebaseTuiApp(App[None]):
     def _time(self, value: Any) -> str:
         return format_timestamp(value, self.display_tzinfo)
 
+    @staticmethod
+    def _countdown(value: Any) -> str:
+        """A `Next run` cell: how long until it, padded so the column never moves."""
+        return format_countdown(value).ljust(COUNTDOWN_WIDTH)
+
+    def _tick_countdowns(self) -> None:
+        """Redraw the projects table's `Next run` cells, once a second.
+
+        One cell per row, in place, rather than a repaint: a repaint would drop the
+        cursor and the marks a second after every keypress. `update_width=False` for the
+        same reason the values are padded — the column was sized for the widest countdown
+        when the rows landed and must not be resized from under the reader.
+        """
+        if self.current_view != "workspace" or not self._project_rows:
+            return
+        try:
+            table = self.query_one("#projects-table", DataTable)
+        except NoMatches:
+            return
+        for row_key, summary in self._project_rows.items():
+            # A row the table no longer has — refreshed away between the two — is not an
+            # error, it is just nothing to draw.
+            with suppress(Exception):
+                row = table.get_row_index(row_key)
+                table.update_cell_at(Coordinate(row, NEXT_RUN_COLUMN), self._countdown(summary.next_run_at))
+
     def _timezone_label(self) -> str:
         if self._display_timezone is not None:
             return str(self._display_timezone)
@@ -4173,6 +4277,30 @@ class RebaseTuiApp(App[None]):
             self._render_workspace_overview(overview)
         self._clear_target_detail()
         self._show_workspace_view()
+        # The composite route answers for everything except secrets, which cost more than
+        # the rest of the view put together and are not what anyone opens the TUI to read.
+        # The fan-out path already has them, and asking twice would undo the point.
+        if not overview.secrets and self.data.offers_secrets():
+            await self._load_workspace_secrets()
+
+    async def _load_workspace_secrets(self) -> None:
+        """Fill the secrets table once the rest of the screen is up.
+
+        Supplementary in the strongest sense: a Secret Manager that is slow or unhappy
+        costs this one table and nothing else, so a failure here is swallowed rather than
+        replacing a working view with an error.
+        """
+        try:
+            secrets = await asyncio.to_thread(self.data.load_workspace_secrets)
+        except Exception:
+            return
+        if not secrets or self.current_view != "workspace" or self.workspace_overview is None:
+            return
+        self.workspace_overview = replace(self.workspace_overview, secrets=secrets)
+        # Preserved: by now the reader has had the table for a moment and may have moved
+        # the cursor, and a second paint must not take that away to deliver a detail.
+        with self._preserve_view():
+            self._render_secrets(secrets)
 
     async def _load_project_targets(
         self, project: dict[str, Any], *, preserve: bool = False, announce: bool = True
@@ -4437,7 +4565,7 @@ class RebaseTuiApp(App[None]):
                 str(summary.endpoint_count),
                 cron_status_text(summary.cron_status, summary.paused_until),
                 last_run_cell,
-                self._time(summary.next_run_at),
+                self._countdown(summary.next_run_at),
                 self._time(project.get("created_at")),
                 key=project_id,
             )
@@ -4471,8 +4599,12 @@ class RebaseTuiApp(App[None]):
                 key=key,
             )
 
+        self._render_secrets(overview.secrets)
+
+    def _render_secrets(self, rows: list[dict[str, Any]]) -> None:
+        """Just the secrets table, because it arrives after everything around it."""
         secrets = self._fill_table("secrets-table")
-        secret_rows = {str(item.get("name")): item for item in overview.secrets if item.get("name")}
+        secret_rows = {str(item.get("name")): item for item in rows if item.get("name")}
         self._workspace_resource_rows["secrets-table"] = secret_rows
         for key, item in secret_rows.items():
             keys = item.get("keys")

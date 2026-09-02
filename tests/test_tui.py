@@ -6,6 +6,7 @@ import re
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
@@ -27,7 +28,9 @@ from rebase.client import Client, RebaseWorkflowError
 from rebase.editor import EditorCommand
 from rebase.tui import (
     AUTO_REFRESH_FAILURE_LIMIT,
+    COUNTDOWN_WIDTH,
     MARK_STYLE,
+    NEXT_RUN_COLUMN,
     DeleteConfirmScreen,
     DetailDrawer,
     OpenSourceChoiceScreen,
@@ -44,6 +47,7 @@ from rebase.tui import (
     detail_payload,
     endpoints_by_target,
     format_bytes,
+    format_countdown,
     format_duration,
     format_endpoint,
     format_json_summary,
@@ -810,6 +814,57 @@ def test_tui_project_row_puts_each_count_under_its_own_header() -> None:
     asyncio.run(scenario())
 
 
+def test_format_countdown_drops_to_the_two_units_that_matter() -> None:
+    """A wall-clock next run is a subtraction the reader has to do; a countdown is not."""
+    now = datetime(2026, 9, 2, 12, 0, 0, tzinfo=UTC)
+
+    def until(**delta: float) -> str:
+        return format_countdown(now + timedelta(**delta), now=now)
+
+    assert until(seconds=12) == "in 12s"
+    assert until(minutes=4, seconds=9) == "in 4m 09s"
+    # Past the hour the seconds are noise, and two units is all the column has room for.
+    assert until(hours=3, minutes=4, seconds=59) == "in 3h 04m"
+    assert until(days=2, hours=3, minutes=59) == "in 2d 3h"
+    # Nothing produced is wider than the width every value is padded out to.
+    assert len(until(days=364, hours=23)) == COUNTDOWN_WIDTH
+    # A time that has been and gone says the schedule owes a run, not "-12s".
+    assert until(seconds=-30) == "due"
+    assert format_countdown(None, now=now) == "-"
+    # Naive timestamps are the API's UTC, the same assumption the timestamp column makes.
+    assert format_countdown("2026-09-02T12:05:00", now=now) == "in 5m 00s"
+
+
+def test_tui_next_run_counts_down_and_ticks_without_a_refresh() -> None:
+    """The overview's Next run is a live duration: it moves on its own, in place."""
+    client = FakeClient()
+    client.workflows[0]["next_run_at"] = (datetime.now(UTC) + timedelta(minutes=5, seconds=30)).isoformat()
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(client, limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+
+            def next_run(row: int) -> str:
+                return str(projects.get_row_at(row)[NEXT_RUN_COLUMN])
+
+            assert next_run(0).strip().startswith("in 5m ")
+            # A project with no cron has no countdown, and pads to the same width so the
+            # column is sized once and never resized under a cell that redraws.
+            assert next_run(1).strip() == "-"
+            assert {len(next_run(0)), len(next_run(1))} == {COUNTDOWN_WIDTH}
+
+            first = next_run(0)
+            await pilot.pause(1.2)
+            # No refresh has run: the cell redrew itself off the clock.
+            assert next_run(0) != first
+            assert next_run(0).strip().startswith("in 5m ")
+
+    asyncio.run(scenario())
+
+
 def test_tui_counts_configured_crons_and_rolls_their_states_into_status() -> None:
     """A stopped or paused cron is still a cron job; the Status column carries its state."""
     client = FakeClient()
@@ -979,6 +1034,7 @@ class CompositeClient(FakeClient):
     def __init__(self) -> None:
         super().__init__()
         self.overview_calls = 0
+        self.secret_calls = 0
 
     def get_workspace_overview(self) -> dict[str, Any]:
         self.overview_calls += 1
@@ -992,8 +1048,12 @@ class CompositeClient(FakeClient):
             "environments": [{"name": "dev"}, {"name": "prod"}],
             "buckets": [{"name": "data"}],
             "volumes": [],
-            "secrets": [{"name": "api", "keys": ["TOKEN"]}],
+            # No secrets: the route deliberately does not answer for them.
         }
+
+    def list_secrets(self) -> list[dict[str, Any]]:
+        self.secret_calls += 1
+        return [{"name": "api", "keys": ["TOKEN"]}]
 
     def _refuse(self, *_a: Any, **_k: Any) -> Any:
         raise AssertionError("the fan-out ran even though the composite route answered")
@@ -1019,7 +1079,30 @@ def test_workspace_overview_prefers_the_composite_route() -> None:
     assert overview.project_summaries[0].cron_status == "active"
     assert overview.project_summaries[0].last_run == LATEST_RUN
     assert [item["name"] for item in overview.buckets] == ["data"]
-    assert [item["name"] for item in overview.secrets] == ["api"]
+    # Secrets are the one thing the route does not carry, so they are not here yet.
+    assert overview.secrets == []
+    assert client.secret_calls == 0
+
+
+def test_workspace_secrets_are_read_on_their_own_after_the_composite() -> None:
+    """Secret Manager costs more than the rest of the view together, so the table it
+    fills waits for nobody."""
+    client = CompositeClient()
+    data = fake_tui_data(client)
+
+    data.load_workspace_overview()
+    assert client.secret_calls == 0
+
+    assert [item["name"] for item in data.load_workspace_secrets()] == ["api"]
+    assert client.secret_calls == 1
+
+
+def test_workspace_secrets_degrade_to_an_empty_table() -> None:
+    class Unsupported(CompositeClient):
+        def list_secrets(self) -> list[dict[str, Any]]:
+            raise RebaseWorkflowError("502 Secret Manager error")
+
+    assert fake_tui_data(Unsupported()).load_workspace_secrets() == []
 
 
 def test_workspace_overview_falls_back_when_the_platform_lacks_the_route() -> None:
@@ -1074,7 +1157,9 @@ def test_tui_app_mounts_and_renders_selected_workflow_run() -> None:
             functions = app.query_one("#functions-table", DataTable)
             workflows = app.query_one("#workflows-table", DataTable)
             assert projects.styles.scrollbar_size_vertical == 1
-            assert projects.styles.scrollbar_size_horizontal == 0
+            # The projects table scrolls sideways too: eight columns past the name, and
+            # "Created" was falling off the right of a narrow terminal with no way back.
+            assert projects.styles.scrollbar_size_horizontal == 1
             assert projects.styles.scrollbar_background.hex == "#101412"
             assert projects.zebra_stripes is False
             assert projects.row_count == 2
@@ -1101,6 +1186,7 @@ def test_tui_app_mounts_and_renders_selected_workflow_run() -> None:
             for table in (functions, workflows, app.query_one("#runs-table", DataTable)):
                 assert table.styles.scrollbar_background.hex == "#101412"
             assert workflows.styles.scrollbar_color.hex == "#03C497"
+            assert app.query_one("#projects-table", DataTable).styles.scrollbar_color.hex == "#03C497"
             assert functions.styles.scrollbar_color.hex != "#03C497"
             assert app.query_one("#runs-table", DataTable).styles.scrollbar_color.hex != "#03C497"
 
