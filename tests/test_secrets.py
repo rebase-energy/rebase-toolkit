@@ -125,6 +125,46 @@ def test_function_rejects_nonpositive_resources() -> None:
             return {}
 
 
+def test_workflow_cpu_memory_normalize_like_a_function() -> None:
+    """A workflow sizes its own job container with the same spelling a function uses."""
+
+    @rb.workflow(name="heavy-flow", mode="job", cpu=2, memory=4096)
+    def heavy_flow() -> dict:
+        return {}
+
+    assert heavy_flow.cloud_run_cpu == "2000m"
+    assert heavy_flow.cloud_run_memory == "4096Mi"
+
+    @rb.workflow(name="string-flow", mode="job", cpu="500m", memory="2Gi")
+    def string_flow() -> dict:
+        return {}
+
+    assert string_flow.cloud_run_cpu == "500m"
+    assert string_flow.cloud_run_memory == "2Gi"
+
+
+def test_workflow_cpu_memory_default_none() -> None:
+    """Declaring nothing stays NULL, so the backend default applies."""
+
+    @rb.workflow(name="light-flow")
+    def light_flow() -> dict:
+        return {}
+
+    assert light_flow.cloud_run_cpu is None
+    assert light_flow.cloud_run_memory is None
+
+
+def test_workflow_resources_is_separate_from_its_own_container() -> None:
+    """`resources=` annotates steps; it must not be mistaken for the job's own size."""
+
+    @rb.workflow(name="stepped", mode="job", resources={"memory": "8Gi"})
+    def stepped() -> dict:
+        return {}
+
+    assert stepped.resource_policy == {"memory": "8Gi"}
+    assert stepped.cloud_run_memory is None
+
+
 def test_predictor_class_cpu_memory() -> None:
     class Heavy(rb.Predictor):
         name = "heavy-model"

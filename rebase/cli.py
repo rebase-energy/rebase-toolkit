@@ -689,6 +689,21 @@ def _progress_prefix(status: str) -> tuple[str, str]:
     return "•", "rebase.muted"
 
 
+def _log_line(timestamp: str, message: str) -> Text:
+    """A log line whose message is literal text, not console markup.
+
+    Built as `Text` rather than interpolated into a markup string: a log message is
+    user output, and Rich reads `[...]` in it as a style tag. A workflow printing
+    `[my-workflow] tick` had the label silently eaten, and a message carrying an
+    unclosed or unknown tag can fail to render at all — losing the line the reader
+    asked for. The timestamp is still styled; only the message is protected.
+    """
+    line = Text(timestamp, style="rebase.muted")
+    line.append(" ")
+    line.append(message)
+    return line
+
+
 def _format_duration(seconds: float) -> str:
     return f"{seconds:.2f}"
 
@@ -724,7 +739,7 @@ class _LineRunProgressReporter:
 
     def log(self, timestamp: str, message: str, severity: str = "INFO") -> None:
         style = "rebase.error" if severity in {"ERROR", "CRITICAL", "WARNING"} else None
-        console.print(f"[rebase.muted]{timestamp}[/rebase.muted] {message}", style=style, highlight=False)
+        console.print(_log_line(timestamp, message), style=style, highlight=False)
 
     def step(self, name: str, status: str) -> None:
         if status == "running":
@@ -787,7 +802,7 @@ class _TerminalRunProgressReporter:
 
     def log(self, timestamp: str, message: str, severity: str = "INFO") -> None:
         style = "rebase.error" if severity in {"ERROR", "CRITICAL", "WARNING"} else None
-        self._live.console.print(f"[rebase.muted]{timestamp}[/rebase.muted] {message}", style=style, highlight=False)
+        self._live.console.print(_log_line(timestamp, message), style=style, highlight=False)
 
     def _workflow_steps_tree(self) -> Tree:
         if self._steps_tree is None:
@@ -2579,6 +2594,50 @@ def workspace_invite_command(
     )
 
 
+def _resolve_workspace_invite(client: Client, target: str) -> dict[str, Any]:
+    """Find a pending workspace invite by email, GitHub username, or invite id."""
+    needle = target.strip().lstrip("@").lower()
+    if not needle:
+        raise RebaseWorkflowError("provide an invite email, GitHub username, or invite id")
+    pending = [invite for invite in client.list_workspace_invites() if invite.get("status") == "pending"]
+    matches = [
+        invite
+        for invite in pending
+        if needle
+        in {
+            str(invite.get("email") or "").lower(),
+            str(invite.get("github_username") or "").lower(),
+            str(invite.get("id") or "").lower(),
+        }
+    ]
+    if not matches:
+        known = ", ".join(sorted(_workspace_member_identity(invite) for invite in pending)) or "none"
+        raise RebaseWorkflowError(f"no pending invite matches {target!r}. Pending invites: {known}")
+    if len(matches) > 1:
+        raise RebaseWorkflowError(f"{target!r} matches more than one pending invite; use the invite id instead")
+    return matches[0]
+
+
+@workspace_app.command("uninvite")
+def workspace_uninvite_command(
+    target: Annotated[
+        str,
+        typer.Argument(help="Invite email, GitHub username, or invite id."),
+    ],
+) -> None:
+    """Revoke a pending invite to the active workspace.
+
+    The invite stops granting access; the person can be invited again later.
+    Only pending invites can be revoked — an accepted invite already became a
+    membership, which `rebase workspace set-role` manages.
+    """
+    client = Client()
+    invite = _resolve_workspace_invite(client, target)
+    revoked = client.revoke_workspace_invite(str(invite["id"]))
+    identity = _workspace_member_identity(revoked)
+    console.print(f"Revoked workspace invite for [rebase.value]{identity}[/rebase.value]")
+
+
 @workspace_app.command("set-role")
 def workspace_set_role_command(
     target: Annotated[
@@ -2801,6 +2860,8 @@ COMPUTE_POLICY_DETAIL_KEYS = [
     "max_concurrent_cloud_run_runs",
     "max_cloud_run_instances",
     "max_cloud_run_concurrency",
+    "max_cloud_run_cpu_milli",
+    "max_cloud_run_memory_mib",
     "cloud_run_enabled",
     "gpu_allowed",
     "updated_at",
@@ -2838,23 +2899,35 @@ def workspace_compute_policy_set_command(
     max_concurrency: Annotated[
         int | None, typer.Option("--max-concurrency", help="Ceiling for a service's per-instance concurrency.")
     ] = None,
+    max_cpu_milli: Annotated[
+        int | None,
+        typer.Option("--max-cpu-milli", help="Ceiling for a target's vCPU, in milli-vCPU (1000 = 1 vCPU)."),
+    ] = None,
+    max_memory_mib: Annotated[
+        int | None,
+        typer.Option("--max-memory-mib", help="Ceiling for a target's memory, in MiB (1024 = 1 GiB)."),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Update the workspace's compute limits.
 
     The policy is a ceiling, not a default: an app still opts in to a longer timeout
-    through its own `cloud_run_timeout_seconds`. A longer timeout also costs
-    proportionally more credits, since ASGI traffic is charged on elapsed runtime.
+    through its own `cloud_run_timeout_seconds`, and a workflow to more memory through
+    its own `memory=`. A longer timeout also costs proportionally more credits, since
+    ASGI traffic is charged on elapsed runtime -- as does more memory, which is charged
+    per GiB-second of whatever the container actually reserves.
     """
     if (
         max_run_timeout_seconds is None
         and max_concurrent_runs is None
         and max_instances is None
         and max_concurrency is None
+        and max_cpu_milli is None
+        and max_memory_mib is None
     ):
         raise RebaseWorkflowError(
             "nothing to update; pass --max-run-timeout-seconds, --max-concurrent-runs, "
-            "--max-instances, or --max-concurrency"
+            "--max-instances, --max-concurrency, --max-cpu-milli, or --max-memory-mib"
         )
     kwargs: dict[str, Any] = {}
     if max_run_timeout_seconds is not None:
@@ -2865,6 +2938,10 @@ def workspace_compute_policy_set_command(
         kwargs["max_cloud_run_instances"] = max_instances
     if max_concurrency is not None:
         kwargs["max_cloud_run_concurrency"] = max_concurrency
+    if max_cpu_milli is not None:
+        kwargs["max_cloud_run_cpu_milli"] = max_cpu_milli
+    if max_memory_mib is not None:
+        kwargs["max_cloud_run_memory_mib"] = max_memory_mib
     policy = Client().update_workspace_compute_policy(**kwargs)
     if json_output:
         _print_json(policy)
@@ -4863,7 +4940,18 @@ schedule_app = typer.Typer(
     rich_markup_mode="rich",
 )
 
-SCHEDULE_DETAIL_KEYS = ["workflow", "cron", "timezone", "day_or", "active", "next_run_at", "workflow_id", "version_id"]
+SCHEDULE_DETAIL_KEYS = [
+    "workflow",
+    "cron",
+    "timezone",
+    "day_or",
+    "active",
+    "paused",
+    "paused_until",
+    "next_run_at",
+    "workflow_id",
+    "version_id",
+]
 
 
 def _schedule_detail(workflow: dict[str, Any], schedule_data: dict[str, Any]) -> dict[str, Any]:
@@ -4874,6 +4962,8 @@ def _schedule_detail(workflow: dict[str, Any], schedule_data: dict[str, Any]) ->
         "timezone": schedule.get("timezone"),
         "day_or": schedule.get("day_or", True),
         "active": schedule_data.get("active"),
+        "paused": schedule_data.get("paused", False),
+        "paused_until": schedule_data.get("paused_until"),
         "next_run_at": schedule_data.get("next_run_at"),
         "workflow_id": schedule_data.get("workflow_id"),
         "version_id": schedule_data.get("version_id"),
@@ -4889,26 +4979,100 @@ def _require_schedule(client: Client, workflow: dict[str, Any]) -> dict[str, Any
     return schedule_data
 
 
-def _set_schedule_active(
+_PAUSE_DURATION_RE = re.compile(r"^\s*(\d+)\s*(m|h|d|w)\s*$")
+_PAUSE_DURATION_UNITS = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
+
+
+def _workflow_schedule_status(workflow: dict[str, Any]) -> str:
+    """A schedule's state as configured: active, paused (with any resume time), or stopped."""
+    schedule = workflow.get("schedule") or {}
+    if workflow.get("enabled") is False or not schedule.get("active", True):
+        return "stopped"
+    if workflow.get("paused"):
+        until = workflow.get("paused_until")
+        if not until:
+            return "paused"
+        try:
+            expiry = datetime.fromisoformat(str(until).replace("Z", "+00:00"))
+        except ValueError:
+            return "paused"
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=UTC)
+        if datetime.now(UTC) < expiry:
+            return f"paused until {str(until)[:10]}"
+    return "active"
+
+
+def _resolve_pause_until(until: str | None, duration: str | None) -> str | None:
+    """Turn --until/--for into a UTC ISO timestamp, or None for an indefinite pause."""
+    if until and duration:
+        raise RebaseWorkflowError("pass either --until or --for, not both")
+    if duration:
+        match = _PAUSE_DURATION_RE.match(duration)
+        if match is None:
+            raise RebaseWorkflowError(f"invalid duration: {duration!r} (expected e.g. '90m', '12h', '3d', '2w')")
+        delta = timedelta(**{_PAUSE_DURATION_UNITS[match.group(2)]: int(match.group(1))})
+        return (datetime.now(UTC) + delta).isoformat()
+    if not until:
+        return None
+    try:
+        parsed = datetime.fromisoformat(until)
+    except ValueError as exc:
+        raise RebaseWorkflowError(f"invalid --until: {until!r} (expected e.g. '2026-09-15' or ISO 8601)") from exc
+    if parsed.tzinfo is None:
+        # A bare date or local time means the user's clock, not UTC.
+        parsed = parsed.astimezone()
+    if parsed <= datetime.now(UTC):
+        raise RebaseWorkflowError(f"--until is in the past: {until!r}")
+    return parsed.astimezone(UTC).isoformat()
+
+
+def _pause_workflow(
     name: str | None,
     project: str | None,
     workflow_id: str | None,
     json_output: bool,
     *,
-    active: bool,
+    until: str | None,
+    duration: str | None,
 ) -> None:
+    resolved_until = _resolve_pause_until(until, duration)
     client = Client()
     workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
-    schedule_data = _require_schedule(client, workflow)
-    schedule = dict(schedule_data["schedule"])
-    schedule["active"] = active
-    client.update_workflow(str(workflow["id"]), schedule=schedule)
+    _require_schedule(client, workflow)
+    client.pause_workflow(str(workflow["id"]), until=resolved_until)
     refreshed = client.get_workflow_schedule(str(workflow["id"]))
     if json_output:
         _print_json(refreshed)
         return
-    title = "Schedule Resumed" if active else "Schedule Paused"
-    console.print(_detail_table(title, _schedule_detail(workflow, refreshed), preferred_keys=SCHEDULE_DETAIL_KEYS))
+    console.print(
+        _detail_table("Schedule Paused", _schedule_detail(workflow, refreshed), preferred_keys=SCHEDULE_DETAIL_KEYS)
+    )
+
+
+def _resume_workflow(
+    name: str | None,
+    project: str | None,
+    workflow_id: str | None,
+    json_output: bool,
+) -> None:
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    schedule_data = _require_schedule(client, workflow)
+    client.resume_workflow(str(workflow["id"]))
+    # Schedules paused by older CLIs carry active=false inside the schedule JSON
+    # itself; lifting only the workflow-level pause would leave those dormant.
+    schedule = dict(schedule_data["schedule"])
+    if not schedule.get("active", True):
+        schedule["active"] = True
+        client.update_workflow(str(workflow["id"]), schedule=schedule)
+    refreshed = client.get_workflow_schedule(str(workflow["id"]))
+    if json_output:
+        _print_json(refreshed)
+        return
+    console.print(
+        _detail_table("Schedule Resumed", _schedule_detail(workflow, refreshed), preferred_keys=SCHEDULE_DETAIL_KEYS)
+    )
 
 
 @schedule_app.command("show")
@@ -4986,12 +5150,18 @@ def workflow_schedule_clear_command(
 @schedule_app.command("pause")
 def workflow_schedule_pause_command(
     name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    until: Annotated[
+        str | None, typer.Option("--until", "-u", help="Resume automatically at this time, e.g. 2026-09-15.")
+    ] = None,
+    duration: Annotated[
+        str | None, typer.Option("--for", "-f", help="Resume automatically after e.g. 90m, 12h, 3d, 2w.")
+    ] = None,
     project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
     workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
     json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
-    """Pause a schedule (keeps it registered; no runs fire)."""
-    _set_schedule_active(name, project, workflow_id, json_output, active=False)
+    """Pause a schedule (keeps it registered; no runs fire). --until/--for resume it automatically."""
+    _pause_workflow(name, project, workflow_id, json_output, until=until, duration=duration)
 
 
 @schedule_app.command("resume")
@@ -5002,7 +5172,35 @@ def workflow_schedule_resume_command(
     json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Resume a paused schedule."""
-    _set_schedule_active(name, project, workflow_id, json_output, active=True)
+    _resume_workflow(name, project, workflow_id, json_output)
+
+
+@workflow_app.command("pause")
+def workflow_pause_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    until: Annotated[
+        str | None, typer.Option("--until", "-u", help="Resume automatically at this time, e.g. 2026-09-15.")
+    ] = None,
+    duration: Annotated[
+        str | None, typer.Option("--for", "-f", help="Resume automatically after e.g. 90m, 12h, 3d, 2w.")
+    ] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Pause a workflow's scheduled runs. Same as 'workflow schedule pause'."""
+    _pause_workflow(name, project, workflow_id, json_output, until=until, duration=duration)
+
+
+@workflow_app.command("resume")
+def workflow_resume_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Resume a paused workflow. Same as 'workflow schedule resume'."""
+    _resume_workflow(name, project, workflow_id, json_output)
 
 
 @schedule_app.command("trigger")
@@ -5078,7 +5276,7 @@ def workflow_schedule_list_command(
     table.add_column("Workflow", style="rebase.value")
     table.add_column("Cron")
     table.add_column("Timezone")
-    table.add_column("Active")
+    table.add_column("Status")
     table.add_column("Next run")
     table.add_column("ID", style="rebase.muted")
     for workflow in scheduled:
@@ -5087,7 +5285,7 @@ def workflow_schedule_list_command(
             str(workflow.get("name", "-")),
             str(schedule.get("cron", "-")),
             _format_value(schedule.get("timezone")),
-            _format_value(schedule.get("active", True)),
+            _workflow_schedule_status(workflow),
             _format_value(workflow.get("next_run_at")),
             str(workflow.get("id", "-")),
         )

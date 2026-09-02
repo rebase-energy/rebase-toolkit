@@ -2480,6 +2480,12 @@ class Client:
         # Cache for tokens read from disk by load_access_token(); explicit
         # credentials (api_key/access_token) never go through this.
         self._cached_disk_token: str | None = None
+        # Routes this platform answered 404/405 for. Only the composite reads use it,
+        # and only to stop re-asking: the TUI re-reads its view every few seconds, so
+        # against a platform behind this package the wasted probe would be paid on every
+        # refresh rather than once. A platform upgraded mid-session is picked up on the
+        # next run, which is soon enough for a route whose absence only costs speed.
+        self._absent_routes: set[str] = set()
 
     def _http_session(self) -> requests.Session:
         pid = os.getpid()
@@ -2499,6 +2505,8 @@ class Client:
             environment_name=environment_name,
         )
         clone._cached_disk_token = self._cached_disk_token
+        # Same platform, so the same routes are missing from it.
+        clone._absent_routes = self._absent_routes
         return clone
 
     def _http_request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
@@ -3234,6 +3242,37 @@ class Client:
 
     def get_workspace(self) -> dict[str, Any]:
         return self._request_dict("GET", "/workspace", expected="workspace response")
+
+    def _composite_read(self, path: str, *, expected: str, route: str | None = None) -> dict[str, Any] | None:
+        """A whole-view read, or None where the platform has no such route."""
+        key = route or path
+        if key in self._absent_routes:
+            return None
+        try:
+            return self._request_dict("GET", path, expected=expected)
+        except RebaseWorkflowError as exc:
+            if exc.status_code in ROUTE_ABSENT_STATUSES:
+                self._absent_routes.add(key)
+                return None
+            raise
+
+    def get_workspace_overview(self) -> dict[str, Any] | None:
+        """Everything the workspace view draws, in one request, where the API offers it.
+
+        `None` on an API old enough not to have the route, so the caller can fall back to
+        assembling the same answer from the individual list calls. That fallback is not
+        theoretical: a toolkit is routinely ahead of the platform it is pointed at.
+        """
+        return self._composite_read("/workspace/overview", expected="workspace overview response")
+
+    def get_project_overview(self, project_id: str) -> dict[str, Any] | None:
+        """Everything the project view draws, in one request, where the API offers it.
+
+        `None` when the route is absent, on the same terms as `get_workspace_overview`.
+        """
+        return self._composite_read(
+            f"/projects/{project_id}/overview", expected="project overview response", route="/projects/*/overview"
+        )
 
     def update_workspace(
         self,
@@ -4207,6 +4246,8 @@ class Client:
         git_tag: str | None = None,
         git_dirty: bool | None = None,
         build: dict[str, Any] | None = None,
+        cloud_run_cpu: str | None = None,
+        cloud_run_memory: str | None = None,
     ) -> dict[str, Any]:
         environment = _resolve_environment(self, environment)
         path = "/workflows"
@@ -4235,6 +4276,8 @@ class Client:
             "env": env or {},
             "secrets": secrets or {},
             "buckets": buckets or [],
+            "cloud_run_cpu": cloud_run_cpu,
+            "cloud_run_memory": cloud_run_memory,
             "enabled": enabled,
             "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
             "environment": environment,
@@ -4285,6 +4328,12 @@ class Client:
         git_tag: str | None = None,
         git_dirty: bool | None = None,
         build: dict[str, Any] | None = None,
+        # _UNSET, not None, for the same reason as buckets/schedule above: None
+        # is a meaningful value here ("back to the backend default"), so it has
+        # to survive the drop-None filter below. Deleting `memory=` from a
+        # decorator must actually clear the limit, not silently keep the old one.
+        cloud_run_cpu: str | None | object = _UNSET,
+        cloud_run_memory: str | None | object = _UNSET,
     ) -> dict[str, Any]:
         execution_payload: dict[str, Any] = {}
         if mode is not None or isolation is not None or run_type is not None:
@@ -4331,6 +4380,10 @@ class Client:
             payload["trigger"] = trigger
         if buckets is not _UNSET:
             payload["buckets"] = buckets
+        if cloud_run_cpu is not _UNSET:
+            payload["cloud_run_cpu"] = cloud_run_cpu
+        if cloud_run_memory is not _UNSET:
+            payload["cloud_run_memory"] = cloud_run_memory
         if build:
             payload["build"] = build
         return self._request_dict("PATCH", f"/workflows/{workflow_id}", json=payload, expected="workflow response")
@@ -4443,6 +4496,16 @@ class Client:
     def get_workflow_schedule(self, workflow_id: str) -> dict[str, Any]:
         return self._request_dict("GET", f"/workflows/{workflow_id}/schedule", expected="workflow schedule response")
 
+    def pause_workflow(self, workflow_id: str, *, until: str | None = None) -> dict[str, Any]:
+        """Pause a workflow's scheduled runs; ``until`` (ISO 8601) lifts the pause on its own."""
+        return self._request_dict(
+            "POST", f"/workflows/{workflow_id}/pause", json={"until": until}, expected="workflow response"
+        )
+
+    def resume_workflow(self, workflow_id: str) -> dict[str, Any]:
+        """Lift a workflow's pause so scheduled runs fire again."""
+        return self._request_dict("POST", f"/workflows/{workflow_id}/resume", expected="workflow response")
+
     def get_workflow_trigger(self, workflow_id: str) -> dict[str, Any]:
         return self._request_dict("GET", f"/workflows/{workflow_id}/trigger", expected="workflow trigger response")
 
@@ -4499,6 +4562,8 @@ class Client:
         max_concurrent_cloud_run_runs: int | None = None,
         max_cloud_run_instances: int | None = None,
         max_cloud_run_concurrency: int | None = None,
+        max_cloud_run_cpu_milli: int | None = None,
+        max_cloud_run_memory_mib: int | None = None,
     ) -> dict[str, Any]:
         # No _UNSET sentinel here, unlike update_workspace_notifications: these are
         # NOT NULL integers with no clear-to-null semantics, so plain "None means not
@@ -4512,6 +4577,10 @@ class Client:
             payload["max_cloud_run_instances"] = max_cloud_run_instances
         if max_cloud_run_concurrency is not None:
             payload["max_cloud_run_concurrency"] = max_cloud_run_concurrency
+        if max_cloud_run_cpu_milli is not None:
+            payload["max_cloud_run_cpu_milli"] = max_cloud_run_cpu_milli
+        if max_cloud_run_memory_mib is not None:
+            payload["max_cloud_run_memory_mib"] = max_cloud_run_memory_mib
         return self._request_dict(
             "PATCH", "/workspace/compute-policy", json=payload, expected="workspace compute policy response"
         )
@@ -5019,6 +5088,8 @@ class Project:
         buckets: list[Bucket | str] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
+        cpu: float | int | str | None = None,
+        memory: int | float | str | None = None,
         resources: dict[str, Any] | None = None,
         backend: str | None = None,
     ) -> Callable[[Callable[..., Any]], Workflow]:
@@ -5048,6 +5119,8 @@ class Project:
                 buckets=buckets,
                 min_instances=min_instances,
                 concurrency=concurrency,
+                cpu=cpu,
+                memory=memory,
                 resources=resources,
             )
             self._workflows.append(workflow)
@@ -6324,6 +6397,8 @@ class Workflow:
         buckets: list[Bucket | str] | list[dict[str, Any]] | None = None,
         min_instances: int | None = None,
         concurrency: int | None = None,
+        cpu: float | int | str | None = None,
+        memory: int | float | str | None = None,
         resources: dict[str, Any] | None = None,
         backend: str | None = None,
     ) -> None:
@@ -6367,6 +6442,13 @@ class Workflow:
         self.image: Image | None = image if isinstance(image, Image) else None
         self.cloud_run_min_instances: int | None = None
         self.cloud_run_concurrency: int | None = None
+        # The workflow's OWN container, distinct from `resource_policy` below,
+        # which annotates its steps. Normalized eagerly, as Function does, so
+        # "2Gi" and a bare MiB int both become the Cloud Run spelling.
+        self.cloud_run_cpu: str | None = _cloud_run_cpu_value(cpu) or (data.get("cloud_run_cpu") if data else None)
+        self.cloud_run_memory: str | None = _cloud_run_memory_value(memory) or (
+            data.get("cloud_run_memory") if data else None
+        )
         self.resource_policy: dict[str, Any] = {}
 
         if fn is not None:
@@ -6569,6 +6651,8 @@ class Workflow:
                 env=self.env,
                 secrets=secrets_payload,
                 buckets=buckets_payload,
+                cloud_run_cpu=self.cloud_run_cpu,
+                cloud_run_memory=self.cloud_run_memory,
                 enabled=self.enabled,
                 endpoint=self.endpoint,
                 build=build,
@@ -6597,6 +6681,8 @@ class Workflow:
             env=self.env,
             secrets=secrets_payload,
             buckets=buckets_payload,
+            cloud_run_cpu=self.cloud_run_cpu,
+            cloud_run_memory=self.cloud_run_memory,
             enabled=self.enabled,
             endpoint=self.endpoint,
             build=build,

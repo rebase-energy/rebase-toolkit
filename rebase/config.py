@@ -7,7 +7,11 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-DEFAULT_SERVER_URL = "https://rebase-toolkit-api-1002868894268.europe-north1.run.app"
+# europe-west3, not europe-north1, because that is where the database is: Supabase sits
+# in AWS eu-central-1, and a round trip to it costs 6.11ms from Frankfurt against 76.65ms
+# from Hamina. Only this service moved -- the Prefect side reaches its own Cloud SQL over
+# a private IP that exists in europe-north1 alone.
+DEFAULT_SERVER_URL = "https://rebase-toolkit-api-1002868894268.europe-west3.run.app"
 DEFAULT_API_URL = DEFAULT_SERVER_URL
 DEFAULT_PROFILE = "default"
 CONFIG_PATH_ENV = "REBASE_CONFIG_PATH"

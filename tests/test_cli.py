@@ -3443,6 +3443,70 @@ def test_workspace_invite_rejects_duplicate_identity(capsys) -> None:
     assert "email was given twice" in capsys.readouterr().err
 
 
+def _fake_invites(*invites: dict[str, Any]):
+    def fake_list_workspace_invites(self: Client) -> list[dict[str, Any]]:
+        return list(invites)
+
+    return fake_list_workspace_invites
+
+
+def test_workspace_uninvite_revokes_pending_invite_by_email(monkeypatch, capsys) -> None:
+    revoked: list[str] = []
+
+    def fake_revoke_workspace_invite(self: Client, invite_id: str) -> dict[str, Any]:
+        revoked.append(invite_id)
+        return {"id": invite_id, "email": "davide@rebase.energy", "status": "revoked"}
+
+    monkeypatch.setattr(
+        Client,
+        "list_workspace_invites",
+        _fake_invites(
+            {"id": "invite-1", "email": "davide@rebase.energy", "github_username": None, "status": "pending"},
+            {"id": "invite-2", "email": "other@rebase.energy", "github_username": None, "status": "accepted"},
+        ),
+    )
+    monkeypatch.setattr(Client, "revoke_workspace_invite", fake_revoke_workspace_invite)
+
+    assert main(["workspace", "uninvite", "davide@rebase.energy"]) == 0
+
+    assert revoked == ["invite-1"]
+    assert "davide@rebase.energy" in capsys.readouterr().out
+
+
+def test_workspace_uninvite_matches_github_username(monkeypatch, capsys) -> None:
+    revoked: list[str] = []
+
+    def fake_revoke_workspace_invite(self: Client, invite_id: str) -> dict[str, Any]:
+        revoked.append(invite_id)
+        return {"id": invite_id, "email": None, "github_username": "davide-github", "status": "revoked"}
+
+    monkeypatch.setattr(
+        Client,
+        "list_workspace_invites",
+        _fake_invites({"id": "invite-1", "email": None, "github_username": "davide-github", "status": "pending"}),
+    )
+    monkeypatch.setattr(Client, "revoke_workspace_invite", fake_revoke_workspace_invite)
+
+    assert main(["workspace", "uninvite", "@davide-github"]) == 0
+
+    assert revoked == ["invite-1"]
+    assert "@davide-github" in capsys.readouterr().out
+
+
+def test_workspace_uninvite_ignores_non_pending_invites(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        Client,
+        "list_workspace_invites",
+        _fake_invites(
+            {"id": "invite-1", "email": "davide@rebase.energy", "github_username": None, "status": "accepted"}
+        ),
+    )
+
+    assert main(["workspace", "uninvite", "davide@rebase.energy"]) == 1
+
+    assert "no pending invite matches" in capsys.readouterr().err
+
+
 def _member(email: str, *, role: str, github_username: str | None = None) -> dict[str, Any]:
     return {
         "profile_id": f"profile-{email.split('@')[0]}",
@@ -4396,15 +4460,20 @@ def test_workflow_schedule_set_rejects_invalid_cron(monkeypatch, capsys) -> None
     assert "cron" in capsys.readouterr().err
 
 
-def test_workflow_schedule_pause_and_resume_toggle_active(monkeypatch, capsys) -> None:
+def test_workflow_schedule_pause_and_resume_use_the_pause_endpoints(monkeypatch, capsys) -> None:
     _stub_workflow_lookup(monkeypatch)
-    schedules: list[dict[str, Any]] = []
+    calls: list[tuple[str, Any]] = []
 
-    def fake_update_workflow(self, workflow_id, **kwargs):
-        schedules.append(dict(kwargs["schedule"]))
+    def fake_pause_workflow(self, workflow_id, *, until=None):
+        calls.append(("pause", until))
         return {"id": workflow_id}
 
-    monkeypatch.setattr(Client, "update_workflow", fake_update_workflow)
+    def fake_resume_workflow(self, workflow_id):
+        calls.append(("resume", None))
+        return {"id": workflow_id}
+
+    monkeypatch.setattr(Client, "pause_workflow", fake_pause_workflow)
+    monkeypatch.setattr(Client, "resume_workflow", fake_resume_workflow)
     monkeypatch.setattr(
         Client,
         "get_workflow_schedule",
@@ -4413,16 +4482,60 @@ def test_workflow_schedule_pause_and_resume_toggle_active(monkeypatch, capsys) -
             "version_id": "version-id",
             "schedule": {"type": "cron", "cron": "0 * * * *", "active": True},
             "active": True,
+            "paused": False,
+            "paused_until": None,
             "next_run_at": None,
         },
     )
 
     assert main(["workflow", "schedule", "pause", "--id", "workflow-id"]) == 0
-    assert schedules[-1]["active"] is False
+    assert calls[-1] == ("pause", None)
     assert "Schedule Paused" in capsys.readouterr().out
 
+    assert main(["workflow", "schedule", "pause", "--id", "workflow-id", "--until", "2099-09-15T10:00:00+00:00"]) == 0
+    assert calls[-1] == ("pause", "2099-09-15T10:00:00+00:00")
+    capsys.readouterr()
+
     assert main(["workflow", "schedule", "resume", "--id", "workflow-id"]) == 0
-    assert schedules[-1]["active"] is True
+    assert calls[-1] == ("resume", None)
+    assert "Schedule Resumed" in capsys.readouterr().out
+
+
+def test_workflow_pause_rejects_until_and_for_together(monkeypatch, capsys) -> None:
+    assert main(["workflow", "pause", "--id", "workflow-id", "--until", "2099-09-15", "--for", "2w"]) == 1
+    assert "not both" in capsys.readouterr().err
+
+
+def test_workflow_pause_rejects_an_expiry_in_the_past(monkeypatch, capsys) -> None:
+    assert main(["workflow", "pause", "--id", "workflow-id", "--until", "2020-01-01"]) == 1
+    assert "in the past" in capsys.readouterr().err
+
+
+def test_workflow_resume_reactivates_a_legacy_inactive_schedule(monkeypatch, capsys) -> None:
+    """Schedules paused by older CLIs carry active=false in the schedule JSON itself."""
+    _stub_workflow_lookup(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    def fake_update_workflow(self, workflow_id, **kwargs):
+        observed["schedule"] = kwargs.get("schedule")
+        return {"id": workflow_id}
+
+    monkeypatch.setattr(Client, "resume_workflow", lambda self, workflow_id: {"id": workflow_id})
+    monkeypatch.setattr(Client, "update_workflow", fake_update_workflow)
+    monkeypatch.setattr(
+        Client,
+        "get_workflow_schedule",
+        lambda self, workflow_id: {
+            "workflow_id": workflow_id,
+            "version_id": "version-id",
+            "schedule": {"type": "cron", "cron": "0 * * * *", "active": False},
+            "active": False,
+            "next_run_at": None,
+        },
+    )
+
+    assert main(["workflow", "resume", "--id", "workflow-id"]) == 0
+    assert observed["schedule"]["active"] is True
     assert "Schedule Resumed" in capsys.readouterr().out
 
 

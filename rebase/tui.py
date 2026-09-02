@@ -124,13 +124,13 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "Workflows",
         "Cron jobs",
         "Endpoints",
+        "Status",
         "Last run",
         "Next run",
         "Created",
     ),
     "workspace-profiles-table": ("Active", "Profile", "Workspace", "Workspace ID", "API URL"),
     "buckets-table": ("Bucket", "URI", "Created", "Updated"),
-    "volumes-table": ("Volume", "Provider", "Storage", "Prefix", "Created", "Updated"),
     "secrets-table": ("Secret", "Keys"),
     # `Origin` sits second in both: you read what a thing is called, then what kind of
     # thing it is, and every column after it is one a one-off has no answer for.
@@ -175,12 +175,55 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "Artifacts",
         "Result / Error",
     ),
+    # `Depends on` sits next to the step it qualifies: the DAG is the reason the Steps
+    # view exists as something other than a filtered Activity, and the edges are what
+    # make an ordering readable rather than merely chronological. Attempt, the two
+    # timestamps and Duration were a `attempt 1 · finished 14:00:20` sentence crammed
+    # into Message; as columns they sort and scan, and Message is left to say the only
+    # thing that varies in shape — the error. Laid out like the Tasks view, which
+    # already answers the same "what ran, how did it go, how long" questions.
+    # There is no separate `Time`: a step row's time *is* its start.
+    "timeline-table-steps": (
+        "Step",
+        "Depends on",
+        "Status",
+        "Attempt",
+        "Started",
+        "Finished",
+        "Duration",
+        "Message",
+    ),
     "timeline-table-artifacts": ("Artifact", "Produced by", "Disposition", "Type", "Size", "URI"),
 }
+#: Where the projects table's ticking countdown lives, and the width every value is padded
+#: to. A cell that redraws once a second must not resize its column under the reader, so
+#: the widest thing `format_countdown` produces ("in 364d 23h") sets the width once and
+#: every shorter value is padded out to it.
+NEXT_RUN_COLUMN = TABLE_COLUMNS["projects-table"].index("Next run")
+COUNTDOWN_WIDTH = 11
+#: How often that countdown redraws. Local arithmetic on rows already in hand — no request
+#: is made, and nothing moves but the digits.
+COUNTDOWN_TICK_SECONDS = 1.0
+#: The background the three chrome rows share — the header, the chip strip under it and
+#: the column header under that. They are one band of furniture above the rows, so they
+#: are one colour: Textual would otherwise paint the header the app background, the
+#: strips and the column header its own `$panel` blue-grey, and draw two seams across a
+#: band that is a single thing. Grey rather than `$panel` because that blue appears
+#: nowhere else in the palette.
+CHROME_GRAY = "#232826"
+#: The same band under the pointer, for the column headers that are also splitters.
+CHROME_GRAY_HOVER = "#33403A"
+
 #: The tab each target table belongs to, in the order `left`/`right` cycle them.
 TARGET_TABS: tuple[tuple[str, str], ...] = (
     ("workflows-tab", "#workflows-table"),
     ("functions-tab", "#functions-table"),
+)
+#: The same for the workspace view's resource chips, in the order they are drawn.
+RESOURCE_TABS: tuple[tuple[str, str], ...] = (
+    ("projects-resource-tab", "#projects-table"),
+    ("buckets-resource-tab", "#buckets-table"),
+    ("secrets-resource-tab", "#secrets-table"),
 )
 #: The two tables a project's targets are drawn into, without their `#`.
 TARGET_TABLE_IDS: tuple[str, ...] = ("workflows-table", "functions-table")
@@ -204,7 +247,6 @@ TERMINAL_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 PRESERVED_TABLE_IDS: tuple[str, ...] = (
     "projects-table",
     "buckets-table",
-    "volumes-table",
     "secrets-table",
     *TARGET_TABLE_IDS,
     "runs-table",
@@ -294,6 +336,12 @@ class ProjectSummary:
     cron_count: int = 0
     last_run: dict[str, Any] | None = None
     next_run_at: str | None = None
+    #: Config-derived rollup of the project's cron states — "active", "paused" or
+    #: "stopped" — with None meaning the project has no crons at all. Run
+    #: outcomes never feed into this; those belong to `last_run`.
+    cron_status: str | None = None
+    #: Soonest automatic resume among the paused crons, when one is timed.
+    paused_until: str | None = None
 
 
 @dataclass(frozen=True)
@@ -304,6 +352,8 @@ class OverviewCounts:
     crons: dict[str, int]
     last_runs: dict[str, dict[str, Any]] = field(default_factory=dict)
     next_runs: dict[str, str] = field(default_factory=dict)
+    cron_statuses: dict[str, str] = field(default_factory=dict)
+    paused_untils: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -311,6 +361,25 @@ class WorkspaceOverviewData:
     projects: list[dict[str, Any]]
     project_summaries: list[ProjectSummary]
     project_names: dict[str, str]
+    environments: list[dict[str, Any]] = field(default_factory=list)
+    buckets: list[dict[str, Any]] = field(default_factory=list)
+    volumes: list[dict[str, Any]] = field(default_factory=list)
+    secrets: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class WorkspaceResources:
+    """The environment siblings of Projects: buckets, volumes, secrets, environments.
+
+    `volumes` is read but no longer drawn: the feature is experimental and its table came
+    out of the workspace view until it is settled. Kept on the model so putting the view
+    back is the tab, the columns and the render, and nothing else.
+
+    Kept apart from `WorkspaceOverviewData` because they answer a different question and
+    degrade independently — none of them is needed to draw the project table. They are
+    read alongside it rather than after it; see `load_workspace_overview`.
+    """
+
     environments: list[dict[str, Any]] = field(default_factory=list)
     buckets: list[dict[str, Any]] = field(default_factory=list)
     volumes: list[dict[str, Any]] = field(default_factory=list)
@@ -402,6 +471,10 @@ class RunDetailData:
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     #: The runtime's own output, which the Logs chip shows alongside the events.
     logs: list[dict[str, Any]] = field(default_factory=list)
+    #: The workflow version's compiled DAG, which is where step *edges* live. A step run
+    #: records which node it is but not what it waited for, so the Steps view reads its
+    #: upstreams from here. None for a run with no reachable version.
+    step_graph: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -437,6 +510,37 @@ def _optional_list(load: Callable[[], list[dict[str, Any]]]) -> list[dict[str, A
         return load()
     except RebaseWorkflowError:
         return []
+
+
+def step_dependencies(step_graph: dict[str, Any] | None) -> dict[str, list[str]]:
+    """Each node's upstream steps, keyed by `node_key` and named the way rows are.
+
+    The graph addresses nodes by `node_key` (`count_to`) while a step row shows the
+    node's `name` (`count-to`), so the keys are translated here rather than leaving the
+    reader to match one spelling against the other. An upstream with no node of its own
+    keeps its raw key: naming it wrongly would be worse than showing it unresolved.
+
+    Separate from `workflow_steps`, which reads the same graph for the targets view:
+    that one keys by function and drops nodes without one, which is right for asking
+    "which workflow calls this function" and wrong for labelling a step run's edges.
+    """
+    nodes = (step_graph or {}).get("nodes")
+    if not isinstance(nodes, list):
+        return {}
+    names = {
+        str(node["node_key"]): str(node.get("name") or node["node_key"])
+        for node in nodes
+        if isinstance(node, dict) and node.get("node_key")
+    }
+    dependencies: dict[str, list[str]] = {}
+    for node in nodes:
+        if not isinstance(node, dict) or not node.get("node_key"):
+            continue
+        upstream = node.get("upstream_node_keys")
+        if not isinstance(upstream, list):
+            continue
+        dependencies[str(node["node_key"])] = [names.get(str(key), str(key)) for key in upstream]
+    return dependencies
 
 
 def _ephemeral_identity(run: dict[str, Any]) -> tuple[str, str] | None:
@@ -560,43 +664,156 @@ class RebaseTuiData:
             return []
         return result if isinstance(result, list) else []
 
-    def load_workspace_overview(self) -> WorkspaceOverviewData:
-        projects = self.client.list_projects()
+    def load_workspace_base(self) -> WorkspaceOverviewData:
+        """Projects and every count the project table draws, in one wave.
+
+        `list_projects` used to run to completion before the counts were even requested,
+        because `_overview_counts` took the project list as an argument and never read
+        it. Nothing in the counts depends on the projects — every one of those routes is
+        workspace-wide and keyed by `project_id` — so both go out together and the wait
+        is the slower of the two rather than their sum.
+
+        The `--project` guard still raises, and still after both are back: a
+        `ThreadPoolExecutor` waits for everything it was given on the way out of the
+        `with` block, and a running thread cannot be interrupted, so checking earlier
+        would not return any sooner.
+        """
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            projects_future = executor.submit(self.client.list_projects)
+            counts_future = executor.submit(self._overview_counts)
+        projects = projects_future.result()
         if self.project is not None and not any(project.get("name") == self.project for project in projects):
             raise RebaseWorkflowError(f"project not found: {self.project}")
+        counts = counts_future.result()
+        return WorkspaceOverviewData(
+            projects=projects,
+            project_summaries=self._summaries(projects, counts),
+            project_names={str(project.get("id", "")): str(project.get("name", "-")) for project in projects},
+        )
 
-        counts = self._overview_counts(projects)
-        # These are environment siblings of Projects. Older servers and lightweight
-        # test clients may not expose all three routes yet, so each column degrades on
-        # its own instead of taking the project overview down with it.
+    def offers_secrets(self) -> bool:
+        """Whether asking for secrets could return anything at all.
+
+        A client older than the route, or a test double, simply has no `list_secrets`.
+        Knowing that here costs nothing; finding it out inside a worker thread costs a
+        thread on every load that will never have anything to show for it.
+        """
+        return callable(getattr(self.client, "list_secrets", None))
+
+    def load_workspace_secrets(self) -> list[dict[str, Any]]:
+        """The secrets table, on its own timeline.
+
+        Its own, because it is the only part of the workspace view that is not a database
+        query: Secret Manager answers in ~0.25s where everything else together takes
+        ~0.1s. Degrades to empty like every other supplementary column.
+        """
+        return self._optional_resource_list("list_secrets")
+
+    def load_workspace_resources(self) -> WorkspaceResources:
+        """The four environment-sibling reads, issued together.
+
+        Older servers and lightweight test clients may not expose all four routes, so
+        each column degrades on its own instead of taking the others down with it.
+        """
         with ThreadPoolExecutor(max_workers=4) as executor:
             environments = executor.submit(self._optional_resource_list, "list_environments")
             buckets = executor.submit(self._optional_resource_list, "list_buckets")
             volumes = executor.submit(self._optional_resource_list, "list_volumes")
             secrets = executor.submit(self._optional_resource_list, "list_secrets")
-        return WorkspaceOverviewData(
-            projects=projects,
-            project_summaries=[
-                ProjectSummary(
-                    project=project,
-                    function_count=counts.functions.get(str(project["id"]), 0),
-                    workflow_count=counts.workflows.get(str(project["id"]), 0),
-                    endpoint_count=counts.endpoints.get(str(project["id"]), 0),
-                    cron_count=counts.crons.get(str(project["id"]), 0),
-                    last_run=counts.last_runs.get(str(project["id"])),
-                    next_run_at=counts.next_runs.get(str(project["id"])),
-                )
-                for project in projects
-            ],
-            project_names={str(project.get("id", "")): str(project.get("name", "-")) for project in projects},
+        return WorkspaceResources(
             environments=environments.result() or [{"name": self.environment_name}],
             buckets=buckets.result(),
             volumes=volumes.result(),
             secrets=secrets.result(),
         )
 
-    def _overview_counts(self, projects: list[dict[str, Any]]) -> OverviewCounts:
-        """Every count the project table shows: three workspace-wide calls, in parallel.
+    def _summaries(self, projects: list[dict[str, Any]], counts: OverviewCounts) -> list[ProjectSummary]:
+        return [
+            ProjectSummary(
+                project=project,
+                function_count=counts.functions.get(str(project["id"]), 0),
+                workflow_count=counts.workflows.get(str(project["id"]), 0),
+                endpoint_count=counts.endpoints.get(str(project["id"]), 0),
+                cron_count=counts.crons.get(str(project["id"]), 0),
+                last_run=counts.last_runs.get(str(project["id"])),
+                next_run_at=counts.next_runs.get(str(project["id"])),
+                cron_status=counts.cron_statuses.get(str(project["id"])),
+                paused_until=counts.paused_untils.get(str(project["id"])),
+            )
+            for project in projects
+        ]
+
+    def load_workspace_composite(self) -> WorkspaceOverviewData | None:
+        """The whole workspace view in one request, where the platform offers the route.
+
+        `None` when this client has no such method (an older pairing, or a test double)
+        or the platform has no such route, so the caller falls back to the fan-out. That
+        is the common case against a platform behind the toolkit, not a rare one.
+
+        The payload is the raw lists rather than per-project counts, and the counts come
+        from the same `_counts_from_rows` the fan-out uses — the cron-status rollup is
+        real logic and belongs in one place.
+        """
+        load = getattr(self.client, "get_workspace_overview", None)
+        if not callable(load):
+            return None
+        payload = load()
+        if payload is None:
+            return None
+        projects = payload.get("projects") or []
+        if self.project is not None and not any(project.get("name") == self.project for project in projects):
+            raise RebaseWorkflowError(f"project not found: {self.project}")
+        counts = self._counts_from_rows(
+            workflows=payload.get("workflows") or [],
+            functions=payload.get("functions") or [],
+            endpoints=payload.get("endpoints") or [],
+            latest_runs=payload.get("latest_runs_by_project") or [],
+        )
+        return WorkspaceOverviewData(
+            projects=projects,
+            project_summaries=self._summaries(projects, counts),
+            project_names={str(project.get("id", "")): str(project.get("name", "-")) for project in projects},
+            environments=payload.get("environments") or [{"name": self.environment_name}],
+            buckets=payload.get("buckets") or [],
+            volumes=payload.get("volumes") or [],
+            # Deliberately absent from the payload: secrets are a Secret Manager call
+            # rather than a query, and waiting on them would hold the project table back
+            # for the one box nobody opens the TUI to read. `load_workspace_secrets`
+            # fills them in after the paint.
+        )
+
+    def load_workspace_overview(self) -> WorkspaceOverviewData:
+        """Everything behind the workspace view: one request where the route exists.
+
+        Falls back to all nine reads in flight at once where it does not.
+
+        Unlike `load_project_base`/`load_project_detail`, where the second phase genuinely
+        needs the first one's answers, these two halves read disjoint things and neither
+        waits on the other, so there is no reason to stage them.
+
+        Staging the two halves was measured and rejected. Against the live API the base
+        costs ~1.17s on its own and the resources ~0.81s, but the two together still cost
+        ~1.17s — the API absorbs the extra four requests. Painting the project table
+        first would have bought it nothing and pushed the resource tables out to ~2.0s.
+        """
+        composite = self.load_workspace_composite()
+        if composite is not None:
+            return composite
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            base_future = executor.submit(self.load_workspace_base)
+            resources_future = executor.submit(self.load_workspace_resources)
+        base = base_future.result()
+        resources = resources_future.result()
+        return replace(
+            base,
+            environments=resources.environments,
+            buckets=resources.buckets,
+            volumes=resources.volumes,
+            secrets=resources.secrets,
+        )
+
+    def _overview_counts(self) -> OverviewCounts:
+        """Every count the project table shows: four workspace-wide calls, in parallel.
 
         Every one of these objects carries its own `project_id`, so each column is one
         request for the whole workspace rather than one per project. Functions used to be
@@ -607,62 +824,151 @@ class RebaseTuiData:
         platform loses the speed rather than the column.
         """
         with ThreadPoolExecutor(max_workers=OVERVIEW_FANOUT_WORKERS) as executor:
-            workflows = executor.submit(self._workflow_and_cron_counts)
+            workflows = executor.submit(self.client.list_workflows)
             # Endpoints are supplementary here, as they are in load_project_targets: an API
             # without the route should cost the column, not the whole overview.
-            endpoints = executor.submit(self._counts_by_project, lambda: _optional_list(self.client.list_endpoints))
-            functions = executor.submit(self._counts_by_project, self.client.list_functions)
+            endpoints = executor.submit(lambda: _optional_list(self.client.list_endpoints))
+            functions = executor.submit(self.client.list_functions)
             # One row per project from the server. Assembling this client-side from
             # `list_runs` does not work: runs come back newest-first across the
             # workspace, so a project on a 15-minute cron fills any page size and
             # the quiet projects — the ones worth checking — drop off the end.
             last_runs = executor.submit(self.client.list_latest_runs_by_project)
-        workflow_counts, cron_counts, next_runs = workflows.result()
-        return OverviewCounts(
+        return self._counts_from_rows(
+            workflows=workflows.result(),
             functions=functions.result(),
-            workflows=workflow_counts,
             endpoints=endpoints.result(),
-            crons=cron_counts,
-            last_runs={str(run["project_id"]): run for run in last_runs.result() if run.get("project_id")},
-            next_runs=next_runs,
+            latest_runs=last_runs.result(),
         )
 
-    def _workflow_and_cron_counts(self) -> tuple[dict[str, int], dict[str, int], dict[str, str]]:
-        """Workflows per project, and how many of them are on a live cron.
+    @classmethod
+    def _counts_from_rows(
+        cls,
+        *,
+        workflows: list[dict[str, Any]],
+        functions: list[dict[str, Any]],
+        endpoints: list[dict[str, Any]],
+        latest_runs: list[dict[str, Any]],
+    ) -> OverviewCounts:
+        """The counts themselves, over rows someone else read.
 
-        Both come out of the one workspace-wide call, so the cron column costs no
-        request of its own. A workflow counts as a cron job when the API gives it a
-        `next_run_at`: that is the platform's own verdict, computed per read, and it
-        already accounts for a missing or paused schedule, a disabled workflow or
-        version, and an unusable cron expression. Re-deriving those rules here would
-        only give them somewhere to drift apart.
+        Separate from the reads so the composite route and the per-route fan-out produce
+        the same table from the same arithmetic. The cron-status rollup in particular is
+        real logic, and having it in one place is the point.
         """
-        workflows = self.client.list_workflows()
+        workflow_counts, cron_counts, next_runs, cron_statuses, paused_untils = cls._workflow_and_cron_counts(workflows)
+        return OverviewCounts(
+            functions=cls._counts_by_project(functions),
+            workflows=workflow_counts,
+            endpoints=cls._counts_by_project(endpoints),
+            crons=cron_counts,
+            last_runs={str(run["project_id"]): run for run in latest_runs if run.get("project_id")},
+            next_runs=next_runs,
+            cron_statuses=cron_statuses,
+            paused_untils=paused_untils,
+        )
+
+    @staticmethod
+    def _workflow_and_cron_counts(
+        workflows: list[dict[str, Any]],
+    ) -> tuple[dict[str, int], dict[str, int], dict[str, str], dict[str, str], dict[str, str]]:
+        """Workflows per project, their cron count, and the config-level cron status.
+
+        All of it comes out of the one workspace-wide read, so no column costs a
+        request of its own. A workflow counts as a cron job whenever it has a cron
+        schedule configured, in any state — a paused or stopped cron is still a cron
+        job; the Status column carries its liveness. That column is the config-only
+        rollup of `workflow_cron_state` (run outcomes stay with Last run): a project
+        is "active" while any cron will fire, "paused" when the best of them is
+        paused, "stopped" when every configured cron is switched off.
+        """
         # The soonest fire time per project, out of the same read the counts come
         # from — so the column costs no request of its own. Earliest wins: with
         # several schedules in a project, the next thing to happen is the answer.
         next_runs: dict[str, str] = {}
+        states: dict[str, list[str]] = {}
+        resume_times: dict[str, list[str]] = {}
         for item in workflows:
-            project_id, next_run_at = str(item.get("project_id") or ""), item.get("next_run_at")
-            if not project_id or not next_run_at:
+            project_id = str(item.get("project_id") or "")
+            if not project_id:
                 continue
-            current = next_runs.get(project_id)
-            if current is None or str(next_run_at) < current:
-                next_runs[project_id] = str(next_run_at)
+            next_run_at = item.get("next_run_at")
+            if next_run_at:
+                current = next_runs.get(project_id)
+                if current is None or str(next_run_at) < current:
+                    next_runs[project_id] = str(next_run_at)
+            state = workflow_cron_state(item)
+            if state is None:
+                continue
+            states.setdefault(project_id, []).append(state)
+            if state == "paused" and item.get("paused_until"):
+                resume_times.setdefault(project_id, []).append(str(item["paused_until"]))
+        cron_statuses = {
+            project_id: next(state for state in ("active", "paused", "stopped") if state in project_states)
+            for project_id, project_states in states.items()
+        }
+        paused_untils = {
+            project_id: min(times)
+            for project_id, times in resume_times.items()
+            if cron_statuses.get(project_id) == "paused"
+        }
         return (
             Counter(str(item["project_id"]) for item in workflows if item.get("project_id")),
-            Counter(
-                str(item["project_id"]) for item in workflows if item.get("project_id") and item.get("next_run_at")
-            ),
+            {project_id: len(project_states) for project_id, project_states in states.items()},
             next_runs,
+            cron_statuses,
+            paused_untils,
         )
 
     @staticmethod
-    def _counts_by_project(load: Callable[[], list[dict[str, Any]]]) -> dict[str, int]:
-        return Counter(str(item["project_id"]) for item in load() if item.get("project_id"))
+    def _counts_by_project(rows: list[dict[str, Any]]) -> dict[str, int]:
+        return Counter(str(item["project_id"]) for item in rows if item.get("project_id"))
+
+    def load_project_composite(self, project: dict[str, Any]) -> ProjectTargetsData | None:
+        """Everything behind opening a project in one request, where the route exists.
+
+        `None` when the client or the platform predates the route, so the caller falls
+        back to the two-phase fan-out.
+
+        This is where the composite route earns the most. Read separately, the current
+        version of every workflow is a request each and the step rows behind Last run are
+        a request per scanned run, so opening a project cost a round trip for every
+        target in it.
+        """
+        load = getattr(self.client, "get_project_overview", None)
+        if not callable(load):
+            return None
+        payload = load(str(project["id"]))
+        if payload is None:
+            return None
+        workflows = payload.get("workflows") or []
+        functions = payload.get("functions") or []
+        runs = payload.get("runs") or []
+        versions = {
+            str(workflow_id): version
+            for workflow_id, version in (payload.get("current_workflow_versions") or {}).items()
+        }
+        return ProjectTargetsData(
+            project=payload.get("project") or project,
+            functions=functions,
+            workflows=workflows,
+            endpoints=payload.get("endpoints") or [],
+            steps=self._workflow_steps_from_versions(workflows, versions),
+            workflow_versions=versions,
+            last_runs=self.load_last_runs(
+                str(project["id"]),
+                runs,
+                target_ids_by_identity(workflows, functions),
+                step_runs=payload.get("step_runs") or [],
+            ),
+            ephemeral=group_ephemeral_runs(runs, deployed_identities(workflows, functions)),
+        )
 
     def load_project_targets(self, project: dict[str, Any]) -> ProjectTargetsData:
         """Everything behind opening a project, for callers that want it in one piece."""
+        composite = self.load_project_composite(project)
+        if composite is not None:
+            return composite
         base, runs = self.load_project_base(project)
         return self.load_project_detail(base, runs)
 
@@ -744,6 +1050,7 @@ class RebaseTuiData:
         project_id: str,
         runs: list[dict[str, Any]] | None = None,
         target_ids: dict[tuple[str, str], str] | None = None,
+        step_runs: list[dict[str, Any]] | None = None,
     ) -> dict[str, str]:
         """When each workflow and function last executed, by target id.
 
@@ -769,7 +1076,9 @@ class RebaseTuiData:
         `group_ephemeral_runs`.
 
         Takes `runs` when the caller has already read them, so the project view pays for
-        the project's run list once rather than once per thing derived from it.
+        the project's run list once rather than once per thing derived from it. Takes
+        `step_runs` on the same terms: the composite route returns them with everything
+        else, and reading them here would undo the point of asking once.
         """
         if runs is None:
             runs = _optional_list(lambda: self.client.list_runs(project_id=project_id, limit=LAST_RUN_SCAN_LIMIT))
@@ -799,14 +1108,17 @@ class RebaseTuiData:
             if run.get("target_type") == "workflow" and isinstance(run.get("id"), str):
                 workflow_run_ids.append(str(run["id"]))
 
-        scanned = workflow_run_ids[:LAST_RUN_STEP_SCAN]
-        if scanned:
-            with ThreadPoolExecutor(max_workers=min(OVERVIEW_FANOUT_WORKERS, len(scanned))) as executor:
-                for steps in executor.map(
-                    lambda run_id: _optional_list(lambda: self.client.list_run_steps(run_id)), scanned
-                ):
-                    for step in steps:
-                        record(step.get("function_id"), step.get("started_at") or step.get("created_at"))
+        if step_runs is None:
+            scanned = workflow_run_ids[:LAST_RUN_STEP_SCAN]
+            step_runs = []
+            if scanned:
+                with ThreadPoolExecutor(max_workers=min(OVERVIEW_FANOUT_WORKERS, len(scanned))) as executor:
+                    for steps in executor.map(
+                        lambda run_id: _optional_list(lambda: self.client.list_run_steps(run_id)), scanned
+                    ):
+                        step_runs.extend(steps)
+        for step in step_runs:
+            record(step.get("function_id"), step.get("started_at") or step.get("created_at"))
         return latest
 
     def load_workflow_versions(self, workflows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -924,7 +1236,28 @@ class RebaseTuiData:
                 tasks=tasks.result(),
                 artifacts=artifacts.result(),
                 logs=logs.result(),
+                step_graph=self.load_step_graph(resolved) if is_workflow else None,
             )
+
+    def load_step_graph(self, run: dict[str, Any]) -> dict[str, Any] | None:
+        """The compiled DAG behind a workflow run, for naming each step's dependencies.
+
+        Not part of the fan-out above, because it cannot be: the version id it needs is
+        an answer from the run request itself. That makes it one extra hop when a
+        workflow run is opened — and only then. Supplementary like the artifact list, so
+        a server that cannot answer costs the `Depends on` column and not the run view.
+        """
+        workflow_id = run.get("target_id")
+        version_id = run.get("target_version_id")
+        load = getattr(self.client, "get_workflow_version", None)
+        if not (workflow_id and version_id and callable(load)):
+            return None
+        try:
+            version = load(str(workflow_id), str(version_id))
+        except Exception:
+            return None
+        graph = version.get("step_graph") if isinstance(version, dict) else None
+        return graph if isinstance(graph, dict) else None
 
     def load_run_logs(self, run_id: str) -> list[dict[str, Any]]:
         entries = self.client.get_run_logs(run_id, limit=RUN_LOG_LIMIT).get("entries")
@@ -1335,6 +1668,46 @@ def format_timestamp(value: Any, tz: tzinfo | None = None) -> str:
     return parsed.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def format_countdown(value: Any, now: datetime | None = None) -> str:
+    """Render how long until *value*, as `in 2d 3h` / `in 3h 04m` / `in 4m 09s` / `in 12s`.
+
+    A wall-clock "next run" is a date you have to subtract today's from before it means
+    anything; the same fact as a countdown is read at a glance, and it ticks — see
+    `RebaseTuiApp._tick_countdowns`. Two units at most: past the hour, the seconds are
+    noise, and the whole thing has to stay inside `COUNTDOWN_WIDTH`.
+
+    A time that has passed reads `due` rather than a negative number: the schedule says a
+    run is owed, and the row will say so until the next refresh brings a later one.
+    """
+    if value in {None, ""}:
+        return "-"
+    if isinstance(value, datetime):
+        target = value
+    else:
+        raw = str(value)
+        try:
+            target = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return raw
+    # A timestamp with no offset is the API's UTC, the same assumption `_time` makes by
+    # rendering it unconverted.
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=UTC)
+    seconds = int((target - (now or datetime.now(UTC))).total_seconds())
+    if seconds <= 0:
+        return "due"
+    minutes, secs = divmod(seconds, 60)
+    hours, mins = divmod(minutes, 60)
+    days, hrs = divmod(hours, 24)
+    if days:
+        return f"in {days}d {hrs}h"
+    if hrs:
+        return f"in {hrs}h {mins:02d}m"
+    if mins:
+        return f"in {mins}m {secs:02d}s"
+    return f"in {secs}s"
+
+
 def format_bool(value: Any) -> str:
     if value is True:
         return "enabled"
@@ -1351,13 +1724,56 @@ def format_execution(value: dict[str, Any]) -> str:
     return str(value.get("run_type") or "-")
 
 
-def format_schedule(value: Any) -> str:
+def format_schedule(value: Any, *, paused: bool = False) -> str:
     if not isinstance(value, dict):
         return "-"
     cron = str(value.get("cron") or "-")
-    if not value.get("active", True):
+    if not value.get("active", True) or paused:
         return f"{cron} ⏸"
     return cron
+
+
+def _pause_in_effect(paused_until: Any) -> bool:
+    """Whether a pause with this expiry still holds. No expiry means indefinite."""
+    if not paused_until:
+        return True
+    try:
+        until = datetime.fromisoformat(str(paused_until).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=UTC)
+    return datetime.now(UTC) < until
+
+
+def workflow_cron_state(workflow: dict[str, Any]) -> str | None:
+    """One workflow's cron state as the user configured it, or None without a cron.
+
+    Purely config-derived — "active", "paused" or "stopped" — so a cron that fires
+    and crashes every time is still active: nobody has stopped it. Run outcomes
+    belong to the Last run column, not here.
+    """
+    schedule = workflow.get("schedule")
+    if not isinstance(schedule, dict) or schedule.get("type", "cron") != "cron":
+        return None
+    if workflow.get("enabled") is False or not schedule.get("active", True):
+        return "stopped"
+    if workflow.get("paused") and _pause_in_effect(workflow.get("paused_until")):
+        return "paused"
+    # Active flags but no computed fire time means the platform cannot run it —
+    # a disabled version or an unusable cron expression: configured, not firing.
+    return "active" if workflow.get("next_run_at") else "stopped"
+
+
+def cron_status_text(status: str | None, paused_until: str | None = None) -> Text:
+    if status is None:
+        return Text("-")
+    if status == "active":
+        return Text("active", style=BRAND_MAIN_GREEN)
+    if status == "paused":
+        label = f"paused → {str(paused_until)[:10]}" if paused_until else "paused"
+        return Text(label, style=BRAND_AMBER)
+    return Text("stopped", style=BRAND_CORAL_RED)
 
 
 def format_json_summary(value: Any, *, max_length: int = 180) -> str:
@@ -1514,6 +1930,11 @@ class HeaderSafeDataTable(DataTable):
     of a project. Clicking there is an ordinary thing to do, and it should do nothing.
     """
 
+    #: Cells one wheel-left/right notch moves. Textual's own 4 is a mouse wheel's tilt
+    #: switch, where notches arrive one at a time; a trackpad swipe arrives as a burst of
+    #: them and at 4 cells each it throws the table end to end.
+    HORIZONTAL_SCROLL_CELLS = 2
+
     def _on_click(self, event: events.Click) -> None:
         if self.ordered_columns:
             return
@@ -1523,6 +1944,50 @@ class HeaderSafeDataTable(DataTable):
         # the crash is. No `super()` call for the same reason: Textual makes it itself.
         event.prevent_default()
         event.stop()
+
+    def _on_mouse_scroll_left(self, event: events.MouseScrollLeft) -> None:
+        self._scroll_sideways(-self.HORIZONTAL_SCROLL_CELLS, event)
+
+    def _on_mouse_scroll_right(self, event: events.MouseScrollRight) -> None:
+        self._scroll_sideways(self.HORIZONTAL_SCROLL_CELLS, event)
+
+    def _scroll_sideways(self, cells: float, event: events.MouseEvent) -> None:
+        """Move a two-finger swipe (or a wheel tilt) along the table's own scrollbar.
+
+        Textual scrolls horizontally on these events already, but animated and four cells
+        a notch — fine for a wheel, and a slide that lags the fingers under a burst from a
+        trackpad. This is the rule it uses for the vertical wheel instead: a small step,
+        applied immediately. An event at the end of the travel is left to bubble, so the
+        swipe carries on to whatever is behind the table rather than dying on it.
+        """
+        if not self.allow_horizontal_scroll:
+            return
+        # `prevent_default` for the same reason as `_on_click` above: Textual runs the
+        # handler of every class in the MRO, so without it its own four-cell animated
+        # scroll happens as well and a notch moves the table six cells, not two.
+        event.prevent_default()
+        target = max(0.0, min(float(self.max_scroll_x), self.scroll_target_x + cells))
+        if target == self.scroll_target_x:
+            return
+        self.scroll_to(x=target, animate=False)
+        event.stop()
+
+
+class ChipSteppingTable(HeaderSafeDataTable):
+    """A table sitting under a chip strip, whose arrows step between those chips.
+
+    The gesture is the same wherever there are chips — `left`/`right` move the strip
+    above whichever table holds the focus — so it lives on one class the tables under a
+    strip share rather than being re-bound per table. Bound here rather than on the app
+    because an app-level binding would have to be `priority` to beat DataTable's own
+    inert cursor_left/cursor_right — and a priority binding on an arrow key takes it
+    away from every Input in every dialog too.
+    """
+
+    BINDINGS = [
+        Binding("left", "app.switch_chip_tab(-1)", "Previous tab", show=False),
+        Binding("right", "app.switch_chip_tab(1)", "Next tab", show=False),
+    ]
 
 
 class DragHeaderTable(HeaderSafeDataTable):
@@ -1670,7 +2135,7 @@ class DragTabbedContent(DragStrip, TabbedContent):
         self.resizes = resizes
 
 
-class SelectableDataTable(HeaderSafeDataTable):
+class SelectableDataTable(ChipSteppingTable):
     """A DataTable whose rows can be *marked* in bulk, on top of the single-row cursor.
 
     Textual's DataTable has a cursor but no notion of a selection, so the marks live
@@ -1685,13 +2150,6 @@ class SelectableDataTable(HeaderSafeDataTable):
         Binding("shift+up", "extend_mark(-1)", "Mark up", show=False),
         Binding("shift+down", "extend_mark(1)", "Mark down", show=False),
         Binding("escape", "clear_marks", "Clear marks", show=False),
-        # The keys that step between the Workflows and Functions chips. Bound here rather
-        # than on the app because an app-level binding would have to be `priority` to beat
-        # DataTable's own inert cursor_left/cursor_right — and a priority binding on an
-        # arrow key takes it away from every Input in every dialog too. They no-op
-        # anywhere but the project view.
-        Binding("left", "app.switch_target_tab(-1)", "Previous target", show=False),
-        Binding("right", "app.switch_target_tab(1)", "Next target", show=False),
     ]
 
     class MarksChanged(Message):
@@ -1766,6 +2224,18 @@ class SelectableDataTable(HeaderSafeDataTable):
         self._anchor = None
         self._apply_marks(set())
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool:
+        """Claim `escape` only while there are marks to clear.
+
+        `escape` is also the app's Back key, and the focused table's binding would
+        otherwise swallow it unconditionally. Declining the action when nothing is
+        marked lets the key fall through to the app, so escape clears marks first
+        and navigates back the press after — the same order `b` users expect.
+        """
+        if action == "clear_marks":
+            return bool(self._marked)
+        return True
+
     def restore_marks(self, keys: Iterable[str]) -> None:
         """Re-mark *keys*, ignoring any whose row is gone.
 
@@ -1777,6 +2247,21 @@ class SelectableDataTable(HeaderSafeDataTable):
         present = {str(row.key.value) for row in self.ordered_rows if row.key.value is not None}
         self._anchor = None
         self._apply_marks({key for key in keys if key in present})
+
+    def update_live_cell(self, row_key: str, column: int, value: Any) -> None:
+        """Write a cell that redraws on a timer, without rubbing out the row's mark.
+
+        A marked row's cells are *styled copies* held in `_unmarked_cells`, so a cell
+        that a timer keeps rewriting has to go through both: the mark colour would
+        otherwise come off the one cell that ticks a second after it was marked, and
+        unmarking would put the value back as it read when the mark went on. The width
+        is left alone — a live cell is padded to a fixed width for exactly that reason.
+        """
+        column_key = self.ordered_columns[column].key
+        if row_key in self._marked:
+            self._unmarked_cells.setdefault(row_key, {})[column_key] = value
+            value = self._mark_text(value)
+        self.update_cell(row_key, column_key, value, update_width=False)
 
     def _apply_marks(self, marked: set[str]) -> None:
         if marked == self._marked:
@@ -2254,8 +2739,16 @@ class RebaseTuiApp(App[None]):
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
         ("b", "back", "Back"),
+        # The same action `b` runs; hidden so the footer does not say Back twice.
+        # Tables bind escape to clear marks, but only claim it while marks exist
+        # (see SelectableDataTable.check_action), so it falls through to here.
+        Binding("escape", "back", "Back", show=False),
+        # The way to everything below, so it stays in the footer with the four you move
+        # around with. `?` because it is the one key a terminal app is expected to answer
+        # for help, and because `j`/`k` are spoken for.
+        Binding("question_mark,?", "toggle_keys_panel", "Keys"),
         # Everything below stays out of the footer and lives in the key panel, which
-        # lists `show=False` bindings too. Ten hints did not fit the width, so the four
+        # lists `show=False` bindings too. Ten hints did not fit the width, so the ones
         # you move around with kept their places and the rest went one keystroke away.
         Binding("d", "delete_selection", "Delete", show=False),
         Binding("o", "open_source", "Open source, or a bucket in the cloud console", show=False),
@@ -2264,6 +2757,7 @@ class RebaseTuiApp(App[None]):
         Binding("v", "choose_environment", "Switch environment", show=False),
         Binding("a", "open_artifact", "Open artifact", show=False),
         Binding("s", "toggle_terminal_select", "Select text", show=False),
+        Binding("c", "copy_row", "Copy ID", show=False),
         Binding("p", "show_details", "Details", show=False),
         Binding("l", "toggle_logs", "Logs", show=False),
         Binding("e", "toggle_events", "Events", show=False),
@@ -2283,9 +2777,20 @@ class RebaseTuiApp(App[None]):
         color: #E8F0ED;
     }}
 
-    RebaseHeader, Header, Footer {{
+    RebaseHeader, Header {{
+        background: {CHROME_GRAY};
+        color: {BRAND_BRIGHT_GREEN};
+    }}
+
+    Footer {{
         background: #101412;
         color: {BRAND_BRIGHT_GREEN};
+    }}
+
+    /* Textual tints the clock a few percent lighter than the bar it sits in, which is
+       a seam across the top row on its own. */
+    RebaseClock {{
+        background: transparent;
     }}
 
     RebaseHeader.-tall, Header.-tall {{
@@ -2310,9 +2815,9 @@ class RebaseTuiApp(App[None]):
         height: 1fr;
     }}
 
-    #projects-table,
+    /* Tables of fixed-width fields, sized to fit: they clip rather than scroll, and the
+       row a bar would cost goes to the rows. */
     #buckets-table,
-    #volumes-table,
     #secrets-table,
     #runs-table,
     #timeline-table {{
@@ -2325,7 +2830,11 @@ class RebaseTuiApp(App[None]):
 
     /* The target tables outgrow their width: nine columns each, three of them
        timestamps. They keep a horizontal scrollbar rather than clipping, so "Last run"
-       is reachable on a narrow terminal instead of merely absent. */
+       is reachable on a narrow terminal instead of merely absent. The projects table is
+       the same story a level up — five counts, a status and two times — and the last
+       column was falling off the right with no way back to it. A two-finger swipe drives
+       the bar, as do `shift`+wheel and dragging the bar itself. */
+    #projects-table,
     #functions-table,
     #workflows-table {{
         overflow-x: auto;
@@ -2335,6 +2844,9 @@ class RebaseTuiApp(App[None]):
         scrollbar-background-active: #101412;
     }}
 
+    /* Green because Textual's default accent is a blue that appears nowhere else, and
+       this bar sits under the first table anyone sees. */
+    #projects-table,
     #workflows-table {{
         scrollbar-color: {BRAND_BRIGHT_GREEN};
         scrollbar-color-hover: {BRAND_BRIGHT_GREEN};
@@ -2343,15 +2855,8 @@ class RebaseTuiApp(App[None]):
 
     #projects-table,
     #buckets-table,
-    #volumes-table,
     #secrets-table {{
         height: 1fr;
-    }}
-
-    #environment-context {{
-        height: 1;
-        padding: 0 1;
-        color: {BRAND_BRIGHT_GREEN};
     }}
 
     #workspace-resource-tabs {{
@@ -2388,12 +2893,14 @@ class RebaseTuiApp(App[None]):
         display: none;
     }}
 
-    /* The project-view strips are splitters as well as chips (see `DragStrip`), and
-       they wear the same background as the column header row under them — `$panel`,
-       the DataTable header's own colour — so the two rows read as one grabbable band. */
+    /* Every strip wears the chrome band, so it reads as one piece with the column
+       header row below it and the app header above — and, in the project view where a
+       strip is a splitter as well as chips (see `DragStrip`), so the two rows you can
+       grab look like the one band they are. */
+    #workspace-resource-tabs Tabs,
     #target-tabs Tabs,
     #timeline-tabs {{
-        background: $panel;
+        background: {CHROME_GRAY};
     }}
 
     /* The chips sit centred in their strip rather than hugging the left edge. The
@@ -2448,7 +2955,7 @@ class RebaseTuiApp(App[None]):
        a terminal can offer for that — there is no cursor to change shape. */
     DragHeaderTable > .datatable--header-hover {{
         color: {BRAND_BRIGHT_GREEN};
-        background: #223029;
+        background: {CHROME_GRAY_HOVER};
     }}
 
     #project-error {{
@@ -2469,9 +2976,10 @@ class RebaseTuiApp(App[None]):
         height: 1fr;
     }}
 
-    /* The one table whose content is prose. It is allowed to run off the right and
-       be scrolled back — `^pgup`/`^pgdn`, the wheel, or the bar — where the others are
-       clipped, because a log line is not a column you can widen your way out of. */
+    /* The one table whose content is prose. It is allowed to run off the right and be
+       scrolled back — `^pgup`/`^pgdn`, a two-finger swipe, or the bar — where the tables
+       of fixed-width fields are clipped, because a log line is not a column you can
+       widen your way out of. */
     #timeline-table {{
         height: 1fr;
         overflow-x: auto;
@@ -2484,6 +2992,11 @@ class RebaseTuiApp(App[None]):
     DataTable {{
         background: #101412;
         scrollbar-size-vertical: 1;
+    }}
+
+    DataTable > .datatable--header {{
+        background: {CHROME_GRAY};
+        color: #E8F0ED;
     }}
 
     /* Textual tints the focused table 5% lighter, which turned the pane you were in a
@@ -2587,7 +3100,6 @@ class RebaseTuiApp(App[None]):
         self._project_rows: dict[str, ProjectSummary] = {}
         self._workspace_resource_rows: dict[str, dict[str, dict[str, Any]]] = {
             "buckets-table": {},
-            "volumes-table": {},
             "secrets-table": {},
         }
         self._profile_rows: dict[str, dict[str, Any]] = {}
@@ -2624,7 +3136,6 @@ class RebaseTuiApp(App[None]):
     def compose(self) -> ComposeResult:
         yield RebaseHeader(show_clock=True, icon="• Commands")
         with Vertical(id="workspace-view"):
-            yield Static("", id="environment-context")
             with TabbedContent(initial="projects-resource-tab", id="workspace-resource-tabs"):
                 with TabPane(Content("[ Projects ]"), id="projects-resource-tab"):
                     yield SelectableDataTable(id="projects-table")
@@ -2632,10 +3143,8 @@ class RebaseTuiApp(App[None]):
                     # Selectable, unlike its sibling resource tables: `o` opens every
                     # marked bucket, so buckets need marks as well as a cursor.
                     yield SelectableDataTable(id="buckets-table")
-                with TabPane(Content("[ Volumes ]"), id="volumes-resource-tab"):
-                    yield HeaderSafeDataTable(id="volumes-table")
                 with TabPane(Content("[ Secrets ]"), id="secrets-resource-tab"):
-                    yield HeaderSafeDataTable(id="secrets-table")
+                    yield ChipSteppingTable(id="secrets-table")
             yield Static("", id="workspace-empty")
         with Vertical(id="workspace-switcher-view"):
             yield HeaderSafeDataTable(id="workspace-profiles-table")
@@ -2678,6 +3187,9 @@ class RebaseTuiApp(App[None]):
         self.run_worker(self._bootstrap_search_path(), name="bootstrap", group="tui-bootstrap")
         if self._refresh_interval:
             self.set_interval(self._refresh_interval, self._refresh_tick)
+        # Not behind `--refresh-interval`: that switches off *requests*, and a countdown
+        # frozen at the value it was loaded with would be worse than a timestamp.
+        self.set_interval(COUNTDOWN_TICK_SECONDS, self._tick_countdowns)
 
     def _workspace_key(self) -> str:
         # A method rather than a cached attribute so switching workspace picks up the
@@ -3005,7 +3517,7 @@ class RebaseTuiApp(App[None]):
         projects.cursor_type = "row"
         projects.zebra_stripes = False
 
-        for table_id in ("buckets-table", "volumes-table", "secrets-table"):
+        for table_id in ("buckets-table", "secrets-table"):
             resource = self.query_one(f"#{table_id}", DataTable)
             resource.cursor_type = "row"
             resource.zebra_stripes = True
@@ -3121,7 +3633,24 @@ class RebaseTuiApp(App[None]):
         run_id = run.get("id")
         return str(run_id) if run_id else None
 
+    def action_toggle_keys_panel(self) -> None:
+        """Show every key the screen answers to, or put the list away. Bound to `?`.
+
+        Textual's own panel, which lists the `show=False` bindings the footer has no room
+        for. `?` toggles it; `b` and `escape` close it, like anything else on top.
+        """
+        if self.screen.query("HelpPanel"):
+            self.action_hide_help_panel()
+        else:
+            self.action_show_help_panel()
+
     def action_back(self) -> None:
+        # The keys panel is the outermost thing on screen, so it is the first thing Back
+        # closes — `b` and `escape` both, rather than leaving the palette as the only way
+        # out of a panel the palette opened.
+        if self.screen.query("HelpPanel"):
+            self.action_hide_help_panel()
+            return
         if self.current_view == "workspace-switcher":
             if self.view_before_switcher == "project":
                 self._show_project_view()
@@ -3189,12 +3718,7 @@ class RebaseTuiApp(App[None]):
         """The tables `tab` moves between, top to bottom, as the screen currently stands."""
         if self.current_view == "workspace":
             active = self.query_one("#workspace-resource-tabs", TabbedContent).active
-            table = {
-                "projects-resource-tab": "#projects-table",
-                "buckets-resource-tab": "#buckets-table",
-                "volumes-resource-tab": "#volumes-table",
-                "secrets-resource-tab": "#secrets-table",
-            }.get(active, "#projects-table")
+            table = dict(RESOURCE_TABS).get(active, "#projects-table")
             return [self.query_one(table, DataTable)]
         if self.current_view == "workspace-switcher":
             return [self.query_one("#workspace-profiles-table", DataTable)]
@@ -3230,16 +3754,26 @@ class RebaseTuiApp(App[None]):
         current = boxes.index(focused) if isinstance(focused, DataTable) and focused in boxes else -1
         boxes[(current + 1) % len(boxes)].focus()
 
-    def action_switch_target_tab(self, delta: int) -> None:
-        """Step between the Workflows and Functions tabs. Bound to left/right."""
-        if self.current_view != "project":
-            return
-        tabs = self.query_one("#target-tabs", TabbedContent)
-        order = [tab_id for tab_id, _ in self._target_tab_order()]
+    def action_switch_chip_tab(self, delta: int) -> None:
+        """Step between the chips above the table that has the focus.
+
+        Which strip that is follows the view: the workspace view's
+        Projects/Buckets/Secrets, the project view's Workflows/Functions. Bound
+        to left/right on every table under a strip; see `ChipSteppingTable`.
+        """
+        if self.current_view == "workspace":
+            self._step_tabs("#workspace-resource-tabs", list(RESOURCE_TABS), delta)
+        elif self.current_view == "project":
+            self._step_tabs("#target-tabs", self._target_tab_order(), delta)
+
+    def _step_tabs(self, strip: str, tabs_and_tables: list[tuple[str, str]], delta: int) -> None:
+        """Move one chip strip `delta` chips along, wrapping, and follow it with the focus."""
+        tabs = self.query_one(strip, TabbedContent)
+        order = [tab_id for tab_id, _ in tabs_and_tables]
         current = order.index(tabs.active) if tabs.active in order else 0
         tabs.active = order[(current + delta) % len(order)]
         # The focus follows, or `tab` would carry on from the box that is no longer there.
-        self.query_one(dict(TARGET_TABS)[tabs.active], DataTable).focus()
+        self.query_one(dict(tabs_and_tables)[tabs.active], DataTable).focus()
 
     @property
     def display_tzinfo(self) -> tzinfo | None:
@@ -3248,6 +3782,31 @@ class RebaseTuiApp(App[None]):
 
     def _time(self, value: Any) -> str:
         return format_timestamp(value, self.display_tzinfo)
+
+    @staticmethod
+    def _countdown(value: Any) -> str:
+        """A `Next run` cell: how long until it, padded so the column never moves."""
+        return format_countdown(value).ljust(COUNTDOWN_WIDTH)
+
+    def _tick_countdowns(self) -> None:
+        """Redraw the projects table's `Next run` cells, once a second.
+
+        One cell per row, in place, rather than a repaint: a repaint would drop the
+        cursor and the marks a second after every keypress. `update_width=False` for the
+        same reason the values are padded — the column was sized for the widest countdown
+        when the rows landed and must not be resized from under the reader.
+        """
+        if self.current_view != "workspace" or not self._project_rows:
+            return
+        try:
+            table = self.query_one("#projects-table", SelectableDataTable)
+        except NoMatches:
+            return
+        for row_key, summary in self._project_rows.items():
+            # A row the table no longer has — refreshed away between the two — is not an
+            # error, it is just nothing to draw.
+            with suppress(Exception):
+                table.update_live_cell(row_key, NEXT_RUN_COLUMN, self._countdown(summary.next_run_at))
 
     def _timezone_label(self) -> str:
         if self._display_timezone is not None:
@@ -3332,6 +3891,68 @@ class RebaseTuiApp(App[None]):
         if new_x == end.x:
             return
         screen.selections = {widget: Selection(start, Offset(new_x, end.y))}
+
+    def action_copy_row(self) -> None:
+        """Copy the highlighted row's identifier — or the marked rows' — to the clipboard.
+
+        Every table keys its rows on the thing's API id (or its name, for things the
+        API identifies by name), which is exactly the handle to paste into a `rebase`
+        command or hand to an agent. Copied as `workflow_id=...` rather than the bare
+        value, so both the reader and whatever it is pasted into can tell what kind of
+        identifier it is. The clipboard write goes through the terminal (OSC 52), the
+        same channel Textual's own selection copy uses, so it works over SSH and
+        inside tmux wherever that copy does.
+        """
+        table = self.focused
+        if not isinstance(table, DataTable):
+            self.notify("Select a row first — c copies its ID.", severity="warning")
+            return
+        keys = table.marked_keys if isinstance(table, SelectableDataTable) else []
+        if not keys:
+            keys = [key for key in (self._cursor_key(table),) if key is not None]
+        table_id = str(table.id or "")
+        ids = [value for key in keys if (value := self._row_identifier(table_id, key)) is not None]
+        if not ids:
+            self.notify("Select a row first — c copies its ID.", severity="warning")
+            return
+        self.copy_to_clipboard("\n".join(ids))
+        self.notify(
+            f"Copied {ids[0]} to the clipboard." if len(ids) == 1 else f"Copied {len(ids)} IDs to the clipboard."
+        )
+
+    def _row_identifier(self, table_id: str, key: str) -> str | None:
+        """The copyable identity behind one row key, as a `label=value` pair.
+
+        The value is almost always the key itself. The two synthetic keys are
+        unwrapped: a one-off row registers no target, so the name it ran under is its
+        identity; a timeline row is keyed by position, so its record's own id is the
+        answer — and for the rows that have none (events, log lines), the run they
+        belong to is. The label says what the value identifies, in the vocabulary an
+        agent would search the API or codebase for — including whether a resource is
+        being named by id or, where its API reports none, by name.
+        """
+        if key.startswith(EPHEMERAL_ROW_PREFIX):
+            _, target_type, name = key.split(":", 2)
+            return f"{target_type}_name={name}"
+        if table_id == "timeline-table":
+            row = self._timeline_rows.get(key)
+            record_id = row.record.get("id") if row is not None else None
+            if record_id and row is not None:
+                return f"{row.kind}_id={record_id}"
+            run_id = self._run_detail.run.get("id") if self._run_detail is not None else None
+            return f"run_id={run_id}" if run_id else None
+        if table_id in self._workspace_resource_rows:
+            kind = table_id.removesuffix("-table").removesuffix("s")
+            item = self._workspace_resource_rows[table_id].get(key, {})
+            return f"{kind}_id={key}" if item.get("id") == key else f"{kind}_name={key}"
+        label = {
+            "projects-table": "project_id",
+            "workflows-table": "workflow_id",
+            "functions-table": "function_id",
+            "runs-table": "run_id",
+            "workspace-profiles-table": "profile",
+        }.get(table_id, "id")
+        return f"{label}={key}"
 
     def action_delete_selection(self) -> None:
         """Delete the marked rows, or the row under the cursor when nothing is marked."""
@@ -3751,6 +4372,30 @@ class RebaseTuiApp(App[None]):
             self._render_workspace_overview(overview)
         self._clear_target_detail()
         self._show_workspace_view()
+        # The composite route answers for everything except secrets, which cost more than
+        # the rest of the view put together and are not what anyone opens the TUI to read.
+        # The fan-out path already has them, and asking twice would undo the point.
+        if not overview.secrets and self.data.offers_secrets():
+            await self._load_workspace_secrets()
+
+    async def _load_workspace_secrets(self) -> None:
+        """Fill the secrets table once the rest of the screen is up.
+
+        Supplementary in the strongest sense: a Secret Manager that is slow or unhappy
+        costs this one table and nothing else, so a failure here is swallowed rather than
+        replacing a working view with an error.
+        """
+        try:
+            secrets = await asyncio.to_thread(self.data.load_workspace_secrets)
+        except Exception:
+            return
+        if not secrets or self.current_view != "workspace" or self.workspace_overview is None:
+            return
+        self.workspace_overview = replace(self.workspace_overview, secrets=secrets)
+        # Preserved: by now the reader has had the table for a moment and may have moved
+        # the cursor, and a second paint must not take that away to deliver a detail.
+        with self._preserve_view():
+            self._render_secrets(secrets)
 
     async def _load_project_targets(
         self, project: dict[str, Any], *, preserve: bool = False, announce: bool = True
@@ -3766,7 +4411,23 @@ class RebaseTuiApp(App[None]):
         phase would temporarily replace those details with dashes and resize the columns,
         then reverse both changes when the version reads finished. Under *preserve*, keep
         the last complete frame until its complete replacement is ready.
+
+        Where the platform has the composite route none of that applies: one request
+        answers everything, so there is no second phase to stage and the table is painted
+        complete the first time.
         """
+        try:
+            composite = await asyncio.to_thread(self.data.load_project_composite, project)
+        except Exception as exc:
+            self._set_error(exc, announce=announce)
+            return
+        if composite is not None:
+            self._refresh_failures = 0
+            self.project_targets = composite
+            with self._preserve_view() if preserve else nullcontext():
+                self._render_project_targets(composite, preserve=preserve)
+            return
+
         try:
             base, runs = await asyncio.to_thread(self.data.load_project_base, project)
         except Exception as exc:
@@ -3983,11 +4644,12 @@ class RebaseTuiApp(App[None]):
         for project_id, summary in self._project_rows.items():
             project = summary.project
             last_run = summary.last_run or {}
-            # Time carries the status colour rather than spending a column on the
-            # word: on a row of counts, whether the last run was green or red is
-            # the signal, and the timestamp is already there to hang it on.
+            # The outcome rides with the timestamp — "14:10:47 completed", coloured —
+            # so Last run answers "what happened when it ran?" on its own, while the
+            # Status column stays purely what the user configured.
+            last_run_time = self._time(last_run.get("created_at"))
             last_run_cell = Text(
-                self._time(last_run.get("created_at")),
+                f"{last_run_time} {last_run['status']}" if last_run.get("status") else last_run_time,
                 style=status_style(last_run["status"]) if last_run.get("status") else "",
             )
             projects.add_row(
@@ -3996,19 +4658,13 @@ class RebaseTuiApp(App[None]):
                 str(summary.workflow_count),
                 str(summary.cron_count),
                 str(summary.endpoint_count),
+                cron_status_text(summary.cron_status, summary.paused_until),
                 last_run_cell,
-                self._time(summary.next_run_at),
+                self._countdown(summary.next_run_at),
                 self._time(project.get("created_at")),
                 key=project_id,
             )
 
-        self.query_one("#environment-context", Static).update(
-            Text.assemble(
-                ("Environment: ", BRAND_MEDIUM_GRAY),
-                (self.environment_name, f"bold {BRAND_BRIGHT_GREEN}"),
-                ("  ·  press v to switch", BRAND_MEDIUM_GRAY),
-            )
-        )
         self._render_environment_resources(overview)
 
     def _render_environment_resources(self, overview: WorkspaceOverviewData) -> None:
@@ -4024,22 +4680,12 @@ class RebaseTuiApp(App[None]):
                 key=key,
             )
 
-        volumes = self._fill_table("volumes-table")
-        volume_rows = {str(item.get("id") or item.get("name")): item for item in overview.volumes if item.get("name")}
-        self._workspace_resource_rows["volumes-table"] = volume_rows
-        for key, item in volume_rows.items():
-            volumes.add_row(
-                str(item.get("name", "-")),
-                str(item.get("provider", "-")),
-                str(item.get("bucket", "-")),
-                str(item.get("prefix", "-")),
-                self._time(item.get("created_at")),
-                self._time(item.get("updated_at")),
-                key=key,
-            )
+        self._render_secrets(overview.secrets)
 
+    def _render_secrets(self, rows: list[dict[str, Any]]) -> None:
+        """Just the secrets table, because it arrives after everything around it."""
         secrets = self._fill_table("secrets-table")
-        secret_rows = {str(item.get("name")): item for item in overview.secrets if item.get("name")}
+        secret_rows = {str(item.get("name")): item for item in rows if item.get("name")}
         self._workspace_resource_rows["secrets-table"] = secret_rows
         for key, item in secret_rows.items():
             keys = item.get("keys")
@@ -4120,7 +4766,10 @@ class RebaseTuiApp(App[None]):
                 format_execution(workflow),
                 format_bool(workflow.get("enabled")),
                 format_endpoint(self._target_endpoints("workflow", workflow_id)),
-                format_schedule(workflow.get("schedule")),
+                format_schedule(
+                    workflow.get("schedule"),
+                    paused=bool(workflow.get("paused")) and _pause_in_effect(workflow.get("paused_until")),
+                ),
                 self._time(workflow.get("next_run_at")),
                 self._time(self._last_runs.get(workflow_id)),
                 compact_id(workflow.get("current_version_id")),
@@ -4222,9 +4871,11 @@ class RebaseTuiApp(App[None]):
         kinds = dict((tab_id, kinds) for tab_id, _, kinds in TIMELINE_FILTERS)[self._timeline_filter]
         showing_all = self._timeline_filter == TIMELINE_FILTERS[0][0]
         table_name = {
+            "timeline-steps": "timeline-table-steps",
             "timeline-tasks": "timeline-table-tasks",
             "timeline-artifacts": "timeline-table-artifacts",
         }.get(self._timeline_filter, "timeline-table-all" if showing_all else "timeline-table")
+        dependencies = step_dependencies(detail.step_graph)
         table = self._fill_table(table_name, widget="timeline-table")
         message_width = self._timeline_message_width()
         self._timeline_rows = {}
@@ -4244,6 +4895,32 @@ class RebaseTuiApp(App[None]):
             message = textwrap.fill(row.message, message_width) if expanded else collapse_message(row.message)
             row_key = str(shown - 1)
             self._timeline_rows[row_key] = row
+
+            if row.kind == "step" and self._timeline_filter == "timeline-steps":
+                # A root step is shown with "-" rather than an empty cell: blank reads as
+                # "not known", and having no dependencies is a fact about the DAG.
+                step = row.record
+                upstream = dependencies.get(str(step.get("node_key") or ""))
+                depends_on = ", ".join(upstream) if upstream else "-"
+                # The error alone, not the composed summary the Activity view shows:
+                # attempt and finished have columns of their own here, and repeating
+                # them in Message would spend the widest column saying it twice.
+                outcome = format_json_summary(step.get("error"), max_length=160)
+                outcome = textwrap.fill(outcome, message_width) if expanded else collapse_message(outcome)
+                attempt = step.get("attempt")
+                table.add_row(
+                    Text(row.stage, style=MARK_STYLE),
+                    Text(depends_on, style=BRAND_MEDIUM_GRAY),
+                    status_text(row.status),
+                    Text(str(attempt) if attempt not in {None, ""} else "-", style=BRAND_MEDIUM_GRAY),
+                    self._time(step.get("started_at")),
+                    self._time(step.get("finished_at")),
+                    format_duration(step.get("started_at"), step.get("finished_at")),
+                    Text(outcome, style=BRAND_MEDIUM_GRAY),
+                    height=outcome.count("\n") + 1 if expanded else 1,
+                    key=row_key,
+                )
+                continue
 
             if row.kind == "task" and self._timeline_filter == "timeline-tasks":
                 task = row.record
@@ -4730,7 +5407,10 @@ class RebaseTuiApp(App[None]):
         return workspace_id if isinstance(workspace_id, str) and workspace_id else "-"
 
     def _update_workspace_title(self) -> None:
-        title = f"Rebase TUI - Workspace: {self._workspace_label()}"
+        # The environment rides along in the title rather than owning a row of its
+        # own: it is one short word, it qualifies the workspace rather than standing
+        # beside it, and this way it stays on screen in the project view too.
+        title = f"Rebase TUI - Workspace: {self._workspace_label()} ({self.environment_name})"
         if self.current_view == "project" and self.selected_project is not None:
             title = f"{title} / {self.selected_project.get('name', '-')}"
         if self._marked_count:

@@ -4,6 +4,19 @@
 
 ### Added
 
+- **Job workflows can size their own container with `cpu=` and `memory=`.** A `mode="job"`
+  workflow gets its own Cloud Run Job, and can now say how big it is, the same way a function
+  already could: `@project.workflow(mode="job", memory="2Gi")`. Both accept Modal-style
+  numbers (`memory=2048`) or Cloud Run strings (`"2Gi"`), and both require `mode="job"` — an
+  interactive workflow shares the Prefect worker's container, so a limit there is refused at
+  deploy time rather than accepted and ignored. This is distinct from `resources=`, which
+  annotates steps and never sized the workflow's own container. Requests are validated
+  against the workspace's `max_cloud_run_cpu_milli` / `max_cloud_run_memory_mib` at deploy
+  time, so asking for too much fails with a clear message instead of being silently shrunk
+  and OOM-killed at run time. A superadmin sets those ceilings with the new
+  `--max-memory-mib` and `--max-cpu-milli` flags on `rebase workspace compute-policy set`,
+  and both now appear in `compute-policy show`.
+
 - **First-class environments now combine Modal-style Python ergonomics with GitOps.**
   Workspaces seed `dev`, `staging`, and `prod` and can create arbitrary additional names.
   Projects, compute, runs, routes, schedules, models, secrets, volumes, and buckets are
@@ -12,7 +25,9 @@
   GitHub ref and Python entrypoint; signed pushes reconcile the exact commit in an isolated,
   release-authorized job, prune compute removed from Python only after a successful apply,
   and retain persistent resources. The TUI adds an environment switcher and sibling Projects,
-  Buckets, Volumes, and Secrets tabs.
+  Buckets, and Secrets tabs. Volumes are isolated by environment like everything else, but
+  have no tab yet: the feature is still experimental and the view will follow once its shape
+  is settled.
 
 - **Pressing `w` in the TUI opens the workspace switcher.** Workspace switching
   is now available from the keyboard and command panel as well as by clicking the
@@ -314,6 +329,40 @@
   three tables that show something different on every line.
 
 ### Fixed
+
+- **`?` shows every key the screen answers to.** The panel listing them was reachable
+  only through the command palette, which is a poor place to keep the answer to "what can
+  I press here" — and the footer, by design, has room for four hints out of a dozen. `?`
+  is now the fifth, and toggles the panel: `?` again, `b` or `escape` put it away.
+  (`k` was not a candidate: it is spoken for by `j`/`k` paging.)
+
+- **`b` and `escape` close the keys panel.** The panel the command palette opens under
+  "Keys" could only be closed from the palette again: Back walked the views underneath it
+  while the panel stayed put. It is the outermost thing on screen, so it is now the first
+  thing Back closes, and the press that closes it does nothing else.
+
+- **The three rows at the top of the screen are one band.** The header, the chip strip
+  under it and the column header under that were three colours — the app background, and
+  Textual's `$panel` blue-grey on the two below, with the workspace chip strip falling
+  through to the background and the clock a few percent lighter again. All of it is one
+  grey now (`#232826`), in both views — and so are the column headers further down the
+  project view, so the furniture around the rows reads as furniture rather than as
+  stacked bars in three colours.
+
+- **Two fingers scroll a table sideways.** A horizontal swipe now steps two cells and
+  lands immediately, where Textual's own handling animated four cells a notch: a trackpad
+  sends a burst of notches, and four animated cells apiece slid the table end to end
+  behind the fingers. It drives the same bar `shift`+wheel and dragging do, on the tables
+  that scroll — projects, workflows, functions and the timeline. The tables of
+  fixed-width fields are still clipped by design.
+
+- **`left` and `right` step the workspace's Projects / Buckets / Secrets chips.**
+  The gesture was bound only on the project view's target tables, so on the workspace
+  overview — the first screen `rebase tui` opens — the arrows did nothing at all and the
+  tabs could only be reached with the mouse. They now step whichever chip strip sits
+  above the focused table, wrapping either way round and carrying the focus onto the table
+  the chip opened, the same way they already worked for Workflows / Functions and the
+  timeline filters.
 
 - **Automatic refresh no longer makes the workflow table pulse between two widths.** The
   fast first paint used when opening a project contains names and schedules but not the

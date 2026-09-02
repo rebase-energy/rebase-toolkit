@@ -3409,6 +3409,109 @@ def test_unfiltered_list_functions_falls_back_when_the_route_is_missing(monkeypa
     assert paths == ["/functions", "/projects", "/projects/p1/functions", "/projects/p2/functions"]
 
 
+class FakeMethodNotAllowedResponse(FakeMissingRouteResponse):
+    """A 405, which is how an absent route can present when a prefix already matches."""
+
+    status_code = 405
+
+    def raise_for_status(self) -> None:
+        raise requests.HTTPError("405")
+
+
+def test_get_workspace_overview_returns_the_payload(monkeypatch) -> None:
+    paths: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        paths.append(url.split("workflows.example.com")[-1])
+        return FakeResponse({"environment": "dev", "projects": [{"id": "p1", "name": "one"}]})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    overview = client.get_workspace_overview()
+
+    assert overview is not None
+    assert [project["name"] for project in overview["projects"]] == ["one"]
+    assert paths == ["/workspace/overview"]
+
+
+@pytest.mark.parametrize("response", [FakeMissingRouteResponse, FakeMethodNotAllowedResponse])
+def test_get_workspace_overview_reports_an_absent_route_as_none(monkeypatch, response) -> None:
+    """A toolkit ahead of its platform should lose the speed, not the answer."""
+    paths: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        paths.append(url.split("workflows.example.com")[-1])
+        return response()
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    assert client.get_workspace_overview() is None
+    # The client only detects the route; assembling the fallback is the caller's job.
+    assert paths == ["/workspace/overview"]
+
+
+def test_get_workspace_overview_reraises_a_real_error(monkeypatch) -> None:
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        return FakeErrorResponse({"detail": "nope"})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    with pytest.raises(rb.RebaseWorkflowError):
+        client.get_workspace_overview()
+
+
+def test_an_absent_overview_route_is_asked_for_once(monkeypatch) -> None:
+    """The TUI re-reads its view every few seconds; a wasted probe each time adds up."""
+    paths: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        paths.append(url.split("workflows.example.com")[-1])
+        return FakeMissingRouteResponse()
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    assert client.get_workspace_overview() is None
+    assert client.get_workspace_overview() is None
+    assert client.get_workspace_overview() is None
+
+    assert paths == ["/workspace/overview"]
+
+
+def test_an_absent_project_overview_route_is_asked_for_once_across_projects(monkeypatch) -> None:
+    """The route is absent, not that project's copy of it, so one 404 answers for all."""
+    paths: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        paths.append(url.split("workflows.example.com")[-1])
+        return FakeMissingRouteResponse()
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    assert client.get_project_overview("p1") is None
+    assert client.get_project_overview("p2") is None
+
+    assert paths == ["/projects/p1/overview"]
+
+
+def test_get_project_overview_reports_an_absent_route_as_none(monkeypatch) -> None:
+    paths: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        paths.append(url.split("workflows.example.com")[-1])
+        return FakeMissingRouteResponse()
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    assert client.get_project_overview("p1") is None
+    assert paths == ["/projects/p1/overview"]
+
+
 # --- inline-result contract & transport (ephemeral fast path) -----------------
 
 
@@ -3619,3 +3722,47 @@ def test_explicit_api_key_survives_a_workspace_override(tmp_path, monkeypatch) -
     monkeypatch.setenv("REBASE_WORKSPACE", "other-workspace")
 
     assert rb.Client(api_key="rb_explicit").api_key == "rb_explicit"
+
+
+def test_register_workflow_sends_cpu_and_memory(monkeypatch) -> None:
+    """The workflow's own container size has to reach the wire.
+
+    It previously could not: `resources=` was handed to steps only, and
+    register/update_workflow had no cpu/memory parameter at all, so a stepless
+    job workflow had no way to ask for more than the backend default.
+    """
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed.update(kwargs["json"])
+        return FakeResponse({"id": "workflow-id", "name": "sync"})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.register_workflow(name="sync", source_code="def sync(): pass", cloud_run_memory="2Gi", cloud_run_cpu="1")
+
+    assert observed["cloud_run_cpu"] == "1"
+    assert observed["cloud_run_memory"] == "2Gi"
+
+
+def test_update_workflow_can_clear_cpu_and_memory(monkeypatch) -> None:
+    """None must survive the drop-None filter, or removing `memory=` is a no-op."""
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed.clear()
+        observed.update(kwargs["json"])
+        return FakeResponse({"id": "workflow-id", "name": "sync"})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.update_workflow("workflow-id", cloud_run_cpu=None, cloud_run_memory=None)
+    assert observed["cloud_run_cpu"] is None
+    assert observed["cloud_run_memory"] is None
+
+    # Not passing them at all leaves the stored values alone.
+    client.update_workflow("workflow-id", source_code="def sync(): pass")
+    assert "cloud_run_cpu" not in observed
+    assert "cloud_run_memory" not in observed
