@@ -19,7 +19,19 @@ from textual.coordinate import Coordinate
 from textual.events import MouseMove
 from textual.geometry import Offset
 from textual.selection import Selection
-from textual.widgets import DataTable, Footer, Header, Input, OptionList, Static, Tab, TabbedContent, Tabs
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    HelpPanel,
+    Input,
+    OptionList,
+    Static,
+    Tab,
+    TabbedContent,
+    Tabs,
+)
+from textual.widgets._footer import FooterKey
 from textual.widgets._toast import Toast
 
 from rebase import config as config_module
@@ -861,6 +873,43 @@ def test_tui_next_run_counts_down_and_ticks_without_a_refresh() -> None:
             # No refresh has run: the cell redrew itself off the clock.
             assert next_run(0) != first
             assert next_run(0).strip().startswith("in 5m ")
+
+    asyncio.run(scenario())
+
+
+def test_tui_countdown_keeps_ticking_on_a_marked_row_without_unmarking_it() -> None:
+    """The one cell that redraws on a timer must not rub the mark off the row it is in."""
+    client = FakeClient()
+    client.workflows[0]["next_run_at"] = (datetime.now(UTC) + timedelta(minutes=5, seconds=30)).isoformat()
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(client, limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            await pilot.press("shift+down")
+            await pilot.pause(0.1)
+            assert projects.marked_keys == ["project-id", "other-project-id"]
+
+            def next_run(row: int) -> Any:
+                return projects.get_row_at(row)[NEXT_RUN_COLUMN]
+
+            first = str(next_run(0))
+            await pilot.pause(1.2)
+            # Still ticking, still marked: the amber is reapplied to the value the tick
+            # wrote, rather than lost with the renderable it replaced.
+            assert str(next_run(0)) != first
+            assert MARK_STYLE in [span.style for span in next_run(0).spans]
+
+            # And unmarking restores what the countdown says *now*, not what it said when
+            # the mark went on a second or more ago.
+            ticked = str(next_run(0))
+            await pilot.press("escape")
+            await pilot.pause(0.1)
+            assert projects.marked_keys == []
+            assert str(next_run(0)) == ticked
 
     asyncio.run(scenario())
 
@@ -3272,6 +3321,66 @@ def test_tui_two_finger_scroll_moves_a_table_sideways() -> None:
     asyncio.run(scenario())
 
 
+def test_tui_question_mark_toggles_the_keys_panel_from_the_footer() -> None:
+    """The way to the keys you cannot see is itself a key you can see."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+
+            # In the footer, beside the four you move around with — not one keystroke
+            # away in the panel it opens.
+            footer_keys = [key.key for key in app.query_one(Footer).query(FooterKey)]
+            assert "question_mark" in footer_keys
+            hint = next(key for key in app.query_one(Footer).query(FooterKey) if key.key == "question_mark")
+            assert hint.key_display == "?"
+            assert hint.description == "Keys"
+
+            await pilot.press("question_mark")
+            await pilot.pause(0.2)
+            assert app.screen.query(HelpPanel)
+
+            # The same key puts it away again.
+            await pilot.press("question_mark")
+            await pilot.pause(0.2)
+            assert not app.screen.query(HelpPanel)
+
+    asyncio.run(scenario())
+
+
+def test_tui_back_closes_the_keys_panel_first() -> None:
+    """`b` and `escape` both close the keys panel, and only then navigate."""
+
+    async def scenario() -> None:
+        for key in ("b", "escape"):
+            app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+            async with app.run_test(size=(140, 42)) as pilot:
+                await _open_run(app, pilot)
+                revealed = app._reveal_level
+                assert revealed > 0
+
+                app.action_show_help_panel()
+                await pilot.pause(0.2)
+                assert app.screen.query(HelpPanel)
+
+                # The press that closes the panel does nothing else: the run stays open.
+                await pilot.press(key)
+                await pilot.pause(0.2)
+                assert not app.screen.query(HelpPanel)
+                assert app.current_view == "project"
+                assert app._reveal_level == revealed
+
+                # The next one goes back, as it always did.
+                await pilot.press(key)
+                await pilot.pause(0.2)
+                assert app._reveal_level == revealed - 1
+
+    asyncio.run(scenario())
+
+
 def test_tui_chrome_rows_share_one_background() -> None:
     """Header, chip strip and column header are one band, in both views."""
 
@@ -3914,7 +4023,7 @@ def test_tui_notifications_wear_the_app_s_colours_and_hug_their_text() -> None:
 
 
 def test_tui_footer_shows_only_the_keys_you_move_around_with() -> None:
-    """Ten hints did not fit the width; the rest are one keystroke away in the key panel."""
+    """Ten hints did not fit the width; the rest are one `?` away in the key panel."""
 
     async def scenario() -> None:
         app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
@@ -3926,7 +4035,8 @@ def test_tui_footer_shows_only_the_keys_you_move_around_with() -> None:
                 for _, binding, enabled, _ in app.screen.active_bindings.values()
                 if enabled and binding.show
             ]
-            assert shown == ["tab", "q", "r", "b"]
+            # The four you move around with, plus the one that shows you the rest.
+            assert shown == ["tab", "q", "r", "b", "question_mark"]
 
             # Hidden, but still bound and still listed by the key panel.
             hidden = {

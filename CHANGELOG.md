@@ -330,6 +330,17 @@
 
 ### Fixed
 
+- **`?` shows every key the screen answers to.** The panel listing them was reachable
+  only through the command palette, which is a poor place to keep the answer to "what can
+  I press here" — and the footer, by design, has room for four hints out of a dozen. `?`
+  is now the fifth, and toggles the panel: `?` again, `b` or `escape` put it away.
+  (`k` was not a candidate: it is spoken for by `j`/`k` paging.)
+
+- **`b` and `escape` close the keys panel.** The panel the command palette opens under
+  "Keys" could only be closed from the palette again: Back walked the views underneath it
+  while the panel stayed put. It is the outermost thing on screen, so it is now the first
+  thing Back closes, and the press that closes it does nothing else.
+
 - **The three rows at the top of the screen are one band.** The header, the chip strip
   under it and the column header under that were three colours — the app background, and
   Textual's `$panel` blue-grey on the two below, with the workspace chip strip falling

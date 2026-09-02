@@ -2248,6 +2248,21 @@ class SelectableDataTable(ChipSteppingTable):
         self._anchor = None
         self._apply_marks({key for key in keys if key in present})
 
+    def update_live_cell(self, row_key: str, column: int, value: Any) -> None:
+        """Write a cell that redraws on a timer, without rubbing out the row's mark.
+
+        A marked row's cells are *styled copies* held in `_unmarked_cells`, so a cell
+        that a timer keeps rewriting has to go through both: the mark colour would
+        otherwise come off the one cell that ticks a second after it was marked, and
+        unmarking would put the value back as it read when the mark went on. The width
+        is left alone — a live cell is padded to a fixed width for exactly that reason.
+        """
+        column_key = self.ordered_columns[column].key
+        if row_key in self._marked:
+            self._unmarked_cells.setdefault(row_key, {})[column_key] = value
+            value = self._mark_text(value)
+        self.update_cell(row_key, column_key, value, update_width=False)
+
     def _apply_marks(self, marked: set[str]) -> None:
         if marked == self._marked:
             return
@@ -2728,8 +2743,12 @@ class RebaseTuiApp(App[None]):
         # Tables bind escape to clear marks, but only claim it while marks exist
         # (see SelectableDataTable.check_action), so it falls through to here.
         Binding("escape", "back", "Back", show=False),
+        # The way to everything below, so it stays in the footer with the four you move
+        # around with. `?` because it is the one key a terminal app is expected to answer
+        # for help, and because `j`/`k` are spoken for.
+        Binding("question_mark,?", "toggle_keys_panel", "Keys"),
         # Everything below stays out of the footer and lives in the key panel, which
-        # lists `show=False` bindings too. Ten hints did not fit the width, so the four
+        # lists `show=False` bindings too. Ten hints did not fit the width, so the ones
         # you move around with kept their places and the rest went one keystroke away.
         Binding("d", "delete_selection", "Delete", show=False),
         Binding("o", "open_source", "Open source, or a bucket in the cloud console", show=False),
@@ -3614,7 +3633,24 @@ class RebaseTuiApp(App[None]):
         run_id = run.get("id")
         return str(run_id) if run_id else None
 
+    def action_toggle_keys_panel(self) -> None:
+        """Show every key the screen answers to, or put the list away. Bound to `?`.
+
+        Textual's own panel, which lists the `show=False` bindings the footer has no room
+        for. `?` toggles it; `b` and `escape` close it, like anything else on top.
+        """
+        if self.screen.query("HelpPanel"):
+            self.action_hide_help_panel()
+        else:
+            self.action_show_help_panel()
+
     def action_back(self) -> None:
+        # The keys panel is the outermost thing on screen, so it is the first thing Back
+        # closes — `b` and `escape` both, rather than leaving the palette as the only way
+        # out of a panel the palette opened.
+        if self.screen.query("HelpPanel"):
+            self.action_hide_help_panel()
+            return
         if self.current_view == "workspace-switcher":
             if self.view_before_switcher == "project":
                 self._show_project_view()
@@ -3763,15 +3799,14 @@ class RebaseTuiApp(App[None]):
         if self.current_view != "workspace" or not self._project_rows:
             return
         try:
-            table = self.query_one("#projects-table", DataTable)
+            table = self.query_one("#projects-table", SelectableDataTable)
         except NoMatches:
             return
         for row_key, summary in self._project_rows.items():
             # A row the table no longer has — refreshed away between the two — is not an
             # error, it is just nothing to draw.
             with suppress(Exception):
-                row = table.get_row_index(row_key)
-                table.update_cell_at(Coordinate(row, NEXT_RUN_COLUMN), self._countdown(summary.next_run_at))
+                table.update_live_cell(row_key, NEXT_RUN_COLUMN, self._countdown(summary.next_run_at))
 
     def _timezone_label(self) -> str:
         if self._display_timezone is not None:
