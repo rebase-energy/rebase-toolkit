@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from rich.theme import Theme
 
 BRAND_MAIN_GREEN = "#0D9373"
@@ -22,3 +24,19 @@ REBASE_THEME = Theme(
         "rebase.warning": BRAND_AMBER,
     }
 )
+
+
+def status_colour(status: Any) -> str:
+    """The brand colour a run, step or task status is shown in, anywhere it is shown."""
+    normalized = str(status or "unknown").lower()
+    if normalized in {"completed", "succeeded", "success"}:
+        return BRAND_MAIN_GREEN
+    if normalized == "running":
+        return BRAND_BRIGHT_GREEN
+    if normalized in {"submitted", "queued", "accepted"}:
+        return BRAND_SLATE_BLUE
+    if normalized in {"failed", "error", "cancelled", "canceled"}:
+        return BRAND_CORAL_RED
+    if normalized in {"pending", "starting", "warning"}:
+        return BRAND_AMBER
+    return BRAND_MEDIUM_GRAY

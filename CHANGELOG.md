@@ -4,13 +4,31 @@
 
 ### Added
 
+- **`i` in the TUI opens a graph pane beside the tables.** On a run, or on the timeline
+  of one, it draws the workflow's steps as a directed graph, each step coloured by how
+  far that run got — and moving the cursor through the runs table recolours it, so a
+  failed step stands out without opening the run. Edges that carry data between steps
+  are drawn bright; the ones that only fix the order are dimmed. On the workflows table
+  it draws the cursor's workflow as deployed, and a workflow with no steps shows the
+  project's triggers instead: which workflows run after which, and which run when a
+  dataset updates, with the cursor's workflow picked out. A step called more than once
+  is labelled with its literal arguments, so twelve `match-quarter` nodes read as
+  `match-quarter · current · fortnox` and so on. Hover or click a step to light
+  everything it waits on. The pane draws with [plotui](https://pypi.org/project/plotui/),
+  an optional extra — `pip install "rebase-toolkit[graph]"` — that renders as a terminal
+  image, so it needs Kitty, Ghostty, iTerm2, WezTerm or Konsole; elsewhere, and without
+  the extra, the pane says so. `escape` and `b` close it before doing anything else.
+
 - **The workflows table shows a day of run history as a bar chart.** A `History` column
   next to `Last run` — and `Schedule`, `Next run`, `Last run` and `History` now come
   straight after `Origin`, ahead of the provenance columns, so an ordinary terminal
   width shows them without scrolling. One character per hour for the last 24 hours with the time axis
   under the header: the bar's height is how many runs landed in that hour (log scale, so
-  an hourly job is still visible beside a per-minute one) and its colour is the status
-  in the hour that most wants looking at — one failure among sixty runs is a red bar. A
+  an hourly job is still visible beside a per-minute one, drawn with the table's mean
+  hour at half height, so a cron that lands the same count every hour is a row of bars
+  rather than a solid block) and its colour is the status
+  in the hour that most wants looking at — one failure among sixty runs is a red bar —
+  in two alternating shades so neighbouring bars stay apart. A
   one-off run of a deployed name counts towards that workflow's row, as it does for
   `Last run`. The counts come from the platform's project overview, which aggregates
   them in the database over the whole window; against an older platform the column is

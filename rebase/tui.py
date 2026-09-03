@@ -20,6 +20,7 @@ from typing import Any, Literal
 from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo, available_timezones
 
+from rich.color import Color, ColorTriplet, blend_rgb
 from rich.json import JSON
 from rich.rule import Rule
 from rich.text import Text
@@ -61,7 +62,7 @@ from rebase.brand import (
     BRAND_CORAL_RED,
     BRAND_MAIN_GREEN,
     BRAND_MEDIUM_GRAY,
-    BRAND_SLATE_BLUE,
+    status_colour,
 )
 from rebase.client import Client, RebaseWorkflowError, run_timing_summary
 from rebase.config import (
@@ -85,6 +86,8 @@ from rebase.locate import (
     is_risky_root,
     project_folder,
 )
+from rebase.tui_graph import node_index, step_dag, trigger_dag, workflow_key
+from rebase.tui_graph_pane import GraphPane
 
 TargetType = Literal["function", "workflow"]
 ViewName = Literal["workspace", "project", "workspace-switcher"]
@@ -114,6 +117,10 @@ HISTORY_BLOCKS = "▁▂▃▄▅▆▇█"
 #: An hour with no runs. A dot rather than a blank, so a short history reads as "these
 #: hours were quiet" instead of "this cell did not load".
 HISTORY_EMPTY = "·"
+#: How much darker every other hour's bar is drawn. The block glyphs fill their cell
+#: edge to edge, so with one colour a flat schedule reads as one solid block; two shades
+#: of the status colour, alternating by hour, keep each bar its own.
+HISTORY_SHADE = 0.3
 #: The History column's header, swapped for `history_column_label` when the columns are
 #: added so the axis can sit under it.
 HISTORY_COLUMN = "History"
@@ -752,42 +759,71 @@ def history_from_runs(
     return history
 
 
-def history_peak(history: RunHistory) -> int:
-    """The busiest hour of any row, which sets the scale for the whole table."""
-    return max((sum(counts.values()) for hours in history.values() for counts in hours.values()), default=0)
+def _history_height(total: int) -> float:
+    """A bar's height before scaling: the hour's run count on a log scale.
+
+    Linear would flatten an hourly job into a hairline next to a per-minute one, and the
+    point of the column is that both are visible at a glance.
+    """
+    return math.log2(total + 1)
+
+
+def history_scale(history: RunHistory) -> float:
+    """The mean bar height over every hour with a run, across the whole table.
+
+    `history_text` draws that height at half the cell, so the bars sit around the middle
+    of the column and a schedule that lands the same number of runs every hour reads as
+    a row of half-height bars, not a solid block. Scaling against the busiest hour did
+    that: a cron with a few jobs an hour is the common case, and it is flat.
+    """
+    totals = (sum(counts.values()) for hours in history.values() for counts in hours.values())
+    heights = [_history_height(total) for total in totals if total > 0]
+    return sum(heights) / len(heights) if heights else 0.0
 
 
 def _worst_status(counts: dict[str, int]) -> str:
     return min(counts, key=lambda status: (HISTORY_STATUS_RANK.get(status.lower(), len(HISTORY_STATUS_RANK)), status))
 
 
+def shaded(colour: str, amount: float = HISTORY_SHADE) -> str:
+    """`colour` blended `amount` of the way towards black, as a hex string."""
+    triplet = blend_rgb(Color.parse(colour).get_truecolor(), ColorTriplet(0, 0, 0), amount)
+    return triplet.hex
+
+
 def history_text(
     hours: dict[datetime, dict[str, int]],
     *,
     now: datetime,
-    peak: int,
+    scale: float,
     width: int = HISTORY_HOURS,
 ) -> Text:
     """A row's History cell: one character per hour, oldest on the left, ending now.
 
-    Height is the number of runs in the hour, on a log scale against the table's busiest
-    hour: linear would flatten an hourly job into a hairline next to a per-minute one,
-    and the point of the column is that both are visible at a glance. Colour is the
-    status in that hour that most wants looking at, in the Status column's colours, so
-    one failure among sixty runs still shows as a red bar.
+    Height is the number of runs in the hour on a log scale (see `_history_height`),
+    drawn so that `scale` — the table's mean bar height, from `history_scale` — fills
+    half the cell: an hour at the mean is a half-height bar, twice the mean or more is a
+    full one, and quieter hours shrink towards the floor. Colour is the status in that
+    hour that most wants looking at, in the Status column's colours, so one failure
+    among sixty runs still shows as a red bar; odd hours take a darker shade of it, so
+    neighbouring bars stay apart (see `HISTORY_SHADE`).
     """
     last = _hour_start(now)
-    scale = math.log2(peak + 1) if peak > 0 else 1.0
+    half = len(HISTORY_BLOCKS) / 2
     text = Text()
     for offset in range(width - 1, -1, -1):
-        counts = hours.get(last - timedelta(hours=offset))
+        hour = last - timedelta(hours=offset)
+        counts = hours.get(hour)
         total = sum(counts.values()) if counts else 0
         if not counts or total <= 0:
             text.append(HISTORY_EMPTY, style=BRAND_MEDIUM_GRAY)
             continue
-        level = round(math.log2(total + 1) / scale * (len(HISTORY_BLOCKS) - 1))
-        block = HISTORY_BLOCKS[max(0, min(len(HISTORY_BLOCKS) - 1, level))]
-        text.append(block, style=status_style(_worst_status(counts)))
+        # Bar heights are in eighths of the cell, and the block at index n is n + 1
+        # eighths tall, so the mean lands on the fourth block: exactly half the cell.
+        eighths = round(_history_height(total) / scale * half) if scale > 0 else len(HISTORY_BLOCKS)
+        block = HISTORY_BLOCKS[max(0, min(len(HISTORY_BLOCKS) - 1, eighths - 1))]
+        colour = status_style(_worst_status(counts))
+        text.append(block, style=shaded(colour) if hour.hour % 2 else colour)
     return text
 
 
@@ -1434,6 +1470,10 @@ class RebaseTuiData:
         graph = version.get("step_graph") if isinstance(version, dict) else None
         return graph if isinstance(graph, dict) else None
 
+    def load_step_runs(self, run_id: str) -> list[dict[str, Any]]:
+        """A run's step rows on their own, for colouring its graph before it is opened."""
+        return _optional_list(lambda: self.client.list_run_steps(run_id))
+
     def load_run_logs(self, run_id: str) -> list[dict[str, Any]]:
         entries = self.client.get_run_logs(run_id, limit=RUN_LOG_LIMIT).get("entries")
         return entries if isinstance(entries, list) else []
@@ -2037,18 +2077,7 @@ def collapse_message(message: str) -> str:
 
 
 def status_style(status: Any) -> str:
-    normalized = str(status or "unknown").lower()
-    if normalized in {"completed", "succeeded", "success"}:
-        return BRAND_MAIN_GREEN
-    if normalized == "running":
-        return BRAND_BRIGHT_GREEN
-    if normalized in {"submitted", "queued", "accepted"}:
-        return BRAND_SLATE_BLUE
-    if normalized in {"failed", "error", "cancelled", "canceled"}:
-        return BRAND_CORAL_RED
-    if normalized in {"pending", "starting", "warning"}:
-        return BRAND_AMBER
-    return BRAND_MEDIUM_GRAY
+    return status_colour(status)
 
 
 def status_text(status: Any) -> Text:
@@ -2934,6 +2963,7 @@ class RebaseTuiApp(App[None]):
         Binding("s", "toggle_terminal_select", "Select text", show=False),
         Binding("c", "copy_row", "Copy ID", show=False),
         Binding("p", "show_details", "Details", show=False),
+        Binding("i", "toggle_graph_pane", "Graph", show=False),
         Binding("l", "toggle_logs", "Logs", show=False),
         Binding("e", "toggle_events", "Events", show=False),
         Binding("m", "maximise_box", "Maximise pane", show=False),
@@ -3285,6 +3315,12 @@ class RebaseTuiApp(App[None]):
         self._last_runs: dict[str, str] = {}
         self._run_rows: dict[str, dict[str, Any]] = {}
         self._run_detail: RunDetailData | None = None
+        #: Whether `i` has the graph pane open beside the tables.
+        self._graph_open = False
+        #: Step runs by run id, fetched for the run under the cursor so the graph pane
+        #: can colour a run that has not been opened. `_render_runs` drops the ones
+        #: still in flight, so a refresh re-reads them.
+        self._step_runs: dict[str, list[dict[str, Any]]] = {}
         #: Which of the timeline's chips is showing. `l` jumps to the logs one.
         self._timeline_filter = TIMELINE_FILTERS[0][0]
         #: The activity record behind each currently rendered row, for lineage-aware
@@ -3349,6 +3385,9 @@ class RebaseTuiApp(App[None]):
                 chips.can_focus = False
                 yield chips
                 yield TimelineTable(resizes="#runs-table", id="timeline-table")
+            # Docked, so it sits beside the boxes rather than among them: the box
+            # heights and `tab` order above never see it.
+            yield GraphPane()
         yield Footer()
 
     def on_mount(self) -> None:
@@ -3726,6 +3765,7 @@ class RebaseTuiApp(App[None]):
             self._render_workspace_profiles()
             return
         if self.current_view == "project" and self.selected_project is not None:
+            self._forget_live_step_runs()
             self.run_worker(
                 self._load_project_targets(self.selected_project, preserve=True),
                 name="project-targets",
@@ -3823,12 +3863,149 @@ class RebaseTuiApp(App[None]):
         else:
             self.action_show_help_panel()
 
+    def action_toggle_graph_pane(self) -> None:
+        """Open the graph pane beside the tables, or put it away. Bound to `i`.
+
+        What it draws follows the cursor: the steps of the run under it, coloured by
+        how far the run got, or — on the workflows table — what fires what across the
+        project. The tables keep the focus, so the keys work as they did.
+        """
+        if self.current_view != "project":
+            self.notify("Open a project first — i draws the graph behind its workflows.", severity="warning")
+            return
+        self._graph_open = not self._graph_open
+        self.query_one(GraphPane).styles.display = "block" if self._graph_open else "none"
+        self._refresh_graph_pane()
+
+    def _close_graph_pane(self) -> None:
+        self._graph_open = False
+        self.query_one(GraphPane).styles.display = "none"
+
+    def _graph_context(self) -> tuple[Literal["steps", "workflow", "triggers"], str | None] | None:
+        """Which graph the cursor asks for.
+
+        On the runs table it is the steps of the run under the cursor; on the timeline,
+        of the run that is open. On the workflows table it is the cursor's workflow as
+        deployed — its steps, coloured by the open run when that run is one of its —
+        and only a workflow without steps falls back to the project's trigger graph,
+        with the workflow picked out. The functions table shows the triggers too.
+        """
+        if self.current_view != "project" or self.project_targets is None:
+            return None
+        focused = self.focused
+        table_id = str(focused.id) if isinstance(focused, DataTable) else ""
+        if table_id == "runs-table":
+            return ("steps", self._cursor_key(focused)) if self.selected_target_type == "workflow" else None
+        if table_id == "timeline-table":
+            if self.selected_target_type != "workflow" or self._run_detail is None:
+                return None
+            return ("steps", str(self._run_detail.run.get("id")))
+        if table_id == "workflows-table":
+            workflow_id = self._cursor_key(focused)
+            detail = self._run_detail
+            if workflow_id and detail is not None and str(detail.run.get("target_id")) == workflow_id:
+                return ("steps", str(detail.run.get("id")))
+            if workflow_id and self._current_step_graph({"target_id": workflow_id}) is not None:
+                return ("workflow", workflow_id)
+            return ("triggers", workflow_id)
+        if table_id == "functions-table":
+            return ("triggers", None)
+        return None
+
+    def _refresh_graph_pane(self) -> None:
+        """Redraw the graph pane for wherever the cursor is now. Free while it is closed."""
+        if not self._graph_open:
+            return
+        pane = self.query_one(GraphPane)
+        context = self._graph_context()
+        if context is None:
+            pane.show_notice("Select a workflow, or one of its runs — i draws the graph behind it.")
+            return
+        kind, key = context
+        project_name = str((self.selected_project or {}).get("name") or "")
+        if kind == "workflow" and key is not None:
+            row = self._workflow_rows.get(key) or {}
+            name = str(row.get("name") or key)
+            spec = step_dag(self._current_step_graph({"target_id": key}), None, title=f"{name} · steps")
+            pane.show(spec, hint="The workflow as deployed. Open one of its runs to colour each step.")
+            return
+        if kind == "triggers":
+            spec = trigger_dag(list(self._workflow_rows.values()), project_name=project_name)
+            row = self._workflow_rows.get(key) if key is not None else None
+            selected = None
+            if row and row.get("name"):
+                selected = node_index(spec, workflow_key(project_name, str(row["name"])))
+            hint = None
+            if not spec.edges:
+                hint = (
+                    "This workflow has no steps, and nothing fires anything here: give a workflow "
+                    "trigger=rb.OnWorkflow(...) or rb.OnUpdate(...) to draw an edge."
+                )
+            pane.show(spec, selected=selected, hint=hint)
+            return
+        if key is None:
+            pane.show_notice("Select a run — i draws its steps.")
+            return
+        detail = self._run_detail
+        if detail is not None and str(detail.run.get("id")) != key:
+            detail = None
+        run = detail.run if detail is not None else self._run_rows.get(key) or {}
+        step_graph = detail.step_graph if detail is not None and detail.step_graph else self._current_step_graph(run)
+        if step_graph is None:
+            pane.show_notice("This run has no step graph: its workflow does the work in its own body.")
+            return
+        steps = detail.steps if detail is not None else self._step_runs.get(key)
+        workflow_name = str((self.selected_target or {}).get("name") or "workflow")
+        title = f"{workflow_name} · {compact_id(key)} · {run.get('status') or '-'}"
+        pane.show(step_dag(step_graph, steps, title=title))
+        if steps is None:
+            # A callable, not a coroutine: `exclusive` cancels a pending fetch the moment
+            # the cursor moves on, and a coroutine cancelled before it starts is a
+            # "never awaited" warning in the log.
+            self.run_worker(partial(self._load_step_runs, key), name="graph-steps", group="tui-graph", exclusive=True)
+
+    def _current_step_graph(self, run: dict[str, Any]) -> dict[str, Any] | None:
+        """The step graph of the run's workflow as currently deployed.
+
+        The run may have gone through an older version; its exact graph is one more
+        request away and is only fetched when the run is opened. Until then the current
+        one is drawn, which is right whenever the workflow has not been redeployed since.
+        A run listed under a workflow belongs to it, so a row that does not say which
+        workflow it ran falls back to the one open above it.
+        """
+        if self.project_targets is None:
+            return None
+        workflow_id = run.get("target_id") or (self.selected_target or {}).get("id")
+        version = self.project_targets.workflow_versions.get(str(workflow_id))
+        graph = version.get("step_graph") if isinstance(version, dict) else None
+        return graph if isinstance(graph, dict) else None
+
+    async def _load_step_runs(self, run_id: str) -> None:
+        try:
+            steps = await asyncio.to_thread(self.data.load_step_runs, run_id)
+        except Exception:
+            steps = []
+        self._step_runs[run_id] = steps
+        self._refresh_graph_pane()
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id in {"workflows-table", "functions-table", "runs-table"}:
+            self._refresh_graph_pane()
+
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        # Which table has the focus decides which graph the pane shows.
+        self._refresh_graph_pane()
+
     def action_back(self) -> None:
         # The keys panel is the outermost thing on screen, so it is the first thing Back
         # closes — `b` and `escape` both, rather than leaving the palette as the only way
         # out of a panel the palette opened.
         if self.screen.query("HelpPanel"):
             self.action_hide_help_panel()
+            return
+        # Then the graph pane, for the same reason: it is on top of the view, not in it.
+        if self._graph_open:
+            self.action_toggle_graph_pane()
             return
         if self.current_view == "workspace-switcher":
             if self.view_before_switcher == "project":
@@ -4937,7 +5114,7 @@ class RebaseTuiApp(App[None]):
         workflows = self._fill_table("workflows-table")
         # One scale for the whole table, so a bar's height compares across rows.
         history_now = datetime.now(UTC)
-        history_scale = history_peak(targets.run_history)
+        history_mean = history_scale(targets.run_history)
         for workflow_id, workflow in self._workflow_rows.items():
             version = targets.workflow_versions.get(workflow_id)
             workflows.add_row(
@@ -4949,7 +5126,7 @@ class RebaseTuiApp(App[None]):
                 ),
                 self._time(workflow.get("next_run_at")),
                 self._time(self._last_runs.get(workflow_id)),
-                history_text(targets.run_history.get(workflow_id, {}), now=history_now, peak=history_scale),
+                history_text(targets.run_history.get(workflow_id, {}), now=history_now, scale=history_mean),
                 format_workflow_source(version),
                 format_workflow_commit(version),
                 format_execution(workflow),
@@ -4969,7 +5146,7 @@ class RebaseTuiApp(App[None]):
                 "-",
                 "-",
                 self._time(group.last_run),
-                history_text(targets.run_history.get(group.row_key, {}), now=history_now, peak=history_scale),
+                history_text(targets.run_history.get(group.row_key, {}), now=history_now, scale=history_mean),
                 "-",
                 "-",
                 group.run_type,
@@ -4982,6 +5159,7 @@ class RebaseTuiApp(App[None]):
 
         if not preserve:
             self._clear_target_detail(clear_project=False)
+        self._refresh_graph_pane()
 
     @staticmethod
     def _ordered_functions(targets: ProjectTargetsData) -> dict[str, dict[str, Any]]:
@@ -5030,6 +5208,20 @@ class RebaseTuiApp(App[None]):
             )
         if not preserve:
             self.query_one("#timeline-table", DataTable).clear(columns=True)
+        self._forget_live_step_runs()
+        self._refresh_graph_pane()
+
+    def _forget_live_step_runs(self) -> None:
+        """Drop the cached steps of runs still going, so a refresh re-reads them.
+
+        A finished run's steps are settled and stay; re-reading those on every tick
+        would cost a request per run the cursor has visited.
+        """
+        self._step_runs = {
+            run_id: steps
+            for run_id, steps in self._step_runs.items()
+            if str((self._run_rows.get(run_id) or {}).get("status")) in TERMINAL_RUN_STATUSES
+        }
 
     def _render_timeline(self) -> None:
         """The selected run's lifecycle events, steps and — when `l` is on — its logs.
@@ -5182,6 +5374,7 @@ class RebaseTuiApp(App[None]):
                     showing_all, "truncated", f"Showing the first {RUN_LOG_LIMIT} log lines of this run."
                 )
             )
+        self._refresh_graph_pane()
 
     def _timeline_message_width(self) -> int:
         """How wide the run-detail table's final prose column can be.
@@ -5216,6 +5409,8 @@ class RebaseTuiApp(App[None]):
         self._run_rows = {}
         self._timeline_rows = {}
         self._run_detail = None
+        self._step_runs = {}
+        self.query_one(GraphPane).clear()
         self._reveal(0)
 
     def _select_project(self, project_id: str) -> None:
@@ -5240,6 +5435,7 @@ class RebaseTuiApp(App[None]):
         self.current_view = "workspace"
         # `m` belongs to the project view, and it hid the header on the way in.
         self._leave_maximised()
+        self._close_graph_pane()
         self.call_after_refresh(self._update_workspace_title)
         self.query_one("#workspace-view", Vertical).styles.display = "block"
         self.query_one("#project-view", Vertical).styles.display = "none"
@@ -5261,6 +5457,7 @@ class RebaseTuiApp(App[None]):
     def _show_workspace_switcher_view(self) -> None:
         self.current_view = "workspace-switcher"
         self._leave_maximised()
+        self._close_graph_pane()
         self.query_one("#workspace-view", Vertical).styles.display = "none"
         self.query_one("#project-view", Vertical).styles.display = "none"
         self.query_one("#workspace-switcher-view", Vertical).styles.display = "block"

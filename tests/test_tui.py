@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
+import sys
 import threading
+import types
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -18,6 +21,7 @@ from textual._xterm_parser import XTermParser
 from textual.coordinate import Coordinate
 from textual.events import MouseMove
 from textual.geometry import Offset
+from textual.message import Message
 from textual.selection import Selection
 from textual.widgets import (
     DataTable,
@@ -36,7 +40,7 @@ from textual.widgets._toast import Toast
 
 from rebase import config as config_module
 from rebase import tui as tui_module
-from rebase.brand import BRAND_MEDIUM_GRAY
+from rebase.brand import BRAND_AMBER, BRAND_BRIGHT_GREEN, BRAND_MAIN_GREEN, BRAND_MEDIUM_GRAY
 from rebase.client import Client, RebaseWorkflowError
 from rebase.editor import EditorCommand
 from rebase.tui import (
@@ -75,15 +79,18 @@ from rebase.tui import (
     history_column_label,
     history_from_buckets,
     history_from_runs,
-    history_peak,
+    history_scale,
     history_text,
     is_github_backed,
+    shaded,
     status_style,
     step_dependencies,
     target_ids_by_identity,
     workflow_definition_line,
     workflow_definition_line_at_commit,
 )
+from rebase.tui_graph import dim
+from rebase.tui_graph_pane import GraphPane
 
 
 @pytest.fixture(autouse=True)
@@ -5035,7 +5042,8 @@ def test_history_from_runs_counts_each_run_in_its_hour_and_folds_one_offs_by_nam
         },
         "ephemeral:workflow:collect": {ten - timedelta(hours=1): {"succeeded": 1}},
     }
-    assert history_peak(history) == 2
+    # The scale is the mean bar height: three single-run hours and one with two.
+    assert history_scale(history) == pytest.approx((3 * math.log2(2) + math.log2(3)) / 4)
 
 
 def test_history_from_buckets_drops_what_it_cannot_attribute() -> None:
@@ -5076,7 +5084,9 @@ def test_history_text_scales_height_by_count_and_colours_by_worst_status() -> No
             ten - timedelta(hours=24): {"succeeded": 100},
         },
         now=now,
-        peak=60,
+        # The four-run hour is the mean, so it draws at half height; sixty is far past
+        # twice the mean and fills the cell; one run shrinks towards the floor.
+        scale=math.log2(4 + 1),
     )
 
     assert len(text.plain) == HISTORY_HOURS
@@ -5086,16 +5096,38 @@ def test_history_text_scales_height_by_count_and_colours_by_worst_status() -> No
     assert text.plain[21:] == "▄██"
     styles = {span.start: str(span.style) for span in text.spans}
     # One failure in sixty is still a red hour; a running run outranks the successes.
+    # Odd hours — 09:00 here, and 11:00 yesterday on the far left — take the darker
+    # shade of their colour, so a run of same-height bars still reads as bars.
     assert styles[23] == status_style("succeeded")
-    assert styles[22] == status_style("failed")
+    assert styles[22] == shaded(status_style("failed"))
     assert styles[21] == status_style("running")
+    assert styles[0] == shaded(status_style("succeeded"))
     assert styles[1] == tui_module.BRAND_MEDIUM_GRAY
 
 
 def test_history_text_is_all_quiet_for_a_row_with_no_runs() -> None:
-    text = history_text({}, now=datetime.now(UTC), peak=0)
+    text = history_text({}, now=datetime.now(UTC), scale=0)
 
     assert text.plain == "·" * HISTORY_HOURS
+
+
+def test_history_text_draws_a_flat_schedule_at_half_height() -> None:
+    """A cron landing the same count every hour is a row of half bars, not a block."""
+    now = datetime(2026, 9, 3, 10, 51, tzinfo=UTC)
+    ten = datetime(2026, 9, 3, 10, tzinfo=UTC)
+    hours = {ten - timedelta(hours=offset): {"succeeded": 6} for offset in range(HISTORY_HOURS)}
+
+    text = history_text(hours, now=now, scale=history_scale({"wf": hours}))
+
+    assert text.plain == "▄" * HISTORY_HOURS
+    # 10:00 is on the right; the shade alternates hour by hour all the way back.
+    styles = [str(span.style) for span in text.spans]
+    assert styles[::-1] == [status_style("succeeded"), shaded(status_style("succeeded"))] * (HISTORY_HOURS // 2)
+
+
+def test_shaded_darkens_a_colour_and_keeps_it_hex() -> None:
+    assert shaded("#0D9373", 0.5) == "#064939"
+    assert shaded("#ffffff", 0.0) == "#ffffff"
 
 
 def test_history_column_label_axis_is_as_wide_as_the_bars() -> None:
@@ -5648,5 +5680,461 @@ def test_a_tick_leaves_the_timeline_you_are_reading_on_screen() -> None:
             await pilot.press("enter")
             await pilot.pause(0.4)
             assert app.query_one("#timeline-table", DataTable).row_count == 0
+
+    asyncio.run(scenario())
+
+
+# ---- the graph pane -------------------------------------------------------------
+
+
+class FakePlotui:
+    """What the pane asks of plotui, recorded: every plot, widget and repaint.
+
+    Installed into `sys.modules` in place of the real package so the tests neither need
+    the native wheel nor a terminal that can show images.
+    """
+
+    def __init__(self, render_mode: str = "placeholder") -> None:
+        self.render_mode = render_mode
+        self.plots: list[Any] = []
+        self.widgets: list[Any] = []
+        fake = self
+
+        class Plot:
+            def __init__(self) -> None:
+                self.graphs: list[dict[str, Any]] = []
+                self.colours: list[tuple[int, list[str], list[str] | None]] = []
+                self.selected: Any = "untouched"
+                fake.plots.append(self)
+
+            def add_graph2d(self, xs: Any, ys: Any, edges: Any, **kwargs: Any) -> int:
+                self.graphs.append({"xs": list(xs), "ys": list(ys), "edges": list(edges), **kwargs})
+                return len(self.graphs) - 1
+
+            def set_graph_colors(self, handle: int, node_colors: Any, edge_colors: Any = None) -> None:
+                self.colours.append((handle, list(node_colors), None if edge_colors is None else list(edge_colors)))
+
+            def set_selected(self, element: Any) -> None:
+                self.selected = element
+
+        class LayeredLayout:
+            def __init__(self, n_nodes: int, edges: Any, rankdir: str = "TB") -> None:
+                self.n_nodes = n_nodes
+                self.edges = list(edges)
+                self.rankdir = rankdir
+
+            def positions(self) -> tuple[list[float], list[float]]:
+                return [float(i) for i in range(self.n_nodes)], [0.0] * self.n_nodes
+
+            def routes(self) -> list[list[tuple[float, float]]]:
+                return [[] for _ in self.edges]
+
+        class PlotWidget(Static):
+            class ElementHovered(Message):
+                def __init__(self, plot_widget: Any, element: tuple[str, int] | None) -> None:
+                    super().__init__()
+                    self.plot_widget = plot_widget
+                    self.element = element
+
+            class ElementPicked(Message):
+                def __init__(self, plot_widget: Any, element: tuple[str, int] | None) -> None:
+                    super().__init__()
+                    self.plot_widget = plot_widget
+                    self.element = element
+
+            def __init__(self, plot: Any, *, pickable: bool = False, crosshair: bool = True, **kwargs: Any) -> None:
+                super().__init__("fake plot", **kwargs)
+                self.plot = plot
+                self.pickable = pickable
+                self.crosshair = crosshair
+                self.invalidations = 0
+                fake.widgets.append(self)
+
+            def set_graph_colors(self, handle: int, node_colors: Any, edge_colors: Any = None) -> None:
+                self.plot.set_graph_colors(handle, node_colors, edge_colors)
+
+            def invalidate(self) -> None:
+                self.invalidations += 1
+
+        self.core = types.ModuleType("plotui")
+        self.core.Plot = Plot  # type: ignore[attr-defined]
+        self.core.LayeredLayout = LayeredLayout  # type: ignore[attr-defined]
+        self.textual = types.ModuleType("plotui.textual")
+        self.textual.PlotWidget = PlotWidget  # type: ignore[attr-defined]
+        self.textual.detect_render_mode = lambda env=None: fake.render_mode  # type: ignore[attr-defined]
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> FakePlotui:
+        monkeypatch.setitem(sys.modules, "plotui", self.core)
+        monkeypatch.setitem(sys.modules, "plotui.textual", self.textual)
+        return self
+
+    @property
+    def plot(self) -> Any:
+        return self.plots[-1]
+
+    @property
+    def widget(self) -> Any:
+        return self.widgets[-1]
+
+
+def _graph_pane(app: RebaseTuiApp) -> GraphPane:
+    return app.query_one(GraphPane)
+
+
+def test_tui_i_toggles_the_graph_pane_and_back_closes_it_first(monkeypatch) -> None:
+    """`i` opens the pane beside the tables; `b` and `escape` close it before going back."""
+    monkeypatch.setitem(sys.modules, "plotui", None)
+
+    async def scenario() -> None:
+        for key in ("b", "escape"):
+            app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+            async with app.run_test(size=(140, 42)) as pilot:
+                await _open_run(app, pilot)
+                revealed = app._reveal_level
+                pane = _graph_pane(app)
+                assert not pane.display
+
+                await pilot.press("i")
+                await pilot.pause(0.2)
+                assert pane.display
+                # The tables keep the focus: the pane is looked at, not driven.
+                assert isinstance(app.focused, DataTable)
+
+                await pilot.press(key)
+                await pilot.pause(0.2)
+                assert not pane.display
+                assert app._reveal_level == revealed
+
+                await pilot.press(key)
+                await pilot.pause(0.2)
+                assert app._reveal_level == revealed - 1
+
+                # Pressing it twice puts it away again.
+                await pilot.press("i")
+                await pilot.press("i")
+                await pilot.pause(0.2)
+                assert not pane.display
+
+    asyncio.run(scenario())
+
+
+def test_tui_graph_pane_wants_a_project_first(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "plotui", None)
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            assert app.current_view == "workspace"
+            await pilot.press("i")
+            await pilot.pause(0.2)
+            assert not _graph_pane(app).display
+            assert any("Open a project first" in note.message for note in app._notifications)
+
+    asyncio.run(scenario())
+
+
+def test_tui_graph_pane_shows_a_notice_without_plotui(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "plotui", None)
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(SteppedClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await _open_run(app, pilot)
+            await pilot.press("i")
+            await pilot.pause(0.2)
+            notice = _graph_pane(app).notice
+            assert notice is not None
+            assert 'pip install "rebase-toolkit[graph]"' in notice
+            # As drawn, too: a bare string would be read as markup and lose `[graph]`.
+            assert 'pip install "rebase-toolkit[graph]"' in str(app.query_one("#graph-notice", Static).render())
+
+    asyncio.run(scenario())
+
+
+def test_tui_graph_pane_shows_a_notice_in_an_unsupported_terminal(monkeypatch) -> None:
+    fake = FakePlotui(render_mode="unsupported").install(monkeypatch)
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(SteppedClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await _open_run(app, pilot)
+            await pilot.press("i")
+            await pilot.pause(0.2)
+            notice = _graph_pane(app).notice
+            assert notice is not None
+            assert "Kitty, Ghostty" in notice
+            assert fake.plots == []
+
+    asyncio.run(scenario())
+
+
+def test_tui_graph_pane_draws_the_open_run_and_repaints_on_refresh(monkeypatch) -> None:
+    """The open run's steps, coloured by how far it got; `r` repaints rather than relays."""
+    fake = FakePlotui().install(monkeypatch)
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(SteppedClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await _open_run(app, pilot)
+            await pilot.press("i")
+            await pilot.pause(0.3)
+            pane = _graph_pane(app)
+            assert pane.notice is None
+            graph = fake.plot.graphs[0]
+            assert graph["labels"] == ["load_weather", "normalize"]
+            assert graph["edges"] == [(0, 1)]
+            assert graph["node_colors"] == [BRAND_MAIN_GREEN, BRAND_MEDIUM_GRAY]
+            assert graph["node_shapes"] == ["rounded", "rounded"]
+            assert (
+                str(app.query_one("#graph-title", Static).render()) == f"forecast · {compact_id('run-id')} · succeeded"
+            )
+            assert fake.widget.pickable
+            assert not fake.widget.crosshair
+            assert not fake.widget.can_focus
+            assert pane.rebuilds == 1
+
+            await pilot.press("r")
+            await pilot.pause(0.4)
+            assert pane.rebuilds == 1
+            assert pane.recolours >= 1
+            assert fake.plot.colours[-1][1] == [BRAND_MAIN_GREEN, BRAND_MEDIUM_GRAY]
+
+    asyncio.run(scenario())
+
+
+def test_tui_graph_pane_lights_what_a_picked_step_waits_on(monkeypatch) -> None:
+    fake = FakePlotui().install(monkeypatch)
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(SteppedClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await _open_run(app, pilot)
+            await pilot.press("i")
+            await pilot.pause(0.3)
+            widget = fake.widget
+            readout = app.query_one("#graph-readout", Static)
+
+            widget.post_message(widget.ElementPicked(widget, ("node", 1)))
+            await pilot.pause(0.2)
+            assert str(readout.render()) == "normalize waits on 1: load_weather"
+            assert fake.plot.colours[-1][1] == [BRAND_MAIN_GREEN, BRAND_MEDIUM_GRAY]
+
+            widget.post_message(widget.ElementHovered(widget, ("node", 0)))
+            await pilot.pause(0.2)
+            assert str(readout.render()) == "load_weather waits on nothing"
+            assert fake.plot.colours[-1][1] == [BRAND_MAIN_GREEN, dim(BRAND_MEDIUM_GRAY)]
+
+            widget.post_message(widget.ElementHovered(widget, ("edge", 0)))
+            await pilot.pause(0.2)
+            assert str(readout.render()) == "load_weather → normalize (ordering only)"
+            assert fake.plot.colours[-1][1] == [BRAND_MAIN_GREEN, BRAND_MEDIUM_GRAY]
+
+    asyncio.run(scenario())
+
+
+class TwoRunClient(SteppedClient):
+    """Two runs of the stepped workflow, one still going, so the cursor has somewhere to move."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.step_calls: list[str] = []
+        self.runs = [
+            self.runs[0],
+            {
+                **self.runs[0],
+                "id": "run-2",
+                "status": "running",
+                "finished_at": None,
+                "created_at": "2026-06-16T15:00:00Z",
+                "started_at": "2026-06-16T15:00:10Z",
+            },
+        ]
+
+    def get_run(self, run_id: str) -> dict[str, Any]:
+        self.run_detail_calls += 1
+        return next(run for run in self.runs if run["id"] == run_id)
+
+    def list_run_steps(self, run_id: str) -> list[dict[str, Any]]:
+        self.step_calls.append(run_id)
+        if run_id == "run-2":
+            return [
+                {"id": "step-2a", "name": "load_weather", "status": "succeeded", "attempt": 1},
+                {"id": "step-2b", "name": "normalize", "status": "running", "attempt": 1},
+            ]
+        return super().list_run_steps(run_id)
+
+
+def test_tui_graph_pane_follows_the_cursor_through_the_runs(monkeypatch) -> None:
+    """A run under the cursor is coloured from its own steps, fetched once while it is settled."""
+    fake = FakePlotui().install(monkeypatch)
+    client = TwoRunClient()
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            runs = app.query_one("#runs-table", DataTable)
+            assert app.focused is runs
+            assert app._run_detail is None
+
+            await pilot.press("i")
+            await pilot.pause(0.4)
+            pane = _graph_pane(app)
+            assert fake.plot.graphs[0]["labels"] == ["load_weather", "normalize"]
+            assert client.step_calls == ["run-id"]
+            assert fake.plot.colours[-1][1] == [BRAND_MAIN_GREEN, BRAND_MEDIUM_GRAY]
+
+            await pilot.press("down")
+            await pilot.pause(0.4)
+            assert client.step_calls == ["run-id", "run-2"]
+            assert fake.plot.colours[-1][1] == [BRAND_MAIN_GREEN, BRAND_BRIGHT_GREEN]
+            assert pane.rebuilds == 1
+
+            # Back up: the finished run's steps are remembered, not re-read.
+            await pilot.press("up")
+            await pilot.pause(0.4)
+            assert client.step_calls == ["run-id", "run-2"]
+            assert fake.plot.colours[-1][1] == [BRAND_MAIN_GREEN, BRAND_MEDIUM_GRAY]
+
+            # A refresh forgets the run still in flight, and only that one.
+            await pilot.press("r")
+            await pilot.pause(0.4)
+            assert "run-id" in app._step_runs
+            assert "run-2" not in app._step_runs
+
+    asyncio.run(scenario())
+
+
+class TriggeredClient(FakeClient):
+    """A second workflow that runs after the first, which is the edge the trigger graph draws."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.workflows = [
+            self.workflows[0],
+            {
+                **self.workflows[0],
+                "id": "publish-id",
+                "name": "publish",
+                "schedule": None,
+                "next_run_at": None,
+                "paused": True,
+                "trigger": {"type": "on_workflow", "source": "forecast", "on": "success", "active": True},
+            },
+        ]
+
+
+def test_tui_graph_pane_draws_a_workflow_as_deployed_from_the_workflows_table(monkeypatch) -> None:
+    """The cursor on a stepped workflow draws its steps before any run is opened."""
+    fake = FakePlotui().install(monkeypatch)
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(SteppedClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            assert app.focused is app.query_one("#workflows-table", DataTable)
+
+            await pilot.press("i")
+            await pilot.pause(0.3)
+            graph = fake.plot.graphs[0]
+            assert graph["labels"] == ["load_weather", "normalize"]
+            assert graph["node_colors"] == [BRAND_MEDIUM_GRAY, BRAND_MEDIUM_GRAY]
+            assert str(app.query_one("#graph-title", Static).render()) == "forecast · steps"
+            assert "Open one of its runs" in str(app.query_one("#graph-readout", Static).render())
+            assert "open a run to colour it" in str(app.query_one("#graph-legend", Static).render())
+
+            # Opening a run of it colours the same graph in place.
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+            assert _graph_pane(app).rebuilds == 1
+            assert fake.plot.colours[-1][1] == [BRAND_MAIN_GREEN, BRAND_MEDIUM_GRAY]
+
+    asyncio.run(scenario())
+
+
+def test_tui_graph_pane_draws_the_triggers_from_the_workflows_table(monkeypatch) -> None:
+    fake = FakePlotui().install(monkeypatch)
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(TriggeredClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            workflows = app.query_one("#workflows-table", DataTable)
+            assert app.focused is workflows
+
+            await pilot.press("i")
+            await pilot.pause(0.3)
+            graph = fake.plot.graphs[0]
+            assert graph["labels"] == ["forecast", "publish"]
+            assert graph["edges"] == [(0, 1)]
+            assert graph["node_shapes"] == ["box", "box"]
+            assert graph["node_colors"] == [BRAND_MAIN_GREEN, BRAND_AMBER]
+            assert "name" not in graph
+            assert fake.plot.selected == ("node", 0)
+
+            # The cursor's workflow is the one picked out, and moving it is a repaint.
+            await pilot.press("down")
+            await pilot.pause(0.3)
+            assert fake.plot.selected == ("node", 1)
+            assert _graph_pane(app).rebuilds == 1
+
+            # Opening the workflow moves on to its runs, which have no step graph here.
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+            notice = _graph_pane(app).notice
+            assert notice is not None
+            assert "no step graph" in notice
+
+    asyncio.run(scenario())
+
+
+def test_tui_graph_pane_says_why_a_trigger_graph_has_no_edges(monkeypatch) -> None:
+    fake = FakePlotui().install(monkeypatch)
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("i")
+            await pilot.pause(0.3)
+            assert fake.plot.graphs[0]["labels"] == ["forecast"]
+            assert fake.plot.graphs[0]["edges"] == []
+            readout = str(app.query_one("#graph-readout", Static).render())
+            assert "no steps" in readout and "rb.OnWorkflow" in readout
 
     asyncio.run(scenario())
