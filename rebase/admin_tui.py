@@ -365,12 +365,17 @@ class QuotaChoiceScreen(ModalScreen[int | str | None]):
 
 # --- the detail pane -------------------------------------------------------------
 
+QUOTA_TABLE_ID = "admin-detail-quota"
+
 
 class WorkspaceDetail(Vertical):
-    """One workspace in full, under the list rather than over it.
+    """One workspace in full, under the list rather than over it -- and somewhere to work.
 
-    A slide-out hides the very list the reader was scanning; a pane beneath keeps
-    both in view, so `enter` on the next row simply replaces what is shown here.
+    A slide-out hides the very list the reader was scanning; a pane beneath keeps both
+    in view, so `enter` on the next row simply replaces what is shown here. The quota
+    is a table rather than text so the cursor can land on a setting: `enter` on a
+    workspace moves the focus down here, `e` edits the highlighted row without the
+    field picker, and `escape`/`b` hands the focus back to the list.
     """
 
     DEFAULT_CSS = f"""
@@ -398,11 +403,19 @@ class WorkspaceDetail(Vertical):
         max-height: 8;
     }}
 
+    #{QUOTA_TABLE_ID} {{
+        height: auto;
+        max-height: 10;
+    }}
+
     #admin-detail-hint {{
         color: {BRAND_MEDIUM_GRAY};
         margin-top: 1;
     }}
     """
+
+    #: Every widget that is hidden until a workspace is shown.
+    _SECTIONS = ("members-heading", "members", "quota-heading", "quota", "usage-heading", "usage")
 
     def compose(self) -> ComposeResult:
         yield Static("", id="admin-detail-title")
@@ -410,27 +423,42 @@ class WorkspaceDetail(Vertical):
             yield Static("", id="admin-detail-members-heading", classes="admin-detail-heading")
             yield HeaderSafeDataTable(id="admin-detail-members", cursor_type="none")
             yield Static("Quota", id="admin-detail-quota-heading", classes="admin-detail-heading")
-            yield Static("", id="admin-detail-quota")
+            yield HeaderSafeDataTable(id=QUOTA_TABLE_ID, cursor_type="row", zebra_stripes=True)
             yield Static("This month", id="admin-detail-usage-heading", classes="admin-detail-heading")
             yield Static("", id="admin-detail-usage")
-        yield Static("enter shows a workspace here. e edits its quota.", id="admin-detail-hint")
+        yield Static("", id="admin-detail-hint")
 
     def on_mount(self) -> None:
         self.query_one("#admin-detail-members", HeaderSafeDataTable).can_focus = False
         self.clear()
 
+    @property
+    def quota_table(self) -> HeaderSafeDataTable:
+        return self.query_one(f"#{QUOTA_TABLE_ID}", HeaderSafeDataTable)
+
+    @property
+    def highlighted_field(self) -> str | None:
+        """The quota setting under the cursor, or None when the table is empty."""
+        table = self.quota_table
+        if not 0 <= table.cursor_row < len(table.ordered_rows):
+            return None
+        value = table.ordered_rows[table.cursor_row].key.value
+        return None if value is None else str(value)
+
     def clear(self) -> None:
         self.query_one("#admin-detail-title", Static).update(
             Text("Select a workspace and press enter to see its members, quota and spend.", style=BRAND_MEDIUM_GRAY)
         )
-        for widget_id in ("members-heading", "members", "quota-heading", "quota", "usage-heading", "usage"):
-            self.query_one(f"#admin-detail-{widget_id}").display = False
+        for section in self._SECTIONS:
+            self.query_one(f"#admin-detail-{section}").display = False
+        self.quota_table.clear(columns=True)
+        self.query_one("#admin-detail-hint", Static).update("enter shows a workspace here.")
 
     def show(self, workspace: dict[str, Any], *, usage: dict[str, Any] | None, usage_error: str | None) -> None:
         policy = workspace["policy"]
         currency = str(policy.get("currency", "EUR"))
-        for widget_id in ("members-heading", "members", "quota-heading", "quota", "usage-heading", "usage"):
-            self.query_one(f"#admin-detail-{widget_id}").display = True
+        for section in self._SECTIONS:
+            self.query_one(f"#admin-detail-{section}").display = True
 
         self.query_one("#admin-detail-title", Static).update(
             Text.assemble(
@@ -453,19 +481,27 @@ class WorkspaceDetail(Vertical):
             )
         table.display = bool(members)
 
-        flagged = (
-            "\n(table defaults — this workspace has no policy row yet)" if workspace.get("policy_defaulted") else ""
-        )
-        quota = Text(
-            "\n".join(
-                f"{FIELD_LABELS[key] + ':':<26} {format_field_value(key, policy[key], currency)}"
-                for key, _, _ in EDITABLE_FIELDS
-            )
-        )
-        if flagged:
-            quota.append(flagged, style=BRAND_AMBER)
-        self.query_one("#admin-detail-quota", Static).update(quota)
+        heading = Text("Quota", style=f"bold {BRAND_BRIGHT_GREEN}")
+        if workspace.get("policy_defaulted"):
+            heading.append("  table defaults — this workspace has no policy row yet", style=BRAND_AMBER)
+        self.query_one("#admin-detail-quota-heading", Static).update(heading)
+
+        # Repaint the quota rows but keep the cursor on the same setting: an edit
+        # reloads the listing, and losing the row you just changed would be rude.
+        quota = self.quota_table
+        keep = self.highlighted_field
+        quota.clear(columns=True)
+        quota.add_columns("Setting", "Value")
+        for key, label, _ in EDITABLE_FIELDS:
+            quota.add_row(label, format_field_value(key, policy[key], currency), key=key)
+        if keep is not None:
+            with suppress(Exception):
+                quota.move_cursor(row=quota.get_row_index(keep))
+
         self.query_one("#admin-detail-usage", Static).update(self._usage_text(usage, usage_error, currency))
+        self.query_one("#admin-detail-hint", Static).update(
+            "↑/↓ pick a setting. e or enter edits it. escape or b goes back to the list."
+        )
 
     @staticmethod
     def _usage_text(usage: dict[str, Any] | None, error: str | None, currency: str) -> Text:
@@ -496,6 +532,8 @@ class RebaseAdminApp(App[None]):
         Binding("r", "refresh", "Refresh"),
         Binding("p", "show_details", "Details"),
         Binding("e", "edit_quota", "Edit quota"),
+        Binding("b", "back", "Back"),
+        Binding("escape", "back", "Back", show=False),
     ]
     CSS = f"""
     Screen {{
@@ -549,10 +587,18 @@ class RebaseAdminApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one(f"#{WORKSPACES_TABLE_ID}", DataTable).focus()
+        self.workspaces_table.focus()
         self.run_worker(self._load(preserve=False, announce=True), name="admin-load", group="admin", exclusive=True)
         if self._refresh_interval:
             self.set_interval(self._refresh_interval, self._refresh_tick)
+
+    @property
+    def workspaces_table(self) -> DataTable:
+        return self.query_one(f"#{WORKSPACES_TABLE_ID}", DataTable)
+
+    @property
+    def detail(self) -> WorkspaceDetail:
+        return self.query_one("#admin-detail", WorkspaceDetail)
 
     # -- loading & rendering ------------------------------------------------------
 
@@ -570,7 +616,7 @@ class RebaseAdminApp(App[None]):
         self._refresh_detail()
 
     def _render(self, workspaces: Sequence[dict[str, Any]]) -> None:
-        table = self.query_one(f"#{WORKSPACES_TABLE_ID}", DataTable)
+        table = self.workspaces_table
         table.clear(columns=True)
         table.add_columns(*WORKSPACE_COLUMNS)
         for workspace in workspaces:
@@ -585,12 +631,10 @@ class RebaseAdminApp(App[None]):
         if self.detail_workspace_id is None:
             return
         workspace = self._workspace(self.detail_workspace_id)
-        detail = self.query_one("#admin-detail", WorkspaceDetail)
         if workspace is None:
-            self.detail_workspace_id = None
-            detail.clear()
+            self.action_back()
             return
-        detail.show(
+        self.detail.show(
             workspace,
             usage=self._usage_cache.get(self.detail_workspace_id),
             usage_error=self._usage_errors.get(self.detail_workspace_id),
@@ -626,7 +670,7 @@ class RebaseAdminApp(App[None]):
 
     def _table_view(self) -> TableView | None:
         try:
-            table = self.query_one(f"#{WORKSPACES_TABLE_ID}", DataTable)
+            table = self.workspaces_table
         except NoMatches:
             return None
         return TableView(
@@ -634,7 +678,7 @@ class RebaseAdminApp(App[None]):
         )
 
     def _restore_table_view(self, view: TableView) -> None:
-        table = self.query_one(f"#{WORKSPACES_TABLE_ID}", DataTable)
+        table = self.workspaces_table
         if view.cursor_key is not None:
             with suppress(Exception):
                 table.move_cursor(row=table.get_row_index(view.cursor_key))
@@ -652,7 +696,7 @@ class RebaseAdminApp(App[None]):
         return next((workspace for workspace in self.workspaces if str(workspace["id"]) == workspace_id), None)
 
     def _selected_workspace(self) -> dict[str, Any] | None:
-        key = self._cursor_key(self.query_one(f"#{WORKSPACES_TABLE_ID}", DataTable))
+        key = self._cursor_key(self.workspaces_table)
         return None if key is None else self._workspace(key)
 
     # -- auto-refresh ---------------------------------------------------------------
@@ -678,9 +722,19 @@ class RebaseAdminApp(App[None]):
     def action_refresh(self) -> None:
         self.run_worker(self._load(preserve=True, announce=True), name="admin-load", group="admin", exclusive=True)
 
+    def action_back(self) -> None:
+        """Close the pane and return the cursor to the list. Nothing open, nothing done."""
+        if self.detail_workspace_id is None:
+            return
+        self.detail_workspace_id = None
+        self.detail.clear()
+        self.workspaces_table.focus()
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == WORKSPACES_TABLE_ID:
             self.action_show_details()
+        elif event.data_table.id == QUOTA_TABLE_ID:
+            self.action_edit_quota()
 
     def action_show_details(self) -> None:
         workspace = self._selected_workspace()
@@ -691,9 +745,12 @@ class RebaseAdminApp(App[None]):
     async def _show_details(self, workspace: dict[str, Any]) -> None:
         workspace_id = str(workspace["id"])
         self.detail_workspace_id = workspace_id
-        # Paint what is already known at once; the usage follows when the API answers.
-        detail = self.query_one("#admin-detail", WorkspaceDetail)
+        # Paint what is already known at once and hand the cursor down to the quota
+        # table; the usage follows when the API answers.
+        detail = self.detail
         detail.show(workspace, usage=self._usage_cache.get(workspace_id), usage_error=None)
+        detail.quota_table.move_cursor(row=0)
+        detail.quota_table.focus()
         usage, error = await self._usage_for(workspace_id)
         if self.detail_workspace_id == workspace_id:
             detail.show(workspace, usage=usage, usage_error=error)
@@ -709,6 +766,14 @@ class RebaseAdminApp(App[None]):
         return usage, None
 
     def action_edit_quota(self) -> None:
+        """Edit the highlighted setting when the cursor is in the pane; ask which otherwise."""
+        detail = self.detail
+        if self.detail_workspace_id is not None and detail.quota_table.has_focus:
+            workspace = self._workspace(self.detail_workspace_id)
+            field = detail.highlighted_field
+            if workspace is not None and field is not None:
+                self._on_field_chosen(workspace, field)
+                return
         workspace = self._selected_workspace()
         if workspace is None:
             self.notify("Select a workspace first.", severity="warning")

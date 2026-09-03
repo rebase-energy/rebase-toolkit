@@ -6,10 +6,11 @@
 
 - **`rebase admin` is a superadmin TUI over every workspace.** One row per workspace with
   its members, quota ceilings, and monthly credit; `enter` fills a pane beneath the list with
-  the members and this month's spend, so the list stays in view, and `e` edits any of the
-  seven quota fields in place — from a pick-list where the sensible values are few (memory
-  follows Cloud Run's tiers), or a typed number where the value is genuinely continuous
-  (milli-vCPU, cents). A
+  the members, the quota as a table, and this month's spend — the list stays in view and the
+  cursor moves down into the quota table, so `e` or `enter` edits the highlighted setting
+  directly and `escape`/`b` goes back to the list. Edits come from a pick-list where the
+  sensible values are few (memory follows Cloud Run's tiers), or a typed number where the
+  value is genuinely continuous (milli-vCPU, cents). A
   workspace that has never run anything is listed with the table defaults and flagged
   `defaults` rather than dropped — its compute-policy row does not exist yet, and the
   listing does not create one. `rebase admin workspaces [--json]` and

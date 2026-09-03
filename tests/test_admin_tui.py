@@ -18,6 +18,7 @@ from rebase.admin_format import (
     workspace_row,
 )
 from rebase.admin_tui import (
+    QUOTA_TABLE_ID,
     WORKSPACES_TABLE_ID,
     AdminTuiData,
     CreditBlockConfirmScreen,
@@ -212,19 +213,38 @@ def test_admin_tui_enter_fills_the_pane_beneath_the_list() -> None:
             members = app.query_one("#admin-detail-members", DataTable)
             assert members.display is True and members.row_count == 2
             assert str(members.get_cell_at(Coordinate(1, 1))) == "Viewer"
-            quota = str(app.query_one("#admin-detail-quota").render())
-            assert "1 GiB" in quota and "€20.00" in quota
+            quota = app.query_one(f"#{QUOTA_TABLE_ID}", DataTable)
+            assert quota.row_count == 7
+            assert str(quota.get_cell_at(Coordinate(0, 1))) == "1 GiB"
+            assert "€20.00" in str(quota.get_cell_at(Coordinate(6, 1)))
             usage = str(app.query_one("#admin-detail-usage").render())
             assert "€15.00" in usage and "€4.00" in usage
+            # The cursor followed enter down into the quota table.
+            assert quota.has_focus and quota.cursor_row == 0
 
-            # The list is still there and still drives the pane.
+            # b closes the pane and hands the cursor back to the list.
+            await pilot.press("b")
+            await pilot.pause(0.1)
+            assert app.detail_workspace_id is None
+            assert app.query_one("#admin-detail-members", DataTable).display is False
             table = app.query_one(f"#{WORKSPACES_TABLE_ID}", DataTable)
+            assert table.has_focus
+
+            # The list still drives the pane.
             table.move_cursor(row=1)
             await pilot.press("enter")
             await pilot.pause(0.5)
             assert app.detail_workspace_id == "fresh"
             assert app.query_one("#admin-detail-members", DataTable).display is False, "no members to show"
-            assert "no policy row yet" in str(app.query_one("#admin-detail-quota").render())
+            assert "no policy row yet" in str(app.query_one("#admin-detail-quota-heading").render())
+
+            # escape does the same as b; with nothing open, both are no-ops.
+            await pilot.press("escape")
+            await pilot.pause(0.1)
+            assert app.detail_workspace_id is None and table.has_focus
+            await pilot.press("escape", "b")
+            await pilot.pause(0.1)
+            assert len(app.screen_stack) == 1 and app.is_running
 
     asyncio.run(scenario())
 
@@ -350,17 +370,30 @@ def test_admin_tui_edit_refreshes_the_open_pane() -> None:
             await pilot.pause(0.3)
             await pilot.press("enter")
             await pilot.pause(0.5)
-            assert "1 GiB" in str(app.query_one("#admin-detail-quota").render())
+            quota = app.query_one(f"#{QUOTA_TABLE_ID}", DataTable)
+            assert str(quota.get_cell_at(Coordinate(0, 1))) == "1 GiB"
 
+            # The cursor is on the memory row: e goes straight to its pick-list.
             await pilot.press("e")
             await pilot.pause(0.1)
-            await pilot.press("enter")  # memory, pick-list
-            await pilot.pause(0.1)
+            assert isinstance(app.screen, QuotaChoiceScreen), "no field picker when a setting is highlighted"
+            assert app.screen.field == "max_cloud_run_memory_mib"
             await pilot.press("down", "down", "enter")  # 1024 -> 4096
             await pilot.pause(0.5)
 
-            assert "4 GiB" in str(app.query_one("#admin-detail-quota").render())
+            assert client.calls == [("policy", "agent-work", {"max_cloud_run_memory_mib": 4096})]
+            assert str(quota.get_cell_at(Coordinate(0, 1))) == "4 GiB", "the pane repainted without another enter"
+            assert quota.has_focus and quota.cursor_row == 0, "and kept the cursor on the setting just changed"
             assert isinstance(app.query_one("#admin-detail"), WorkspaceDetail)
+
+            # Any row: two down is the run timeout, and enter edits it too.
+            await pilot.press("down", "down", "enter")
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, QuotaChoiceScreen)
+            assert app.screen.field == "max_run_timeout_seconds"
+            await pilot.press("escape")
+            await pilot.pause(0.1)
+            assert quota.cursor_row == 2
 
     asyncio.run(scenario())
 
