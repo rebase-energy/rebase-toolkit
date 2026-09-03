@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, nullcontext, suppress
-from dataclasses import dataclass
 from time import monotonic
 from typing import Any
 
@@ -35,7 +34,9 @@ from rebase.admin_format import (
     FIELD_LABELS,
     FIELD_UNITS,
     WORKSPACE_COLUMNS,
+    choices_for,
     credit_change_blocks,
+    format_field_value,
     format_money,
     workspace_row,
 )
@@ -125,8 +126,12 @@ class QuotaFieldScreen(ModalScreen[str | None]):
         policy = self.workspace["policy"]
         with Vertical(id="quota-field-dialog"):
             yield Static(f"Edit quota — {self.workspace.get('name') or self.workspace['id']}", id="quota-field-title")
+            currency = str(policy.get("currency", "EUR"))
             yield OptionList(
-                *(f"{FIELD_LABELS[key]}  ({policy[key]} {FIELD_UNITS[key]})" for key, _, _ in EDITABLE_FIELDS),
+                *(
+                    f"{FIELD_LABELS[key]:<26} {format_field_value(key, policy[key], currency)}"
+                    for key, _, _ in EDITABLE_FIELDS
+                ),
                 id="quota-field-options",
             )
             yield Static("Enter picks a field. Escape cancels.", id="quota-field-hint")
@@ -278,123 +283,210 @@ class CreditBlockConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class WorkspaceDrawer(ModalScreen[None]):
-    """One workspace in full: members, policy, and this month's usage."""
+CUSTOM = "custom"
 
-    BINDINGS = [
-        Binding("escape", "close", "Close"),
-        Binding("p", "close", "Close"),
-        Binding("q", "close", "Close"),
-    ]
+
+class QuotaChoiceScreen(ModalScreen[int | str | None]):
+    """Pick a value from the handful anyone actually sets, or drop to free text.
+
+    Memory follows Cloud Run's own tiers and the small caps have a few sensible
+    values; typing `4096` when the choice is really between 2, 4 and 8 GiB is
+    friction for nothing. The current value is always in the list and starts
+    highlighted, and `Custom…` opens the free-text field for the rare odd number.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
     CSS = f"""
-    WorkspaceDrawer {{
-        align: right top;
-        background: {_BACKGROUND} 40%;
+    QuotaChoiceScreen {{
+        align: center middle;
+        background: {_BACKGROUND} 70%;
     }}
 
-    #admin-drawer {{
-        width: 66%;
-        height: 100%;
+    #quota-choice-dialog {{
+        width: 60;
+        height: auto;
         padding: 1 2;
         background: {_BACKGROUND};
-        border-left: solid {BRAND_BRIGHT_GREEN};
+        border: solid {BRAND_BRIGHT_GREEN};
     }}
 
-    .admin-drawer-heading {{
+    #quota-choice-title {{
         color: {BRAND_BRIGHT_GREEN};
         text-style: bold;
-        margin-top: 1;
+        margin-bottom: 1;
     }}
 
-    #admin-drawer-body {{
-        height: 1fr;
-        background: {_BACKGROUND};
-        scrollbar-size-vertical: 1;
-        scrollbar-color: {BRAND_BRIGHT_GREEN};
-    }}
-
-    #admin-drawer-members {{
+    #quota-choice-options {{
         height: auto;
         max-height: 12;
+        background: {_BACKGROUND};
+        border: none;
     }}
 
-    #admin-drawer-hint {{
+    #quota-choice-hint {{
         color: {BRAND_MEDIUM_GRAY};
         margin-top: 1;
     }}
     """
 
-    def __init__(self, workspace: dict[str, Any], *, usage: dict[str, Any] | None, usage_error: str | None) -> None:
+    def __init__(self, workspace: dict[str, Any], field: str, choices: Sequence[int]) -> None:
         super().__init__()
         self.workspace = workspace
-        self.usage = usage
-        self.usage_error = usage_error
+        self.field = field
+        self.current = int(workspace["policy"][field])
+        self.choices = list(choices)
 
     def compose(self) -> ComposeResult:
-        workspace = self.workspace
-        policy = workspace["policy"]
-        currency = str(policy.get("currency", "EUR"))
-        with Vertical(id="admin-drawer"):
-            yield Static(
-                Text.assemble(
-                    (str(workspace.get("name") or workspace["id"]), f"bold {BRAND_BRIGHT_GREEN}"),
-                    (f"  {workspace['id']}", BRAND_MEDIUM_GRAY),
-                )
-            )
-            with VerticalScroll(id="admin-drawer-body"):
-                yield Static(f"Members ({len(workspace.get('members', []))})", classes="admin-drawer-heading")
-                members = HeaderSafeDataTable(id="admin-drawer-members", cursor_type="none")
-                yield members
-                yield Static("Quota", classes="admin-drawer-heading")
-                flagged = "  (table defaults — no policy row yet)" if workspace.get("policy_defaulted") else ""
-                yield Static(
-                    "\n".join(
-                        f"{FIELD_LABELS[key] + ':':<26} {policy[key]} {FIELD_UNITS[key]}"
-                        for key, _, _ in EDITABLE_FIELDS
-                    )
-                    + flagged
-                )
-                yield Static("This month", classes="admin-drawer-heading")
-                yield Static(self._usage_text(currency), id="admin-drawer-usage")
-            yield Static("e edits a quota field. Arrow keys scroll. p or escape closes.", id="admin-drawer-hint")
+        name = self.workspace.get("name") or self.workspace["id"]
+        currency = str(self.workspace["policy"].get("currency", "EUR"))
+        labels = [
+            format_field_value(self.field, value, currency) + ("   (current)" if value == self.current else "")
+            for value in self.choices
+        ]
+        with Vertical(id="quota-choice-dialog"):
+            yield Static(f"{FIELD_LABELS[self.field]} for {name}", id="quota-choice-title")
+            yield OptionList(*labels, "Custom…", id="quota-choice-options")
+            yield Static("Enter applies the highlighted value. Escape cancels.", id="quota-choice-hint")
 
     def on_mount(self) -> None:
-        table = self.query_one("#admin-drawer-members", HeaderSafeDataTable)
+        options = self.query_one("#quota-choice-options", OptionList)
+        options.highlighted = self.choices.index(self.current) if self.current in self.choices else 0
+        options.focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_index >= len(self.choices):
+            self.dismiss(CUSTOM)
+            return
+        self.dismiss(self.choices[event.option_index])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# --- the detail pane -------------------------------------------------------------
+
+
+class WorkspaceDetail(Vertical):
+    """One workspace in full, under the list rather than over it.
+
+    A slide-out hides the very list the reader was scanning; a pane beneath keeps
+    both in view, so `enter` on the next row simply replaces what is shown here.
+    """
+
+    DEFAULT_CSS = f"""
+    WorkspaceDetail {{
+        height: 1fr;
+        border-top: solid {BRAND_MEDIUM_GRAY};
+        padding: 0 1;
+        background: {_BACKGROUND};
+    }}
+
+    WorkspaceDetail .admin-detail-heading {{
+        color: {BRAND_BRIGHT_GREEN};
+        text-style: bold;
+        margin-top: 1;
+    }}
+
+    #admin-detail-body {{
+        height: 1fr;
+        scrollbar-size-vertical: 1;
+        scrollbar-color: {BRAND_BRIGHT_GREEN};
+    }}
+
+    #admin-detail-members {{
+        height: auto;
+        max-height: 8;
+    }}
+
+    #admin-detail-hint {{
+        color: {BRAND_MEDIUM_GRAY};
+        margin-top: 1;
+    }}
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="admin-detail-title")
+        with VerticalScroll(id="admin-detail-body", can_focus=False):
+            yield Static("", id="admin-detail-members-heading", classes="admin-detail-heading")
+            yield HeaderSafeDataTable(id="admin-detail-members", cursor_type="none")
+            yield Static("Quota", id="admin-detail-quota-heading", classes="admin-detail-heading")
+            yield Static("", id="admin-detail-quota")
+            yield Static("This month", id="admin-detail-usage-heading", classes="admin-detail-heading")
+            yield Static("", id="admin-detail-usage")
+        yield Static("enter shows a workspace here. e edits its quota.", id="admin-detail-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#admin-detail-members", HeaderSafeDataTable).can_focus = False
+        self.clear()
+
+    def clear(self) -> None:
+        self.query_one("#admin-detail-title", Static).update(
+            Text("Select a workspace and press enter to see its members, quota and spend.", style=BRAND_MEDIUM_GRAY)
+        )
+        for widget_id in ("members-heading", "members", "quota-heading", "quota", "usage-heading", "usage"):
+            self.query_one(f"#admin-detail-{widget_id}").display = False
+
+    def show(self, workspace: dict[str, Any], *, usage: dict[str, Any] | None, usage_error: str | None) -> None:
+        policy = workspace["policy"]
+        currency = str(policy.get("currency", "EUR"))
+        for widget_id in ("members-heading", "members", "quota-heading", "quota", "usage-heading", "usage"):
+            self.query_one(f"#admin-detail-{widget_id}").display = True
+
+        self.query_one("#admin-detail-title", Static).update(
+            Text.assemble(
+                (str(workspace.get("name") or workspace["id"]), f"bold {BRAND_BRIGHT_GREEN}"),
+                (f"  {workspace['id']}", BRAND_MEDIUM_GRAY),
+            )
+        )
+
+        members = workspace.get("members", [])
+        self.query_one("#admin-detail-members-heading", Static).update(f"Members ({len(members)})")
+        table = self.query_one("#admin-detail-members", HeaderSafeDataTable)
+        table.clear(columns=True)
         table.add_columns("Email", "Role", "GitHub", "Enabled")
-        for member in self.workspace.get("members", []):
+        for member in members:
             table.add_row(
                 str(member.get("email") or "-"),
                 str(member.get("role", "-")),
                 str(member.get("github_username") or "-"),
                 "yes" if member.get("enabled", True) else "no",
             )
-        self.query_one("#admin-drawer-body", VerticalScroll).focus()
+        table.display = bool(members)
 
-    def _usage_text(self, currency: str) -> Text:
-        if self.usage is None:
-            return Text(f"usage unavailable — {self.usage_error or 'not loaded'}", style=BRAND_AMBER)
-        usage = self.usage
-        lines = [
-            f"{'Grant:':<26} {format_money(int(usage['monthly_credit_cents']), currency)}",
-            f"{'Spent:':<26} {format_money(int(usage['finalized_spend_cents']), currency)}",
-            f"{'Reserved:':<26} {format_money(int(usage['active_reservation_cents']), currency)}",
-            f"{'Remaining:':<26} {format_money(int(usage['remaining_cents']), currency)}",
-        ]
-        text = Text("\n".join(lines))
+        flagged = (
+            "\n(table defaults — this workspace has no policy row yet)" if workspace.get("policy_defaulted") else ""
+        )
+        quota = Text(
+            "\n".join(
+                f"{FIELD_LABELS[key] + ':':<26} {format_field_value(key, policy[key], currency)}"
+                for key, _, _ in EDITABLE_FIELDS
+            )
+        )
+        if flagged:
+            quota.append(flagged, style=BRAND_AMBER)
+        self.query_one("#admin-detail-quota", Static).update(quota)
+        self.query_one("#admin-detail-usage", Static).update(self._usage_text(usage, usage_error, currency))
+
+    @staticmethod
+    def _usage_text(usage: dict[str, Any] | None, error: str | None, currency: str) -> Text:
+        if usage is None:
+            return Text(f"usage unavailable — {error or 'not loaded'}", style=BRAND_AMBER)
+        text = Text(
+            "\n".join(
+                (
+                    f"{'Grant:':<26} {format_money(int(usage['monthly_credit_cents']), currency)}",
+                    f"{'Spent:':<26} {format_money(int(usage['finalized_spend_cents']), currency)}",
+                    f"{'Reserved:':<26} {format_money(int(usage['active_reservation_cents']), currency)}",
+                    f"{'Remaining:':<26} {format_money(int(usage['remaining_cents']), currency)}",
+                )
+            )
+        )
         if usage.get("compute_blocked"):
             text.append("\n\ncompute is BLOCKED — the grant is exhausted", style=f"bold {BRAND_CORAL_RED}")
         return text
 
-    def action_close(self) -> None:
-        self.dismiss(None)
-
 
 # --- the app ---------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class AdminLoad:
-    workspaces: list[dict[str, Any]]
 
 
 class RebaseAdminApp(App[None]):
@@ -402,7 +494,7 @@ class RebaseAdminApp(App[None]):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
-        Binding("p", "open_drawer", "Details"),
+        Binding("p", "show_details", "Details"),
         Binding("e", "edit_quota", "Edit quota"),
     ]
     CSS = f"""
@@ -412,7 +504,8 @@ class RebaseAdminApp(App[None]):
     }}
 
     #{WORKSPACES_TABLE_ID} {{
-        height: 1fr;
+        height: auto;
+        max-height: 45%;
         background: {_BACKGROUND};
         scrollbar-size-vertical: 1;
         scrollbar-color: {BRAND_BRIGHT_GREEN};
@@ -440,7 +533,10 @@ class RebaseAdminApp(App[None]):
         super().__init__()
         self.data = data or AdminTuiData(client or Client(), limit=limit)
         self.workspaces: list[dict[str, Any]] = []
+        #: The workspace the detail pane is showing, so a refresh or an edit updates it.
+        self.detail_workspace_id: str | None = None
         self._usage_cache: dict[str, dict[str, Any]] = {}
+        self._usage_errors: dict[str, str] = {}
         self._refresh_interval = refresh_interval
         self._refresh_failures = 0
         self._last_key_at = 0.0
@@ -449,9 +545,11 @@ class RebaseAdminApp(App[None]):
         yield RebaseHeader(show_clock=True, icon="• Admin")
         yield Static("", id="admin-error")
         yield HeaderSafeDataTable(id=WORKSPACES_TABLE_ID, cursor_type="row", zebra_stripes=True)
+        yield WorkspaceDetail(id="admin-detail")
         yield Footer()
 
     def on_mount(self) -> None:
+        self.query_one(f"#{WORKSPACES_TABLE_ID}", DataTable).focus()
         self.run_worker(self._load(preserve=False, announce=True), name="admin-load", group="admin", exclusive=True)
         if self._refresh_interval:
             self.set_interval(self._refresh_interval, self._refresh_tick)
@@ -469,6 +567,7 @@ class RebaseAdminApp(App[None]):
         self.workspaces = workspaces
         with self._preserve_view() if preserve else nullcontext():
             self._render(workspaces)
+        self._refresh_detail()
 
     def _render(self, workspaces: Sequence[dict[str, Any]]) -> None:
         table = self.query_one(f"#{WORKSPACES_TABLE_ID}", DataTable)
@@ -480,6 +579,22 @@ class RebaseAdminApp(App[None]):
                 cells[-1] = Text(cells[-1], style=BRAND_AMBER)  # type: ignore[call-overload]
             table.add_row(*cells, key=str(workspace["id"]))
         self.sub_title = f"{len(workspaces)} workspace{'s' if len(workspaces) != 1 else ''}"
+
+    def _refresh_detail(self) -> None:
+        """Keep the pane on the same workspace after a reload, with the reloaded row."""
+        if self.detail_workspace_id is None:
+            return
+        workspace = self._workspace(self.detail_workspace_id)
+        detail = self.query_one("#admin-detail", WorkspaceDetail)
+        if workspace is None:
+            self.detail_workspace_id = None
+            detail.clear()
+            return
+        detail.show(
+            workspace,
+            usage=self._usage_cache.get(self.detail_workspace_id),
+            usage_error=self._usage_errors.get(self.detail_workspace_id),
+        )
 
     def _set_error(self, error: Exception, *, announce: bool) -> None:
         """Quiet on a timer until it stops looking like a blip -- same rule as the main TUI."""
@@ -533,9 +648,12 @@ class RebaseAdminApp(App[None]):
         value = table.ordered_rows[table.cursor_row].key.value
         return None if value is None else str(value)
 
+    def _workspace(self, workspace_id: str) -> dict[str, Any] | None:
+        return next((workspace for workspace in self.workspaces if str(workspace["id"]) == workspace_id), None)
+
     def _selected_workspace(self) -> dict[str, Any] | None:
         key = self._cursor_key(self.query_one(f"#{WORKSPACES_TABLE_ID}", DataTable))
-        return next((workspace for workspace in self.workspaces if str(workspace["id"]) == key), None)
+        return None if key is None else self._workspace(key)
 
     # -- auto-refresh ---------------------------------------------------------------
 
@@ -561,24 +679,33 @@ class RebaseAdminApp(App[None]):
         self.run_worker(self._load(preserve=True, announce=True), name="admin-load", group="admin", exclusive=True)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        self.action_open_drawer()
+        if event.data_table.id == WORKSPACES_TABLE_ID:
+            self.action_show_details()
 
-    def action_open_drawer(self) -> None:
+    def action_show_details(self) -> None:
         workspace = self._selected_workspace()
         if workspace is None:
             return
-        self.run_worker(self._open_drawer(workspace), name="admin-drawer", group="admin-edit", exclusive=True)
+        self.run_worker(self._show_details(workspace), name="admin-detail", group="admin-detail", exclusive=True)
 
-    async def _open_drawer(self, workspace: dict[str, Any]) -> None:
-        usage, error = await self._usage_for(str(workspace["id"]))
-        self.push_screen(WorkspaceDrawer(workspace, usage=usage, usage_error=error))
+    async def _show_details(self, workspace: dict[str, Any]) -> None:
+        workspace_id = str(workspace["id"])
+        self.detail_workspace_id = workspace_id
+        # Paint what is already known at once; the usage follows when the API answers.
+        detail = self.query_one("#admin-detail", WorkspaceDetail)
+        detail.show(workspace, usage=self._usage_cache.get(workspace_id), usage_error=None)
+        usage, error = await self._usage_for(workspace_id)
+        if self.detail_workspace_id == workspace_id:
+            detail.show(workspace, usage=usage, usage_error=error)
 
     async def _usage_for(self, workspace_id: str) -> tuple[dict[str, Any] | None, str | None]:
         try:
             usage = await asyncio.to_thread(self.data.usage, workspace_id)
         except Exception as exc:
+            self._usage_errors[workspace_id] = str(exc)
             return None, str(exc)
         self._usage_cache[workspace_id] = usage
+        self._usage_errors.pop(workspace_id, None)
         return usage, None
 
     def action_edit_quota(self) -> None:
@@ -591,6 +718,24 @@ class RebaseAdminApp(App[None]):
     def _on_field_chosen(self, workspace: dict[str, Any], field: str | None) -> None:
         if field is None:
             return
+        choices = choices_for(field, int(workspace["policy"][field]))
+        if choices is None:
+            self._ask_free_text(workspace, field)
+            return
+        self.push_screen(
+            QuotaChoiceScreen(workspace, field, choices),
+            lambda picked: self._on_choice_picked(workspace, field, picked),
+        )
+
+    def _on_choice_picked(self, workspace: dict[str, Any], field: str, picked: int | str | None) -> None:
+        if picked is None:
+            return
+        if picked == CUSTOM:
+            self._ask_free_text(workspace, field)
+            return
+        self._on_value_entered(workspace, field, int(picked))
+
+    def _ask_free_text(self, workspace: dict[str, Any], field: str) -> None:
         self.push_screen(
             QuotaValueScreen(workspace, field), lambda value: self._on_value_entered(workspace, field, value)
         )
@@ -613,7 +758,7 @@ class RebaseAdminApp(App[None]):
             # The server's 409 is the authority; show its words, not ours.
             self.notify(str(exc), severity="error")
             return
-        self.notify(f"{FIELD_LABELS[field]} for {name} is now {value} {FIELD_UNITS[field]}.")
+        self.notify(f"{FIELD_LABELS[field]} for {name} is now {format_field_value(field, value)}.")
         await self._load(preserve=True, announce=False)
 
     async def _apply_credit(self, workspace: dict[str, Any], monthly_credit_cents: int) -> None:
