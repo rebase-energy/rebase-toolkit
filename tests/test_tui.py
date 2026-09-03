@@ -42,6 +42,7 @@ from rebase.editor import EditorCommand
 from rebase.tui import (
     AUTO_REFRESH_FAILURE_LIMIT,
     COUNTDOWN_WIDTH,
+    HISTORY_HOURS,
     MARK_STYLE,
     NEXT_RUN_COLUMN,
     DeleteConfirmScreen,
@@ -71,6 +72,11 @@ from rebase.tui import (
     format_workflow_source,
     github_workflow_source_url,
     group_ephemeral_runs,
+    history_column_label,
+    history_from_buckets,
+    history_from_runs,
+    history_peak,
+    history_text,
     is_github_backed,
     status_style,
     step_dependencies,
@@ -1308,12 +1314,12 @@ def test_tui_app_shows_workflow_provenance_the_endpoint_column_and_the_target_ta
             functions = app.query_one("#functions-table", DataTable)
             # A GitHub-backed workflow names its source and deployed commit. The table
             # shortens the SHA; the drawer below keeps the copyable value intact.
-            assert str(workflows.get_cell_at(Coordinate(0, 2))) == "GitHub"
-            assert str(workflows.get_cell_at(Coordinate(0, 3))) == "01234567..."
+            assert str(workflows.get_cell_at(Coordinate(0, 6))) == "GitHub"
+            assert str(workflows.get_cell_at(Coordinate(0, 7))) == "01234567..."
 
-            # Endpoint is the 7th workflow column and the 7th function column, which
-            # carries two different columns up front for the step graph.
-            assert str(workflows.get_cell_at(Coordinate(0, 6))) == "POST /forecast"
+            # Endpoint sits after the schedule columns in the workflow table and after
+            # the step-graph columns in the function table.
+            assert str(workflows.get_cell_at(Coordinate(0, 10))) == "POST /forecast"
             assert str(functions.get_cell_at(Coordinate(0, 6))) == "-"
 
             # The workflow's endpoint, with the full URL the column has no room for.
@@ -1380,8 +1386,8 @@ def test_tui_marks_rebase_hosted_workflow_without_a_git_commit() -> None:
             await pilot.pause(0.3)
 
             workflows = app.query_one("#workflows-table", DataTable)
-            assert str(workflows.get_cell_at(Coordinate(0, 2))) == "Rebase"
-            assert str(workflows.get_cell_at(Coordinate(0, 3))) == "-"
+            assert str(workflows.get_cell_at(Coordinate(0, 6))) == "Rebase"
+            assert str(workflows.get_cell_at(Coordinate(0, 7))) == "-"
 
             workflows.focus()
             workflows.move_cursor(row=0)
@@ -4648,8 +4654,14 @@ def test_functions_table_shows_when_each_function_last_ran() -> None:
 
             workflows = app.query_one("#workflows-table", SelectableDataTable)
             wf_labels = [str(column.label) for column in workflows.columns.values()]
-            # Next to Next run: the schedule's two ends belong side by side.
-            assert wf_labels.index("Last run") == wf_labels.index("Next run") + 1
+            # Straight after Origin, so they fit a terminal that clips the table's right
+            # edge; and next to Next run, the schedule's two ends side by side.
+            assert wf_labels[2:5] == ["Schedule", "Next run", "Last run"]
+            # History follows Last run: the one run, then the day of runs before it. Its
+            # header carries the time axis on a second line, which needs the room.
+            history = next(label for label in wf_labels if label.startswith("History\n"))
+            assert wf_labels.index(history) == wf_labels.index("Last run") + 1
+            assert workflows.header_height == 2
 
     asyncio.run(scenario())
 
@@ -4936,6 +4948,166 @@ def test_project_targets_prefer_the_composite_route() -> None:
     assert [group.name for group in targets.ephemeral] == ["collect"]
 
 
+def _hour(offset: int) -> datetime:
+    return datetime.now(UTC).replace(minute=0, second=0, microsecond=0) - timedelta(hours=offset)
+
+
+class HistoryCompositeClient(CompositeProjectClient):
+    """A platform whose overview also carries the run-history aggregate."""
+
+    def get_project_overview(self, project_id: str) -> dict[str, Any]:
+        payload = super().get_project_overview(project_id)
+        payload["run_history"] = [
+            {
+                "target_type": "workflow",
+                "target_id": "workflow-id",
+                "ephemeral_name": None,
+                "bucket": _hour(0).isoformat(),
+                "status": "succeeded",
+                "runs": 60,
+            },
+            # A one-off run of the deployed name is that workflow, run by hand.
+            {
+                "target_type": "workflow",
+                "target_id": None,
+                "ephemeral_name": "forecast",
+                "bucket": _hour(1).isoformat(),
+                "status": "failed",
+                "runs": 1,
+            },
+            # A one-off of a name nothing is deployed under gets the one-off row's key.
+            {
+                "target_type": "workflow",
+                "target_id": None,
+                "ephemeral_name": "collect",
+                "bucket": _hour(2).isoformat(),
+                "status": "succeeded",
+                "runs": 2,
+            },
+        ]
+        return payload
+
+
+def test_project_history_comes_from_the_platform_aggregate_when_it_is_sent() -> None:
+    """The run list is capped; only the platform's count over the window is honest."""
+    targets = fake_tui_data(HistoryCompositeClient()).load_project_targets({"id": "project-id", "name": "energy"})
+
+    assert targets.run_history == {
+        "workflow-id": {_hour(0): {"succeeded": 60}, _hour(1): {"failed": 1}},
+        "ephemeral:workflow:collect": {_hour(2): {"succeeded": 2}},
+    }
+
+
+def test_history_from_runs_counts_each_run_in_its_hour_and_folds_one_offs_by_name() -> None:
+    """Without the aggregate the runs read for the table are bucketed the same way."""
+    now = datetime(2026, 9, 3, 10, 51, tzinfo=UTC)
+    ten = datetime(2026, 9, 3, 10, tzinfo=UTC)
+
+    def deployed(run_id: str, status: str, created: str) -> dict[str, Any]:
+        return {"id": run_id, "target_type": "workflow", "target_id": "wf", "status": status, "created_at": created}
+
+    history = history_from_runs(
+        [
+            deployed("r1", "succeeded", "2026-09-03T10:05:00Z"),
+            deployed("r2", "failed", "2026-09-03T10:30:00Z"),
+            # 23 hours back is the first hour of the window; 24 is outside it.
+            deployed("r3", "succeeded", "2026-09-02T11:59:00Z"),
+            deployed("r4", "succeeded", "2026-09-02T10:59:00Z"),
+            _ephemeral_run("e1", "forecast", started="2026-09-03T09:10:00Z"),
+            _ephemeral_run("e2", "collect", started="2026-09-03T09:20:00Z"),
+            {
+                "id": "r5",
+                "target_type": "workflow",
+                "target_id": None,
+                "status": "failed",
+                "created_at": "2026-09-03T10:00:00Z",
+            },
+        ],
+        {("workflow", "forecast"): "wf"},
+        now=now,
+    )
+
+    assert history == {
+        "wf": {
+            ten: {"succeeded": 1, "failed": 1},
+            ten - timedelta(hours=1): {"succeeded": 1},
+            ten - timedelta(hours=23): {"succeeded": 1},
+        },
+        "ephemeral:workflow:collect": {ten - timedelta(hours=1): {"succeeded": 1}},
+    }
+    assert history_peak(history) == 2
+
+
+def test_history_from_buckets_drops_what_it_cannot_attribute() -> None:
+    history = history_from_buckets(
+        [
+            {
+                "target_type": "workflow",
+                "target_id": None,
+                "ephemeral_name": None,
+                "bucket": _hour(0).isoformat(),
+                "status": "failed",
+                "runs": 3,
+            },
+            {"target_type": "workflow", "target_id": "wf", "bucket": "not a time", "status": "failed", "runs": 3},
+            {
+                "target_type": "workflow",
+                "target_id": "wf",
+                "bucket": _hour(0).isoformat(),
+                "status": "failed",
+                "runs": 0,
+            },
+        ],
+        {},
+    )
+
+    assert history == {}
+
+
+def test_history_text_scales_height_by_count_and_colours_by_worst_status() -> None:
+    now = datetime(2026, 9, 3, 10, 51, tzinfo=UTC)
+    ten = datetime(2026, 9, 3, 10, tzinfo=UTC)
+    text = history_text(
+        {
+            ten: {"succeeded": 60},
+            ten - timedelta(hours=1): {"succeeded": 59, "failed": 1},
+            ten - timedelta(hours=2): {"succeeded": 3, "running": 1},
+            ten - timedelta(hours=23): {"succeeded": 1},
+            ten - timedelta(hours=24): {"succeeded": 100},
+        },
+        now=now,
+        peak=60,
+    )
+
+    assert len(text.plain) == HISTORY_HOURS
+    # Oldest on the left, the current hour on the right, and a day-old hour not at all.
+    assert text.plain[0] == "▂"
+    assert text.plain[1:21] == "·" * 20
+    assert text.plain[21:] == "▄██"
+    styles = {span.start: str(span.style) for span in text.spans}
+    # One failure in sixty is still a red hour; a running run outranks the successes.
+    assert styles[23] == status_style("succeeded")
+    assert styles[22] == status_style("failed")
+    assert styles[21] == status_style("running")
+    assert styles[1] == tui_module.BRAND_MEDIUM_GRAY
+
+
+def test_history_text_is_all_quiet_for_a_row_with_no_runs() -> None:
+    text = history_text({}, now=datetime.now(UTC), peak=0)
+
+    assert text.plain == "·" * HISTORY_HOURS
+
+
+def test_history_column_label_axis_is_as_wide_as_the_bars() -> None:
+    name, axis = history_column_label().plain.split("\n")
+
+    assert name == "History"
+    assert len(axis) == HISTORY_HOURS
+    assert axis.startswith("-24h")
+    assert axis.endswith("now")
+    assert axis.index("-12h") == HISTORY_HOURS // 2
+
+
 def test_project_targets_fall_back_without_the_composite_route() -> None:
     targets = fake_tui_data(EphemeralClient()).load_project_targets({"id": "project-id", "name": "energy"})
 
@@ -4956,6 +5128,7 @@ def test_composite_and_fanout_agree_on_the_project_view() -> None:
     assert composite.steps == fanout.steps
     assert composite.workflow_versions == fanout.workflow_versions
     assert composite.ephemeral == fanout.ephemeral
+    assert composite.run_history == fanout.run_history
 
 
 def test_ephemeral_runs_filter_to_the_name_they_ran_as() -> None:
@@ -4993,11 +5166,14 @@ def test_tui_one_off_runs_get_a_row_and_open_like_any_target() -> None:
                 ("forecast", tui_module.ORIGIN_DEPLOYED),
                 ("collect", tui_module.ORIGIN_ONE_OFF),
             ]
-            # A one-off has no deployed source, commit, state, endpoint or schedule.
+            # A one-off has no schedule or next run, no deployed source, commit, state,
+            # endpoint or version — only what it ran as and when.
             one_off = rows[1]
             assert one_off[2:4] == ["-", "-"]
-            assert one_off[5:9] == ["-", "-", "-", "-"]
-            assert (one_off[10], one_off[11]) == ("-", "-")
+            assert len(one_off[5]) == HISTORY_HOURS
+            assert one_off[6:8] == ["-", "-"]
+            assert one_off[8] == "quick"
+            assert one_off[9:13] == ["-", "-", "-", "-"]
 
             workflows.focus()
             workflows.move_cursor(row=1)
@@ -5123,14 +5299,14 @@ def test_tui_paints_the_targets_before_the_slower_detail_arrives() -> None:
                 "collect",
             ]
             # The Last run column is what it is still waiting on.
-            assert str(workflows.get_row_at(0)[9]) == "-"
+            assert str(workflows.get_row_at(0)[4]) == "-"
 
             client.release_detail.set()
             for _ in range(50):
                 await pilot.pause(0.05)
-                if str(workflows.get_row_at(0)[9]) != "-":
+                if str(workflows.get_row_at(0)[4]) != "-":
                     break
-            assert str(workflows.get_row_at(0)[9]) != "-"
+            assert str(workflows.get_row_at(0)[4]) != "-"
 
     asyncio.run(scenario())
 
@@ -5158,11 +5334,11 @@ def test_tui_refresh_keeps_the_complete_frame_until_slow_detail_arrives() -> Non
             workflows = app.query_one("#workflows-table", SelectableDataTable)
             for _ in range(50):
                 await pilot.pause(0.05)
-                if str(workflows.get_cell_at(Coordinate(0, 2))) == "GitHub":
+                if str(workflows.get_cell_at(Coordinate(0, 6))) == "GitHub":
                     break
             before = [str(cell) for cell in workflows.get_row_at(0)]
-            assert before[2:4] == ["GitHub", "01234567..."]
-            assert before[9] != "-"
+            assert before[6:8] == ["GitHub", "01234567..."]
+            assert before[4] != "-"
 
             # Hold the detail phase of a refresh open. The old implementation painted
             # `base` here, making Source, Commit and Last run disappear every tick.
@@ -5212,7 +5388,7 @@ def test_tui_second_paint_keeps_the_row_you_already_opened() -> None:
             client.release_detail.set()
             for _ in range(50):
                 await pilot.pause(0.05)
-                if str(workflows.get_row_at(0)[9]) != "-":
+                if str(workflows.get_row_at(0)[4]) != "-":
                     break
 
             # Still on the same row, and its runs are still on screen.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import math
 import subprocess
 import textwrap
 import webbrowser
@@ -11,7 +12,7 @@ from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator,
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, tzinfo
+from datetime import UTC, datetime, timedelta, tzinfo
 from functools import partial
 from pathlib import Path
 from time import monotonic
@@ -105,6 +106,34 @@ LAST_RUN_SCAN_LIMIT = 200
 #: How many recent workflow runs to open for their step rows. A step's executions are
 #: only reachable per run, so this bounds the cost of answering for steps at all.
 LAST_RUN_STEP_SCAN = 5
+#: How far back the History column reaches. One character per hour, so this is also
+#: how wide the column is. Mirrors the platform's `PROJECT_OVERVIEW_HISTORY_HOURS`.
+HISTORY_HOURS = 24
+#: Bar heights for an hour with runs in it, lowest first.
+HISTORY_BLOCKS = "▁▂▃▄▅▆▇█"
+#: An hour with no runs. A dot rather than a blank, so a short history reads as "these
+#: hours were quiet" instead of "this cell did not load".
+HISTORY_EMPTY = "·"
+#: The History column's header, swapped for `history_column_label` when the columns are
+#: added so the axis can sit under it.
+HISTORY_COLUMN = "History"
+#: Ranks a status for the colour of an hour that held several: the one that most wants
+#: looking at wins. Anything unlisted ranks after these, i.e. a healthy hour.
+HISTORY_STATUS_RANK = {
+    "failed": 0,
+    "error": 0,
+    "cancelled": 0,
+    "canceled": 0,
+    "running": 1,
+    "pending": 2,
+    "starting": 2,
+    "submitted": 2,
+    "queued": 2,
+    "accepted": 2,
+}
+#: Runs per status per hour, by row: a target id for a deployed row, an
+#: `EphemeralGroup.row_key` for a one-off row. Hours are keyed by their UTC start.
+RunHistory = dict[str, dict[datetime, dict[str, int]]]
 #: Concurrent requests used to collect a project's per-workflow step graphs.
 STEP_GRAPH_FANOUT_WORKERS = 8
 #: The run, its events, its steps and its tasks: four independent reads behind one
@@ -146,17 +175,22 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "Version",
         "Updated",
     ),
+    # The schedule and its outcomes come first after Origin: when it runs, when it ran,
+    # how the last day went. They are what a workflow is opened for, and a table this
+    # wide clips its right edge on an ordinary terminal, so the provenance columns are
+    # the ones to lose to the scrollbar.
     "workflows-table": (
         "Name",
         "Origin",
+        "Schedule",
+        "Next run",
+        "Last run",
+        HISTORY_COLUMN,
         "Source",
         "Commit",
         "Execution",
         "State",
         "Endpoint",
-        "Schedule",
-        "Next run",
-        "Last run",
         "Version",
         "Updated",
     ),
@@ -449,6 +483,8 @@ class ProjectTargetsData:
     last_runs: dict[str, str] = field(default_factory=dict)
     #: One entry per name that has only ever run one-off. See `group_ephemeral_runs`.
     ephemeral: tuple[EphemeralGroup, ...] = ()
+    #: Runs per hour behind the History column. See `history_from_buckets`.
+    run_history: RunHistory = field(default_factory=dict)
 
     def steps_by_function(self) -> dict[str, list[WorkflowStep]]:
         grouped: dict[str, list[WorkflowStep]] = {}
@@ -635,6 +671,134 @@ def group_ephemeral_runs(
             grouped.items(), key=lambda item: (item[1]["last_run"] or "", item[0][1]), reverse=True
         )
     )
+
+
+def _hour_start(value: datetime) -> datetime:
+    return value.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+
+
+def _history_key(
+    target_id: str | None,
+    identity: tuple[str, str] | None,
+    target_ids: dict[tuple[str, str], str],
+) -> str | None:
+    """The row a run's hour is counted against.
+
+    A deployed run names its target. A one-off run names only what it ran as, so it goes
+    to the deployed row of that name when there is one — `rebase run …::sync` is that
+    workflow being run, just by hand — and otherwise to the one-off row that
+    `group_ephemeral_runs` gives the name. Same attribution as the Last run column.
+    """
+    if target_id:
+        return target_id
+    if identity is None:
+        return None
+    target_type, name = identity
+    return target_ids.get(identity) or f"{EPHEMERAL_ROW_PREFIX}{target_type}:{name}"
+
+
+def _record_history(history: RunHistory, key: str, when: datetime, status: str, count: int) -> None:
+    counts = history.setdefault(key, {}).setdefault(_hour_start(when), {})
+    counts[status] = counts.get(status, 0) + count
+
+
+def history_from_buckets(buckets: list[dict[str, Any]], target_ids: dict[tuple[str, str], str]) -> RunHistory:
+    """The History column's counts, from the platform's `run_history` aggregate.
+
+    The platform counts in the database over the whole window, which is the only honest
+    source: the run list a project view reads is capped, and a per-minute workflow fills
+    the cap in a few hours, so counting that list would show the busiest row as idle for
+    most of the day. Rows that cannot be attributed — no target and no name — are
+    dropped rather than shown under a made-up row.
+    """
+    history: RunHistory = {}
+    for row in buckets:
+        when = _parse_timestamp(row.get("bucket"))
+        count = row.get("runs")
+        if when is None or not isinstance(count, int) or count <= 0:
+            continue
+        name = row.get("ephemeral_name")
+        identity = (str(row.get("target_type") or "workflow"), name) if isinstance(name, str) and name else None
+        target_id = row.get("target_id")
+        key = _history_key(str(target_id) if target_id else None, identity, target_ids)
+        if key is not None:
+            _record_history(history, key, when, str(row.get("status") or "unknown"), count)
+    return history
+
+
+def history_from_runs(
+    runs: list[dict[str, Any]],
+    target_ids: dict[tuple[str, str], str],
+    *,
+    now: datetime | None = None,
+) -> RunHistory:
+    """The History column's counts from raw runs, for a platform without the aggregate.
+
+    Only as honest as the run list is deep: the hours before the oldest run read show as
+    quiet whether they were or not. Kept so a toolkit ahead of its platform draws the
+    column at all, and so the two sources agree on attribution.
+    """
+    since = _hour_start(now or datetime.now(UTC)) - timedelta(hours=HISTORY_HOURS - 1)
+    history: RunHistory = {}
+    for run in runs:
+        when = _parse_timestamp(run.get("created_at") or run.get("started_at"))
+        if when is None or when < since:
+            continue
+        identity = _ephemeral_identity(run)
+        target_id = None if identity is not None else run.get("target_id")
+        key = _history_key(str(target_id) if target_id else None, identity, target_ids)
+        if key is not None:
+            _record_history(history, key, when, str(run.get("status") or "unknown"), 1)
+    return history
+
+
+def history_peak(history: RunHistory) -> int:
+    """The busiest hour of any row, which sets the scale for the whole table."""
+    return max((sum(counts.values()) for hours in history.values() for counts in hours.values()), default=0)
+
+
+def _worst_status(counts: dict[str, int]) -> str:
+    return min(counts, key=lambda status: (HISTORY_STATUS_RANK.get(status.lower(), len(HISTORY_STATUS_RANK)), status))
+
+
+def history_text(
+    hours: dict[datetime, dict[str, int]],
+    *,
+    now: datetime,
+    peak: int,
+    width: int = HISTORY_HOURS,
+) -> Text:
+    """A row's History cell: one character per hour, oldest on the left, ending now.
+
+    Height is the number of runs in the hour, on a log scale against the table's busiest
+    hour: linear would flatten an hourly job into a hairline next to a per-minute one,
+    and the point of the column is that both are visible at a glance. Colour is the
+    status in that hour that most wants looking at, in the Status column's colours, so
+    one failure among sixty runs still shows as a red bar.
+    """
+    last = _hour_start(now)
+    scale = math.log2(peak + 1) if peak > 0 else 1.0
+    text = Text()
+    for offset in range(width - 1, -1, -1):
+        counts = hours.get(last - timedelta(hours=offset))
+        total = sum(counts.values()) if counts else 0
+        if not counts or total <= 0:
+            text.append(HISTORY_EMPTY, style=BRAND_MEDIUM_GRAY)
+            continue
+        level = round(math.log2(total + 1) / scale * (len(HISTORY_BLOCKS) - 1))
+        block = HISTORY_BLOCKS[max(0, min(len(HISTORY_BLOCKS) - 1, level))]
+        text.append(block, style=status_style(_worst_status(counts)))
+    return text
+
+
+def history_column_label(hours: int = HISTORY_HOURS) -> Text:
+    """The History header with its time axis on a second line, as wide as the bars."""
+    left, middle, right = f"-{hours}h", f"-{hours // 2}h", "now"
+    axis = left.ljust(hours // 2) + middle.ljust(hours - hours // 2 - len(right)) + right
+    label = Text(HISTORY_COLUMN)
+    label.append("\n")
+    label.append(axis, style=BRAND_MEDIUM_GRAY)
+    return label
 
 
 class RebaseTuiData:
@@ -948,6 +1112,15 @@ class RebaseTuiData:
             str(workflow_id): version
             for workflow_id, version in (payload.get("current_workflow_versions") or {}).items()
         }
+        target_ids = target_ids_by_identity(workflows, functions)
+        # A platform with the route but not yet the aggregate gets the honest-as-far-as-
+        # it-goes count from the runs it did send.
+        buckets = payload.get("run_history")
+        run_history = (
+            history_from_buckets(buckets, target_ids)
+            if isinstance(buckets, list)
+            else history_from_runs(runs, target_ids)
+        )
         return ProjectTargetsData(
             project=payload.get("project") or project,
             functions=functions,
@@ -958,10 +1131,11 @@ class RebaseTuiData:
             last_runs=self.load_last_runs(
                 str(project["id"]),
                 runs,
-                target_ids_by_identity(workflows, functions),
+                target_ids,
                 step_runs=payload.get("step_runs") or [],
             ),
             ephemeral=group_ephemeral_runs(runs, deployed_identities(workflows, functions)),
+            run_history=run_history,
         )
 
     def load_project_targets(self, project: dict[str, Any]) -> ProjectTargetsData:
@@ -1008,6 +1182,7 @@ class RebaseTuiData:
                 # in so a one-off run of a deployed target folds into that target's row
                 # instead of becoming a second row with the same name.
                 ephemeral=group_ephemeral_runs(run_rows, deployed_identities(workflow_rows, function_rows)),
+                run_history=history_from_runs(run_rows, target_ids_by_identity(workflow_rows, function_rows)),
             ),
             run_rows,
         )
@@ -3502,7 +3677,9 @@ class RebaseTuiApp(App[None]):
         """
         table = self.query_one(f"#{widget or table_id}", DataTable)
         table.clear(columns=True)
-        table.add_columns(*TABLE_COLUMNS[table_id])
+        table.add_columns(
+            *(history_column_label() if label == HISTORY_COLUMN else label for label in TABLE_COLUMNS[table_id])
+        )
         return table
 
     def _setup_tables(self) -> None:
@@ -3533,6 +3710,8 @@ class RebaseTuiApp(App[None]):
         workflows = self.query_one("#workflows-table", DataTable)
         workflows.cursor_type = "row"
         workflows.zebra_stripes = True
+        # Room for the History column's time axis under its name.
+        workflows.header_height = 2
 
         runs = self.query_one("#runs-table", DataTable)
         runs.cursor_type = "row"
@@ -4756,22 +4935,26 @@ class RebaseTuiApp(App[None]):
             )
 
         workflows = self._fill_table("workflows-table")
+        # One scale for the whole table, so a bar's height compares across rows.
+        history_now = datetime.now(UTC)
+        history_scale = history_peak(targets.run_history)
         for workflow_id, workflow in self._workflow_rows.items():
             version = targets.workflow_versions.get(workflow_id)
             workflows.add_row(
                 str(workflow.get("name", "-")),
                 ORIGIN_DEPLOYED,
-                format_workflow_source(version),
-                format_workflow_commit(version),
-                format_execution(workflow),
-                format_bool(workflow.get("enabled")),
-                format_endpoint(self._target_endpoints("workflow", workflow_id)),
                 format_schedule(
                     workflow.get("schedule"),
                     paused=bool(workflow.get("paused")) and _pause_in_effect(workflow.get("paused_until")),
                 ),
                 self._time(workflow.get("next_run_at")),
                 self._time(self._last_runs.get(workflow_id)),
+                history_text(targets.run_history.get(workflow_id, {}), now=history_now, peak=history_scale),
+                format_workflow_source(version),
+                format_workflow_commit(version),
+                format_execution(workflow),
+                format_bool(workflow.get("enabled")),
+                format_endpoint(self._target_endpoints("workflow", workflow_id)),
                 compact_id(workflow.get("current_version_id")),
                 self._time(workflow.get("updated_at")),
                 key=workflow_id,
@@ -4785,12 +4968,13 @@ class RebaseTuiApp(App[None]):
                 ORIGIN_ONE_OFF,
                 "-",
                 "-",
+                self._time(group.last_run),
+                history_text(targets.run_history.get(group.row_key, {}), now=history_now, peak=history_scale),
+                "-",
+                "-",
                 group.run_type,
                 "-",
                 "-",
-                "-",
-                "-",
-                self._time(group.last_run),
                 "-",
                 "-",
                 key=group.row_key,

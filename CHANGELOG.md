@@ -4,6 +4,18 @@
 
 ### Added
 
+- **The workflows table shows a day of run history as a bar chart.** A `History` column
+  next to `Last run` — and `Schedule`, `Next run`, `Last run` and `History` now come
+  straight after `Origin`, ahead of the provenance columns, so an ordinary terminal
+  width shows them without scrolling. One character per hour for the last 24 hours with the time axis
+  under the header: the bar's height is how many runs landed in that hour (log scale, so
+  an hourly job is still visible beside a per-minute one) and its colour is the status
+  in the hour that most wants looking at — one failure among sixty runs is a red bar. A
+  one-off run of a deployed name counts towards that workflow's row, as it does for
+  `Last run`. The counts come from the platform's project overview, which aggregates
+  them in the database over the whole window; against an older platform the column is
+  built from the runs the table already reads, and is only as deep as that list.
+
 - **`rebase admin` is a superadmin TUI over every workspace.** One row per workspace with
   its members, quota ceilings, and monthly credit; `enter` fills a pane beneath the list with
   the members, the quota as a table, and this month's spend — the list stays in view and the
