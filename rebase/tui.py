@@ -314,11 +314,6 @@ GITHUB_SOURCE_MODES = frozenset({"workspace_repo", "project_repo"})
 #: Runs scanned when grouping one-off runs into rows, and the ceiling on how many of a
 #: single group's runs the runs table then lists.
 EPHEMERAL_SCAN_LIMIT = 200
-#: A run scan that the platform refuses with a 5xx is halved and retried down to this
-#: many rows. One project's runs carried ~260 KiB results each, so 200 of them overran
-#: Cloud Run's 32 MiB response cap while 100 fit; the size that fits is remembered per
-#: scan so a ten-second refresh does not re-pay the failing reads every tick.
-RUN_SCAN_FLOOR = 25
 #: What the run-detail chips filter down to. Execution children stay beside one another,
 #: followed by the two observability views. Steps, tasks and artifacts are hidden for a
 #: run that has none; the other views are always useful ways into the run's own account.
@@ -558,13 +553,6 @@ def _optional_list(load: Callable[[], list[dict[str, Any]]]) -> list[dict[str, A
         return load()
     except RebaseWorkflowError:
         return []
-
-
-def _optional_dict(load: Callable[[], dict[str, Any]]) -> dict[str, Any]:
-    try:
-        return load()
-    except RebaseWorkflowError:
-        return {}
 
 
 def step_dependencies(step_graph: dict[str, Any] | None) -> dict[str, list[str]]:
@@ -854,31 +842,6 @@ class RebaseTuiData:
         self.client = client or Client()
         self.project = project
         self.limit = limit
-        self._run_scan_caps: dict[str, int] = {}
-        self._composite_failed: set[str] = set()
-
-    def _shrinking(self, key: str, limit: int, load: Callable[[int], list[dict[str, Any]]]) -> list[dict[str, Any]]:
-        """`load(limit)`, halving the limit on a server error until the answer fits.
-
-        Only 5xx shrinks: a 4xx is not a size problem, and hiding it behind a smaller
-        request would hide the real error. Below `RUN_SCAN_FLOOR` the error is raised.
-        """
-        limit = min(limit, self._run_scan_caps.get(key, limit))
-        while True:
-            try:
-                rows = load(limit)
-            except RebaseWorkflowError as exc:
-                if (exc.status_code or 0) < 500 or limit <= RUN_SCAN_FLOOR:
-                    raise
-                limit = max(RUN_SCAN_FLOOR, limit // 2)
-                continue
-            self._run_scan_caps[key] = limit
-            return rows
-
-    def _scan_project_runs(self, project_id: str, limit: int = EPHEMERAL_SCAN_LIMIT) -> list[dict[str, Any]]:
-        return self._shrinking(
-            project_id, limit, lambda n: self.client.list_runs(project_id=project_id, limit=n, include_result=False)
-        )
 
     @property
     def environment_name(self) -> str:
@@ -1173,17 +1136,9 @@ class RebaseTuiData:
         target in it.
         """
         load = getattr(self.client, "get_project_overview", None)
-        if not callable(load) or str(project["id"]) in self._composite_failed:
+        if not callable(load):
             return None
-        try:
-            payload = load(str(project["id"]))
-        except RebaseWorkflowError as exc:
-            # Present but failing is not absent: fall back to the piecewise reads, whose
-            # run scan can shrink, and do not pay for this answer again this session.
-            if (exc.status_code or 0) < 500:
-                raise
-            self._composite_failed.add(str(project["id"]))
-            return None
+        payload = load(str(project["id"]))
         if payload is None:
             return None
         workflows = payload.get("workflows") or []
@@ -1246,7 +1201,9 @@ class RebaseTuiData:
             functions = executor.submit(self.client.list_functions, project_id=project_id)
             # Supplementary data: never let it take down the function/workflow view.
             endpoints = executor.submit(lambda: _optional_list(lambda: self.client.list_project_endpoints(project_id)))
-            runs = executor.submit(lambda: _optional_list(lambda: self._scan_project_runs(project_id)))
+            runs = executor.submit(
+                lambda: _optional_list(lambda: self.client.list_runs(project_id=project_id, limit=EPHEMERAL_SCAN_LIMIT))
+            )
         run_rows = runs.result()
         workflow_rows = workflows.result()
         function_rows = functions.result()
@@ -1296,7 +1253,7 @@ class RebaseTuiData:
         column the route does not filter on, so the project's runs are read and matched
         locally.
         """
-        runs = self._scan_project_runs(project_id)
+        runs = self.client.list_runs(project_id=project_id, limit=EPHEMERAL_SCAN_LIMIT)
         return [run for run in runs if _ephemeral_identity(run) == (target_type, name)]
 
     def load_last_runs(
@@ -1335,7 +1292,7 @@ class RebaseTuiData:
         else, and reading them here would undo the point of asking once.
         """
         if runs is None:
-            runs = _optional_list(lambda: self._scan_project_runs(project_id, LAST_RUN_SCAN_LIMIT))
+            runs = _optional_list(lambda: self.client.list_runs(project_id=project_id, limit=LAST_RUN_SCAN_LIMIT))
         latest: dict[str, str] = {}
 
         def record(target_id: Any, when: Any) -> None:
@@ -1437,12 +1394,10 @@ class RebaseTuiData:
         column beside it showed a time: the same runs, found by name there and by id
         here. Given a name and project, those runs are read and merged in.
         """
-        ids = {"function_id": target_id} if target_type == "function" else {"workflow_id": target_id}
-        registered = self._shrinking(
-            target_id,
-            self.limit,
-            lambda n: self.client.list_runs(**ids, target_type=target_type, limit=n, include_result=False),
-        )
+        if target_type == "function":
+            registered = self.client.list_runs(function_id=target_id, target_type="function", limit=self.limit)
+        else:
+            registered = self.client.list_runs(workflow_id=target_id, target_type="workflow", limit=self.limit)
         if not name or not project_id:
             return registered
 
@@ -5648,13 +5603,6 @@ class RebaseTuiApp(App[None]):
             return None
         if table_id == "runs-table":
             run = self._run_rows.get(key)
-            if run is not None and "result" not in run:
-                # A slim list row: its body was left out on purpose. Selecting the row
-                # already read the full record; otherwise read it now, once.
-                detail = self._run_detail.run if self._run_detail is not None else {}
-                if str(detail.get("id")) != key:
-                    detail = _optional_dict(lambda: self.data.client.get_run(key))
-                run = self._run_rows[key] = {**run, **detail}
             return None if run is None else self._run_drawer(run)
         if table_id == "projects-table":
             summary = self._project_rows.get(key)

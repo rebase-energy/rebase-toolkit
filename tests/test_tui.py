@@ -49,7 +49,6 @@ from rebase.tui import (
     HISTORY_HOURS,
     MARK_STYLE,
     NEXT_RUN_COLUMN,
-    RUN_SCAN_FLOOR,
     DeleteConfirmScreen,
     DetailDrawer,
     OpenSourceChoiceScreen,
@@ -284,7 +283,6 @@ class FakeClient:
         model_id: str | None = None,
         target_type: str | None = None,
         limit: int = 100,
-        include_result: bool | None = None,
     ) -> list[dict[str, Any]]:
         self.run_calls.append(
             {
@@ -6140,147 +6138,3 @@ def test_tui_graph_pane_says_why_a_trigger_graph_has_no_edges(monkeypatch) -> No
             assert "no steps" in readout and "rb.OnWorkflow" in readout
 
     asyncio.run(scenario())
-
-
-# --- Run scans against a project whose runs carry large results -------------------------
-#
-# `/runs` ships every run's full `result`. One project's runs were ~260 KiB each, so 200 of
-# them made a ~50 MiB answer that the platform's front end refused with a bare 500, while
-# the same request against a quiet project came back fine. The TUI must shrink what it
-# asks for rather than error out, and must not keep paying for the failing request on
-# every refresh tick — those repeated heavy reads were what made *unrelated* requests
-# start failing too.
-
-
-def _server_error(status: int = 500) -> RebaseWorkflowError:
-    error = RebaseWorkflowError(f"HTTP {status} with an empty response body")
-    error.status_code = status
-    return error
-
-
-class OversizedRunsClient(EphemeralClient):
-    """A project whose run list only fits in an answer when at most `fits` rows are asked for."""
-
-    fits = 50
-
-    def list_runs(self, **kwargs: Any) -> list[dict[str, Any]]:
-        rows = super().list_runs(**kwargs)
-        if kwargs.get("limit", 100) > self.fits:
-            raise _server_error()
-        return rows
-
-    def scan_limits(self) -> list[int]:
-        return [call["limit"] for call in self.run_calls if call["project_id"] is not None]
-
-
-def test_project_run_scan_halves_on_a_server_error_and_remembers_what_fit() -> None:
-    client = OversizedRunsClient()
-    data = fake_tui_data(client)
-
-    base, runs = data.load_project_base({"id": "project-id", "name": "energy"})
-
-    # Halved until the answer fit, and the rows that fit are the rows shown.
-    assert client.scan_limits() == [200, 100, 50]
-    assert len(runs) == 3
-    assert [group.name for group in base.ephemeral] == ["collect"]
-
-    # The next read of the same project starts where the last one succeeded: a refresh
-    # every ten seconds must not re-pay two failing heavy reads each tick.
-    data.load_project_base({"id": "project-id", "name": "energy"})
-    assert client.scan_limits() == [200, 100, 50, 50]
-
-    # And the one-off runs view scans through the same remembered cap.
-    data.load_ephemeral_runs("collect", "workflow", "project-id")
-    assert client.scan_limits() == [200, 100, 50, 50, 50]
-
-
-def test_project_run_scan_gives_up_below_the_floor_without_taking_the_view_down() -> None:
-    client = OversizedRunsClient()
-    client.fits = 0
-    data = fake_tui_data(client)
-
-    base, runs = data.load_project_base({"id": "project-id", "name": "energy"})
-
-    assert runs == []
-    assert base.ephemeral == ()
-    assert [workflow["name"] for workflow in base.workflows] == ["forecast"]
-    assert client.scan_limits()[-1] == RUN_SCAN_FLOOR
-    assert min(client.scan_limits()) == RUN_SCAN_FLOOR
-
-
-def test_project_run_scan_does_not_shrink_on_a_client_error() -> None:
-    """A 4xx is not a size problem; halving would only hide it. The scan stays optional."""
-
-    class ForbiddenRunsClient(EphemeralClient):
-        def list_runs(self, **kwargs: Any) -> list[dict[str, Any]]:
-            super().list_runs(**kwargs)
-            raise _server_error(403)
-
-    client = ForbiddenRunsClient()
-    _, runs = fake_tui_data(client).load_project_base({"id": "project-id", "name": "energy"})
-
-    assert runs == []
-    assert [call["limit"] for call in client.run_calls] == [200]
-
-
-def test_target_runs_halve_on_a_server_error() -> None:
-    class OversizedTargetRunsClient(FakeClient):
-        def list_runs(self, **kwargs: Any) -> list[dict[str, Any]]:
-            super().list_runs(**kwargs)
-            if kwargs.get("limit", 100) > 25:
-                raise _server_error()
-            return self.runs[: kwargs["limit"]]
-
-    client = OversizedTargetRunsClient()
-    data = fake_tui_data(client, limit=100)
-
-    runs = data.load_target_runs("workflow", "workflow-id")
-
-    assert [call["limit"] for call in client.run_calls] == [100, 50, 25]
-    assert runs == client.runs[:25]
-
-
-def test_target_runs_still_raise_when_no_size_fits() -> None:
-    class AlwaysFailingClient(FakeClient):
-        def list_runs(self, **kwargs: Any) -> list[dict[str, Any]]:
-            super().list_runs(**kwargs)
-            raise _server_error()
-
-    with pytest.raises(RebaseWorkflowError, match="HTTP 500"):
-        fake_tui_data(AlwaysFailingClient(), limit=100).load_target_runs("workflow", "workflow-id")
-
-
-def test_project_composite_server_error_falls_back_to_the_fan_out() -> None:
-    """The composite answer carries the same 200 runs, so it hits the same wall.
-
-    A route that is *present but failing* must not be treated like one that is absent
-    (404: try again next time) nor like a fatal error (the old behaviour, an error pane
-    over an empty table). Fall back to the piecewise reads, whose run scan can shrink.
-    """
-
-    class FailingCompositeClient(OversizedRunsClient):
-        def __init__(self) -> None:
-            super().__init__()
-            self.overview_calls: list[str] = []
-
-        def get_project_overview(self, project_id: str) -> dict[str, Any]:
-            self.overview_calls.append(project_id)
-            raise _server_error()
-
-    client = FailingCompositeClient()
-    data = fake_tui_data(client)
-
-    targets = data.load_project_targets({"id": "project-id", "name": "energy"})
-
-    assert client.overview_calls == ["project-id"]
-    assert [workflow["name"] for workflow in targets.workflows] == ["forecast"]
-    assert [group.name for group in targets.ephemeral] == ["collect"]
-    assert targets.last_runs == {"workflow-id": "2026-08-09T17:00:05Z"}
-
-    # The composite read is remembered as failing for this project. On the next tick the
-    # view goes straight to the fan-out rather than paying for the oversized answer again.
-    data.load_project_targets({"id": "project-id", "name": "energy"})
-    assert client.overview_calls == ["project-id"]
-    # Another project is not tarred with the same brush.
-    assert data.load_project_composite({"id": "other-project-id", "name": "trading"}) is None
-    assert client.overview_calls == ["project-id", "other-project-id"]
