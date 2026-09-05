@@ -3243,13 +3243,15 @@ class Client:
     def get_workspace(self) -> dict[str, Any]:
         return self._request_dict("GET", "/workspace", expected="workspace response")
 
-    def _composite_read(self, path: str, *, expected: str, route: str | None = None) -> dict[str, Any] | None:
+    def _composite_read(
+        self, path: str, *, expected: str, route: str | None = None, **kwargs: Any
+    ) -> dict[str, Any] | None:
         """A whole-view read, or None where the platform has no such route."""
         key = route or path
         if key in self._absent_routes:
             return None
         try:
-            return self._request_dict("GET", path, expected=expected)
+            return self._request_dict("GET", path, expected=expected, **kwargs)
         except RebaseWorkflowError as exc:
             if exc.status_code in ROUTE_ABSENT_STATUSES:
                 self._absent_routes.add(key)
@@ -3270,8 +3272,13 @@ class Client:
 
         `None` when the route is absent, on the same terms as `get_workspace_overview`.
         """
+        # Same opt-out as `list_runs(include_result=False)`: the runs ride along in this
+        # answer, and the view draws none of their bodies.
         return self._composite_read(
-            f"/projects/{project_id}/overview", expected="project overview response", route="/projects/*/overview"
+            f"/projects/{project_id}/overview",
+            expected="project overview response",
+            route="/projects/*/overview",
+            params={"include_result": "false"},
         )
 
     def update_workspace(
@@ -4597,9 +4604,7 @@ class Client:
         )
 
     def get_admin_workspace_usage(self, workspace_id: str) -> dict[str, Any]:
-        return self._request_dict(
-            "GET", f"/admin/workspaces/{workspace_id}/usage", expected="workspace usage response"
-        )
+        return self._request_dict("GET", f"/admin/workspaces/{workspace_id}/usage", expected="workspace usage response")
 
     def update_admin_compute_policy(
         self,
@@ -4655,8 +4660,14 @@ class Client:
         status: str | None = None,
         trigger_source: str | None = None,
         limit: int = 100,
+        include_result: bool | None = None,
     ) -> list[dict[str, Any]]:
         """Runs, newest first. Name what ran with `target_id` + `target_type`.
+
+        `include_result=False` asks for the rows without their `result` and
+        `parameters` bodies. A list view only needs status and timestamps, and one
+        project's results were ~260 KiB a run — 200 of them overran the platform's
+        32 MiB response cap. A platform without the flag ignores it and answers in full.
 
         `workflow_id` / `function_id` / `model_id` are kept as spellings of the same
         filter, because a run's own `workflow_id` column is null for an ordinary
@@ -4681,6 +4692,7 @@ class Client:
                 "status": status,
                 "trigger_source": trigger_source,
                 "limit": limit,
+                "include_result": None if include_result is None else str(include_result).lower(),
             }.items()
             if value is not None
         }
