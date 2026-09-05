@@ -1202,7 +1202,11 @@ class RebaseTuiData:
             # Supplementary data: never let it take down the function/workflow view.
             endpoints = executor.submit(lambda: _optional_list(lambda: self.client.list_project_endpoints(project_id)))
             runs = executor.submit(
-                lambda: _optional_list(lambda: self.client.list_runs(project_id=project_id, limit=EPHEMERAL_SCAN_LIMIT))
+                lambda: _optional_list(
+                    lambda: self.client.list_runs(
+                        project_id=project_id, limit=EPHEMERAL_SCAN_LIMIT, include_result=False
+                    )
+                )
             )
         run_rows = runs.result()
         workflow_rows = workflows.result()
@@ -1253,7 +1257,7 @@ class RebaseTuiData:
         column the route does not filter on, so the project's runs are read and matched
         locally.
         """
-        runs = self.client.list_runs(project_id=project_id, limit=EPHEMERAL_SCAN_LIMIT)
+        runs = self.client.list_runs(project_id=project_id, limit=EPHEMERAL_SCAN_LIMIT, include_result=False)
         return [run for run in runs if _ephemeral_identity(run) == (target_type, name)]
 
     def load_last_runs(
@@ -1292,7 +1296,9 @@ class RebaseTuiData:
         else, and reading them here would undo the point of asking once.
         """
         if runs is None:
-            runs = _optional_list(lambda: self.client.list_runs(project_id=project_id, limit=LAST_RUN_SCAN_LIMIT))
+            runs = _optional_list(
+                lambda: self.client.list_runs(project_id=project_id, limit=LAST_RUN_SCAN_LIMIT, include_result=False)
+            )
         latest: dict[str, str] = {}
 
         def record(target_id: Any, when: Any) -> None:
@@ -1395,9 +1401,13 @@ class RebaseTuiData:
         here. Given a name and project, those runs are read and merged in.
         """
         if target_type == "function":
-            registered = self.client.list_runs(function_id=target_id, target_type="function", limit=self.limit)
+            registered = self.client.list_runs(
+                function_id=target_id, target_type="function", limit=self.limit, include_result=False
+            )
         else:
-            registered = self.client.list_runs(workflow_id=target_id, target_type="workflow", limit=self.limit)
+            registered = self.client.list_runs(
+                workflow_id=target_id, target_type="workflow", limit=self.limit, include_result=False
+            )
         if not name or not project_id:
             return registered
 
@@ -5603,6 +5613,13 @@ class RebaseTuiApp(App[None]):
             return None
         if table_id == "runs-table":
             run = self._run_rows.get(key)
+            if run is not None and "result" not in run:
+                # The list left the body out; the drawer is where it is wanted, so read
+                # the one record now (or take it from the detail already loaded for it).
+                detail = self._run_detail.run if self._run_detail is not None else {}
+                if str(detail.get("id")) != key:
+                    detail = self.data.client.get_run(key)
+                run = self._run_rows[key] = {**run, **detail}
             return None if run is None else self._run_drawer(run)
         if table_id == "projects-table":
             summary = self._project_rows.get(key)

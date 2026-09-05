@@ -283,6 +283,7 @@ class FakeClient:
         model_id: str | None = None,
         target_type: str | None = None,
         limit: int = 100,
+        include_result: bool | None = None,
     ) -> list[dict[str, Any]]:
         self.run_calls.append(
             {
