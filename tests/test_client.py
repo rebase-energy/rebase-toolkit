@@ -9,7 +9,7 @@ import requests
 from http_stub import patch_client_http
 
 import rebase as rb
-from rebase.config import DEFAULT_API_URL, DEFAULT_SERVER_URL, write_profile
+from rebase.config import DEFAULT_API_URL, DEFAULT_SERVER_URL, set_active_environment, write_profile
 
 
 class FakeResponse:
@@ -3714,6 +3714,55 @@ def test_override_matching_the_profile_workspace_keeps_the_key(tmp_path, monkeyp
     assert rb.Client().api_key == "rbw_key"
 
 
+def test_with_workspace_is_process_local_and_drops_the_profile_key(tmp_path, monkeypatch) -> None:
+    """The clone is how the TUI switches workspace: nothing reaches the profile,
+    and an rbw_ key stays behind for the same reason a `--workspace` override
+    leaves it -- it names one workspace, and the server believes the key.
+    """
+    config = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config))
+    write_profile(api_key="rbw_key", workspace={"id": "agent-work"}, path=config)
+    set_active_environment("rebase-grid", "prod", path=config)
+    monkeypatch.chdir(tmp_path)
+    before = config.read_text(encoding="utf-8")
+
+    client = rb.Client()
+    moved = client.with_workspace("rebase-grid")
+
+    assert moved.workspace_id == "rebase-grid"
+    assert moved.api_key is None
+    assert moved.api_url == client.api_url
+    # The new workspace's own configured default, not the old client's environment.
+    assert moved.environment_name == "prod"
+    assert client.with_workspace("rebase-grid", environment_name="staging").environment_name == "staging"
+    # Same workspace: the key is still the right credential.
+    assert client.with_workspace("agent-work").api_key == "rbw_key"
+    assert client.workspace_id == "agent-work"
+    assert config.read_text(encoding="utf-8") == before
+
+
+def test_as_session_steps_off_the_api_key_onto_the_signed_in_session(tmp_path, monkeypatch) -> None:
+    config = tmp_path / "config.json"
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(config))
+    write_profile(api_key="rbw_key", workspace={"id": "agent-work"}, path=config)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("rebase.client.load_access_token", lambda: "session-token")
+
+    client = rb.Client()
+    person = client.as_session()
+
+    assert person is not None and person is not client
+    assert person.api_key is None
+    assert person.access_token == "session-token"
+    assert person.workspace_id == "agent-work"
+    assert person.api_url == client.api_url
+    # Already a person: nothing to step off.
+    assert person.as_session() is person
+
+    monkeypatch.setattr("rebase.client.load_access_token", lambda: None)
+    assert client.as_session() is None
+
+
 def test_explicit_api_key_survives_a_workspace_override(tmp_path, monkeypatch) -> None:
     config = tmp_path / "config.json"
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(config))
@@ -3790,4 +3839,143 @@ def test_admin_client_methods_address_the_workspace_in_the_path(monkeypatch) -> 
         ("GET", "/admin/workspaces/acme/usage", None),
         ("PATCH", "/admin/workspaces/acme/compute-policy", {"max_cloud_run_memory_mib": 4096}),
         ("PATCH", "/admin/workspaces/acme/credit-grant", {"monthly_credit_cents": 500}),
+    ]
+
+
+# --- run lists: summaries by default, bodies on request ----------------------
+
+
+def test_client_list_runs_include_asks_for_the_bodies(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["params"] = kwargs["params"]
+        return FakeResponse([{"id": "run-id", "status": "succeeded", "result": {"ok": True}}])
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.list_runs(include=["result", "parameters"])
+    assert observed["params"] == {"limit": 100, "include": "result,parameters"}
+
+    # A typo must not quietly come back as summaries.
+    with pytest.raises(rb.RebaseWorkflowError, match="unknown include"):
+        client.list_runs(include=["results"])
+
+
+# --- composite reads: ETags and 304 ------------------------------------------
+
+
+class FakeTaggedResponse(FakeResponse):
+    """A 200 that carries an ETag, the way the overview routes answer."""
+
+    status_code = 200
+
+    def __init__(self, payload: dict[str, Any], etag: str) -> None:
+        super().__init__(payload)
+        self.headers = {"ETag": etag}
+
+
+class FakeNotModifiedResponse:
+    status_code = 304
+    headers: dict[str, str] = {}
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> Any:
+        raise ValueError("a 304 has no body")
+
+
+def test_read_overview_stores_the_etag_and_revalidates_with_it(monkeypatch) -> None:
+    """The TUI re-reads its view every few seconds; most of those reads change nothing."""
+    from rebase.client import OverviewRead
+
+    sent: list[str | None] = []
+    answers: list[Any] = [
+        FakeTaggedResponse({"environment": "dev", "projects": []}, 'W/"v1"'),
+        FakeNotModifiedResponse(),
+        FakeTaggedResponse({"environment": "dev", "projects": [{"id": "p1"}]}, 'W/"v2"'),
+        FakeNotModifiedResponse(),
+    ]
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        sent.append(kwargs["headers"].get("If-None-Match"))
+        return answers.pop(0)
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    first = client.read_workspace_overview()
+    assert first == OverviewRead({"environment": "dev", "projects": []})
+    assert not first.unchanged and not first.absent
+
+    second = client.read_workspace_overview()
+    assert second.unchanged and second.payload is None and not second.absent
+    # A 304 is not a missing route: the next read still asks.
+    assert client._absent_routes == set()
+
+    third = client.read_workspace_overview()
+    assert third.payload == {"environment": "dev", "projects": [{"id": "p1"}]}
+    fourth = client.read_workspace_overview()
+    assert fourth.unchanged
+
+    assert sent == [None, 'W/"v1"', 'W/"v1"', 'W/"v2"']
+
+
+def test_get_workspace_overview_is_never_conditional(monkeypatch) -> None:
+    """None from `get_*` keeps meaning "absent"; only `read_*` can say "unchanged"."""
+    sent: list[str | None] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        sent.append(kwargs["headers"].get("If-None-Match"))
+        return FakeTaggedResponse({"environment": "dev"}, 'W/"v1"')
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    assert client.read_workspace_overview() is not None
+    assert client.get_workspace_overview() == {"environment": "dev"}
+    assert client.read_workspace_overview(conditional=False).payload == {"environment": "dev"}
+
+    assert sent == [None, None, None]
+
+
+def test_the_etag_cache_does_not_travel_with_a_clone(monkeypatch) -> None:
+    """A clone is what a workspace or environment switch produces: its screen is empty."""
+    sent: list[tuple[str | None, str | None]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        sent.append((kwargs["headers"].get("If-None-Match"), kwargs["headers"].get("X-Rebase-Environment")))
+        return FakeTaggedResponse({"environment": "dev"}, 'W/"v1"')
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.read_workspace_overview()
+    client.with_environment("prod").read_workspace_overview()
+    client.read_workspace_overview()
+
+    assert sent == [(None, "dev"), (None, "prod"), ('W/"v1"', "dev")]
+
+
+def test_project_overview_etags_are_per_project(monkeypatch) -> None:
+    sent: list[tuple[str, str | None]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> Any:
+        path = url.split("workflows.example.com")[-1]
+        sent.append((path, kwargs["headers"].get("If-None-Match")))
+        return FakeTaggedResponse({"project": {"id": path.split("/")[2]}}, f'W/"{path}"')
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.read_project_overview("p1")
+    client.read_project_overview("p2")
+    client.read_project_overview("p1")
+
+    assert sent == [
+        ("/projects/p1/overview", None),
+        ("/projects/p2/overview", None),
+        ("/projects/p1/overview", 'W/"/projects/p1/overview"'),
     ]

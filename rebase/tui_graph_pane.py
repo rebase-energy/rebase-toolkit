@@ -26,6 +26,7 @@ from rebase.tui_graph import (
     edge_colours,
     edge_summary,
     highlight_colours,
+    layout_spacing,
     node_colour,
     node_colours,
     node_shapes,
@@ -136,7 +137,12 @@ class GraphPane(Vertical):
         self._notice = text
 
     def clear(self) -> None:
-        """Forget the graph: the next `show` lays out afresh, whatever it is asked for."""
+        """Forget the graph: the next `show` lays out afresh, whatever it is asked for.
+
+        This is also what takes the picture off the screen. plotui paints the graph
+        as a terminal image, which hiding the pane leaves in place; unmounting the
+        widget is what makes plotui delete it.
+        """
         self._spec = None
         self._plot = None
         self._widget = None
@@ -182,14 +188,23 @@ class GraphPane(Vertical):
         self._spec = spec
         self._base = base
         edges = spec.edge_pairs
-        layout = core.LayeredLayout(len(spec.nodes), edges, rankdir=spec.rankdir)
+        labels = [node.label for node in spec.nodes]
+        try:
+            # The labels size the boxes, so the layout keeps them from touching.
+            layout = core.LayeredLayout(
+                len(spec.nodes), edges, rankdir=spec.rankdir, labels=labels, **layout_spacing(spec.rankdir)
+            )
+        except TypeError:
+            # plotui 0.5.0 lays out without labels, and its boxes overlap.
+            self.show_notice(OLD_PLOTUI_NOTICE, title=spec.title)
+            return
         xs, ys = layout.positions()
         plot = core.Plot()
         self._handle = plot.add_graph2d(
             xs,
             ys,
             edges,
-            labels=[node.label for node in spec.nodes],
+            labels=labels,
             node_colors=base[0],
             edge_colors=base[1],
             node_shapes=node_shapes(spec),
@@ -235,6 +250,8 @@ class GraphPane(Vertical):
                 legend.append("  ")
             legend.append("■ ", style=colour)
             legend.append(label, style=BRAND_MEDIUM_GRAY)
+        if spec.caption:
+            legend.append(f"  {spec.caption}", style=BRAND_MEDIUM_GRAY)
         return legend
 
     # ---- hover and click ----------------------------------------------------------

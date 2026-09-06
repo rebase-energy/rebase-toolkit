@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import re
 import sys
 import threading
@@ -36,6 +37,7 @@ from textual.widgets import (
     Tabs,
 )
 from textual.widgets._footer import FooterKey
+from textual.widgets._key_panel import BindingsTable
 from textual.widgets._toast import Toast
 
 from rebase import config as config_module
@@ -99,6 +101,9 @@ def _isolate_rebase_config(monkeypatch, tmp_path):
     itself runs inside a git repository — without this, every test that starts the app
     would write to the developer's real ~/.rebase/config.json."""
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(tmp_path / "isolated-config.json"))
+    # A switch in the TUI exports these for the process; a test must start without them.
+    monkeypatch.delenv("REBASE_WORKSPACE", raising=False)
+    monkeypatch.delenv("REBASE_ENVIRONMENT", raising=False)
 
 
 class FakeClient:
@@ -370,6 +375,48 @@ class EnvironmentClient(FakeClient):
         return [{"name": f"{self.environment_name}-api", "keys": ["TOKEN"]}]
 
 
+class WorkspaceClient(EnvironmentClient):
+    """A signed-in profile that belongs to two workspaces, each with its own environments."""
+
+    def __init__(self, workspace_id: str = "workspace-dev", environment_name: str = "dev") -> None:
+        super().__init__(environment_name)
+        self.workspace_id = workspace_id
+        self.projects = [{"id": f"{workspace_id}-{environment_name}-project", "name": f"{workspace_id} energy"}]
+
+    def list_my_workspaces(self) -> list[dict[str, Any]]:
+        return [
+            {"id": "workspace-prod", "name": "Production", "role": "Admin", "default": False},
+            {"id": "workspace-dev", "name": "Development", "role": "Owner", "default": True},
+        ]
+
+    def list_environments(self) -> list[dict[str, Any]]:
+        if self.workspace_id == "workspace-prod":
+            return [{"name": "dev", "deploy_mode": "direct"}, {"name": "prod", "deploy_mode": "gitops"}]
+        return [{"name": "dev", "deploy_mode": "direct"}, {"name": "staging", "deploy_mode": "direct"}]
+
+    def with_environment(self, environment_name: str) -> WorkspaceClient:
+        return WorkspaceClient(self.workspace_id, environment_name)
+
+    def with_workspace(self, workspace_id: str, *, environment_name: str | None = None) -> WorkspaceClient:
+        return WorkspaceClient(workspace_id, environment_name or "dev")
+
+
+class KeyedWorkspaceClient(WorkspaceClient):
+    """A profile on an API key: the memberships route refuses it, the session lists them."""
+
+    def __init__(self, workspace_id: str = "workspace-prod", environment_name: str = "dev") -> None:
+        super().__init__(workspace_id, environment_name)
+        self.api_key = "rbw_key"
+        self.session_used = False
+
+    def list_my_workspaces(self) -> list[dict[str, Any]]:
+        raise RebaseWorkflowError("Supabase user token required")
+
+    def as_session(self) -> WorkspaceClient:
+        self.session_used = True
+        return WorkspaceClient(self.workspace_id, self.environment_name)
+
+
 class SteppedClient(FakeClient):
     """A project whose workflow is built out of steps, which are functions of its own."""
 
@@ -458,6 +505,7 @@ class SteppedClient(FakeClient):
                     "node_key": "normalize",
                     "name": "normalize",
                     "function_id": "function-id",
+                    "input_bindings": {"weather": {"type": "node_output", "node_key": "load_weather"}},
                     "upstream_node_keys": ["load_weather"],
                 },
             ],
@@ -502,6 +550,13 @@ def test_tui_environment_resources_and_switcher() -> None:
             assert app.data.environment_name == "prod"
             assert app.title.endswith("(prod)")
             assert str(app.query_one("#buckets-table", DataTable).get_cell_at(Coordinate(0, 0))) == "prod-data"
+            # The pick is this process's: exported for anything it starts, written nowhere.
+            assert os.environ["REBASE_ENVIRONMENT"] == "prod"
+            assert os.environ["REBASE_WORKSPACE"] == "workspace-id"
+            assert config_module.active_environment("workspace-id") is None
+        # And the process is put back the way the app found it.
+        assert "REBASE_ENVIRONMENT" not in os.environ
+        assert "REBASE_WORKSPACE" not in os.environ
 
     asyncio.run(scenario())
 
@@ -629,13 +684,29 @@ def test_tui_step_dependencies_resolve_node_keys_to_the_names_rows_show() -> Non
 
     Left untranslated the column would say `count_to` beside a row reading `count-to`,
     which is the same step spelled two ways. An upstream with no node of its own keeps
-    its raw key rather than being renamed into something that is not there.
+    its raw key rather than being renamed into something that is not there. Only the
+    steps a node reads count: `sign_off` lists `count_to` in `upstream_node_keys`
+    because it was traced next, and that is not a dependency.
     """
+
+    def out(key: str) -> dict[str, str]:
+        return {"type": "node_output", "node_key": key}
+
     graph = {
         "nodes": [
-            {"node_key": "announce", "name": "announce", "upstream_node_keys": []},
-            {"node_key": "count_to", "name": "count-to", "upstream_node_keys": ["announce"]},
-            {"node_key": "sign_off", "name": "sign-off", "upstream_node_keys": ["count_to", "dropped"]},
+            {"node_key": "announce", "name": "announce", "input_bindings": {}, "upstream_node_keys": []},
+            {
+                "node_key": "count_to",
+                "name": "count-to",
+                "input_bindings": {"greeting": out("announce")},
+                "upstream_node_keys": ["announce"],
+            },
+            {
+                "node_key": "sign_off",
+                "name": "sign-off",
+                "input_bindings": {"n": out("count_to"), "extra": {"type": "list", "items": [out("dropped")]}},
+                "upstream_node_keys": ["announce", "count_to", "dropped"],
+            },
         ]
     }
 
@@ -1587,6 +1658,13 @@ def local_rebase_api(
             payload: Any
             if parsed.path == "/projects":
                 payload = projects
+            elif parsed.path == "/me/workspaces":
+                payload = [
+                    {"id": "workspace-dev", "name": "Development", "role": "Owner"},
+                    {"id": "workspace-prod", "name": "Production", "role": "Admin"},
+                ]
+            elif parsed.path == "/workspace/environments":
+                payload = [{"name": "dev", "deploy_mode": "direct"}, {"name": "prod", "deploy_mode": "gitops"}]
             elif parsed.path == "/projects/project-id/functions":
                 payload = functions
             elif parsed.path in {"/workflows", "/projects/project-id/workflows"}:
@@ -1897,13 +1975,23 @@ def test_tui_workspace_title_opens_switcher_and_changes_profile(monkeypatch, tmp
                 assert header.tall is False
 
                 assert await pilot.click("HeaderTitle")
-                await pilot.pause(0.2)
+                await pilot.pause(0.3)
 
-                profiles = app.query_one("#workspace-profiles-table", DataTable)
+                workspaces = app.query_one("#workspaces-table", DataTable)
                 assert app.query_one("#workspace-switcher-view").styles.display == "block"
-                assert profiles.row_count == 2
+                assert app.query_one("#profile-switcher-view").styles.display == "none"
+                assert workspaces.row_count == 2
+                assert str(workspaces.get_cell_at(Coordinate(0, 1))) == "Production"
                 assert header.size.height == 1
                 assert header.tall is False
+
+                # The profile is the machine-wide choice, one key further in.
+                await pilot.press("f")
+                await pilot.pause(0.2)
+                profiles = app.query_one("#workspace-profiles-table", DataTable)
+                assert app.current_view == "profile-switcher"
+                assert app.query_one("#profile-switcher-view").styles.display == "block"
+                assert profiles.row_count == 2
 
                 profiles.focus()
                 profiles.move_cursor(row=0)
@@ -1933,29 +2021,127 @@ def test_tui_w_opens_switcher_and_changes_workspace(monkeypatch) -> None:
             api_url="https://api.example.com",
             workspace={"id": "workspace-prod", "name": "Production"},
         )
-        monkeypatch.setattr(tui_module, "Client", lambda **_kwargs: FakeClient())
+        monkeypatch.setattr(tui_module, "Client", lambda **_kwargs: WorkspaceClient("workspace-prod"))
+        config_before = config_module.read_config()
 
+        app = RebaseTuiApp(data=fake_tui_data(WorkspaceClient("workspace-prod"), limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            assert app.title == "Rebase TUI - Workspace: Production (dev)"
+
+            await pilot.press("w")
+            await pilot.pause(0.3)
+
+            workspaces = app.query_one("#workspaces-table", DataTable)
+            environments = app.query_one("#workspace-environments-table", DataTable)
+            assert app.current_view == "workspace-switcher"
+            assert workspaces.has_focus
+            # The live workspace leads and sits under the cursor, marked.
+            assert [str(workspaces.get_cell_at(Coordinate(row, 1))) for row in range(2)] == [
+                "Production",
+                "Development",
+            ]
+            assert str(workspaces.get_cell_at(Coordinate(0, 0))) == "*"
+            assert workspaces.cursor_row == 0
+            # Its environments are underneath, the live one marked.
+            assert [str(environments.get_cell_at(Coordinate(row, 1))) for row in range(2)] == ["dev", "prod"]
+            assert str(environments.get_cell_at(Coordinate(0, 0))) == "*"
+
+            # Moving the cursor refills the second table for that workspace.
+            workspaces.move_cursor(row=1)
+            await pilot.pause(0.3)
+            assert [str(environments.get_cell_at(Coordinate(row, 1))) for row in range(2)] == ["dev", "staging"]
+            assert str(environments.get_cell_at(Coordinate(0, 0))) == ""
+
+            # Enter on the workspace hands the cursor down; enter on an environment switches.
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+            assert environments.has_focus
+            environments.move_cursor(row=1)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            assert app.current_view == "workspace"
+            assert app.title == "Rebase TUI - Workspace: Development (staging)"
+            assert app.data.client.workspace_id == "workspace-dev"
+            assert app.data.environment_name == "staging"
+            assert str(app.query_one("#projects-table", DataTable).get_cell_at(Coordinate(0, 0))) == (
+                "workspace-dev energy"
+            )
+            # Exported to the process, and nowhere else: the profile still says Production.
+            assert os.environ["REBASE_WORKSPACE"] == "workspace-dev"
+            assert os.environ["REBASE_ENVIRONMENT"] == "staging"
+            assert config_module.read_config()["profiles"] == config_before["profiles"]
+            assert config_module.active_environment("workspace-dev") is None
+            assert config_module.selected_profile_name() == "prod"
+
+            # `t` is the one deliberate write: the profile now opens here by default.
+            await pilot.press("t")
+            await pilot.pause(0.2)
+            profile = config_module.load_profile("prod")
+            assert profile["workspace_id"] == "workspace-dev"
+            assert profile["workspace_name"] == "Development"
+            assert config_module.active_environment("workspace-dev") == "staging"
+
+    asyncio.run(scenario())
+
+
+def test_tui_switcher_lists_workspaces_on_the_session_when_the_profile_holds_a_key() -> None:
+    """An rbw_ key is one workspace's; the person behind it is who has memberships."""
+
+    async def scenario() -> None:
+        client = KeyedWorkspaceClient("workspace-prod")
+        app = RebaseTuiApp(data=fake_tui_data(client, limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            await pilot.press("w")
+            await pilot.pause(0.4)
+
+            workspaces = app.query_one("#workspaces-table", DataTable)
+            assert client.session_used
+            assert workspaces.row_count == 2
+            assert not any("Could not list" in n.message for n in app._notifications)
+
+    asyncio.run(scenario())
+
+
+def test_tui_title_and_header_flag_a_non_production_platform(monkeypatch) -> None:
+    """A terminal left on a development deployment must not look like production."""
+
+    async def scenario() -> None:
+        monkeypatch.setenv("REBASE_PLATFORM", "staging")
         app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
 
         async with app.run_test(size=(140, 42)) as pilot:
             await pilot.pause(0.2)
-            assert app.title == "Rebase TUI - Workspace: Production (dev)"
+            assert app.title.startswith("Rebase TUI @ staging - Workspace: ")
+            assert app.query_one(tui_module.RebaseHeader).has_class("-platform")
 
+    asyncio.run(scenario())
+
+
+def test_tui_switching_away_from_the_directory_pin_says_so(monkeypatch) -> None:
+    """The marker sets where `rebase tui` opens; a switch is allowed to leave it, out loud."""
+
+    async def scenario() -> None:
+        monkeypatch.setattr(tui_module, "local_workspace_id", lambda: "workspace-prod")
+        app = RebaseTuiApp(data=fake_tui_data(WorkspaceClient("workspace-prod"), limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
             await pilot.press("w")
-            await pilot.pause(0.1)
-
-            profiles = app.query_one("#workspace-profiles-table", DataTable)
-            assert app.current_view == "workspace-switcher"
-            assert profiles.has_focus
-            assert profiles.row_count == 2
-
-            profiles.move_cursor(row=0)
+            await pilot.pause(0.3)
+            app.query_one("#workspaces-table", DataTable).move_cursor(row=1)
+            await pilot.pause(0.3)
+            app.query_one("#workspace-environments-table", DataTable).focus()
             await pilot.press("enter")
-            await pilot.pause(0.2)
+            await pilot.pause(0.3)
 
-            assert config_module.selected_profile_name() == "dev"
-            assert app.title == "Rebase TUI - Workspace: Development (dev)"
-            assert app.current_view == "workspace"
+            assert app.data.client.workspace_id == "workspace-dev"
+            messages = [notification.message for notification in app._notifications]
+            assert any("pinned to workspace workspace-prod" in message for message in messages), messages
 
     asyncio.run(scenario())
 
@@ -2785,8 +2971,8 @@ def test_tui_does_not_rewrite_the_config_when_the_git_root_is_already_recorded(m
     asyncio.run(scenario())
 
 
-def test_tui_tables_have_no_header_until_their_rows_arrive() -> None:
-    """Headers sized against header text and then resized by the data is the jump to avoid."""
+def test_tui_tables_show_their_header_before_their_rows_arrive() -> None:
+    """The header is local knowledge, so it never waits on the request that brings the rows."""
 
     class SlowClient(FakeClient):
         def __init__(self) -> None:
@@ -2805,7 +2991,8 @@ def test_tui_tables_have_no_header_until_their_rows_arrive() -> None:
             await pilot.pause(0.2)
             projects = app.query_one("#projects-table", SelectableDataTable)
             assert projects.row_count == 0
-            assert list(projects.columns) == []
+            # The header is local knowledge and goes up before the request answers.
+            assert [str(column.label) for column in projects.columns.values()][0] == "Project"
 
             client.release.set()
             await pilot.pause(0.4)
@@ -2831,10 +3018,12 @@ def test_tui_tables_have_no_header_until_their_rows_arrive() -> None:
             assert workflows.row_count == 1
             assert [str(column.label) for column in workflows.columns.values()][0] == "Name"
 
-            # And leaving takes the header with it, so no stale widths greet the next project.
+            # Leaving empties the rows and rebuilds the header, so the next project meets
+            # a labelled table at header widths rather than this one's leftovers.
             await pilot.press("b")
             await pilot.pause(0.2)
-            assert list(workflows.columns) == []
+            assert workflows.row_count == 0
+            assert [str(column.label) for column in workflows.columns.values()][0] == "Name"
 
     asyncio.run(scenario())
 
@@ -3350,10 +3539,16 @@ def test_tui_question_mark_toggles_the_keys_panel_from_the_footer() -> None:
             hint = next(key for key in app.query_one(Footer).query(FooterKey) if key.key == "question_mark")
             assert hint.key_display == "?"
             assert hint.description == "Keys"
+            # Key hints wear the brand green, not Textual's stock orange accent, in the
+            # footer and in the panel alike.
+            assert app.theme == "rebase"
+            assert hint.get_component_styles("footer-key--key").color.hex == "#03C497"
 
             await pilot.press("question_mark")
             await pilot.pause(0.2)
             assert app.screen.query(HelpPanel)
+            keys_table = app.screen.query_one(BindingsTable)
+            assert keys_table.get_component_styles("bindings-table--key").color.hex == "#03C497"
 
             # The same key puts it away again.
             await pilot.press("question_mark")
@@ -4020,6 +4215,10 @@ def test_tui_notifications_wear_the_app_s_colours_and_hug_their_text() -> None:
 
             toast = app.query_one(Toast)
             assert toast.styles.border_top[1].hex == "#03C497"
+            # A round border's cells take the widget's background, so a tinted toast
+            # shows as a lighter slab around its line. The toast sits on the screen's
+            # own ground instead, and only the line is left.
+            assert toast.styles.background.hex == app.screen.styles.background.hex
             # Standing clear of the footer, not sharing its row: the footer is the last
             # line, and the toast's region has to end above it.
             footer = app.query_one(Footer)
@@ -5698,6 +5897,7 @@ class FakePlotui:
         self.render_mode = render_mode
         self.plots: list[Any] = []
         self.widgets: list[Any] = []
+        self.layouts: list[Any] = []
         fake = self
 
         class Plot:
@@ -5718,10 +5918,22 @@ class FakePlotui:
                 self.selected = element
 
         class LayeredLayout:
-            def __init__(self, n_nodes: int, edges: Any, rankdir: str = "TB") -> None:
+            def __init__(
+                self,
+                n_nodes: int,
+                edges: Any,
+                rankdir: str = "TB",
+                labels: Any = None,
+                node_sep: float = 2.0,
+                rank_sep: float = 3.0,
+            ) -> None:
                 self.n_nodes = n_nodes
                 self.edges = list(edges)
                 self.rankdir = rankdir
+                self.labels = None if labels is None else list(labels)
+                self.node_sep = node_sep
+                self.rank_sep = rank_sep
+                fake.layouts.append(self)
 
             def positions(self) -> tuple[list[float], list[float]]:
                 return [float(i) for i in range(self.n_nodes)], [0.0] * self.n_nodes
@@ -5819,6 +6031,64 @@ def test_tui_i_toggles_the_graph_pane_and_back_closes_it_first(monkeypatch) -> N
     asyncio.run(scenario())
 
 
+def test_tui_m_maximises_the_graph_pane_while_it_is_open(monkeypatch) -> None:
+    """With the pane open, `m` hands it the screen; `m` or `b` give the tables back."""
+    monkeypatch.setitem(sys.modules, "plotui", None)
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await _open_run(app, pilot)
+            pane = _graph_pane(app)
+            header = app.query_one(tui_module.RebaseHeader)
+            boxes = [app.query_one(box) for box in tui_module.BOX_SELECTORS]
+            focused_before = app.focused
+
+            await pilot.press("i")
+            await pilot.pause(0.2)
+            assert pane.display
+            beside = pane.size.width
+            assert 0 < beside < 140
+
+            await pilot.press("m")
+            await pilot.pause(0.2)
+            assert app._graph_maximised
+            # The whole project view, less its own padding: more than double its share.
+            assert pane.size.width > 2 * beside
+            assert [box.display for box in boxes] == [False, False, False]
+            assert header.display is False
+            # The box maximise is untouched: this is the pane's screen, not a box's.
+            assert app._maximised is None
+
+            # b gives the tables back before it closes anything.
+            await pilot.press("b")
+            await pilot.pause(0.2)
+            assert pane.display
+            assert not app._graph_maximised
+            assert pane.size.width == beside
+            assert [box.display for box in boxes] == [True, True, True]
+            assert header.display is True
+            assert app.focused is focused_before
+
+            # m toggles it off again itself, and i closes the pane from inside it.
+            await pilot.press("m")
+            await pilot.pause(0.2)
+            assert app._graph_maximised
+            await pilot.press("m")
+            await pilot.pause(0.2)
+            assert not app._graph_maximised and pane.display
+            await pilot.press("m")
+            await pilot.press("i")
+            await pilot.pause(0.2)
+            assert not pane.display
+            assert not app._graph_maximised
+            assert [box.display for box in boxes] == [True, True, True]
+            assert header.display is True
+
+    asyncio.run(scenario())
+
+
 def test_tui_graph_pane_wants_a_project_first(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "plotui", None)
 
@@ -5873,6 +6143,34 @@ def test_tui_graph_pane_shows_a_notice_in_an_unsupported_terminal(monkeypatch) -
     asyncio.run(scenario())
 
 
+def test_tui_graph_pane_asks_for_an_upgrade_when_the_layout_takes_no_labels(monkeypatch) -> None:
+    """plotui 0.5.0 has `LayeredLayout` but lays out blind to the labels, so its boxes
+    overlap; the pane asks for the upgrade rather than drawing that."""
+    fake = FakePlotui().install(monkeypatch)
+    blind = fake.core.LayeredLayout
+
+    class BlindLayout(blind):  # type: ignore[misc, valid-type]
+        def __init__(self, n_nodes: int, edges: Any, rankdir: str = "TB") -> None:
+            super().__init__(n_nodes, edges, rankdir)
+
+    fake.core.LayeredLayout = BlindLayout  # type: ignore[attr-defined]
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(SteppedClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await _open_run(app, pilot)
+            await pilot.press("i")
+            await pilot.pause(0.3)
+            pane = _graph_pane(app)
+            assert pane.notice is not None
+            assert "predates" in pane.notice
+            assert 'pip install -U "rebase-toolkit[graph]"' in pane.notice
+            assert not fake.widgets
+
+    asyncio.run(scenario())
+
+
 def test_tui_graph_pane_draws_the_open_run_and_repaints_on_refresh(monkeypatch) -> None:
     """The open run's steps, coloured by how far it got; `r` repaints rather than relays."""
     fake = FakePlotui().install(monkeypatch)
@@ -5891,6 +6189,10 @@ def test_tui_graph_pane_draws_the_open_run_and_repaints_on_refresh(monkeypatch) 
             assert graph["edges"] == [(0, 1)]
             assert graph["node_colors"] == [BRAND_MAIN_GREEN, BRAND_MEDIUM_GRAY]
             assert graph["node_shapes"] == ["rounded", "rounded"]
+            # The layout gets the labels too, so box widths are part of the layout.
+            assert fake.layouts[-1].labels == graph["labels"]
+            # A chain is drawn top-down at plotui's own spacing.
+            assert (fake.layouts[-1].rankdir, fake.layouts[-1].node_sep, fake.layouts[-1].rank_sep) == ("TB", 2.0, 3.0)
             assert (
                 str(app.query_one("#graph-title", Static).render()) == f"forecast · {compact_id('run-id')} · succeeded"
             )
@@ -5904,6 +6206,42 @@ def test_tui_graph_pane_draws_the_open_run_and_repaints_on_refresh(monkeypatch) 
             assert pane.rebuilds == 1
             assert pane.recolours >= 1
             assert fake.plot.colours[-1][1] == [BRAND_MAIN_GREEN, BRAND_MEDIUM_GRAY]
+
+    asyncio.run(scenario())
+
+
+def test_tui_closing_the_graph_pane_takes_the_plot_widget_down(monkeypatch) -> None:
+    """Hiding the pane would leave the terminal image painted: plotui only deletes it when
+    the widget unmounts. So closing unmounts, and reopening lays the graph out afresh."""
+    fake = FakePlotui().install(monkeypatch)
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(SteppedClient(), project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await _open_run(app, pilot)
+            await pilot.press("i")
+            await pilot.pause(0.3)
+            pane = _graph_pane(app)
+            widget = fake.widget
+            assert widget.is_attached
+            assert pane.rebuilds == 1
+
+            for key in ("b", "i"):
+                await pilot.press(key)
+                await pilot.pause(0.3)
+                assert not pane.display
+                assert not widget.is_attached
+                assert pane.spec is None
+                assert not list(app.query_one("#graph-body").children)
+
+                await pilot.press("i")
+                await pilot.pause(0.3)
+                assert pane.display
+                assert fake.widget is not widget
+                widget = fake.widget
+                assert widget.is_attached
+            assert pane.rebuilds == 3
 
     asyncio.run(scenario())
 
@@ -5933,7 +6271,7 @@ def test_tui_graph_pane_lights_what_a_picked_step_waits_on(monkeypatch) -> None:
 
             widget.post_message(widget.ElementHovered(widget, ("edge", 0)))
             await pilot.pause(0.2)
-            assert str(readout.render()) == "load_weather → normalize (ordering only)"
+            assert str(readout.render()) == "load_weather → normalize (data)"
             assert fake.plot.colours[-1][1] == [BRAND_MAIN_GREEN, BRAND_MEDIUM_GRAY]
 
     asyncio.run(scenario())
@@ -6063,6 +6401,8 @@ def test_tui_graph_pane_draws_a_workflow_as_deployed_from_the_workflows_table(mo
             assert str(app.query_one("#graph-title", Static).render()) == "forecast · steps"
             assert "Open one of its runs" in str(app.query_one("#graph-readout", Static).render())
             assert "open a run to colour it" in str(app.query_one("#graph-legend", Static).render())
+            # No repeated step here, so the legend has no caption to add.
+            assert "named by argument" not in str(app.query_one("#graph-legend", Static).render())
 
             # Opening a run of it colours the same graph in place.
             await pilot.press("enter")
@@ -6136,5 +6476,286 @@ def test_tui_graph_pane_says_why_a_trigger_graph_has_no_edges(monkeypatch) -> No
             assert fake.plot.graphs[0]["edges"] == []
             readout = str(app.query_one("#graph-readout", Static).render())
             assert "no steps" in readout and "rb.OnWorkflow" in readout
+
+    asyncio.run(scenario())
+
+
+# --- run lists are summaries; the drawer reads the body ----------------------
+
+
+def test_tui_run_drawer_marks_a_summary_row_as_loading() -> None:
+    """A list row carries the sizes of the bodies, not the bodies; the drawer says so."""
+    app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
+
+    drawer = app._run_drawer({"id": "run-9", "status": "succeeded", "result_bytes": 1331, "parameters_bytes": 40})
+    assert drawer.pending_run_id == "run-9"
+    assert drawer.sections == [{"parameters": "<40 B — loading…>"}, {"result": "<1.3 KiB — loading…>"}]
+
+    # A null size is a run with no result, and stays a null result.
+    none = app._run_drawer({"id": "run-9", "status": "failed", "result_bytes": None, "error": "boom"})
+    assert none.sections[1] == {"error": "boom", "result": None}
+
+    # A full record, as the timeline and an older platform hand over, is not pending.
+    full = app._run_drawer({"id": "run-9", "status": "succeeded", "parameters": {}, "result": {"ok": True}})
+    assert full.pending_run_id is None
+
+
+class SummaryClient(FakeClient):
+    """A platform whose run lists leave the bodies out, as the current one does.
+
+    Its `get_run` takes a moment, the way a real one does, so a test can see the drawer
+    open on the sizes before the record arrives.
+    """
+
+    def get_run(self, run_id: str) -> dict[str, Any]:
+        import time
+
+        time.sleep(0.3)
+        return super().get_run(run_id)
+
+    def list_runs(self, **kwargs: Any) -> list[dict[str, Any]]:
+        rows = super().list_runs(**kwargs)
+        return [
+            {
+                **{key: value for key, value in row.items() if key not in {"result", "parameters"}},
+                "result_bytes": 11,
+                "parameters_bytes": 22,
+            }
+            for row in rows
+        ]
+
+
+def test_tui_p_on_a_summary_row_reads_the_body_off_the_ui_thread() -> None:
+    async def scenario() -> None:
+        client = SummaryClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            app.query_one("#runs-table", DataTable).focus()
+            await pilot.pause(0.1)
+            assert client.run_detail_calls == 0
+
+            await pilot.press("p")
+            drawer = app.screen
+            assert isinstance(drawer, DetailDrawer)
+            # Open at once, on the sizes, while the record is being read.
+            assert drawer.sections[0] == {"parameters": "<22 B — loading…>"}
+            await pilot.pause(0.8)
+            assert drawer.pending_run_id is None
+            assert drawer.sections == [{"parameters": {"site_id": "site-001"}}, {"result": {"ok": True}}]
+            assert client.run_detail_calls == 1
+            await pilot.press("p")
+            await pilot.pause(0.2)
+
+            # The record outlives the drawer, and a repaint of the table.
+            await pilot.press("p")
+            await pilot.pause(0.2)
+            assert app.screen.sections[0] == {"parameters": {"site_id": "site-001"}}
+            await pilot.press("p")
+            await pilot.pause(0.2)
+            app._render_runs(client.list_runs(workflow_id="workflow-id"), preserve=True)
+            await pilot.press("p")
+            await pilot.pause(0.2)
+            assert app.screen.sections[0] == {"parameters": {"site_id": "site-001"}}
+            assert client.run_detail_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_tui_p_reuses_the_run_already_opened_with_enter() -> None:
+    async def scenario() -> None:
+        client = SummaryClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            app.query_one("#runs-table", DataTable).focus()
+            await pilot.press("enter")
+            await pilot.pause(0.8)
+            assert client.run_detail_calls == 1
+
+            await pilot.press("p")
+            await pilot.pause(0.3)
+            drawer = app.screen
+            assert isinstance(drawer, DetailDrawer)
+            assert drawer.pending_run_id is None
+            assert drawer.sections[0] == {"parameters": {"site_id": "site-001"}}
+            assert client.run_detail_calls == 1
+
+    asyncio.run(scenario())
+
+
+# --- the overview's own aggregates, and an unchanged overview ----------------
+
+
+def test_ephemeral_groups_come_from_the_overview_aggregate() -> None:
+    """The platform folds one-off runs per name itself; the page no longer has to hold them."""
+
+    class AggregateClient(CompositeProjectClient):
+        def get_project_overview(self, project_id: str) -> dict[str, Any]:
+            payload = super().get_project_overview(project_id)
+            payload["runs"] = [run for run in payload["runs"] if not run.get("is_ephemeral")]
+            payload["ephemeral_targets"] = [
+                {
+                    "target_type": "workflow",
+                    "name": "collect",
+                    "runs": 7,
+                    "last_run": "2026-08-09T18:52:48Z",
+                    "last_status": "succeeded",
+                    "execution_backend": "cloud_run",
+                    "run_type": "quick",
+                },
+                # A one-off run of a deployed name is that workflow, and gets no row.
+                {"target_type": "workflow", "name": "forecast", "runs": 1, "last_run": "2026-08-09T19:00:00Z"},
+                {"target_type": "function", "name": "", "runs": 1, "last_run": "2026-08-09T19:00:00Z"},
+            ]
+            payload["latest_runs_by_target"] = [
+                {
+                    "id": "older-run",
+                    "target_type": "function",
+                    "target_id": "function-id",
+                    "status": "succeeded",
+                    "created_at": "2026-07-01T09:00:00Z",
+                    "started_at": "2026-07-01T09:00:05Z",
+                }
+            ]
+            return payload
+
+    targets = fake_tui_data(AggregateClient()).load_project_targets({"id": "project-id", "name": "energy"})
+
+    assert [(group.name, group.runs, group.run_type, group.last_run) for group in targets.ephemeral] == [
+        ("collect", 7, "quick", "2026-08-09T18:52:48Z")
+    ]
+    # A target whose newest run fell off the page keeps its Last run from the aggregate.
+    assert targets.last_runs == {"workflow-id": "2026-08-09T17:00:05Z", "function-id": "2026-07-01T09:00:05Z"}
+
+
+def test_project_composite_reports_an_unchanged_overview() -> None:
+    from rebase.client import OverviewRead
+    from rebase.tui import UNCHANGED
+
+    class ConditionalClient(CompositeProjectClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conditional_calls: list[bool] = []
+
+        def read_project_overview(self, project_id: str, *, conditional: bool = True) -> OverviewRead:
+            self.conditional_calls.append(conditional)
+            if conditional:
+                return OverviewRead(None, unchanged=True)
+            return OverviewRead(self.get_project_overview(project_id))
+
+    client = ConditionalClient()
+    data = fake_tui_data(client)
+    project = {"id": "project-id", "name": "energy"}
+
+    assert data.load_project_composite(project, conditional=True) is UNCHANGED
+    targets = data.load_project_composite(project)
+    assert targets is not UNCHANGED and targets is not None
+    assert [workflow["name"] for workflow in targets.workflows] == ["forecast"]
+    assert client.conditional_calls == [True, False]
+
+
+def test_tui_timer_leaves_the_workspace_alone_on_an_unchanged_overview() -> None:
+    """A tick the platform answers 304 to costs a round trip and no repaint."""
+    from rebase.client import OverviewRead
+
+    class ConditionalClient(CompositeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conditional_calls: list[bool] = []
+
+        def read_workspace_overview(self, *, conditional: bool = True) -> OverviewRead:
+            self.conditional_calls.append(conditional)
+            if conditional:
+                return OverviewRead(None, unchanged=True)
+            return OverviewRead(self.get_workspace_overview())
+
+    async def scenario() -> None:
+        client = ConditionalClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, limit=5), refresh_interval=0.2)
+        renders: list[int] = []
+        original = app._render_workspace_overview
+
+        def counted(overview: Any) -> None:
+            renders.append(1)
+            original(overview)
+
+        app._render_workspace_overview = counted  # type: ignore[method-assign]
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            # The first read is answered in full: there was nothing on screen to keep.
+            assert client.conditional_calls == [False]
+            app._last_key_at = 0.0
+            await pilot.pause(1.0)
+
+            assert len(client.conditional_calls) >= 3
+            assert all(client.conditional_calls[1:])
+            assert renders == [1]
+            assert app._refresh_failures == 0
+            assert app.workspace_overview is not None
+
+            # `r` is a deliberate re-read, and is answered in full.
+            await pilot.press("r")
+            await pilot.pause(0.3)
+            assert client.conditional_calls[-1] is False
+
+    asyncio.run(scenario())
+
+
+def test_tui_timer_leaves_the_project_alone_on_an_unchanged_overview() -> None:
+    from rebase.client import OverviewRead
+
+    class ConditionalClient(CompositeProjectClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.conditional_calls: list[bool] = []
+
+        def read_project_overview(self, project_id: str, *, conditional: bool = True) -> OverviewRead:
+            self.conditional_calls.append(conditional)
+            if conditional:
+                return OverviewRead(None, unchanged=True)
+            return OverviewRead(self.get_project_overview(project_id))
+
+        # The workspace view has no composite route on this fake, so its fan-out is
+        # allowed; only the project's is refused.
+        list_workflows = FakeClient.list_workflows
+        list_functions = FakeClient.list_functions
+        list_endpoints = FakeClient.list_endpoints
+
+    async def scenario() -> None:
+        client = ConditionalClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, limit=5), refresh_interval=0.2)
+        renders: list[int] = []
+        original = app._render_project_targets
+
+        def counted(targets: Any, **kwargs: Any) -> None:
+            renders.append(1)
+            original(targets, **kwargs)
+
+        app._render_project_targets = counted  # type: ignore[method-assign]
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await _open_project(pilot, app)
+            assert client.conditional_calls == [False]
+            painted = len(renders)
+            app._last_key_at = 0.0
+            await pilot.pause(1.0)
+
+            assert len(client.conditional_calls) >= 3
+            assert all(client.conditional_calls[1:])
+            assert len(renders) == painted
+            assert app._refresh_failures == 0
+            assert [group.name for group in app.project_targets.ephemeral] == ["collect"]
 
     asyncio.run(scenario())

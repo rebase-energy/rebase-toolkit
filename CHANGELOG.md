@@ -4,20 +4,55 @@
 
 ### Added
 
+- **The TUI's workspace switcher lists your workspaces, then their environments.** `w`,
+  or a click on the title, now opens two tables: every workspace the signed-in profile
+  belongs to, and beneath it the environments of the one under the cursor, which refill
+  as the cursor moves. Enter on a workspace hands the cursor down; enter on an environment
+  is what switches, so a stray keypress never changes what you are looking at. The
+  profiles moved one key further in, to `f`: a profile is which server and sign-in the
+  whole machine uses, where a workspace is one tenant on that server. Memberships are a
+  person's, not an API key's, so a key-backed profile lists them on the session `rebase
+  setup` signed in with (`Client.as_session()`), and says what to do when there is none.
+
+- **Switching workspace or environment in the TUI is now this process's alone.** Neither
+  `w` nor `v` writes to `~/.rebase/config.json` any more. The directory marker and the
+  profile still decide where `rebase tui` opens, and a switch is free to leave them — it
+  says so when it leaves a pinned workspace — but two terminals on one machine can hold
+  two different workspaces at once, and the next launch in a directory comes back to that
+  directory's workspace. The live selection is exported as `REBASE_WORKSPACE` and
+  `REBASE_ENVIRONMENT`, the same variables `--workspace` sets, so an editor or shell
+  opened from the TUI inherits it; both are put back on exit. `t` is the one deliberate
+  write: it makes the live workspace and environment the profile's default, the way
+  `rebase workspace use` does. Picking a profile with `f` still switches the whole
+  machine, as before. `Client.with_workspace(id, environment_name=...)` is the clone the
+  TUI uses; an API key does not travel across it, for the reason `--workspace` drops one.
+
 - **`i` in the TUI opens a graph pane beside the tables.** On a run, or on the timeline
   of one, it draws the workflow's steps as a directed graph, each step coloured by how
   far that run got — and moving the cursor through the runs table recolours it, so a
-  failed step stands out without opening the run. Edges that carry data between steps
-  are drawn bright; the ones that only fix the order are dimmed. On the workflows table
-  it draws the cursor's workflow as deployed, and a workflow with no steps shows the
-  project's triggers instead: which workflows run after which, and which run when a
-  dataset updates, with the cursor's workflow picked out. A step called more than once
-  is labelled with its literal arguments, so twelve `match-quarter` nodes read as
-  `match-quarter · current · fortnox` and so on. Hover or click a step to light
+  failed step stands out without opening the run. It is the data-dependency graph: an
+  edge means one step reads another's output, and the ordering edge the compiler adds
+  between consecutive steps is not drawn, so a pipeline that fans one result out to
+  many steps draws as a fan rather than a chain with a line to every node. The
+  timeline's dependency column follows the same definition. A graph that is wider
+  than it is deep is laid out left to right, with the gaps between stacked boxes
+  halved to match a terminal cell's height, so a fan of fourteen steps runs down the
+  pane's long side instead of being squeezed into one unreadable row. On the
+  workflows table it draws the cursor's workflow as deployed, and a workflow with no
+  steps shows the project's triggers instead: which workflows run after which, and
+  which run when a dataset updates, with the cursor's workflow picked out. A step
+  called more than once is labelled by its literal arguments alone, so twelve
+  `match-quarter` boxes read `current · fortnox` and so on, the legend names the
+  steps drawn that way, and the readout gives the full name — the box is what the
+  picture is scaled by, and a step name repeated down a rank is what shrinks the text
+  past reading. Hover or click a step to light
   everything it waits on. The pane draws with [plotui](https://pypi.org/project/plotui/),
   an optional extra — `pip install "rebase-toolkit[graph]"` — that renders as a terminal
   image, so it needs Kitty, Ghostty, iTerm2, WezTerm or Konsole; elsewhere, and without
-  the extra, the pane says so. `escape` and `b` close it before doing anything else.
+  the extra, the pane says so. `m` while the pane is open gives it the whole screen —
+  the graph is drawn at the largest text size that fits, so the width is what makes
+  a wide pipeline readable — and `m` or `b` give the tables back. `escape` and `b`
+  close it before doing anything else.
 
 - **The workflows table shows a day of run history as a bar chart.** A `History` column
   next to `Last run` — and `Schedule`, `Next run`, `Last run` and `History` now come
@@ -360,6 +395,31 @@
   options got one. The remaining 34 lost the letter to an option declared earlier in the same
   command (`rebase deploy --sync` has no `-s`, because `--source` took it), and `-h` is reserved
   for `--help` throughout. Hand-written short flags are unchanged.
+
+### Changed
+
+- **Run lists are summaries; a run's body is one request away.** `Client.list_runs`,
+  `rebase run list` and the overviews behind the TUI no longer carry each run's `result`
+  and `parameters`. A list is read to see what ran, and one run's result can be a
+  megabyte: a project whose functions return large results could not be opened in the
+  TUI at all, because 200 of them at once was more than the platform would send. Each
+  row now says how big the bodies are instead — `result_bytes`, `parameters_bytes` — and
+  `Client.list_runs(include=["result", "parameters"])` or `rebase run list --include
+  result,parameters` asks for the whole records where a script wants them. `rebase run
+  get` and `Client.get_run` are unchanged. In the TUI, `p` on a run opens the drawer at
+  once on the sizes and reads the record behind it, once, off the screen's thread; a run
+  opened with Enter is not read twice. Against a platform older than this the lists
+  still carry the bodies, and nothing else changes.
+
+- **The TUI's timer no longer repaints a view that did not change.** The overview routes
+  answer with an ETag, and the periodic re-read sends it back: a platform that confirms
+  nothing changed (`304`) costs one round trip and no repaint, which is what most ticks
+  are. `r` still re-reads in full. `Client.read_workspace_overview` and
+  `read_project_overview` are the reads that can answer "unchanged"; the `get_*` pair
+  keep their shape. The project overview also now carries the platform's own folding of
+  one-off runs per name (`ephemeral_targets`) and the newest run of each deployed target
+  (`latest_runs_by_target`), so a workflow idle since yesterday keeps its Last run even
+  though the page of runs the view is sent got shorter. Responses come back gzipped.
 
 ### Removed
 

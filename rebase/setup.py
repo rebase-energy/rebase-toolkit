@@ -761,8 +761,32 @@ def _stored_session() -> Any | None:
         return None
 
 
+def _session_is_for_another_identity_provider(session: Any | None, config: dict[str, Any]) -> tuple[str, str] | None:
+    """The stored session's issuer and this API's, when they are not the same project.
+
+    A session is minted by one Supabase project and means nothing to another. Offering
+    it as "Continue as you" would sign in with a token the API cannot verify -- and
+    refreshing it first would spend a round trip on the wrong project to get there.
+    """
+    stored = getattr(session, "supabase_url", None)
+    expected = config.get("supabase_url")
+    if not isinstance(stored, str) or not stored or not isinstance(expected, str) or not expected:
+        return None
+    if stored.rstrip("/") == expected.rstrip("/"):
+        return None
+    return stored.rstrip("/"), expected.rstrip("/")
+
+
 def _access_token(args: Any, config: dict[str, Any]) -> str:
     if not args.force_auth:
+        mismatch = _session_is_for_another_identity_provider(_stored_session(), config)
+        if mismatch is not None:
+            stored, expected = mismatch
+            _hint(
+                f"The stored session was issued by {stored}, but this API signs in through {expected}; "
+                "signing in afresh."
+            )
+            return _oauth_session(args, config)
         try:
             token = load_access_token()
         except AuthError as exc:

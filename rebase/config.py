@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
@@ -17,13 +18,65 @@ DEFAULT_PROFILE = "default"
 CONFIG_PATH_ENV = "REBASE_CONFIG_PATH"
 LOCAL_CONFIG_DIRNAME = ".rebase"
 LOCAL_CONFIG_FILENAME = "config.json"
+# Which toolkit deployment this machine talks to. Absent on every ordinary install: the
+# hosted platform is the only one, and nothing here is surfaced. A pointer file names a
+# second deployment, and the config and session then live in a directory of their own,
+# so the profiles, sessions and workspace settings of one platform never mix with the
+# other's. The name is a path component, hence the shape check.
+PLATFORM_ENV = "REBASE_PLATFORM"
+DEFAULT_PLATFORM = "production"
+_PLATFORM_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+def platform_pointer_path() -> Path:
+    return Path.home() / LOCAL_CONFIG_DIRNAME / "platform"
+
+
+def active_platform() -> str:
+    """The named deployment in force: the environment, then the pointer file, then the default.
+
+    A malformed name is an error rather than a fallback. The file only ever exists on a
+    developer's machine, and quietly reverting to production is the one outcome the
+    pointer exists to prevent.
+    """
+    name = os.getenv(PLATFORM_ENV)
+    source = f"${PLATFORM_ENV}"
+    if not name:
+        pointer = platform_pointer_path()
+        try:
+            name = pointer.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return DEFAULT_PLATFORM
+        except OSError as exc:
+            raise RuntimeError(f"cannot read the platform pointer {pointer}: {exc}") from exc
+        source = str(pointer)
+        if not name:
+            return DEFAULT_PLATFORM
+    if not _PLATFORM_NAME.fullmatch(name):
+        raise RuntimeError(f"invalid platform name {name!r} in {source}: use lowercase letters, digits, '-' or '_'")
+    return name
+
+
+def is_default_platform() -> bool:
+    return active_platform() == DEFAULT_PLATFORM
+
+
+def platform_dir(name: str) -> Path:
+    return Path.home() / LOCAL_CONFIG_DIRNAME / "platforms" / name
+
+
+def platform_auth_path(name: str, config_home: Path) -> Path:
+    return config_home / "rebase" / "platforms" / name / "auth.json"
 
 
 def config_path() -> Path:
     override = os.getenv(CONFIG_PATH_ENV)
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".rebase" / "config.json"
+    platform = active_platform()
+    if platform != DEFAULT_PLATFORM:
+        return platform_dir(platform) / LOCAL_CONFIG_FILENAME
+    return Path.home() / LOCAL_CONFIG_DIRNAME / LOCAL_CONFIG_FILENAME
 
 
 def find_local_config(start: str | Path | None = None) -> Path | None:
@@ -34,7 +87,9 @@ def find_local_config(start: str | Path | None = None) -> Path | None:
 
     The global config lives at `~/.rebase/config.json`, which sits directly on this
     walk for any repo under the home directory. It is credentials, not a marker, so
-    it is skipped — otherwise every lookup outside a marked repo would "find" it.
+    it is skipped — otherwise every lookup outside a marked repo would "find" it. A
+    platform's config sits under `~/.rebase/platforms/<name>/` and can never be a
+    candidate here, since a candidate's parent directory is always `.rebase` itself.
     """
     try:
         current = Path(start).expanduser().resolve() if start else Path.cwd().resolve()

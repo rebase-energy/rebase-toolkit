@@ -192,6 +192,8 @@ def test_admin_tui_lists_every_workspace_and_flags_defaults() -> None:
             assert str(table.get_cell_at(Coordinate(0, 0))) == "agent-work"
             assert str(table.get_cell_at(Coordinate(1, 8))) == "defaults"
             assert app.sub_title == "2 workspaces"
+            # The same brand theme as the main TUI: green key hints, not orange.
+            assert app.theme == "rebase"
             # Nothing selected yet: the pane below invites rather than shows.
             assert app.query_one("#admin-detail-members", DataTable).display is False
 

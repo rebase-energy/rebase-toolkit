@@ -212,6 +212,28 @@ PROJECT_BATCH_DELETE_LIMIT = 100
 #: error is what surfaced "Delete failed -- Method Not Allowed" instead of falling
 #: back to one request per project.
 ROUTE_ABSENT_STATUSES = frozenset({404, 405})
+#: What a run list can be asked to carry beyond its summary rows. The platform answers
+#: with the whole record when either is named: `parameters` is required on it and a
+#: null `result` already means "none yet", so a half-filled record would be
+#: indistinguishable from a real one.
+RUN_INCLUDES = frozenset({"result", "parameters"})
+
+
+@dataclass(frozen=True)
+class OverviewRead:
+    """One read of a composite view.
+
+    `payload` is the view, or None. `unchanged` says which None it is: the platform
+    answered 304 to the ETag we sent, so what the caller already holds is still the
+    truth. Without it, None means the platform has no such route (`absent`).
+    """
+
+    payload: dict[str, Any] | None
+    unchanged: bool = False
+
+    @property
+    def absent(self) -> bool:
+        return self.payload is None and not self.unchanged
 
 
 def _resolve_run_target(
@@ -2486,6 +2508,12 @@ class Client:
         # refresh rather than once. A platform upgraded mid-session is picked up on the
         # next run, which is soon enough for a route whose absence only costs speed.
         self._absent_routes: set[str] = set()
+        # The ETag of the last composite view read, per path, per workspace and
+        # environment it was read in. A conditional re-read sends it back and gets a 304
+        # when nothing changed, which is most of the TUI's ticks. Deliberately not copied
+        # by `_clone`/`as_session`: a clone is what a workspace or environment switch
+        # produces, and its first read must be answered in full.
+        self._etags: dict[tuple[str, str | None, str], str] = {}
 
     def _http_session(self) -> requests.Session:
         pid = os.getpid()
@@ -2497,11 +2525,52 @@ class Client:
         return self._session
 
     def with_environment(self, environment_name: str) -> Client:
+        return self._clone(workspace_id=self.workspace_id, environment_name=environment_name, api_key=self.api_key)
+
+    def with_workspace(self, workspace_id: str, *, environment_name: str | None = None) -> Client:
+        """The same credentials pointed at another workspace, for this process only.
+
+        Nothing is written to the profile: two terminals can each hold a different
+        workspace against one signed-in profile, and closing the process forgets the
+        choice. An API key does not travel across: it is minted for one workspace and
+        the server reads the workspace off the key row rather than the header, so the
+        clone falls through to the signed-in session the way `--workspace` does.
+        Without an environment the new workspace's configured default applies.
+        """
+        api_key = self.api_key if workspace_id == self.workspace_id else None
+        resolved_environment = environment_name or active_environment(workspace_id) or "dev"
+        return self._clone(workspace_id=workspace_id, environment_name=resolved_environment, api_key=api_key)
+
+    def as_session(self) -> Client | None:
+        """This client on the signed-in session instead of its API key; None without one.
+
+        `/me/workspaces` and the other personal routes answer to a person. An API key
+        belongs to one workspace and has no memberships to list, so a key-backed
+        profile has to step over to the session `rebase setup` signed in with.
+        """
+        if not self.api_key:
+            return self
+        try:
+            token = load_access_token()
+        except AuthError:
+            return None
+        if token is None:
+            return None
         clone = Client(
-            api_key=self.api_key,
+            access_token=token,
+            api_url=self.api_url,
+            workspace_id=self.workspace_id,
+            environment_name=self.environment_name,
+        )
+        clone._absent_routes = self._absent_routes
+        return clone
+
+    def _clone(self, *, workspace_id: str | None, environment_name: str, api_key: str | None) -> Client:
+        clone = Client(
+            api_key=api_key,
             api_url=self.api_url,
             access_token=self.access_token,
-            workspace_id=self.workspace_id,
+            workspace_id=workspace_id,
             environment_name=environment_name,
         )
         clone._cached_disk_token = self._cached_disk_token
@@ -3243,18 +3312,59 @@ class Client:
     def get_workspace(self) -> dict[str, Any]:
         return self._request_dict("GET", "/workspace", expected="workspace response")
 
-    def _composite_read(self, path: str, *, expected: str, route: str | None = None) -> dict[str, Any] | None:
-        """A whole-view read, or None where the platform has no such route."""
+    def _composite_read(
+        self, path: str, *, expected: str, route: str | None = None, conditional: bool = False
+    ) -> OverviewRead:
+        """A whole-view read; absent where the platform has no such route.
+
+        With `conditional`, the ETag of the last answer for this path is sent back as
+        `If-None-Match`, and a 304 comes back as `unchanged` rather than as a payload.
+        This goes through `_request_response` rather than `request()` because a 304 has
+        no body to parse. A platform without ETags never answers 304, so against it a
+        conditional read is an ordinary one.
+        """
         key = route or path
         if key in self._absent_routes:
-            return None
+            return OverviewRead(None)
+        etag_key = (path, self.workspace_id, _environment_context.get() or self.environment_name)
+        headers: dict[str, str] = {}
+        if conditional and (etag := self._etags.get(etag_key)):
+            headers["If-None-Match"] = etag
         try:
-            return self._request_dict("GET", path, expected=expected)
+            response = self._request_response("GET", path, headers=headers)
         except RebaseWorkflowError as exc:
             if exc.status_code in ROUTE_ABSENT_STATUSES:
                 self._absent_routes.add(key)
-                return None
+                return OverviewRead(None)
             raise
+        if getattr(response, "status_code", None) == 304:
+            return OverviewRead(None, unchanged=True)
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RebaseWorkflowError(f"expected {expected}")
+        etag = (getattr(response, "headers", None) or {}).get("ETag")
+        if isinstance(etag, str) and etag:
+            self._etags[etag_key] = etag
+        return OverviewRead(payload)
+
+    def read_workspace_overview(self, *, conditional: bool = True) -> OverviewRead:
+        """`get_workspace_overview`, with the answer's provenance.
+
+        `unchanged` when the platform confirmed the last answer still stands, which is
+        the one a periodic re-read wants to hear: nothing to parse, nothing to repaint.
+        """
+        return self._composite_read(
+            "/workspace/overview", expected="workspace overview response", conditional=conditional
+        )
+
+    def read_project_overview(self, project_id: str, *, conditional: bool = True) -> OverviewRead:
+        """`get_project_overview`, with the answer's provenance; see `read_workspace_overview`."""
+        return self._composite_read(
+            f"/projects/{project_id}/overview",
+            expected="project overview response",
+            route="/projects/*/overview",
+            conditional=conditional,
+        )
 
     def get_workspace_overview(self) -> dict[str, Any] | None:
         """Everything the workspace view draws, in one request, where the API offers it.
@@ -3262,17 +3372,18 @@ class Client:
         `None` on an API old enough not to have the route, so the caller can fall back to
         assembling the same answer from the individual list calls. That fallback is not
         theoretical: a toolkit is routinely ahead of the platform it is pointed at.
+
+        Never conditional, so None keeps meaning "absent"; `read_workspace_overview` is
+        the one that can answer "unchanged".
         """
-        return self._composite_read("/workspace/overview", expected="workspace overview response")
+        return self.read_workspace_overview(conditional=False).payload
 
     def get_project_overview(self, project_id: str) -> dict[str, Any] | None:
         """Everything the project view draws, in one request, where the API offers it.
 
         `None` when the route is absent, on the same terms as `get_workspace_overview`.
         """
-        return self._composite_read(
-            f"/projects/{project_id}/overview", expected="project overview response", route="/projects/*/overview"
-        )
+        return self.read_project_overview(project_id, conditional=False).payload
 
     def update_workspace(
         self,
@@ -4597,9 +4708,7 @@ class Client:
         )
 
     def get_admin_workspace_usage(self, workspace_id: str) -> dict[str, Any]:
-        return self._request_dict(
-            "GET", f"/admin/workspaces/{workspace_id}/usage", expected="workspace usage response"
-        )
+        return self._request_dict("GET", f"/admin/workspaces/{workspace_id}/usage", expected="workspace usage response")
 
     def update_admin_compute_policy(
         self,
@@ -4655,14 +4764,27 @@ class Client:
         status: str | None = None,
         trigger_source: str | None = None,
         limit: int = 100,
+        include: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Runs, newest first. Name what ran with `target_id` + `target_type`.
+
+        The rows are summaries: status, target and timestamps, plus `result_bytes` and
+        `parameters_bytes` saying how big the bodies are, but not the bodies themselves —
+        a list is read to see what ran, and one run's result can be a megabyte. Pass
+        `include=["result", "parameters"]` for the whole record per row, or read one run
+        with `get_run`. A platform older than this parameter ignores it and sends the
+        whole record either way, so treat `result` and `parameters` as optional keys.
 
         `workflow_id` / `function_id` / `model_id` are kept as spellings of the same
         filter, because a run's own `workflow_id` column is null for an ordinary
         registered run -- what it ran is `target_type` + `target_id`, and that is what
         `/runs` filters on.
         """
+        unknown = sorted(set(include or ()) - RUN_INCLUDES)
+        if unknown:
+            raise RebaseWorkflowError(
+                f"unknown include value(s): {', '.join(unknown)}; expected {', '.join(sorted(RUN_INCLUDES))}"
+            )
         resolved_id, resolved_type = _resolve_run_target(
             target_id=target_id,
             target_type=target_type,
@@ -4681,6 +4803,7 @@ class Client:
                 "status": status,
                 "trigger_source": trigger_source,
                 "limit": limit,
+                "include": ",".join(include) if include else None,
             }.items()
             if value is not None
         }

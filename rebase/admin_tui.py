@@ -49,6 +49,7 @@ from rebase.tui import (
     HeaderSafeDataTable,
     RebaseHeader,
     TableView,
+    apply_rebase_theme,
 )
 
 WORKSPACES_TABLE_ID = "admin-workspaces-table"
@@ -569,6 +570,7 @@ class RebaseAdminApp(App[None]):
         refresh_interval: float = AUTO_REFRESH_SECONDS,
     ) -> None:
         super().__init__()
+        apply_rebase_theme(self)
         self.data = data or AdminTuiData(client or Client(), limit=limit)
         self.workspaces: list[dict[str, Any]] = []
         #: The workspace the detail pane is showing, so a refresh or an edit updates it.

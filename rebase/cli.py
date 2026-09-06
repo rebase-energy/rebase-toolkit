@@ -39,6 +39,7 @@ from rebase.brand import (
 )
 from rebase.client import (
     DEFAULT_API_KEY_PERMISSIONS,
+    RUN_INCLUDES,
     Agent,
     ASGIApp,
     Bucket,
@@ -66,8 +67,11 @@ from rebase.client import (
     set_build_log_consumer,
 )
 from rebase.config import (
+    DEFAULT_PLATFORM,
     DEFAULT_PROFILE,
     DEFAULT_SERVER_URL,
+    PLATFORM_ENV,
+    active_platform,
     add_search_path,
     config_path,
     editor_settings,
@@ -1457,8 +1461,12 @@ def _profile_show_data(profile: str | None = None) -> dict[str, Any]:
         has_auth_session=auth["exists"],
     )
     local_config = find_local_config()
+    platform = active_platform()
     return {
         **summary,
+        # Only when it is not the hosted platform: an ordinary install never has one
+        # to name, and its output stays exactly as it was.
+        **({"platform": platform} if platform != DEFAULT_PLATFORM else {}),
         "exists": profile_exists,
         "active_profile": active_profile,
         "config_file": str(config_path()),
@@ -1481,6 +1489,8 @@ def _profile_show_table(data: dict[str, Any]) -> Table:
     table.add_column("Field", style="rebase.muted")
     table.add_column("Value", style="rebase.value", overflow="fold")
     auth = data.get("auth") if isinstance(data.get("auth"), dict) else {}
+    if data.get("platform"):
+        table.add_row("Platform", _format_value(data.get("platform")))
     table.add_row("Active profile", _format_value(data.get("active_profile")))
     table.add_row("Profile", _format_value(data.get("profile")))
     table.add_row("Profile exists", "yes" if data.get("exists") else "no")
@@ -6349,6 +6359,23 @@ def run_command(
     console.print_json(data=result)
 
 
+def _run_include_fields(include: str | None) -> dict[str, list[str]]:
+    """`--include a,b` as the `include=` keyword for `Client.list_runs`, or nothing.
+
+    Empty when the flag was not given, so the call sends no parameter and an older
+    platform sees the request it always did.
+    """
+    fields = [field.strip() for field in (include or "").split(",") if field.strip()]
+    if not fields:
+        return {}
+    unknown = sorted(set(fields) - RUN_INCLUDES)
+    if unknown:
+        raise RebaseWorkflowError(
+            f"--include does not know {', '.join(unknown)}; expected {', '.join(sorted(RUN_INCLUDES))}"
+        )
+    return {"include": fields}
+
+
 @run_app.command("list")
 def run_list_command(
     project: Annotated[str | None, typer.Option("--project", "-p", help="Filter by project name.")] = None,
@@ -6357,11 +6384,26 @@ def run_list_command(
         typer.Option("--target-type", "-t", help="Filter by target type: function, workflow, or model."),
     ] = None,
     limit: Annotated[int, typer.Option("--limit", "-l", min=1, max=500, help="Maximum number of runs to list.")] = 100,
+    include: Annotated[
+        str | None,
+        typer.Option(
+            "--include",
+            "-i",
+            help="Comma-separated bodies the rows leave out by default: result, parameters. "
+            "Naming either returns each run's whole record.",
+        ),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
-    """List submitted runs in the active workspace."""
+    """List submitted runs in the active workspace.
+
+    The rows are summaries — what ran, its status and when — with the size of each
+    run's result and parameters rather than the bodies. `--include result,parameters`
+    asks for the whole records, and `rebase run get` shows one run's.
+    """
     if target_type is not None and target_type not in {"function", "workflow", "model"}:
         raise RebaseWorkflowError("--target-type must be 'function', 'workflow', or 'model'")
+    fields = _run_include_fields(include)
 
     client = Client()
     project_id: str | None = None
@@ -6369,7 +6411,7 @@ def run_list_command(
         project_data = _resolve_project_by_name(client, project)
         project_id = str(project_data["id"])
 
-    runs = client.list_runs(project_id=project_id, target_type=target_type, limit=limit)
+    runs = client.list_runs(project_id=project_id, target_type=target_type, limit=limit, **fields)
     if json_output:
         _print_json(runs)
         return
@@ -7137,14 +7179,19 @@ def hillclimb_start_command(
 @hillclimb_app.command("list")
 def hillclimb_list_command(
     limit: Annotated[int, typer.Option("--limit", "-l", min=1, max=500)] = 50,
+    include: Annotated[
+        str | None,
+        typer.Option("--include", "-i", help="Comma-separated bodies to add to each row: result, parameters."),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", "-j")] = False,
 ) -> None:
     """List hosted hillclimb search runs."""
     module = _hillclimb()
+    fields = _run_include_fields(include)
     client = Client()
     runs = [
         run
-        for run in client.list_runs(target_type="function", limit=limit)
+        for run in client.list_runs(target_type="function", limit=limit, **fields)
         if str(run.get("name", "")).startswith(module.RUN_NAME_PREFIX)
     ]
     if json_output:
@@ -7271,6 +7318,12 @@ def _parse_logo_variant(args: list[str]) -> tuple[int, list[str]]:
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
+    # Pinned for the life of the process, so a long-running TUI keeps reading and
+    # writing the platform it started on even if the pointer file changes underneath
+    # it, and anything it spawns inherits the same one. Nothing is set on the default.
+    platform = active_platform()
+    if platform != DEFAULT_PLATFORM:
+        os.environ.setdefault(PLATFORM_ENV, platform)
     logo_variant, args = _parse_logo_variant(list(args))
     if not args or args in (["--help"], ["-h"]):
         console.print(_banner(logo_variant))

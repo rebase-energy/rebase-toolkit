@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -1459,6 +1460,63 @@ def test_setup_offers_to_switch_account_when_a_session_is_stored(monkeypatch) ->
         setup_module.SWITCH_ACCOUNT,
     ]
     assert observed["default"] == "Continue as 1234+bob@users.noreply.github.com (via github)"
+
+
+def test_setup_signs_in_fresh_when_the_stored_session_is_for_another_supabase_project(monkeypatch) -> None:
+    """A session is minted by one Supabase project and means nothing to another."""
+    from rebase import setup as setup_module
+
+    hints: list[str] = []
+    monkeypatch.setattr(setup_module, "_can_prompt", lambda: True)
+    monkeypatch.setattr(setup_module, "load_access_token", lambda: pytest.fail("must not refresh the wrong session"))
+    monkeypatch.setattr(
+        setup_module,
+        "load_session",
+        lambda: AuthSession(
+            access_token="stored-token",
+            refresh_token="refresh-token",
+            expires_at=2_000_000_000,
+            token_type="bearer",
+            supabase_url="https://oyldgfpjnmfzsradovyi.supabase.co",
+        ),
+    )
+    monkeypatch.setattr(setup_module, "_choose", lambda *args, **kwargs: pytest.fail("must not offer Continue as"))
+    monkeypatch.setattr(setup_module, "_hint", hints.append)
+    monkeypatch.setattr(setup_module, "_oauth_session", lambda args, config: "new-token")
+    config = {"supabase_url": "https://rgglvcamwgatiwfztqyd.supabase.co/", "supabase_anon_key": "anon"}
+
+    assert setup_module._access_token(_auth_args(), config) == "new-token"
+    assert hints and "oyldgfpjnmfzsradovyi" in hints[0] and "rgglvcamwgatiwfztqyd" in hints[0]
+
+
+def test_setup_still_offers_the_stored_session_when_the_supabase_project_matches(monkeypatch) -> None:
+    from rebase import setup as setup_module
+
+    offered: list[list[str]] = []
+    monkeypatch.setattr(setup_module, "_can_prompt", lambda: True)
+    monkeypatch.setattr(setup_module, "load_access_token", lambda: "stored-token")
+    monkeypatch.setattr(
+        setup_module,
+        "load_session",
+        lambda: AuthSession(
+            access_token="stored-token",
+            refresh_token="refresh-token",
+            expires_at=2_000_000_000,
+            token_type="bearer",
+            email="bob@example.com",
+            supabase_url="https://rgglvcamwgatiwfztqyd.supabase.co",
+        ),
+    )
+
+    def choose(label: str, values: list[str], **kwargs: Any) -> str:
+        offered.append(values)
+        return values[0]
+
+    monkeypatch.setattr(setup_module, "_choose", choose)
+    config = {"supabase_url": "https://rgglvcamwgatiwfztqyd.supabase.co/", "supabase_anon_key": "anon"}
+
+    assert setup_module._access_token(_auth_args(), config) == "stored-token"
+    assert offered and offered[0][0].startswith("Continue as bob@example.com")
 
 
 def test_setup_keeps_the_stored_session_when_you_continue(monkeypatch) -> None:
@@ -3013,6 +3071,44 @@ def test_profile_list_json_does_not_leak_api_keys(monkeypatch, tmp_path: Path, c
         }
     ]
     assert "rbw_secret" not in output
+
+
+def test_profile_command_names_the_platform_only_when_not_production(monkeypatch, tmp_path: Path, capsys) -> None:
+    """An ordinary install has one platform and never hears the word."""
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(tmp_path / "config.json"))
+    monkeypatch.setenv("REBASE_AUTH_FILE", str(tmp_path / "auth.json"))
+
+    assert main(["profile"]) == 0
+    assert "Platform" not in capsys.readouterr().out
+
+    monkeypatch.setenv("REBASE_PLATFORM", "staging")
+    assert main(["profile"]) == 0
+    output = capsys.readouterr().out
+    assert "Platform" in output and "staging" in output
+
+    assert main(["profile", "show", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["platform"] == "staging"
+    monkeypatch.setenv("REBASE_PLATFORM", "production")
+    assert main(["profile", "show", "--json"]) == 0
+    assert "platform" not in json.loads(capsys.readouterr().out)
+
+
+def test_main_pins_a_non_default_platform_into_the_environment(monkeypatch, tmp_path: Path, capsys) -> None:
+    """A running process keeps its platform even if the pointer file changes under it."""
+    home = tmp_path / "home"
+    (home / ".rebase").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("REBASE_PLATFORM", raising=False)
+    monkeypatch.setenv("REBASE_CONFIG_PATH", str(tmp_path / "config.json"))
+    monkeypatch.setenv("REBASE_AUTH_FILE", str(tmp_path / "auth.json"))
+
+    assert main(["profile"]) == 0
+    assert "REBASE_PLATFORM" not in os.environ
+
+    (home / ".rebase" / "platform").write_text("staging\n", encoding="utf-8")
+    assert main(["profile"]) == 0
+    assert os.environ["REBASE_PLATFORM"] == "staging"
+    assert "staging" in capsys.readouterr().out
 
 
 def test_profile_show_json_returns_safe_profile_metadata(monkeypatch, tmp_path: Path, capsys) -> None:
@@ -5595,3 +5691,23 @@ def test_bare_admin_opens_the_tui_lazily(monkeypatch) -> None:
 
     assert main(["admin"]) == 0
     assert opened == [True]
+
+
+def test_run_list_command_include_asks_for_the_bodies(monkeypatch, capsys) -> None:
+    """The rows are summaries by default; `--include` is how a script gets the bodies."""
+    observed: list[dict[str, Any]] = []
+
+    def list_runs(self: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        observed.append(kwargs)
+        return [{"id": "run-id", "status": "queued", "result_bytes": 12}]
+
+    monkeypatch.setattr(Client, "list_runs", list_runs)
+
+    assert main(["run", "list", "--json"]) == 0
+    assert "include" not in observed[-1]
+
+    assert main(["run", "list", "--json", "--include", "result,parameters"]) == 0
+    assert observed[-1]["include"] == ["result", "parameters"]
+
+    assert main(["run", "list", "--json", "--include", "results"]) != 0
+    assert "--include does not know results" in capsys.readouterr().err

@@ -14,6 +14,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import requests
 
+from rebase.config import DEFAULT_PLATFORM, active_platform, platform_auth_path
+
 
 class AuthError(RuntimeError):
     pass
@@ -60,6 +62,11 @@ def auth_file_path() -> Path:
     if override:
         return Path(override).expanduser()
     config_home = Path(os.getenv("XDG_CONFIG_HOME", "~/.config")).expanduser()
+    # A second deployment signs in through its own identity provider, so its session
+    # is its own file: signing in there must not replace the session for the first.
+    platform = active_platform()
+    if platform != DEFAULT_PLATFORM:
+        return platform_auth_path(platform, config_home)
     return config_home / "rebase" / "auth.json"
 
 

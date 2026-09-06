@@ -11,6 +11,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture(autouse=True)
+def _pin_the_hosted_platform(monkeypatch):
+    """A developer's laptop may carry a `~/.rebase/platform` pointer; the suite must
+    not follow it. Tests of the pointer itself unset this and point HOME at tmp_path."""
+    monkeypatch.setenv("REBASE_PLATFORM", "production")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_dataset_registry():
     """Datasets declared with a contract/freshness register process-wide (deploy
     preflight relies on it); tests must not leak registrations across modules."""

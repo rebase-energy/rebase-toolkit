@@ -4,6 +4,7 @@ import ast
 import asyncio
 import json
 import math
+import os
 import subprocess
 import textwrap
 import webbrowser
@@ -36,6 +37,7 @@ from textual.geometry import Offset
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.selection import SELECT_ALL, Selection
+from textual.theme import BUILTIN_THEMES, Theme
 from textual.widget import Widget
 from textual.widgets import (
     DataTable,
@@ -64,10 +66,14 @@ from rebase.brand import (
     BRAND_MEDIUM_GRAY,
     status_colour,
 )
-from rebase.client import Client, RebaseWorkflowError, run_timing_summary
+from rebase.client import Client, OverviewRead, RebaseWorkflowError, run_timing_summary
 from rebase.config import (
+    DEFAULT_PLATFORM,
+    active_environment,
+    active_platform,
     add_search_path,
     editor_settings,
+    is_default_platform,
     list_profiles,
     load_profile,
     local_workspace_id,
@@ -75,6 +81,7 @@ from rebase.config import (
     selected_profile_name,
     set_active_environment,
     set_default_profile,
+    set_profile_workspace,
     workspace_key,
 )
 from rebase.editor import NO_EDITOR_HINT, build_argv, resolve_editor, run_foreground, spawn_detached
@@ -86,11 +93,13 @@ from rebase.locate import (
     is_risky_root,
     project_folder,
 )
-from rebase.tui_graph import node_index, step_dag, trigger_dag, workflow_key
+from rebase.tui_graph import data_upstream_keys, node_index, step_dag, trigger_dag, workflow_key
 from rebase.tui_graph_pane import GraphPane
 
 TargetType = Literal["function", "workflow"]
-ViewName = Literal["workspace", "project", "workspace-switcher"]
+ViewName = Literal["workspace", "project", "workspace-switcher", "profile-switcher"]
+#: The process variables a switch in the TUI exports, and puts back on the way out.
+SELECTION_VARIABLES = ("REBASE_WORKSPACE", "REBASE_ENVIRONMENT")
 DeletableKind = Literal["project", "function", "workflow"]
 
 #: Tables whose rows `d` can delete, and the kind of object each row is.
@@ -102,6 +111,35 @@ DELETABLE_TABLES: dict[str, DeletableKind] = {
 #: What a multi-item delete asks the user to type. Compared case-insensitively.
 CONFIRM_WORD = "delete"
 MARK_STYLE = f"bold {BRAND_AMBER}"
+
+#: Textual's stock dark theme, with its orange accent swapped for the brand green.
+#: The accent is what colours the key hints — the footer, the `?` keys panel, the
+#: command palette — and Textual's default is an orange that appears nowhere else in
+#: the toolkit. Everything else stays the stock theme's, so nothing already pinned in
+#: the apps' CSS shifts under it. `text-accent` is pinned too: Textual would otherwise
+#: derive a washed-out mint for it, and the keys panel reads its key names from there.
+REBASE_TEXTUAL_THEME = Theme(
+    name="rebase",
+    primary=BUILTIN_THEMES["textual-dark"].primary,
+    secondary=BUILTIN_THEMES["textual-dark"].secondary,
+    warning=BUILTIN_THEMES["textual-dark"].warning,
+    error=BUILTIN_THEMES["textual-dark"].error,
+    success=BUILTIN_THEMES["textual-dark"].success,
+    foreground=BUILTIN_THEMES["textual-dark"].foreground,
+    accent=BRAND_BRIGHT_GREEN,
+    variables={
+        "footer-key-foreground": BRAND_BRIGHT_GREEN,
+        "text-accent": BRAND_BRIGHT_GREEN,
+    },
+)
+
+
+def apply_rebase_theme(app: App[Any]) -> None:
+    """Register the brand theme on `app` and make it the one in use."""
+    app.register_theme(REBASE_TEXTUAL_THEME)
+    app.theme = REBASE_TEXTUAL_THEME.name
+
+
 #: Concurrent requests used to collect the workspace overview's per-project function counts.
 OVERVIEW_FANOUT_WORKERS = 16
 #: How many of a project's runs to read when working out when each function last ran.
@@ -152,7 +190,8 @@ REVEAL_LEVELS: tuple[tuple[str, ...], ...] = (
     ("#runs-table",),
     ("#timeline-pane",),
 )
-#: Header text per table, added when the rows are and never before. See `_setup_tables`.
+#: Header text per table. Local, so a table shows its header the moment it is on screen
+#: and keeps it while the rows are still on their way. See `_setup_tables`.
 TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "projects-table": (
         "Project",
@@ -166,6 +205,8 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "Created",
     ),
     "workspace-profiles-table": ("Active", "Profile", "Workspace", "Workspace ID", "API URL"),
+    "workspaces-table": ("Active", "Workspace", "Workspace ID", "Role"),
+    "workspace-environments-table": ("Active", "Environment", "Deploy mode", "Protected"),
     "buckets-table": ("Bucket", "URI", "Created", "Updated"),
     "secrets-table": ("Secret", "Keys"),
     # `Origin` sits second in both: you read what a thing is called, then what kind of
@@ -398,6 +439,14 @@ class OverviewCounts:
 
 
 @dataclass(frozen=True)
+class Unchanged:
+    """A conditional read the platform answered 304 to: what is on screen still stands."""
+
+
+UNCHANGED = Unchanged()
+
+
+@dataclass(frozen=True)
 class WorkspaceOverviewData:
     projects: list[dict[str, Any]]
     project_summaries: list[ProjectSummary]
@@ -556,7 +605,11 @@ def _optional_list(load: Callable[[], list[dict[str, Any]]]) -> list[dict[str, A
 
 
 def step_dependencies(step_graph: dict[str, Any] | None) -> dict[str, list[str]]:
-    """Each node's upstream steps, keyed by `node_key` and named the way rows are.
+    """Each node's data dependencies, keyed by `node_key` and named the way rows are.
+
+    The same edges the graph pane draws (`tui_graph.data_upstream_keys`): the steps
+    whose output a node reads, not the ordering edge the compiler adds to whichever
+    step ran before, which would make every row depend on the one above it.
 
     The graph addresses nodes by `node_key` (`count_to`) while a step row shows the
     node's `name` (`count-to`), so the keys are translated here rather than leaving the
@@ -579,10 +632,7 @@ def step_dependencies(step_graph: dict[str, Any] | None) -> dict[str, list[str]]
     for node in nodes:
         if not isinstance(node, dict) or not node.get("node_key"):
             continue
-        upstream = node.get("upstream_node_keys")
-        if not isinstance(upstream, list):
-            continue
-        dependencies[str(node["node_key"])] = [names.get(str(key), str(key)) for key in upstream]
+        dependencies[str(node["node_key"])] = [names.get(key, key) for key in data_upstream_keys(node)]
     return dependencies
 
 
@@ -636,6 +686,40 @@ def target_ids_by_identity(
         ("function", str(item["name"])): str(item["id"]) for item in functions if item.get("name") and item.get("id")
     }
     return mapping
+
+
+def ephemeral_groups_from_targets(
+    rows: list[dict[str, Any]],
+    deployed: Collection[tuple[str, str]] = (),
+) -> tuple[EphemeralGroup, ...]:
+    """`group_ephemeral_runs`, from the platform's own per-name aggregate.
+
+    The overview's `ephemeral_targets` rows are the same fold done in the database, over
+    every run in the window rather than the page the view happened to be sent. The
+    filtering and the order are kept here, on the same terms as `group_ephemeral_runs`:
+    which names count as deployed is the view's knowledge, not the query's.
+    """
+    known = set(deployed)
+    groups: list[EphemeralGroup] = []
+    for row in rows:
+        name = row.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        target_type = row.get("target_type")
+        identity = (target_type if isinstance(target_type, str) and target_type else "workflow", name)
+        if identity in known:
+            continue
+        last_run = row.get("last_run")
+        groups.append(
+            EphemeralGroup(
+                name=name,
+                target_type=identity[0],
+                run_type=format_execution(row),
+                runs=int(row.get("runs") or 0),
+                last_run=last_run if isinstance(last_run, str) and last_run else None,
+            )
+        )
+    return tuple(sorted(groups, key=lambda group: (group.last_run or "", group.name), reverse=True))
 
 
 def group_ephemeral_runs(
@@ -854,6 +938,26 @@ class RebaseTuiData:
         if callable(switch):
             self.client = switch(name)
 
+    def _read_composite(self, reader: str, getter: str, *args: Any, conditional: bool) -> OverviewRead | None:
+        """One composite view, through whichever of the two client methods exists.
+
+        `reader` is the conditional read that can answer "unchanged"; `getter` is the
+        older plain read, which a test double or an earlier client may be all that
+        offers. None when the client has neither, which is how the fan-out fallback is
+        chosen.
+        """
+        read = getattr(self.client, reader, None)
+        if callable(read):
+            return read(*args, conditional=conditional)
+        load = getattr(self.client, getter, None)
+        if not callable(load):
+            return None
+        return OverviewRead(load(*args))
+
+    def load_run_body(self, run_id: str) -> dict[str, Any]:
+        """The whole record of one run, for a drawer opened on a summary row."""
+        return self.client.get_run(run_id)
+
     def _optional_resource_list(self, method: str) -> list[dict[str, Any]]:
         load = getattr(self.client, method, None)
         if not callable(load):
@@ -943,23 +1047,26 @@ class RebaseTuiData:
             for project in projects
         ]
 
-    def load_workspace_composite(self) -> WorkspaceOverviewData | None:
+    def load_workspace_composite(self, *, conditional: bool = False) -> WorkspaceOverviewData | Unchanged | None:
         """The whole workspace view in one request, where the platform offers the route.
 
         `None` when this client has no such method (an older pairing, or a test double)
         or the platform has no such route, so the caller falls back to the fan-out. That
         is the common case against a platform behind the toolkit, not a rare one.
 
+        `UNCHANGED` when `conditional` and the platform confirmed the last answer still
+        stands, so a periodic re-read costs a round trip and nothing else.
+
         The payload is the raw lists rather than per-project counts, and the counts come
         from the same `_counts_from_rows` the fan-out uses — the cron-status rollup is
         real logic and belongs in one place.
         """
-        load = getattr(self.client, "get_workspace_overview", None)
-        if not callable(load):
+        read = self._read_composite("read_workspace_overview", "get_workspace_overview", conditional=conditional)
+        if read is None or read.absent:
             return None
-        payload = load()
-        if payload is None:
-            return None
+        if read.unchanged:
+            return UNCHANGED
+        payload = read.payload or {}
         projects = payload.get("projects") or []
         if self.project is not None and not any(project.get("name") == self.project for project in projects):
             raise RebaseWorkflowError(f"project not found: {self.project}")
@@ -982,7 +1089,7 @@ class RebaseTuiData:
             # fills them in after the paint.
         )
 
-    def load_workspace_overview(self) -> WorkspaceOverviewData:
+    def load_workspace_overview(self, *, conditional: bool = False) -> WorkspaceOverviewData | Unchanged:
         """Everything behind the workspace view: one request where the route exists.
 
         Falls back to all nine reads in flight at once where it does not.
@@ -996,7 +1103,7 @@ class RebaseTuiData:
         ~1.17s — the API absorbs the extra four requests. Painting the project table
         first would have bought it nothing and pushed the resource tables out to ~2.0s.
         """
-        composite = self.load_workspace_composite()
+        composite = self.load_workspace_composite(conditional=conditional)
         if composite is not None:
             return composite
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -1124,26 +1231,45 @@ class RebaseTuiData:
     def _counts_by_project(rows: list[dict[str, Any]]) -> dict[str, int]:
         return Counter(str(item["project_id"]) for item in rows if item.get("project_id"))
 
-    def load_project_composite(self, project: dict[str, Any]) -> ProjectTargetsData | None:
+    def load_project_composite(
+        self, project: dict[str, Any], *, conditional: bool = False
+    ) -> ProjectTargetsData | Unchanged | None:
         """Everything behind opening a project in one request, where the route exists.
 
         `None` when the client or the platform predates the route, so the caller falls
-        back to the two-phase fan-out.
+        back to the two-phase fan-out. `UNCHANGED` when `conditional` and the platform
+        confirmed the last answer still stands.
 
         This is where the composite route earns the most. Read separately, the current
         version of every workflow is a request each and the step rows behind Last run are
         a request per scanned run, so opening a project cost a round trip for every
         target in it.
         """
-        load = getattr(self.client, "get_project_overview", None)
-        if not callable(load):
+        read = self._read_composite(
+            "read_project_overview", "get_project_overview", str(project["id"]), conditional=conditional
+        )
+        if read is None or read.absent:
             return None
-        payload = load(str(project["id"]))
-        if payload is None:
-            return None
+        if read.unchanged:
+            return UNCHANGED
+        payload = read.payload or {}
         workflows = payload.get("workflows") or []
         functions = payload.get("functions") or []
         runs = payload.get("runs") or []
+        # The platform's own answers to two questions the view used to derive from the
+        # run page: the newest run of each deployed target, and the one-off runs folded
+        # per name. Both see every run in the window, where the page is the newest few
+        # dozen, so a target idle since yesterday keeps its Last run. A platform without
+        # them sends a wider page, and the page-based derivation still applies.
+        latest_by_target = payload.get("latest_runs_by_target")
+        last_run_rows = runs + latest_by_target if isinstance(latest_by_target, list) else runs
+        deployed = deployed_identities(workflows, functions)
+        targets = payload.get("ephemeral_targets")
+        ephemeral = (
+            ephemeral_groups_from_targets(targets, deployed)
+            if isinstance(targets, list)
+            else group_ephemeral_runs(runs, deployed)
+        )
         versions = {
             str(workflow_id): version
             for workflow_id, version in (payload.get("current_workflow_versions") or {}).items()
@@ -1166,17 +1292,19 @@ class RebaseTuiData:
             workflow_versions=versions,
             last_runs=self.load_last_runs(
                 str(project["id"]),
-                runs,
+                last_run_rows,
                 target_ids,
                 step_runs=payload.get("step_runs") or [],
             ),
-            ephemeral=group_ephemeral_runs(runs, deployed_identities(workflows, functions)),
+            ephemeral=ephemeral,
             run_history=run_history,
         )
 
-    def load_project_targets(self, project: dict[str, Any]) -> ProjectTargetsData:
+    def load_project_targets(
+        self, project: dict[str, Any], *, conditional: bool = False
+    ) -> ProjectTargetsData | Unchanged:
         """Everything behind opening a project, for callers that want it in one piece."""
-        composite = self.load_project_composite(project)
+        composite = self.load_project_composite(project, conditional=conditional)
         if composite is not None:
             return composite
         base, runs = self.load_project_base(project)
@@ -2740,10 +2868,29 @@ class DetailDrawer(ModalScreen[None]):
         #: through its own top-level key -- `parameters`, `result` -- rather than through
         #: a caption above it, because that key is genuinely part of the document.
         self.sections = list(sections)
+        #: The run whose body the sections stand in for, while it is still being read:
+        #: a run list carries sizes, not bodies, and the drawer is where the body is
+        #: wanted. None once the sections are the real thing.
+        self.pending_run_id: str | None = None
 
     @property
     def drawer_title(self) -> str:
         return self.fields[0].value if self.fields else ""
+
+    def _section_widgets(self) -> list[Static]:
+        widgets: list[Static] = []
+        for index, payload in enumerate(self.sections):
+            if index:
+                widgets.append(Static(Rule(style=BRAND_MEDIUM_GRAY), classes="detail-rule"))
+            widgets.append(Static(JSON(json.dumps(payload, indent=2, sort_keys=True, default=str))))
+        return widgets
+
+    async def replace_sections(self, sections: Sequence[Any]) -> None:
+        """Swap the JSON bodies in place, keeping the fields, the focus and the screen."""
+        self.sections = list(sections)
+        body = self.query_one("#detail-body", VerticalScroll)
+        await body.remove_children()
+        await body.mount(*self._section_widgets())
 
     @property
     def payload(self) -> Any:
@@ -2763,10 +2910,7 @@ class DetailDrawer(ModalScreen[None]):
                 )
             yield Static(Rule(style=BRAND_MEDIUM_GRAY), classes="detail-rule")
             with VerticalScroll(id="detail-body"):
-                for index, payload in enumerate(self.sections):
-                    if index:
-                        yield Static(Rule(style=BRAND_MEDIUM_GRAY), classes="detail-rule")
-                    yield Static(JSON(json.dumps(payload, indent=2, sort_keys=True, default=str)))
+                yield from self._section_widgets()
             yield Static("Arrow keys scroll. p or escape closes.", id="detail-hint")
 
     def on_mount(self) -> None:
@@ -2959,6 +3103,8 @@ class RebaseTuiApp(App[None]):
         Binding("g", "open_github", "Open deployed code on GitHub", show=False),
         Binding("w", "switch_workspace", "Switch workspace", show=False),
         Binding("v", "choose_environment", "Switch environment", show=False),
+        Binding("f", "switch_profile", "Switch profile", show=False),
+        Binding("t", "pin_selection", "Make this workspace and environment the profile's default", show=False),
         Binding("a", "open_artifact", "Open artifact", show=False),
         Binding("s", "toggle_terminal_select", "Select text", show=False),
         Binding("c", "copy_row", "Copy ID", show=False),
@@ -2985,6 +3131,13 @@ class RebaseTuiApp(App[None]):
     RebaseHeader, Header {{
         background: {CHROME_GRAY};
         color: {BRAND_BRIGHT_GREEN};
+    }}
+
+    /* Not the hosted platform: the header changes colour so a terminal left on a
+       development deployment is told apart from production at a glance. */
+    RebaseHeader.-platform, RebaseHeader.-platform HeaderIcon, RebaseHeader.-platform HeaderTitle {{
+        background: {BRAND_AMBER};
+        color: #101412;
     }}
 
     Footer {{
@@ -3016,8 +3169,20 @@ class RebaseTuiApp(App[None]):
         height: 1fr;
     }}
 
-    #workspace-switcher-view {{
+    #workspace-switcher-view, #profile-switcher-view {{
         height: 1fr;
+    }}
+
+    /* The workspaces take the room; the environments of the one under the cursor sit
+       beneath them, sized to their handful of rows. */
+    #workspaces-table {{
+        height: 1fr;
+    }}
+
+    #workspace-environments-table {{
+        height: auto;
+        max-height: 40%;
+        border-top: solid {CHROME_GRAY};
     }}
 
     /* Tables of fixed-width fields, sized to fit: they clip rather than scroll, and the
@@ -3223,7 +3388,12 @@ class RebaseTuiApp(App[None]):
        This one is the app's own: a bordered card in the brand green, sized to its text,
        standing clear of the footer rather than sharing a row with the key hints. The
        border is the whole point — a message has to be unmissable, and a background a
-       shade off the app's is not. Stacking and severity are Textual's, re-coloured. */
+       shade off the app's is not. Stacking and severity are Textual's, re-coloured.
+
+       The background is the screen's own, deliberately. Textual paints a `round`
+       border's cells with the widget's background, so any tint here shows as a lighter
+       slab one cell outside the line — a line floating inside a box, not a card. On the
+       screen's ground only the line is left. */
     ToastRack {{
         margin-bottom: 1;
         margin-right: 2;
@@ -3235,7 +3405,7 @@ class RebaseTuiApp(App[None]):
         max-width: 60%;
         padding: 0 2;
         margin-top: 1;
-        background: #16211d;
+        background: #101412;
         color: #E8F0ED;
         text-style: bold;
         border: round {BRAND_BRIGHT_GREEN};
@@ -3247,12 +3417,10 @@ class RebaseTuiApp(App[None]):
 
     Toast.-warning {{
         border: round {BRAND_AMBER};
-        background: #241f14;
     }}
 
     Toast.-error {{
         border: round {BRAND_CORAL_RED};
-        background: #241618;
     }}
 
     Toast .toast--title {{
@@ -3279,6 +3447,7 @@ class RebaseTuiApp(App[None]):
         refresh_interval: float = AUTO_REFRESH_SECONDS,
     ) -> None:
         super().__init__()
+        apply_rebase_theme(self)
         self.data = data or RebaseTuiData(client, project=project, limit=limit)
         self.project = project
         self.limit = limit
@@ -3308,12 +3477,28 @@ class RebaseTuiApp(App[None]):
             "secrets-table": {},
         }
         self._profile_rows: dict[str, dict[str, Any]] = {}
+        #: Workspaces the signed-in profile belongs to, by id, as the switcher lists them.
+        self._workspace_rows: dict[str, dict[str, Any]] = {}
+        #: Environments of the workspace under the switcher's cursor, by name.
+        self._environment_rows: dict[str, dict[str, Any]] = {}
+        #: Which workspace the environments table is showing, or was asked to show.
+        self._switcher_workspace_id: str | None = None
+        #: The name of a workspace picked in the switcher. The profile only knows the
+        #: name of the one it was set up with; a switch is this process's alone.
+        self._workspace_name: str | None = None
+        #: What REBASE_WORKSPACE and REBASE_ENVIRONMENT were before this app exported a
+        #: selection, so leaving puts the process back the way it found it.
+        self._inherited_selection: dict[str, str | None] | None = None
         self._function_rows: dict[str, dict[str, Any]] = {}
         self._workflow_rows: dict[str, dict[str, Any]] = {}
         self._steps_by_function: dict[str, list[WorkflowStep]] = {}
         self._endpoints_by_target: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._last_runs: dict[str, str] = {}
         self._run_rows: dict[str, dict[str, Any]] = {}
+        #: Whole run records read for the drawer, by run id. `_run_rows` holds what the
+        #: list sent, which is a summary without the bodies, and is rebuilt on every
+        #: repaint; this survives the repaint so `p` on the same row costs one request.
+        self._run_bodies: dict[str, dict[str, Any]] = {}
         self._run_detail: RunDetailData | None = None
         #: Whether `i` has the graph pane open beside the tables.
         self._graph_open = False
@@ -3342,6 +3527,10 @@ class RebaseTuiApp(App[None]):
         self._box_heights: dict[str, int] = {}
         #: The box `m` gave the whole view to, if any.
         self._maximised: str | None = None
+        #: `m` while the graph pane is open: the pane has the width, the boxes are off screen.
+        self._graph_maximised = False
+        #: The table that had the focus when the pane took the screen; hiding it drops the focus.
+        self._graph_maximised_focus: Widget | None = None
         self._drag_box: tuple[str, int, int] | None = None
 
     def compose(self) -> ComposeResult:
@@ -3358,6 +3547,9 @@ class RebaseTuiApp(App[None]):
                     yield ChipSteppingTable(id="secrets-table")
             yield Static("", id="workspace-empty")
         with Vertical(id="workspace-switcher-view"):
+            yield HeaderSafeDataTable(id="workspaces-table")
+            yield HeaderSafeDataTable(id="workspace-environments-table")
+        with Vertical(id="profile-switcher-view"):
             yield HeaderSafeDataTable(id="workspace-profiles-table")
         with Vertical(id="project-view"):
             yield Static("", id="project-error", classes="panel")
@@ -3392,6 +3584,8 @@ class RebaseTuiApp(App[None]):
 
     def on_mount(self) -> None:
         self._setup_tables()
+        if not is_default_platform():
+            self.query_one(RebaseHeader).add_class("-platform")
         self._reveal(0)
         self._warn_on_local_workspace_mismatch()
         self._update_workspace_title()
@@ -3408,7 +3602,7 @@ class RebaseTuiApp(App[None]):
     def _workspace_key(self) -> str:
         # A method rather than a cached attribute so switching workspace picks up the
         # new one's search paths without extra bookkeeping.
-        return workspace_key(self.profile_data, self.profile_name)
+        return self._effective_workspace_id() or workspace_key(self.profile_data, self.profile_name)
 
     async def _bootstrap_search_path(self) -> None:
         """Remember the repository the TUI was started in, so `o` works with no setup.
@@ -3518,9 +3712,10 @@ class RebaseTuiApp(App[None]):
         maximised = self._maximised is not None
         for selector in selectors:
             widget = self.query_one(selector)
-            widget.styles.display = "none" if maximised and selector != flexible else "block"
+            hidden = self._graph_maximised or (maximised and selector != flexible)
+            widget.styles.display = "none" if hidden else "block"
             widget.styles.height = "1fr" if selector == flexible else self._box_height(selector)
-        self.query_one(RebaseHeader).styles.display = "none" if maximised else "block"
+        self.query_one(RebaseHeader).styles.display = "none" if maximised or self._graph_maximised else "block"
 
     def _available_rows(self) -> int:
         """Rows the boxes have to share, taken off the view rather than off the boxes.
@@ -3608,7 +3803,15 @@ class RebaseTuiApp(App[None]):
         self._apply_box_heights()
 
     def action_maximise_box(self) -> None:
-        """Give the focused box the whole project view. `b` or `m` again gives it back."""
+        """Give the focused box the whole project view. `b` or `m` again gives it back.
+
+        With the graph pane open it is the pane that gets the screen: a graph is drawn
+        at the largest text size that fits its pane, so the width is what makes a wide
+        pipeline readable, and the tables beside it are what the width goes to.
+        """
+        if self._graph_open:
+            self._set_graph_maximised(not self._graph_maximised)
+            return
         selectors = self._box_selectors()
         if len(selectors) < 2:
             self.notify("Only one pane is open — it already has the screen.", severity="warning")
@@ -3711,8 +3914,8 @@ class RebaseTuiApp(App[None]):
     def _fill_table(self, table_id: str, *, widget: str | None = None) -> DataTable:
         """Empty a table and give it its header back, ready for rows.
 
-        Headers and rows land in the same paint this way, so the columns are sized once
-        against real data instead of snapping from header width to content width.
+        Clearing the columns too resets their widths, so a table emptied on the way to
+        another project does not greet it with the previous project's column widths.
         """
         table = self.query_one(f"#{widget or table_id}", DataTable)
         table.clear(columns=True)
@@ -3722,12 +3925,12 @@ class RebaseTuiApp(App[None]):
         return table
 
     def _setup_tables(self) -> None:
-        """Set the tables up, but leave them without columns.
+        """Set the tables up, headers included.
 
-        Column widths are computed from the header text until the first row lands, so a
-        table that shows its headers early shows them at the wrong widths and then jerks
-        them into place when the data arrives. Headers are added in `_fill_table` instead,
-        in the same paint as the rows.
+        The headers are known before any request is made, so they go up at once: an
+        empty table with a header reads as "loading", where a bare pane reads as broken.
+        The columns are sized to the header text until the first row lands and widen
+        then, which is the usual shape of a table filling in and cheaper than a blank.
         """
         projects = self.query_one("#projects-table", DataTable)
         projects.cursor_type = "row"
@@ -3738,9 +3941,10 @@ class RebaseTuiApp(App[None]):
             resource.cursor_type = "row"
             resource.zebra_stripes = True
 
-        profiles = self.query_one("#workspace-profiles-table", DataTable)
-        profiles.cursor_type = "row"
-        profiles.zebra_stripes = True
+        for table_id in ("workspace-profiles-table", "workspaces-table", "workspace-environments-table"):
+            switcher = self.query_one(f"#{table_id}", DataTable)
+            switcher.cursor_type = "row"
+            switcher.zebra_stripes = True
 
         functions = self.query_one("#functions-table", DataTable)
         functions.cursor_type = "row"
@@ -3760,8 +3964,34 @@ class RebaseTuiApp(App[None]):
         timeline.cursor_type = "row"
         timeline.zebra_stripes = True
 
+        for table_id in (
+            "projects-table",
+            "buckets-table",
+            "secrets-table",
+            "workspace-profiles-table",
+            "workspaces-table",
+            "workspace-environments-table",
+            "functions-table",
+            "workflows-table",
+            "runs-table",
+        ):
+            self._fill_table(table_id)
+        self._fill_table(self._timeline_table_name(), widget="timeline-table")
+
+    def _timeline_table_name(self) -> str:
+        """Which column set the timeline table shows under the current filter."""
+        showing_all = self._timeline_filter == TIMELINE_FILTERS[0][0]
+        return {
+            "timeline-steps": "timeline-table-steps",
+            "timeline-tasks": "timeline-table-tasks",
+            "timeline-artifacts": "timeline-table-artifacts",
+        }.get(self._timeline_filter, "timeline-table-all" if showing_all else "timeline-table")
+
     def action_refresh(self) -> None:
         if self.current_view == "workspace-switcher":
+            self._load_workspaces_in_background()
+            return
+        if self.current_view == "profile-switcher":
             self._render_workspace_profiles()
             return
         if self.current_view == "project" and self.selected_project is not None:
@@ -3798,7 +4028,7 @@ class RebaseTuiApp(App[None]):
             return
         if self.current_view == "workspace":
             self.run_worker(
-                self._load_workspace_overview(preserve=True, announce=False),
+                self._load_workspace_overview(preserve=True, announce=False, conditional=True),
                 name="auto-refresh",
                 group="tui",
                 exclusive=True,
@@ -3834,7 +4064,7 @@ class RebaseTuiApp(App[None]):
         """
         if self.selected_project is None:
             return
-        await self._load_project_targets(self.selected_project, preserve=True, announce=False)
+        await self._load_project_targets(self.selected_project, preserve=True, announce=False, conditional=True)
         if self._reveal_level >= 1 and self._runs_reload is not None:
             await self._runs_reload(preserve=True, announce=False)
         if self._reveal_level >= 2 and self._live_run_id is not None:
@@ -3873,13 +4103,45 @@ class RebaseTuiApp(App[None]):
         if self.current_view != "project":
             self.notify("Open a project first — i draws the graph behind its workflows.", severity="warning")
             return
-        self._graph_open = not self._graph_open
-        self.query_one(GraphPane).styles.display = "block" if self._graph_open else "none"
+        if self._graph_open:
+            self._close_graph_pane()
+            return
+        self._graph_open = True
+        self.query_one(GraphPane).styles.display = "block"
         self._refresh_graph_pane()
 
     def _close_graph_pane(self) -> None:
+        # Hiding the pane is not enough: plotui draws the graph as a terminal image,
+        # and terminals keep that painted until the widget unmounts and deletes it.
+        # Clearing takes the widget down; reopening lays the graph out afresh.
+        if self._graph_maximised:
+            self._set_graph_maximised(False)
         self._graph_open = False
-        self.query_one(GraphPane).styles.display = "none"
+        pane = self.query_one(GraphPane)
+        pane.styles.display = "none"
+        pane.clear()
+
+    def _set_graph_maximised(self, on: bool) -> None:
+        """Hand the graph pane the whole width, or the tables their share of it back.
+
+        The boxes go off screen rather than to zero width, along with the header, as
+        under `m` on a box. Hiding the focused table takes the focus with it, so the
+        table is remembered on the way in and given the focus back on the way out: the
+        arrow keys drive the same cursor before and after.
+        """
+        if on == self._graph_maximised:
+            return
+        if on:
+            self._graph_maximised_focus = self.focused
+        self._graph_maximised = on
+        pane = self.query_one(GraphPane)
+        # `None` clears the inline width and the pane's own stylesheet takes over.
+        pane.styles.width = "100%" if on else None
+        self._apply_box_heights()
+        if not on:
+            focused, self._graph_maximised_focus = self._graph_maximised_focus, None
+            if focused is not None and focused.is_attached and focused.display:
+                focused.focus()
 
     def _graph_context(self) -> tuple[Literal["steps", "workflow", "triggers"], str | None] | None:
         """Which graph the cursor asks for.
@@ -3991,6 +4253,12 @@ class RebaseTuiApp(App[None]):
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.data_table.id in {"workflows-table", "functions-table", "runs-table"}:
             self._refresh_graph_pane()
+        elif event.data_table.id == "workspaces-table":
+            # The environments follow the cursor, so the second table is never about a
+            # workspace other than the one you are looking at.
+            workspace_id = event.row_key.value
+            if workspace_id is not None and workspace_id != self._switcher_workspace_id:
+                self._load_workspace_environments_in_background(str(workspace_id))
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         # Which table has the focus decides which graph the pane shows.
@@ -4004,10 +4272,14 @@ class RebaseTuiApp(App[None]):
             self.action_hide_help_panel()
             return
         # Then the graph pane, for the same reason: it is on top of the view, not in it.
+        # A maximised pane first gives the tables back, as `m` on a box does.
         if self._graph_open:
-            self.action_toggle_graph_pane()
+            if self._graph_maximised:
+                self._set_graph_maximised(False)
+            else:
+                self.action_toggle_graph_pane()
             return
-        if self.current_view == "workspace-switcher":
+        if self.current_view in {"workspace-switcher", "profile-switcher"}:
             if self.view_before_switcher == "project":
                 self._show_project_view()
             else:
@@ -4034,6 +4306,36 @@ class RebaseTuiApp(App[None]):
         if self.current_view != "workspace-switcher":
             self._open_workspace_switcher()
 
+    def action_switch_profile(self) -> None:
+        """Open the profile picker: which server and sign-in the whole machine uses."""
+        if self.current_view != "profile-switcher":
+            self._open_profile_switcher()
+
+    def action_pin_selection(self) -> None:
+        """Write the live workspace and environment back to the profile.
+
+        A switch is otherwise this process's alone: the next `rebase tui` in this
+        directory opens whatever the directory's marker or the profile names. This is
+        the one deliberate way to move that default, the same write `rebase workspace
+        use` does.
+        """
+        workspace_id = self._effective_workspace_id()
+        if workspace_id is None:
+            self.notify("No workspace is selected.", severity="warning")
+            return
+        try:
+            set_profile_workspace(workspace_id, self._workspace_name_for(workspace_id), profile=self.profile_name)
+        except KeyError:
+            self.notify(f"Unknown profile: {self.profile_name}", severity="error")
+            return
+        set_active_environment(workspace_id, self.environment_name)
+        self.profile_data = load_profile(self.profile_name)
+        self.notify(
+            f"Profile '{self.profile_name}' now opens {self._workspace_label()} ({self.environment_name}) by default."
+        )
+        if self.current_view == "workspace-switcher":
+            self._render_workspaces()
+
     def action_choose_environment(self) -> None:
         """Open the environment picker without leaving the current workspace."""
         environments = [
@@ -4051,9 +4353,9 @@ class RebaseTuiApp(App[None]):
             return
         self.environment_name = environment
         self.data.use_environment(environment)
-        workspace_id = getattr(self.data.client, "workspace_id", None)
-        if isinstance(workspace_id, str) and workspace_id:
-            set_active_environment(workspace_id, environment)
+        # Not written to the config on purpose: another terminal on the same workspace
+        # keeps its own environment, and `t` is how a choice becomes the default.
+        self._export_selection()
         self.workspace_overview = None
         self.selected_project = None
         self.project_targets = None
@@ -4077,6 +4379,11 @@ class RebaseTuiApp(App[None]):
             table = dict(RESOURCE_TABS).get(active, "#projects-table")
             return [self.query_one(table, DataTable)]
         if self.current_view == "workspace-switcher":
+            return [
+                self.query_one("#workspaces-table", DataTable),
+                self.query_one("#workspace-environments-table", DataTable),
+            ]
+        if self.current_view == "profile-switcher":
             return [self.query_one("#workspace-profiles-table", DataTable)]
         active = self.query_one("#target-tabs", TabbedContent).active
         # The target box holds whichever of its two tables the chip strip has open; the
@@ -4307,6 +4614,8 @@ class RebaseTuiApp(App[None]):
             "functions-table": "function_id",
             "runs-table": "run_id",
             "workspace-profiles-table": "profile",
+            "workspaces-table": "workspace_id",
+            "workspace-environments-table": "environment",
         }.get(table_id, "id")
         return f"{label}={key}"
 
@@ -4712,13 +5021,25 @@ class RebaseTuiApp(App[None]):
         self._marked_count = len(event.marked)
         self._update_workspace_title()
 
-    async def _load_workspace_overview(self, *, preserve: bool = False, announce: bool = True) -> None:
+    async def _load_workspace_overview(
+        self, *, preserve: bool = False, announce: bool = True, conditional: bool = False
+    ) -> None:
+        """Read and paint the workspace view.
+
+        `conditional` is the timer's: it lets the platform answer "unchanged" instead of
+        the view, and then the frame on screen is kept as it is. Only honoured when there
+        is a frame to keep — the first read, and every read that replaces the view rather
+        than preserving it, is answered in full.
+        """
+        revalidate = conditional and preserve and self.workspace_overview is not None
         try:
-            overview = await asyncio.to_thread(self.data.load_workspace_overview)
+            overview = await asyncio.to_thread(partial(self.data.load_workspace_overview, conditional=revalidate))
         except Exception as exc:
             self._set_error(exc, announce=announce)
             return
         self._refresh_failures = 0
+        if isinstance(overview, Unchanged):
+            return
         self.workspace_overview = overview
         self.project_targets = None
         self.selected_project = None
@@ -4754,7 +5075,12 @@ class RebaseTuiApp(App[None]):
             self._render_secrets(secrets)
 
     async def _load_project_targets(
-        self, project: dict[str, Any], *, preserve: bool = False, announce: bool = True
+        self,
+        project: dict[str, Any],
+        *,
+        preserve: bool = False,
+        announce: bool = True,
+        conditional: bool = False,
     ) -> None:
         """Load a project's targets, progressively on entry and atomically on refresh.
 
@@ -4771,11 +5097,27 @@ class RebaseTuiApp(App[None]):
         Where the platform has the composite route none of that applies: one request
         answers everything, so there is no second phase to stage and the table is painted
         complete the first time.
+
+        `conditional` is the timer's, on the terms `_load_workspace_overview` gives: the
+        platform may answer "unchanged", and only when this project's complete frame is
+        already on screen to keep.
         """
+        current = self.project_targets
+        revalidate = (
+            conditional
+            and preserve
+            and current is not None
+            and str(current.project.get("id")) == str(project.get("id"))
+        )
         try:
-            composite = await asyncio.to_thread(self.data.load_project_composite, project)
+            composite = await asyncio.to_thread(
+                partial(self.data.load_project_composite, project, conditional=revalidate)
+            )
         except Exception as exc:
             self._set_error(exc, announce=announce)
+            return
+        if isinstance(composite, Unchanged):
+            self._refresh_failures = 0
             return
         if composite is not None:
             self._refresh_failures = 0
@@ -5207,9 +5549,23 @@ class RebaseTuiApp(App[None]):
                 key=run_id,
             )
         if not preserve:
-            self.query_one("#timeline-table", DataTable).clear(columns=True)
+            self._fill_table(self._timeline_table_name(), widget="timeline-table")
         self._forget_live_step_runs()
+        self._forget_stale_run_bodies()
         self._refresh_graph_pane()
+
+    def _forget_stale_run_bodies(self) -> None:
+        """Keep the drawer's cached records only for finished runs still in the table.
+
+        A live run's result is still being written, so its record is re-read on the next
+        `p`; a run that has left the table will not be asked for again. What remains is
+        bounded by the table's page.
+        """
+        self._run_bodies = {
+            run_id: body
+            for run_id, body in self._run_bodies.items()
+            if str((self._run_rows.get(run_id) or {}).get("status")) in TERMINAL_RUN_STATUSES
+        }
 
     def _forget_live_step_runs(self) -> None:
         """Drop the cached steps of runs still going, so a refresh re-reads them.
@@ -5246,13 +5602,8 @@ class RebaseTuiApp(App[None]):
         run_finished = str(detail.run.get("status") or "") in TERMINAL_RUN_STATUSES
         kinds = dict((tab_id, kinds) for tab_id, _, kinds in TIMELINE_FILTERS)[self._timeline_filter]
         showing_all = self._timeline_filter == TIMELINE_FILTERS[0][0]
-        table_name = {
-            "timeline-steps": "timeline-table-steps",
-            "timeline-tasks": "timeline-table-tasks",
-            "timeline-artifacts": "timeline-table-artifacts",
-        }.get(self._timeline_filter, "timeline-table-all" if showing_all else "timeline-table")
         dependencies = step_dependencies(detail.step_graph)
-        table = self._fill_table(table_name, widget="timeline-table")
+        table = self._fill_table(self._timeline_table_name(), widget="timeline-table")
         message_width = self._timeline_message_width()
         self._timeline_rows = {}
         artifacts_by_task = Counter(
@@ -5398,15 +5749,16 @@ class RebaseTuiApp(App[None]):
 
     def _clear_target_detail(self, *, clear_project: bool = True) -> None:
         if clear_project:
-            self.query_one("#functions-table", DataTable).clear(columns=True)
-            self.query_one("#workflows-table", DataTable).clear(columns=True)
+            self._fill_table("functions-table")
+            self._fill_table("workflows-table")
             self._function_rows = {}
             self._workflow_rows = {}
             self._endpoints_by_target = {}
             self._steps_by_function = {}
-        self.query_one("#runs-table", DataTable).clear(columns=True)
-        self.query_one("#timeline-table", DataTable).clear(columns=True)
+        self._fill_table("runs-table")
+        self._fill_table(self._timeline_table_name(), widget="timeline-table")
         self._run_rows = {}
+        self._run_bodies = {}
         self._timeline_rows = {}
         self._run_detail = None
         self._step_runs = {}
@@ -5437,36 +5789,239 @@ class RebaseTuiApp(App[None]):
         self._leave_maximised()
         self._close_graph_pane()
         self.call_after_refresh(self._update_workspace_title)
-        self.query_one("#workspace-view", Vertical).styles.display = "block"
-        self.query_one("#project-view", Vertical).styles.display = "none"
-        self.query_one("#workspace-switcher-view", Vertical).styles.display = "none"
+        self._display_views("workspace-view")
         self._visible_boxes()[0].focus()
 
     def _show_project_view(self) -> None:
         self.current_view = "project"
         self.call_after_refresh(self._update_workspace_title)
-        self.query_one("#workspace-view", Vertical).styles.display = "none"
-        self.query_one("#project-view", Vertical).styles.display = "block"
-        self.query_one("#workspace-switcher-view", Vertical).styles.display = "none"
+        self._display_views("project-view")
         # The focus would otherwise stay on the projects table, which is no longer on
         # screen — and `tab`, `d` and `p` all read it.
         boxes = self._visible_boxes()
         if boxes and self.focused not in boxes:
             boxes[0].focus()
 
+    def _display_views(self, shown: str) -> None:
+        for view in ("workspace-view", "project-view", "workspace-switcher-view", "profile-switcher-view"):
+            self.query_one(f"#{view}", Vertical).styles.display = "block" if view == shown else "none"
+
     def _show_workspace_switcher_view(self) -> None:
         self.current_view = "workspace-switcher"
         self._leave_maximised()
         self._close_graph_pane()
-        self.query_one("#workspace-view", Vertical).styles.display = "none"
-        self.query_one("#project-view", Vertical).styles.display = "none"
-        self.query_one("#workspace-switcher-view", Vertical).styles.display = "block"
+        self._display_views("workspace-switcher-view")
+        self.query_one("#workspaces-table", DataTable).focus()
+
+    def _show_profile_switcher_view(self) -> None:
+        self.current_view = "profile-switcher"
+        self._leave_maximised()
+        self._close_graph_pane()
+        self._display_views("profile-switcher-view")
         self.query_one("#workspace-profiles-table", DataTable).focus()
 
     def _open_workspace_switcher(self) -> None:
-        self.view_before_switcher = self.current_view
-        self._render_workspace_profiles()
+        if self.current_view not in {"workspace-switcher", "profile-switcher"}:
+            self.view_before_switcher = self.current_view
+        self._render_workspaces()
         self._show_workspace_switcher_view()
+        self._load_workspaces_in_background()
+
+    def _open_profile_switcher(self) -> None:
+        if self.current_view not in {"workspace-switcher", "profile-switcher"}:
+            self.view_before_switcher = self.current_view
+        self._render_workspace_profiles()
+        self._show_profile_switcher_view()
+
+    def _effective_workspace_id(self) -> str | None:
+        workspace_id = getattr(self.data.client, "workspace_id", None)
+        return workspace_id if isinstance(workspace_id, str) and workspace_id else None
+
+    def _workspace_name_for(self, workspace_id: str) -> str | None:
+        listed = self._workspace_rows.get(workspace_id, {}).get("name")
+        if isinstance(listed, str) and listed:
+            return listed
+        if workspace_id == self._effective_workspace_id() and self._workspace_name:
+            return self._workspace_name
+        if self.profile_data.get("workspace_id") == workspace_id:
+            name = self.profile_data.get("workspace_name")
+            return name if isinstance(name, str) and name else None
+        return None
+
+    def _load_workspaces_in_background(self) -> None:
+        self.run_worker(self._load_workspaces(), name="workspaces", group="switcher", exclusive=True)
+
+    async def _load_workspaces(self) -> None:
+        load = getattr(self.data.client, "list_my_workspaces", None)
+        if not callable(load):
+            return
+        try:
+            memberships: Any = await asyncio.to_thread(load)
+        except RebaseWorkflowError as exc:
+            memberships = await self._load_workspaces_as_person(exc)
+            if memberships is None:
+                return
+        rows: dict[str, dict[str, Any]] = {}
+        for item in memberships if isinstance(memberships, list) else []:
+            workspace_id = item.get("id") or item.get("workspace_id")
+            if isinstance(workspace_id, str) and workspace_id:
+                rows[workspace_id] = item
+        self._workspace_rows = rows
+        # The list is also where a pinned or switched workspace's name comes from.
+        self._update_workspace_title()
+        if self.current_view == "workspace-switcher":
+            self._render_workspaces()
+
+    async def _load_workspaces_as_person(self, error: RebaseWorkflowError) -> Any | None:
+        """Retry the memberships on the signed-in session: an API key has none to list."""
+        as_session = getattr(self.data.client, "as_session", None)
+        person = as_session() if callable(as_session) else None
+        if person is None or person is self.data.client:
+            self.notify(
+                f"Could not list workspaces: {error}. Listing them needs a signed-in session, and "
+                f"profile '{self.profile_name}' uses an API key; `rebase setup` signs in.",
+                severity="error",
+                timeout=10,
+            )
+            return None
+        try:
+            return await asyncio.to_thread(person.list_my_workspaces)
+        except RebaseWorkflowError as exc:
+            self.notify(f"Could not list workspaces: {exc}", severity="error", timeout=10)
+            return None
+
+    def _render_workspaces(self) -> None:
+        """Draw the memberships, the live one first and under the cursor."""
+        effective = self._effective_workspace_id()
+        rows = dict(self._workspace_rows)
+        # The workspace the data comes from belongs in the list even before the
+        # memberships have loaded, or when a marker pinned one the list does not name.
+        if effective and effective not in rows:
+            rows = {effective: {"id": effective, "name": self._workspace_name_for(effective)}, **rows}
+        table = self._fill_table("workspaces-table")
+        ordered = sorted(rows.items(), key=lambda entry: (entry[0] != effective, str(entry[1].get("name") or entry[0])))
+        for workspace_id, item in ordered:
+            name = item.get("name")
+            table.add_row(
+                "*" if workspace_id == effective else "",
+                name if isinstance(name, str) and name else workspace_id,
+                workspace_id,
+                str(item.get("role") or "-"),
+                key=workspace_id,
+            )
+        if effective in rows:
+            table.move_cursor(row=list(dict(ordered)).index(effective))
+        elif table.row_count == 0:
+            self._environment_rows = {}
+            self._switcher_workspace_id = None
+            self._fill_table("workspace-environments-table")
+
+    def _load_workspace_environments_in_background(self, workspace_id: str) -> None:
+        self._switcher_workspace_id = workspace_id
+        self._environment_rows = {}
+        self._fill_table("workspace-environments-table")
+        self.run_worker(
+            self._load_workspace_environments(workspace_id),
+            name="workspace-environments",
+            group="switcher-environments",
+            exclusive=True,
+        )
+
+    async def _load_workspace_environments(self, workspace_id: str) -> None:
+        client = self.data.client if workspace_id == self._effective_workspace_id() else self._client_for(workspace_id)
+        load = getattr(client, "list_environments", None)
+        if not callable(load):
+            return
+        try:
+            environments: Any = await asyncio.to_thread(load)
+        except RebaseWorkflowError as exc:
+            self._set_error(exc)
+            return
+        # The cursor may have moved on while the request was out.
+        if self._switcher_workspace_id != workspace_id:
+            return
+        rows: dict[str, dict[str, Any]] = {}
+        for item in environments if isinstance(environments, list) else []:
+            name = item.get("name")
+            if isinstance(name, str) and name:
+                rows[name] = item
+        self._environment_rows = rows
+        self._render_workspace_environments(workspace_id)
+
+    def _render_workspace_environments(self, workspace_id: str) -> None:
+        live = workspace_id == self._effective_workspace_id()
+        rows = dict(self._environment_rows)
+        if live and self.environment_name not in rows:
+            rows = {self.environment_name: {"name": self.environment_name}, **rows}
+        table = self._fill_table("workspace-environments-table")
+        for name, item in rows.items():
+            protected = item.get("protected")
+            table.add_row(
+                "*" if live and name == self.environment_name else "",
+                name,
+                str(item.get("deploy_mode") or "-"),
+                "yes" if protected else ("no" if protected is False else "-"),
+                key=name,
+            )
+        if live and self.environment_name in rows:
+            table.move_cursor(row=list(rows).index(self.environment_name))
+
+    def _client_for(self, workspace_id: str, environment: str | None = None) -> Client:
+        """The current credentials aimed at another workspace, without touching the profile."""
+        clone = getattr(self.data.client, "with_workspace", None)
+        if callable(clone):
+            return clone(workspace_id, environment_name=environment)
+        return Client(
+            profile=self.profile_name,
+            workspace_id=workspace_id,
+            environment_name=environment or active_environment(workspace_id) or "dev",
+        )
+
+    def _use_workspace(self, workspace_id: str, environment: str) -> None:
+        """Point this TUI at a workspace and environment, for this process only.
+
+        The choice lives in the client and the process environment, never in the
+        profile: a second terminal keeps whatever it had, and the next launch in this
+        directory comes back to the marker's or the profile's workspace. `t` is what
+        writes it back.
+        """
+        if workspace_id == self._effective_workspace_id() and environment == self.environment_name:
+            self._show_workspace_view()
+            return
+        pinned = local_workspace_id()
+        self._workspace_name = self._workspace_name_for(workspace_id)
+        self._adopt_client(self._client_for(workspace_id, environment), environment)
+        if pinned and pinned != workspace_id:
+            self.notify(
+                f"This directory is pinned to workspace {pinned}; showing {self._workspace_label()} "
+                "for this session only.",
+                severity="warning",
+                timeout=8,
+            )
+
+    def _export_selection(self) -> None:
+        """Hand the live workspace and environment to anything this process starts.
+
+        The CLI's `--workspace` sets the same variable, and the SDK reads both at the
+        top of its precedence chain, so an editor or shell opened from here sees the
+        selection instead of falling back to the directory marker.
+        """
+        if self._inherited_selection is None:
+            self._inherited_selection = {name: os.environ.get(name) for name in SELECTION_VARIABLES}
+        workspace_id = self._effective_workspace_id()
+        if workspace_id:
+            os.environ["REBASE_WORKSPACE"] = workspace_id
+        os.environ["REBASE_ENVIRONMENT"] = self.environment_name
+
+    def on_unmount(self) -> None:
+        if self._inherited_selection is None:
+            return
+        for name, value in self._inherited_selection.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        self._inherited_selection = None
 
     def _select_workspace_profile(self, profile_name: str) -> None:
         if profile_name not in self._profile_rows:
@@ -5481,18 +6036,33 @@ class RebaseTuiApp(App[None]):
             return
         self.profile_name = selected_profile_name()
         self.profile_data = load_profile(self.profile_name)
-        self.project = None
+        self._workspace_name = None
+        self._workspace_rows = {}
         chosen_workspace_id = self.profile_data.get("workspace_id")
-        self.data = RebaseTuiData(
+        workspace_id = chosen_workspace_id if isinstance(chosen_workspace_id, str) and chosen_workspace_id else None
+        # Resolved here rather than left to the client: a switch earlier in this
+        # session exported REBASE_ENVIRONMENT, which would otherwise outrank the new
+        # profile's own default.
+        environment = (active_environment(workspace_id) if workspace_id else None) or "dev"
+        self._adopt_client(
             Client(
                 profile=self.profile_name,
                 # Explicit beats the directory marker: picking a workspace here is a
                 # deliberate act, and it would otherwise be overridden on the next request.
-                workspace_id=chosen_workspace_id if isinstance(chosen_workspace_id, str) else None,
+                workspace_id=workspace_id,
+                environment_name=environment,
             ),
-            limit=self.limit,
+            environment,
         )
-        self.environment_name = self.data.environment_name
+
+    def _adopt_client(self, client: Client, environment: str) -> None:
+        """Rebuild every pane against another client, and start it loading."""
+        self.project = None
+        self.data = RebaseTuiData(client, limit=self.limit)
+        self.environment_name = environment
+        self._export_selection()
+        self._switcher_workspace_id = None
+        self._environment_rows = {}
         self.workspace_overview = None
         self.project_targets = None
         self.selected_project = None
@@ -5504,6 +6074,7 @@ class RebaseTuiApp(App[None]):
         self._steps_by_function = {}
         self._endpoints_by_target = {}
         self._run_rows = {}
+        self._run_bodies = {}
         self._update_workspace_title()
         self._clear_target_detail()
         self._show_workspace_view()
@@ -5516,17 +6087,59 @@ class RebaseTuiApp(App[None]):
             self.notify("Select a row first — p shows its full record.", severity="warning")
             return
         self.push_screen(details)
+        if details.pending_run_id is not None:
+            # Its own worker group: the `tui` group's exclusive loads must not cancel it,
+            # and it must not cancel them.
+            self.run_worker(
+                self._load_run_body(details.pending_run_id, details),
+                name="run-body",
+                group="run-body",
+                exclusive=True,
+            )
 
-    def _run_drawer(self, run: dict[str, Any]) -> DetailDrawer:
-        """A run, split the way it actually divides: what it was asked, what came back.
+    async def _load_run_body(self, run_id: str, drawer: DetailDrawer) -> None:
+        """Read one run's whole record for an open drawer, off the UI thread, and swap it in."""
+        try:
+            run = await asyncio.to_thread(self.data.load_run_body, run_id)
+        except Exception as exc:
+            if drawer.is_attached and drawer.pending_run_id == run_id:
+                await drawer.replace_sections([{"parameters": f"<could not load the run: {exc}>"}])
+            return
+        self._run_bodies[run_id] = run
+        if drawer.is_attached and drawer.pending_run_id == run_id:
+            drawer.pending_run_id = None
+            await drawer.replace_sections(self._run_sections(run))
 
-        The id is spelled out in full rather than shortened — the drawer is where you
-        come to copy it — and the status gets its own line instead of riding along
-        after a separator.
+    def _full_run(self, run_id: str, summary: dict[str, Any]) -> dict[str, Any]:
+        """The whole record for a runs-table row, where one has already been read."""
+        detail = self._run_detail
+        if detail is not None and str(detail.run.get("id")) == run_id:
+            return detail.run
+        return self._run_bodies.get(run_id, summary)
+
+    @staticmethod
+    def _is_run_summary(run: dict[str, Any]) -> bool:
+        """Whether a run row came from a list, which leaves the bodies out."""
+        return "result" not in run and "parameters" not in run
+
+    @staticmethod
+    def _run_sections(run: dict[str, Any]) -> list[Any]:
+        """What the run was asked, and what came back, as the drawer's two JSON bodies.
+
+        A summary row has no bodies, only their sizes, so those stand in until the record
+        is read: the size is the one thing worth knowing before deciding to wait for a
+        megabyte of result. A null `result_bytes` is a run with no result, and says so.
         """
+        if RebaseTuiApp._is_run_summary(run):
+            parameters: Any = f"<{format_bytes(run.get('parameters_bytes'))} — loading…>"
+            result_bytes = run.get("result_bytes")
+            result: Any = None if result_bytes is None else f"<{format_bytes(result_bytes)} — loading…>"
+        else:
+            parameters = run.get("parameters") or {}
+            result = run.get("result")
         # The key stays on the document rather than becoming a caption above it: what
         # you are looking at is the run's `parameters`, and that is what it should say.
-        output: dict[str, Any] = {"result": run.get("result")}
+        output: dict[str, Any] = {"result": result}
         if run.get("error"):
             output["error"] = run["error"]
         # The structured diagnosis, when the server produced one: why the run
@@ -5534,7 +6147,18 @@ class RebaseTuiApp(App[None]):
         reason = run.get("failure_reason")
         if isinstance(reason, dict) and reason.get("message"):
             output["diagnosis"] = {key: reason[key] for key in ("message", "hint") if reason.get(key)}
-        sections: list[Any] = [{"parameters": run.get("parameters") or {}}, output]
+        return [{"parameters": parameters}, output]
+
+    def _run_drawer(self, run: dict[str, Any]) -> DetailDrawer:
+        """A run, split the way it actually divides: what it was asked, what came back.
+
+        The id is spelled out in full rather than shortened — the drawer is where you
+        come to copy it — and the status gets its own line instead of riding along
+        after a separator.
+
+        Given a summary row, the drawer opens at once on the sizes and says which run it
+        is still waiting for; `action_show_details` reads the record and swaps it in.
+        """
         status = str(run.get("status", "unknown"))
         fields = [
             DetailField("Run ID", str(run.get("id", "-"))),
@@ -5543,10 +6167,10 @@ class RebaseTuiApp(App[None]):
         timing = run_timing_summary(run)
         if timing:
             fields.append(DetailField("Timing", timing))
-        return DetailDrawer(
-            fields=fields,
-            sections=sections,
-        )
+        drawer = DetailDrawer(fields=fields, sections=self._run_sections(run))
+        if self._is_run_summary(run) and run.get("id") is not None:
+            drawer.pending_run_id = str(run["id"])
+        return drawer
 
     @staticmethod
     def _task_drawer(row: TimelineRow) -> DetailDrawer:
@@ -5603,7 +6227,7 @@ class RebaseTuiApp(App[None]):
             return None
         if table_id == "runs-table":
             run = self._run_rows.get(key)
-            return None if run is None else self._run_drawer(run)
+            return None if run is None else self._run_drawer(self._full_run(key, run))
         if table_id == "projects-table":
             summary = self._project_rows.get(key)
             if summary is None:
@@ -5760,6 +6384,14 @@ class RebaseTuiApp(App[None]):
             self.run_worker(self._load_run_detail(row_id), name="run-detail", group="tui", exclusive=True)
         elif event.data_table.id == "workspace-profiles-table":
             self._select_workspace_profile(row_id)
+        elif event.data_table.id == "workspaces-table":
+            # Picking a workspace opens its environments; the environment is what
+            # commits the switch, so nothing changes under you on a stray enter.
+            if row_id != self._switcher_workspace_id:
+                self._load_workspace_environments_in_background(str(row_id))
+            self.query_one("#workspace-environments-table", DataTable).focus()
+        elif event.data_table.id == "workspace-environments-table" and self._switcher_workspace_id:
+            self._use_workspace(self._switcher_workspace_id, str(row_id))
 
     def _workspace_label(self) -> str:
         """The workspace the data actually comes from, which a marker may have pinned.
@@ -5767,9 +6399,9 @@ class RebaseTuiApp(App[None]):
         The profile's own `workspace_name` is the nicer label, but it is only the truth
         while the profile is what decided the workspace.
         """
-        effective = getattr(self.data.client, "workspace_id", None)
-        if isinstance(effective, str) and effective and self.profile_data.get("workspace_id") != effective:
-            return effective
+        effective = self._effective_workspace_id()
+        if effective and self.profile_data.get("workspace_id") != effective:
+            return self._workspace_name_for(effective) or effective
         return self._profile_workspace_label(self.profile_data, fallback=self.profile_name)
 
     @staticmethod
@@ -5792,6 +6424,11 @@ class RebaseTuiApp(App[None]):
         # own: it is one short word, it qualifies the workspace rather than standing
         # beside it, and this way it stays on screen in the project view too.
         title = f"Rebase TUI - Workspace: {self._workspace_label()} ({self.environment_name})"
+        # `@`, not another parenthesis: an environment can be called `staging` too, and
+        # the two must not read alike.
+        platform = active_platform()
+        if platform != DEFAULT_PLATFORM:
+            title = title.replace("Rebase TUI", f"Rebase TUI @ {platform}", 1)
         if self.current_view == "project" and self.selected_project is not None:
             title = f"{title} / {self.selected_project.get('name', '-')}"
         if self._marked_count:
