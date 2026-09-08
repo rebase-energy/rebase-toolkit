@@ -537,9 +537,10 @@ def add(a: int, b: int) -> dict:
         "cloud_run_min_instances": None,
         "cloud_run_concurrency": None,
         # Forwarded as kwargs even when empty; run_ephemeral drops empty dicts
-        # from the request body so an older API still accepts it.
+        # and lists from the request body so an older API still accepts it.
         "env": {},
         "secrets": {},
+        "buckets": [],
     }
     assert "def add(a: int, b: int) -> dict:" in observed["source_code"]
     assert '"sum": 3' in capsys.readouterr().out

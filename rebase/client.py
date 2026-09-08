@@ -328,6 +328,24 @@ def run_timing_summary(run: dict[str, Any]) -> str | None:
     return " · ".join(parts) or None
 
 
+#: Marker the server sets on a stored result that wraps a non-dict return.
+RESULT_WRAPPED_KEY = "__rebase_wrapped__"
+
+
+def unwrap_result(result: Any) -> Any:
+    """What the function returned, given what the run record stores.
+
+    The server stores a dict return as-is and wraps anything else as
+    ``{"value": ..., "__rebase_wrapped__": true}``; the marker is what makes
+    ``{"value": [...]}`` from wrapping distinguishable from a function that
+    literally returned that dict. An unmarked dict (an older server, or a
+    genuine dict return) comes back unchanged.
+    """
+    if isinstance(result, dict) and result.get(RESULT_WRAPPED_KEY) is True and "value" in result:
+        return result["value"]
+    return result
+
+
 def run_failure_summary(run: dict[str, Any]) -> str | None:
     """One human line for a failed run, preferring the structured diagnosis.
 
@@ -4554,6 +4572,7 @@ class Client:
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
         timeout_seconds: int | None = None,
+        buckets: list[Any] | None = None,
     ) -> Run:
         resolved_mode, resolved_isolation = _validate_execution(
             mode,
@@ -4592,6 +4611,12 @@ class Client:
             payload["secrets"] = dict(secrets)
         if timeout_seconds is not None:
             payload["timeout_seconds"] = timeout_seconds
+        # Bucket grants ride along the same way: without them the run is
+        # refused its own bucket at the first read, since the server checks the
+        # grant against what the run was submitted with.
+        buckets_payload = _resolve_buckets_payload(buckets, self)
+        if buckets_payload:
+            payload["buckets"] = buckets_payload
 
         response = self._request_dict(
             "POST",
@@ -5697,7 +5722,15 @@ class Function:
             raise RebaseWorkflowError("function has no ID after deployment")
         return self._client.run_function(self.id, parameters)
 
-    def remote(self, **parameters: Any) -> dict[str, Any]:
+    def remote(self, **parameters: Any) -> Any:
+        """Run the function on the platform and return what it returned.
+
+        The return value is the function's own: a dict as a dict, a list as a
+        list, a scalar as a scalar. (Before 0.8.1 a non-dict return came back
+        wrapped as ``{"value": ...}`` while a dict did not, so a caller could
+        not tell the two apart -- rebase-toolkit #16.) A function that raises
+        surfaces as :class:`RebaseWorkflowError` naming the exception.
+        """
         return self.spawn(**parameters).result()
 
     def _infer_map_parameter(self) -> str:
@@ -5715,7 +5748,7 @@ class Function:
         if event.get("status") == "succeeded":
             result = event.get("result")
             if isinstance(result, dict):
-                return result
+                return unwrap_result(result)
             return {"value": result}
 
         error = RebaseWorkflowError(str(event.get("error") or "Function.map item failed"))
@@ -5793,6 +5826,7 @@ class Function:
             cloud_run_concurrency=self.cloud_run_concurrency,
             env=self.env,
             secrets=_resolve_secrets_payload(self.secrets, self._client),
+            buckets=self.buckets,
         )
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
@@ -6421,6 +6455,7 @@ class Model(_EmflowModel):
             cloud_run_concurrency=function.cloud_run_concurrency,
             env=function.env,
             secrets=_resolve_secrets_payload(function.secrets, self._client),
+            buckets=function.buckets,
         )
 
 
@@ -6936,7 +6971,8 @@ class Workflow:
             raise RebaseWorkflowError("workflow has no ID after deployment")
         return self._client.run_workflow(self.id, parameters)
 
-    def remote(self, **parameters: Any) -> dict[str, Any]:
+    def remote(self, **parameters: Any) -> Any:
+        """Run the workflow on the platform and return what it returned, unwrapped like Function.remote."""
         return self.spawn(**parameters).result()
 
     def run(self, **parameters: Any) -> Run:
@@ -6963,6 +6999,7 @@ class Workflow:
             env=self.env,
             secrets=_resolve_secrets_payload(self.secrets, self._client),
             timeout_seconds=self.timeout_seconds,
+            buckets=self.buckets,
         )
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
@@ -7010,7 +7047,14 @@ class Run:
             self.refresh()
         return str(self.data["status"])
 
-    def result(self, *, timeout: int = 600, poll_interval: float = 5.0) -> dict[str, Any]:
+    def result(self, *, timeout: int = 600, poll_interval: float = 5.0) -> Any:
+        """Block until the run ends and return what the function returned.
+
+        A dict comes back as the function returned it; a list, string, number
+        or None comes back as that value, unwrapped from the ``{"value": ...}``
+        the run record stores (see :func:`unwrap_result`). A failed run raises
+        :class:`RebaseWorkflowError` carrying the run's ``failure_reason``.
+        """
         deadline = time.monotonic() + timeout
         terminal_statuses = {"succeeded", "failed", "cancelled"}
         # The ephemeral submit response is already terminal on current servers, so
@@ -7027,7 +7071,7 @@ class Run:
             status = data["status"]
             if status in terminal_statuses:
                 if status == "succeeded":
-                    return data["result"]
+                    return unwrap_result(data.get("result"))
                 raise RebaseWorkflowError(run_failure_summary(data) or f"run ended with status {status}")
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"run {self.id} did not finish within {timeout} seconds")

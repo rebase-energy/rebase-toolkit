@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.8.1 — unreleased
+
+### Fixed
+
+- **`Function.remote()` returns what the function returned.** A list, string,
+  number or `None` came back wrapped as `{"value": ...}` while a dict came back as
+  itself, so code correct against one callee broke silently against another. The
+  server now marks the wrapper it stores for a non-dict return, `Run.result()` and
+  `Function.map()` unwrap on that marker, and the docstrings say so. Results
+  recorded by an older server are returned unchanged. (#16)
+- **A function that raises reports its exception.** `rebase run get` shows the
+  exception type and message in `error`, `failure_reason` carries
+  `code: function_exception` with the traceback under `observed`, and `rebase run
+  logs` prints the traceback, instead of the bare `Cloud Run execution failed: 500`
+  that made every bug look like a platform incident. Job-mode functions record the
+  same shape. (#13)
+- **`buckets=` reaches function runs.** A deployed `run_type="long"` or quick
+  function with `buckets=[...]` was refused its own bucket at the first read, and an
+  ephemeral `rebase run` never sent the grant at all; both now carry it, checked at
+  submit against the workspace's buckets the way a deploy is. (#15, case 2)
+- **The platform's own credential no longer expires under a tenant's call.** The
+  API reused its service-account token for a fixed ten minutes regardless of how
+  much life the token had left, so signed-URL, bucket and secret calls could fail
+  with `401 ACCESS_TOKEN_EXPIRED`; it now honours the token's real expiry and
+  retries such a call once with a fresh token. (#12)
+
 ## 0.8.0 — 2026-09-08
 
 ### Added

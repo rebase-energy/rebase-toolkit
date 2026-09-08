@@ -3540,6 +3540,84 @@ def test_ephemeral_run_terminal_response_needs_no_refetch(monkeypatch) -> None:
     assert calls == ["POST /runs/ephemeral"]
 
 
+def test_run_result_unwraps_a_marked_non_dict_return(monkeypatch) -> None:
+    """remote() hands back what the function returned: the server marks the
+    {"value": ...} it stores for a list return, and the marker is unwrapped."""
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        return FakeResponse(
+            {"id": "run-1", "status": "succeeded", "result": {"value": ["A"], "__rebase_wrapped__": True}}
+        )
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    run = client.run_ephemeral(
+        target_type="function",
+        project="demo",
+        name="fn",
+        source_code="def fn():\n    return ['A']\n",
+        entrypoint="fn",
+        run_type="quick_shared",
+    )
+
+    assert run.result() == ["A"]
+
+
+def test_run_result_passes_a_dict_return_and_an_unmarked_wrapper_through() -> None:
+    assert rb.client.unwrap_result({"value": ["A"]}) == {"value": ["A"]}
+    assert rb.client.unwrap_result({"status": "ok", "value": 1}) == {"status": "ok", "value": 1}
+    assert rb.client.unwrap_result({"value": None, "__rebase_wrapped__": True}) is None
+    assert rb.client.unwrap_result({}) == {}
+
+
+def test_ephemeral_run_submits_the_declared_bucket_grants(monkeypatch) -> None:
+    """`rebase run` of a function with buckets= must send the same attachment
+    list a deploy records, or the server refuses the run its own bucket."""
+    bodies: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        bodies.append(kwargs.get("json") or {})
+        return FakeResponse({"id": "run-1", "status": "succeeded", "result": {}})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.run_ephemeral(
+        target_type="function",
+        project="demo",
+        name="fn",
+        source_code="def fn():\n    return 7\n",
+        entrypoint="fn",
+        run_type="quick_shared",
+        buckets=["grid-archive", {"bucket": "scratch"}],
+    )
+
+    assert bodies[0]["buckets"] == [{"bucket": "grid-archive"}, {"bucket": "scratch"}]
+
+
+def test_ephemeral_run_omits_buckets_when_none_are_declared(monkeypatch) -> None:
+    bodies: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        bodies.append(kwargs.get("json") or {})
+        return FakeResponse({"id": "run-1", "status": "succeeded", "result": {}})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.run_ephemeral(
+        target_type="function",
+        project="demo",
+        name="fn",
+        source_code="def fn():\n    return 7\n",
+        entrypoint="fn",
+        run_type="quick_shared",
+    )
+
+    assert "buckets" not in bodies[0]
+
+
 def test_ephemeral_run_non_terminal_response_still_polls(monkeypatch) -> None:
     """Old-server contract: a `submitted` body falls back to the poll loop."""
     calls: list[str] = []
