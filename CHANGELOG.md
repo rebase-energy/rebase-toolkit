@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.8.0 — unreleased
+
+### Added
+
+- **`rb.workflow(timeout_seconds=)` bounds a whole run, and step timeouts are now
+  enforced.** A step's `timeout_seconds` bounds one attempt of that step; the workflow's
+  bounds the run. Leave the workflow's out and the platform derives it from the steps —
+  the sum of every step's `timeout_seconds × (retries + 1)` plus a minute of startup —
+  so declaring per-step timeouts is enough to size the run. A step with no timeout means
+  the run falls back to the platform default, and `deploy()` warns you which step is why.
+  A step longer than its workflow is refused at deploy, naming both numbers. `rebase
+  workflow get` shows `timeout_seconds`, `effective_timeout_seconds` and where the number
+  came from (`explicit`, `derived`, `default`). Until now a step's `timeout_seconds` was
+  recorded and ignored, and every job run was cut off at five minutes by an
+  infrastructure timeout nothing declared.
+- **A run that hits its bound fails with a reason, not an infrastructure crash.** The
+  run's `failure_reason` carries `step_timeout` or `run_timeout` with the step name, the
+  bound, and a hint; the step row records the same. A timed-out step attempt is never
+  retried — its work cannot be reclaimed — while ordinary failures now honour the step's
+  `retries`, which were previously recorded and ignored as well.
+- **Manual and `rebase run` workflow runs see their `secrets=`.** Only scheduled fires
+  delivered workflow-level env and secrets before; `rebase workflow run` and an ephemeral
+  `rebase run` of the same file started with neither, so a credentialed workflow could
+  only be tested by waiting for its cron. The platform now resolves them at submit time
+  for every run kind, and the ephemeral runner no longer needs Secret Manager access of
+  its own (the raw 403 is gone).
+
+### Changed
+
+- **The workspace timeout quota is split the way Cloud Run splits it.**
+  `--max-run-timeout-seconds` keeps bounding what a service answers in one request (ASGI
+  apps, quick functions, interactive workflows; at most 3600), and the new
+  `--max-job-timeout-seconds` bounds a `mode="job"` workflow's run, up to 86400. Both are
+  on `rebase admin set` and `rebase workspace compute-policy set`, and `compute-policy
+  show` lists both.
+
 ## 0.7.0 — 2026-09-06
 
 ### Added

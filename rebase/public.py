@@ -383,6 +383,7 @@ def workflow(
     concurrency: int | None = None,
     cpu: float | int | str | None = None,
     memory: int | float | str | None = None,
+    timeout_seconds: int | None = None,
     resources: dict[str, Any] | None = None,
     backend: str | None = None,
 ) -> Callable[[Callable[..., Any]], Workflow]: ...
@@ -411,6 +412,7 @@ def workflow(
     concurrency: int | None = None,
     cpu: float | int | str | None = None,
     memory: int | float | str | None = None,
+    timeout_seconds: int | None = None,
     resources: dict[str, Any] | None = None,
     backend: str | None = None,
 ) -> Workflow: ...
@@ -438,6 +440,7 @@ def workflow(
     concurrency: int | None = None,
     cpu: float | int | str | None = None,
     memory: int | float | str | None = None,
+    timeout_seconds: int | None = None,
     resources: dict[str, Any] | None = None,
     backend: str | None = None,
 ) -> Callable[[Callable[..., Any]], Workflow] | Workflow:
@@ -464,6 +467,7 @@ def workflow(
             concurrency=concurrency,
             cpu=cpu,
             memory=memory,
+            timeout_seconds=timeout_seconds,
             resources=resources,
         )
 

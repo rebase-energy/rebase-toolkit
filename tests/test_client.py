@@ -3979,3 +3979,98 @@ def test_project_overview_etags_are_per_project(monkeypatch) -> None:
         ("/projects/p2/overview", None),
         ("/projects/p1/overview", 'W/"/projects/p1/overview"'),
     ]
+
+
+def test_register_and_update_workflow_send_timeout_seconds(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed.clear()
+        observed.update(kwargs["json"])
+        return FakeResponse({"id": "workflow-id", "name": "sync"})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.register_workflow(name="sync", source_code="def sync(): pass", timeout_seconds=900)
+    assert observed["timeout_seconds"] == 900
+
+    # Omitted on register still sends the key (None = derive from the steps).
+    client.register_workflow(name="sync", source_code="def sync(): pass")
+    assert observed["timeout_seconds"] is None
+
+    # On update, None must survive the drop-None filter so removing
+    # `timeout_seconds=` really hands the bound back to the derivation.
+    client.update_workflow("workflow-id", timeout_seconds=None)
+    assert observed["timeout_seconds"] is None
+    client.update_workflow("workflow-id", timeout_seconds=1200)
+    assert observed["timeout_seconds"] == 1200
+    client.update_workflow("workflow-id", source_code="def sync(): pass")
+    assert "timeout_seconds" not in observed
+
+
+def test_workflow_deploy_refuses_a_step_longer_than_the_workflow_before_any_request(monkeypatch) -> None:
+    """The server checks the same thing; catching it here names both numbers in the user's file."""
+    project = rb.project("timeouts")
+
+    @project.step(timeout_seconds=2100)
+    def fetch() -> dict:
+        return {}
+
+    @project.workflow(timeout_seconds=900)
+    def collect() -> dict:
+        return fetch()
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        raise AssertionError("no request should be made")
+
+    patch_client_http(monkeypatch, fake_request)
+    collect.client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    with pytest.raises(rb.RebaseWorkflowError, match=r"'fetch' declares timeout_seconds=2100.*timeout_seconds=900"):
+        collect.deploy()
+
+
+def test_workflow_and_step_reject_non_positive_timeouts() -> None:
+    with pytest.raises(ValueError, match="timeout_seconds must be greater than or equal to 1"):
+        rb.workflow(lambda: None, name="w", timeout_seconds=0)
+    with pytest.raises(ValueError, match="timeout_seconds must be greater than 0"):
+        rb.step(lambda: None, name="s", timeout_seconds=0)
+
+
+def test_workflow_reads_back_the_effective_timeout_after_deploy(monkeypatch) -> None:
+    project = rb.project("timeouts")
+
+    @project.step(timeout_seconds=120)
+    def fetch() -> dict:
+        return {}
+
+    @project.workflow()
+    def collect() -> dict:
+        return fetch()
+
+    responses = {
+        "POST /functions": {"id": "fn-id", "name": "fetch", "current_version_id": "fv-id"},
+        "POST /workflows": {
+            "id": "workflow-id",
+            "name": "collect",
+            "timeout_seconds": None,
+            "effective_timeout_seconds": 180,
+            "timeout_source": "derived",
+            "timeout_note": None,
+        },
+    }
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        path = url.split("workflows.example.com", 1)[-1].split("?", 1)[0]
+        if method == "GET":
+            return FakeResponse([])
+        for key, body in responses.items():
+            if path.endswith(key.split(" ", 1)[1]) and method == key.split(" ", 1)[0]:
+                return FakeResponse(body)
+        return FakeResponse({"id": "any-id", "name": "any", "current_version_id": "v-id"})
+
+    patch_client_http(monkeypatch, fake_request)
+    collect.client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    collect.deploy()
+    assert collect.effective_timeout_seconds == 180
+    assert collect.timeout_source == "derived"

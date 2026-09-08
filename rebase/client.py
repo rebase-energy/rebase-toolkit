@@ -4359,6 +4359,7 @@ class Client:
         build: dict[str, Any] | None = None,
         cloud_run_cpu: str | None = None,
         cloud_run_memory: str | None = None,
+        timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
         environment = _resolve_environment(self, environment)
         path = "/workflows"
@@ -4389,6 +4390,7 @@ class Client:
             "buckets": buckets or [],
             "cloud_run_cpu": cloud_run_cpu,
             "cloud_run_memory": cloud_run_memory,
+            "timeout_seconds": timeout_seconds,
             "enabled": enabled,
             "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
             "environment": environment,
@@ -4445,6 +4447,7 @@ class Client:
         # decorator must actually clear the limit, not silently keep the old one.
         cloud_run_cpu: str | None | object = _UNSET,
         cloud_run_memory: str | None | object = _UNSET,
+        timeout_seconds: int | None | object = _UNSET,
     ) -> dict[str, Any]:
         execution_payload: dict[str, Any] = {}
         if mode is not None or isolation is not None or run_type is not None:
@@ -4495,6 +4498,8 @@ class Client:
             payload["cloud_run_cpu"] = cloud_run_cpu
         if cloud_run_memory is not _UNSET:
             payload["cloud_run_memory"] = cloud_run_memory
+        if timeout_seconds is not _UNSET:
+            payload["timeout_seconds"] = timeout_seconds
         if build:
             payload["build"] = build
         return self._request_dict("PATCH", f"/workflows/{workflow_id}", json=payload, expected="workflow response")
@@ -4548,6 +4553,7 @@ class Client:
         cloud_run_concurrency: int | None = None,
         env: dict[str, str] | None = None,
         secrets: dict[str, str] | None = None,
+        timeout_seconds: int | None = None,
     ) -> Run:
         resolved_mode, resolved_isolation = _validate_execution(
             mode,
@@ -4584,6 +4590,8 @@ class Client:
             payload["env"] = dict(env)
         if secrets:
             payload["secrets"] = dict(secrets)
+        if timeout_seconds is not None:
+            payload["timeout_seconds"] = timeout_seconds
 
         response = self._request_dict(
             "POST",
@@ -4670,6 +4678,7 @@ class Client:
         self,
         *,
         max_run_timeout_seconds: int | None = None,
+        max_job_timeout_seconds: int | None = None,
         max_concurrent_cloud_run_runs: int | None = None,
         max_cloud_run_instances: int | None = None,
         max_cloud_run_concurrency: int | None = None,
@@ -4682,6 +4691,8 @@ class Client:
         payload: dict[str, Any] = {}
         if max_run_timeout_seconds is not None:
             payload["max_run_timeout_seconds"] = max_run_timeout_seconds
+        if max_job_timeout_seconds is not None:
+            payload["max_job_timeout_seconds"] = max_job_timeout_seconds
         if max_concurrent_cloud_run_runs is not None:
             payload["max_concurrent_cloud_run_runs"] = max_concurrent_cloud_run_runs
         if max_cloud_run_instances is not None:
@@ -4715,6 +4726,7 @@ class Client:
         workspace_id: str,
         *,
         max_run_timeout_seconds: int | None = None,
+        max_job_timeout_seconds: int | None = None,
         max_concurrent_cloud_run_runs: int | None = None,
         max_cloud_run_instances: int | None = None,
         max_cloud_run_concurrency: int | None = None,
@@ -4726,6 +4738,7 @@ class Client:
         payload: dict[str, Any] = {}
         for key, value in (
             ("max_run_timeout_seconds", max_run_timeout_seconds),
+            ("max_job_timeout_seconds", max_job_timeout_seconds),
             ("max_concurrent_cloud_run_runs", max_concurrent_cloud_run_runs),
             ("max_cloud_run_instances", max_cloud_run_instances),
             ("max_cloud_run_concurrency", max_cloud_run_concurrency),
@@ -5269,6 +5282,7 @@ class Project:
         concurrency: int | None = None,
         cpu: float | int | str | None = None,
         memory: int | float | str | None = None,
+        timeout_seconds: int | None = None,
         resources: dict[str, Any] | None = None,
         backend: str | None = None,
     ) -> Callable[[Callable[..., Any]], Workflow]:
@@ -5300,6 +5314,7 @@ class Project:
                 concurrency=concurrency,
                 cpu=cpu,
                 memory=memory,
+                timeout_seconds=timeout_seconds,
                 resources=resources,
             )
             self._workflows.append(workflow)
@@ -6495,6 +6510,8 @@ class Step(Function):
         )
         if retries < 0:
             raise ValueError("retries must be greater than or equal to 0")
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be greater than 0")
         self.retries = retries
         self.timeout_seconds = timeout_seconds
         self.cache = cache
@@ -6578,6 +6595,7 @@ class Workflow:
         concurrency: int | None = None,
         cpu: float | int | str | None = None,
         memory: int | float | str | None = None,
+        timeout_seconds: int | None = None,
         resources: dict[str, Any] | None = None,
         backend: str | None = None,
     ) -> None:
@@ -6628,6 +6646,15 @@ class Workflow:
         self.cloud_run_memory: str | None = _cloud_run_memory_value(memory) or (
             data.get("cloud_run_memory") if data else None
         )
+        # The hard bound for a whole run. None means the platform derives it
+        # from the steps' own timeouts at deploy time; the effective value and
+        # where it came from are read back from the server after a deploy.
+        self.timeout_seconds: int | None = (
+            timeout_seconds if timeout_seconds is not None else (data.get("timeout_seconds") if data else None)
+        )
+        self.effective_timeout_seconds: int | None = data.get("effective_timeout_seconds") if data else None
+        self.timeout_source: str | None = data.get("timeout_source") if data else None
+        self.timeout_note: str | None = data.get("timeout_note") if data else None
         self.resource_policy: dict[str, Any] = {}
 
         if fn is not None:
@@ -6654,6 +6681,8 @@ class Workflow:
                 raise ValueError("min_instances must be greater than or equal to 0")
             if concurrency is not None and concurrency < 1:
                 raise ValueError("concurrency must be greater than or equal to 1")
+            if timeout_seconds is not None and timeout_seconds < 1:
+                raise ValueError("timeout_seconds must be greater than or equal to 1")
             self.cloud_run_min_instances = min_instances
             self.cloud_run_concurrency = concurrency
             self.resource_policy = resources or {}
@@ -6785,6 +6814,7 @@ class Workflow:
         if self.name is None:
             raise RebaseWorkflowError("workflow name is required")
         self._validate_schedule_defaults()
+        self._check_step_timeouts()
         build = None
         if self.fn and self.image and self.image.build_enabled:
             if self.mode != "job":
@@ -6832,15 +6862,14 @@ class Workflow:
                 buckets=buckets_payload,
                 cloud_run_cpu=self.cloud_run_cpu,
                 cloud_run_memory=self.cloud_run_memory,
+                timeout_seconds=self.timeout_seconds,
                 enabled=self.enabled,
                 endpoint=self.endpoint,
                 build=build,
                 environment=environment,
                 **source_metadata,
             )
-            self.id = workflow["id"]
-            self.data = workflow
-            self.step_graph = step_graph
+            self._adopt_deployed(workflow, step_graph)
             return self
 
         workflow = self._client.register_workflow(
@@ -6862,16 +6891,43 @@ class Workflow:
             buckets=buckets_payload,
             cloud_run_cpu=self.cloud_run_cpu,
             cloud_run_memory=self.cloud_run_memory,
+            timeout_seconds=self.timeout_seconds,
             enabled=self.enabled,
             endpoint=self.endpoint,
             build=build,
             environment=environment,
             **source_metadata,
         )
+        self._adopt_deployed(workflow, step_graph)
+        return self
+
+    def _check_step_timeouts(self) -> None:
+        """Refuse, before any request, a step that could never finish inside the run.
+
+        The server checks the same thing; catching it here saves a deploy round
+        trip and names the numbers in the user's own file.
+        """
+        if self.timeout_seconds is None:
+            return
+        for step in self._collect_steps():
+            if step.timeout_seconds is not None and step.timeout_seconds > self.timeout_seconds:
+                raise RebaseWorkflowError(
+                    f"step {step.name!r} declares timeout_seconds={step.timeout_seconds:g}, which exceeds "
+                    f"workflow {self.name!r}'s timeout_seconds={self.timeout_seconds}; raise the workflow "
+                    "timeout or lower the step's"
+                )
+
+    def _adopt_deployed(self, workflow: dict[str, Any], step_graph: dict[str, Any] | None) -> None:
         self.id = workflow["id"]
         self.data = workflow
         self.step_graph = step_graph
-        return self
+        self.effective_timeout_seconds = workflow.get("effective_timeout_seconds")
+        self.timeout_source = workflow.get("timeout_source")
+        self.timeout_note = workflow.get("timeout_note")
+        if self.timeout_source == "default" and self.timeout_note:
+            # The run is bounded at a number the user never chose. Say so once,
+            # at deploy, rather than letting a slow step discover it at 3 a.m.
+            warnings.warn(f"workflow {self.name!r}: {self.timeout_note}", stacklevel=3)
 
     def spawn(self, **parameters: Any) -> Run:
         if self.id is None:
@@ -6906,6 +6962,7 @@ class Workflow:
             image_spec=self.image_spec,
             env=self.env,
             secrets=_resolve_secrets_payload(self.secrets, self._client),
+            timeout_seconds=self.timeout_seconds,
         )
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:

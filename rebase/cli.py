@@ -2301,7 +2301,21 @@ def admin_set_command(
         int | None, typer.Option("--max-cpu-milli", help="Ceiling for a target's vCPU, in milli-vCPU.")
     ] = None,
     max_run_timeout_seconds: Annotated[
-        int | None, typer.Option("--max-run-timeout-seconds", help="Ceiling for a single request, in seconds.")
+        int | None,
+        typer.Option(
+            "--max-run-timeout-seconds",
+            help=(
+                "Ceiling for a service request (ASGI apps, quick functions, interactive workflows), "
+                "in seconds; max 3600."
+            ),
+        ),
+    ] = None,
+    max_job_timeout_seconds: Annotated[
+        int | None,
+        typer.Option(
+            "--max-job-timeout-seconds",
+            help="Ceiling for a job workflow's run (mode='job'), in seconds; max 86400.",
+        ),
     ] = None,
     max_concurrent_runs: Annotated[
         int | None, typer.Option("--max-concurrent-runs", help="Cloud Run runs allowed in flight at once.")
@@ -2334,6 +2348,7 @@ def admin_set_command(
             "max_cloud_run_memory_mib": max_memory_mib,
             "max_cloud_run_cpu_milli": max_cpu_milli,
             "max_run_timeout_seconds": max_run_timeout_seconds,
+            "max_job_timeout_seconds": max_job_timeout_seconds,
             "max_concurrent_cloud_run_runs": max_concurrent_runs,
             "max_cloud_run_instances": max_instances,
             "max_cloud_run_concurrency": max_concurrency,
@@ -2999,6 +3014,7 @@ compute_policy_app = typer.Typer(
 COMPUTE_POLICY_DETAIL_KEYS = [
     "workspace_id",
     "max_run_timeout_seconds",
+    "max_job_timeout_seconds",
     "max_concurrent_cloud_run_runs",
     "max_cloud_run_instances",
     "max_cloud_run_concurrency",
@@ -3029,7 +3045,19 @@ def workspace_compute_policy_set_command(
         typer.Option(
             "--max-run-timeout-seconds",
             "-m",
-            help="Ceiling for a single request, in seconds (max 3600). Raising it requires superadmin.",
+            help=(
+                "Ceiling for a service request (ASGI apps, quick functions, interactive workflows), in "
+                "seconds; max 3600. Raising it requires superadmin."
+            ),
+        ),
+    ] = None,
+    max_job_timeout_seconds: Annotated[
+        int | None,
+        typer.Option(
+            "--max-job-timeout-seconds",
+            help=(
+                "Ceiling for a job workflow's run (mode='job'), in seconds; max 86400. Raising it requires superadmin."
+            ),
         ),
     ] = None,
     max_concurrent_runs: Annotated[
@@ -3061,6 +3089,7 @@ def workspace_compute_policy_set_command(
     """
     if (
         max_run_timeout_seconds is None
+        and max_job_timeout_seconds is None
         and max_concurrent_runs is None
         and max_instances is None
         and max_concurrency is None
@@ -3074,6 +3103,8 @@ def workspace_compute_policy_set_command(
     kwargs: dict[str, Any] = {}
     if max_run_timeout_seconds is not None:
         kwargs["max_run_timeout_seconds"] = max_run_timeout_seconds
+    if max_job_timeout_seconds is not None:
+        kwargs["max_job_timeout_seconds"] = max_job_timeout_seconds
     if max_concurrent_runs is not None:
         kwargs["max_concurrent_cloud_run_runs"] = max_concurrent_runs
     if max_instances is not None:
@@ -5045,6 +5076,9 @@ def workflow_get_command(
                 "mode",
                 "isolation",
                 "enabled",
+                "timeout_seconds",
+                "effective_timeout_seconds",
+                "timeout_source",
                 "default_parameters",
                 "current_version_id",
                 "created_at",
