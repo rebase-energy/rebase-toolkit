@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rebase-toolkit"
-version = "0.9.0"
+version = "0.10.0"
 description = "Python client and toolkit for the Rebase Platform"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -40,8 +40,7 @@ modeling = [
     "emflow>=0.3.1,<0.4",
 ]
 hillclimb = [
-    "hillclimb[emflow]>=0.2,<0.3",
-    "google-cloud-storage>=2.14",
+    "hillclimb[emflow]>=0.3,<0.4",
 ]
 snowflake = [
     "pandas>=2.0",
@@ -76,8 +75,7 @@ all = [
     "emflow>=0.3.1,<0.4",
     "energydatamodel",
     "huggingface-hub>=1.20.1",
-    "hillclimb[emflow]>=0.2,<0.3",
-    "google-cloud-storage>=2.14",
+    "hillclimb[emflow]>=0.3,<0.4",
     "rebase-toolkit[bigquery]",
     "rebase-toolkit[databricks]",
     "rebase-toolkit[fabric]",

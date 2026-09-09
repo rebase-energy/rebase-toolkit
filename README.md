@@ -384,8 +384,14 @@ job), or on your own machine with `--local`:
 
 ```bash
 rebase hillclimb start emflow://gefcom2014:solar --budget 2h
+rebase hillclimb start emflow://gefcom2014:solar --budget 2h --parallel-searches 3 --parallel-operators 2
 rebase hillclimb start emflow://gefcom2014:solar --budget 2h --local
 ```
+
+A hosted run can carry several independent searches (`--parallel-searches`),
+each its own engine, sharing what they learn as they go; `--parallel-operators`
+is how many agents each search keeps busy. The platform sizes the job from
+that shape. `--policy` picks the search engine (`greedy`, `openevolve`, `gepa`).
 
 Hidden holdout selection is enabled by default. For public-data plumbing checks
 where private holdout credentials are intentionally unavailable, pass
@@ -395,14 +401,23 @@ Any problem in emflow's registry is a valid target (`emflow://<name>`), as are
 plain hillclimb problem folders. `--backend dummy` runs the search loop
 without agent calls (smoke tests).
 
-Watch and control a hosted search — its state (candidate tree, scores, budget)
-syncs to the workspace artifacts bucket every ~30 s:
+Watch a hosted search in hillclimb's own TUIs — the same screens as
+`hillclimb watch`, fed by a live mirror the platform streams to your laptop —
+or read it as text:
 
 ```bash
-rebase hillclimb list
+rebase hillclimb watch <run-id>    # runs → searches → candidates; s = stop, x = prune
+rebase hillclimb chart <run-id>    # the hillclimb: best score over time
+rebase hillclimb tree <run-id>     # one search's exploration tree
+rebase hillclimb graph <run-id>    # the knowledge graph
 rebase hillclimb status <run-id>   # candidates, best score, budget left
+rebase hillclimb logs <run-id>     # engine logs
 rebase hillclimb stop <run-id>     # graceful: parks after the current operator
+rebase hillclimb list
 ```
+
+Without a run id, `watch`, `chart`, `tree` and `graph` open the local
+hillclimb dir, exactly like the standalone commands.
 
 When the search finishes, promote the selected model into your workspace repo
 as versioned source, then deploy it like any other model:
@@ -416,13 +431,19 @@ rebase model deploy models/gefcom2014_solar.py
 The promoted file exposes `get_model() -> emflow.Predictor` — the same class
 that won the backtest is what serves in production.
 
-Hosted searches bill agent calls to the workspace's configured Claude
-credentials (a `CLAUDE_CODE_OAUTH_TOKEN` for subscription billing, or an
-API key); `--local` searches use your local Claude login. Search state lives
-under `gs://<artifacts-bucket>/hillclimb/<sync-id>/`; set
-`REBASE_HILLCLIMB_BUCKET` to read it from the CLI. Server-side requirements
-(job image, secrets, artifacts bucket) are documented in
-`platform/workflows/HILLCLIMB.md`.
+Hosted agents bill the workspace secret named `hillclimb` when it exists —
+a `CLAUDE_CODE_OAUTH_TOKEN` for subscription billing (mint one with
+`claude setup-token`) or an `ANTHROPIC_API_KEY` — else the platform's own
+credentials; `--claude-secret` names a different bundle:
+
+```bash
+claude setup-token | rebase secret create hillclimb CLAUDE_CODE_OAUTH_TOKEN=-
+```
+
+`--local` searches use your local Claude login. Hosted search state is served
+by the platform (`/runs/{id}/hillclimb/...`); nothing on your machine needs
+Google credentials or a bucket name. Server-side requirements are documented
+in `platform/toolkit/HILLCLIMB.md`.
 
 ## Stitching and Forecast Windows
 

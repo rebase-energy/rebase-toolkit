@@ -7188,11 +7188,63 @@ def _hillclimb():
 
 
 def _hillclimb_sync_id(client: Client, run_id: str) -> str:
-    run = client.get_run(run_id)
-    sync_id = (run.get("parameters") or {}).get("sync_id")
-    if not sync_id:
-        raise RebaseWorkflowError(f"run {run_id} is not a hillclimb search (no sync_id)")
-    return str(sync_id)
+    from .hillclimb_mirror import sync_id_of
+
+    return sync_id_of(client.get_run(run_id))
+
+
+def _hillclimb_engine_config():
+    """The engine's Config for the current hillclimb dir (local or mirror), as a CLI error when there is none."""
+    from hillclimb.config import Config, HillclimbDirNotFound
+
+    try:
+        return Config.load()
+    except HillclimbDirNotFound as exc:
+        raise RebaseWorkflowError(f"{exc}\nrun `rebase hillclimb init` here, or name a hosted run id") from exc
+
+
+def _hillclimb_tui(kind: str, run_id: str | None, *, search: str | None = None, **options: Any) -> None:
+    """Open one of the engine's TUIs on the local hillclimb dir, or on a
+    live mirror of the hosted run ``run_id`` fed through the platform API."""
+    _hillclimb()
+    mirror = None
+    if run_id is not None:
+        from .hillclimb_mirror import Mirror
+
+        client = Client()
+        mirror = Mirror(client, run_id, sync_id=_hillclimb_sync_id(client, run_id), log=console.print)
+        console.print(f"mirroring run {run_id} into {mirror.hillclimb_dir} ...")
+        mirror.start()
+        mirror.apply_engine_env()
+    try:
+        config = _hillclimb_engine_config()
+        if kind == "watch":
+            from hillclimb.cli import resolve_search_dir
+            from hillclimb.watch import WatchApp
+
+            search_dir = resolve_search_dir(config, search) if search else None
+            WatchApp(config, search_dir=search_dir).run()
+        elif kind == "chart":
+            from hillclimb.chart import ChartApp
+
+            ChartApp(
+                config, search, detail=bool(options.get("detail")), holdout=None, cost=bool(options.get("cost"))
+            ).run()
+        elif kind == "tree":
+            from hillclimb.treeview import TreeApp
+
+            TreeApp(config, search).run()
+        elif kind == "graph":
+            from hillclimb.graphview import GraphApp
+
+            GraphApp(config).run()
+        else:  # pragma: no cover - guarded by the command table
+            raise RebaseWorkflowError(f"unknown hillclimb view {kind!r}")
+    finally:
+        if mirror is not None:
+            mirror.stop()
+            if mirror.last_error:
+                console.print(f"[yellow]mirror: last error was {mirror.last_error}[/yellow]")
 
 
 def _parse_budget_seconds(value: str) -> int:
@@ -7270,6 +7322,28 @@ def hillclimb_start_command(
             help="Use the hidden holdout for final selection; disable it only for smoke tests.",
         ),
     ] = True,
+    policy: Annotated[
+        str | None, typer.Option("--policy", "-P", help="Search policy: greedy (default) | openevolve | gepa.")
+    ] = None,
+    parallel_searches: Annotated[
+        int,
+        typer.Option("--parallel-searches", "-S", min=1, help="Independent searches under one hosted run (share knowledge)."),
+    ] = 1,
+    parallel_operators: Annotated[
+        int | None,
+        typer.Option("--parallel-operators", "-O", min=1, help="Concurrent operators per search (hosted default: 3)."),
+    ] = None,
+    claude_secret: Annotated[
+        str | None,
+        typer.Option(
+            "--claude-secret",
+            "-c",
+            help=(
+                "Workspace secret holding CLAUDE_CODE_OAUTH_TOKEN (or ANTHROPIC_API_KEY) that bills the agents. "
+                "Default: the `hillclimb` secret when it exists, else the platform's own credentials."
+            ),
+        ),
+    ] = None,
     project: Annotated[str, typer.Option("--project", "-p", help="Project for the platform run.")] = "hillclimb",
     local: Annotated[bool, typer.Option("--local", "-l", help="Run on this machine instead of the platform.")] = False,
 ) -> None:
@@ -7290,17 +7364,31 @@ def hillclimb_start_command(
         if outcome.selected is not None:
             console.print(f"selected {outcome.selected.candidate_id}: val={outcome.selected.val_score}")
         return
+    client = Client()
+    try:
+        secret_name, secrets = module.resolve_agent_secrets(client, claude_secret)
+    except RuntimeError as exc:
+        raise RebaseWorkflowError(str(exc)) from exc
     run = module.start_hosted_search(
-        Client(),
+        client,
         target,
         budget_s=budget_s,
         name=name,
         project=project,
         model=model,
         backend=backend,
+        policy=policy,
+        parallel_searches=parallel_searches,
+        parallel_operators=parallel_operators,
         holdout=holdout,
+        secrets=secrets,
     )
     console.print(f"Submitted hosted search run [bold]{run.id}[/bold]")
+    if secret_name:
+        console.print(f"  agents bill workspace secret [bold]{secret_name}[/bold]")
+    else:
+        console.print("  agents bill the platform's own credentials (no `hillclimb` workspace secret found)")
+    console.print(f"  watch:  rebase hillclimb watch {run.id}")
     console.print(f"  status: rebase hillclimb status {run.id}")
     console.print(f"  events: rebase run get {run.id}")
 
@@ -7335,28 +7423,101 @@ def hillclimb_list_command(
 @hillclimb_app.command("status")
 def hillclimb_status_command(
     run_id: Annotated[str, typer.Argument(help="Platform run ID from `hillclimb start`.")],
-    bucket: Annotated[str | None, typer.Option("--bucket", "-b", help="Artifacts bucket override.")] = None,
 ) -> None:
-    """Live search state (candidates, best score, budget) from synced GCS state."""
-    module = _hillclimb()
+    """Live search state (candidates, best score, budget) of a hosted search."""
+    from . import hillclimb as module
+
     client = Client()
     run = client.get_run(run_id)
     console.print(f"platform run: {run.get('status')}")
-    sync_id = _hillclimb_sync_id(client, run_id)
-    statuses = module.read_hosted_state(sync_id, bucket=bucket)
-    console.print(module.format_hosted_status(statuses))
+    _hillclimb_sync_id(client, run_id)
+    console.print(module.format_hosted_status(module.read_hosted_state(client, run_id)))
 
 
 @hillclimb_app.command("stop")
 def hillclimb_stop_command(
     run_id: Annotated[str, typer.Argument(help="Platform run ID.")],
-    bucket: Annotated[str | None, typer.Option("--bucket", "-b")] = None,
 ) -> None:
     """Gracefully stop a hosted search (parks after the current operator)."""
-    module = _hillclimb()
-    sync_id = _hillclimb_sync_id(Client(), run_id)
-    module.request_hosted_stop(sync_id, bucket=bucket)
-    console.print("stop queued: delivered to the search within one sync interval (~30s)")
+    from . import hillclimb as module
+
+    client = Client()
+    _hillclimb_sync_id(client, run_id)
+    module.request_hosted_stop(client, run_id)
+    console.print("stop queued: the search parks within seconds of its next status sync")
+
+
+@hillclimb_app.command("watch")
+def hillclimb_watch_command(
+    run_id: Annotated[
+        str | None, typer.Argument(help="Hosted run ID to mirror; omit for the local hillclimb dir.")
+    ] = None,
+    search: Annotated[
+        str | None,
+        typer.Option("--search", "-s", help="Open straight on one search: latest, <run-id>, or <run-id>/<search-id>."),
+    ] = None,
+) -> None:
+    """The hillclimb watch TUI: runs, searches, candidates, live agent streams (s = stop, x = prune)."""
+    _hillclimb_tui("watch", run_id, search=search)
+
+
+@hillclimb_app.command("chart")
+def hillclimb_chart_command(
+    run_id: Annotated[
+        str | None, typer.Argument(help="Hosted run ID to mirror; omit for the local hillclimb dir.")
+    ] = None,
+    search: Annotated[
+        str | None, typer.Option("--search", "-s", help="latest, <run-id>, or <run-id>/<search-id>.")
+    ] = None,
+    detail: Annotated[bool, typer.Option("--detail", "-d", help="Draw the exploration tree on the curve.")] = False,
+    cost: Annotated[bool, typer.Option("--cost", "-c", help="Plot agent cost instead of wall-clock on the x axis.")] = False,
+) -> None:
+    """The hillclimb chart: best score so far across searches, every candidate a dot."""
+    _hillclimb_tui("chart", run_id, search=search, detail=detail, cost=cost)
+
+
+@hillclimb_app.command("tree")
+def hillclimb_tree_command(
+    run_id: Annotated[
+        str | None, typer.Argument(help="Hosted run ID to mirror; omit for the local hillclimb dir.")
+    ] = None,
+    search: Annotated[
+        str | None, typer.Option("--search", "-s", help="latest, <run-id>, or <run-id>/<search-id>.")
+    ] = None,
+) -> None:
+    """One search's exploration tree: expanded vs discontinued lineages."""
+    _hillclimb_tui("tree", run_id, search=search)
+
+
+@hillclimb_app.command("graph")
+def hillclimb_graph_command(
+    run_id: Annotated[
+        str | None, typer.Argument(help="Hosted run ID to mirror; omit for the local hillclimb dir.")
+    ] = None,
+) -> None:
+    """The knowledge graph the searches grow."""
+    _hillclimb_tui("graph", run_id)
+
+
+@hillclimb_app.command("logs")
+def hillclimb_logs_command(
+    run_id: Annotated[str, typer.Argument(help="Hosted run ID.")],
+    lines: Annotated[int, typer.Option("--lines", "-n", min=1, help="Lines per engine log.")] = 40,
+) -> None:
+    """The engine logs of a hosted run (one per search of a fleet)."""
+    from .hillclimb_mirror import Mirror
+
+    client = Client()
+    mirror = Mirror(client, run_id, sync_id=_hillclimb_sync_id(client, run_id))
+    mirror.prepare()
+    mirror.pull_once()
+    logs = sorted(mirror.runs_dir.glob("*/logs/*.log"))
+    if not logs:
+        console.print("no engine logs synced yet")
+        return
+    for path in logs:
+        console.print(f"[bold]== {path.relative_to(mirror.runs_dir)}[/bold]")
+        console.print("\n".join(path.read_text(errors="replace").splitlines()[-lines:]))
 
 
 @hillclimb_app.command("promote")
@@ -7366,7 +7527,6 @@ def hillclimb_promote_command(
         typer.Argument(help="Platform run ID, or with --local a runs/ id, unique substring, or 'latest'."),
     ],
     dest: Annotated[str, typer.Option("--dest", "-d", help="Directory for the model files.")] = "models",
-    bucket: Annotated[str | None, typer.Option("--bucket", "-b")] = None,
     local: Annotated[
         bool, typer.Option("--local", "-l", help="Promote from a local search (state in ./runs/).")
     ] = False,
@@ -7385,8 +7545,9 @@ def hillclimb_promote_command(
         except RuntimeError as exc:
             raise RebaseWorkflowError(str(exc)) from exc
     else:
-        sync_id = _hillclimb_sync_id(Client(), run_id)
-        written = module.fetch_best_solution(sync_id, Path(dest), bucket=bucket)
+        client = Client()
+        _hillclimb_sync_id(client, run_id)
+        written = module.fetch_best_solution(client, run_id, Path(dest))
         if not written:
             raise RebaseWorkflowError("no best/solution.py synced yet — is the search finished?")
     for path in written:

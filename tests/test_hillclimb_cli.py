@@ -99,3 +99,117 @@ def test_hosted_hillclimb_passes_holdout_as_run_parameter() -> None:
 
     assert client.kwargs["parameters"]["holdout"] is False
     assert "holdout: bool = True" in client.kwargs["source_code"]
+    assert client.kwargs["mode"] == "job" and client.kwargs["image_spec"] == {"runtime": "hillclimb"}
+    # the platform sizes the job from the search shape in the env
+    assert client.kwargs["env"] == {
+        "REBASE_HILLCLIMB_PARALLEL_SEARCHES": "1",
+        "REBASE_HILLCLIMB_PARALLEL_OPERATORS": "3",
+    }
+    assert client.kwargs["secrets"] == {}
+
+
+def test_hosted_hillclimb_start_forwards_fleet_shape_and_secrets(monkeypatch, capsys) -> None:
+    from rebase import cli, hillclimb
+
+    class FakeClient:
+        kwargs: dict = {}
+
+        def list_secrets(self):
+            return [{"name": "other"}, {"name": "hillclimb"}]
+
+        def get_secret(self, name):
+            assert name == "hillclimb"
+            return {"secret_refs": {"CLAUDE_CODE_OAUTH_TOKEN": "ws-claude:3", "UNRELATED": "x"}}
+
+        def run_ephemeral(self, **kwargs):
+            FakeClient.kwargs = kwargs
+            return SimpleNamespace(id="run-id")
+
+    monkeypatch.setattr(cli, "Client", FakeClient)
+    assert (
+        main(
+            [
+                "hillclimb",
+                "start",
+                "emflow://gefcom2014:solar",
+                "--budget",
+                "15m",
+                "--parallel-searches",
+                "2",
+                "--parallel-operators",
+                "2",
+                "--policy",
+                "gepa",
+            ]
+        )
+        == 0
+    )
+    kwargs = FakeClient.kwargs
+    assert kwargs["parameters"]["budget_s"] == 900
+    assert kwargs["parameters"]["parallel_searches"] == 2
+    assert kwargs["parameters"]["parallel_operators"] == 2
+    assert kwargs["parameters"]["policy"] == "gepa"
+    assert kwargs["env"] == {"REBASE_HILLCLIMB_PARALLEL_SEARCHES": "2", "REBASE_HILLCLIMB_PARALLEL_OPERATORS": "2"}
+    assert kwargs["secrets"] == {"CLAUDE_CODE_OAUTH_TOKEN": "ws-claude:3"}
+    out = capsys.readouterr().out
+    assert "agents bill workspace secret hillclimb" in out
+    assert "rebase hillclimb watch run-id" in out
+    assert hillclimb.RUN_NAME_PREFIX in kwargs["name"]
+
+
+def test_resolve_agent_secrets_falls_back_to_deployment_credentials() -> None:
+    from rebase.hillclimb import resolve_agent_secrets
+
+    class NoSecrets:
+        def list_secrets(self):
+            return [{"name": "other"}]
+
+    assert resolve_agent_secrets(NoSecrets(), None) == (None, {})
+
+    class Wrong:
+        def get_secret(self, name):
+            return {"secret_refs": {"UNRELATED": "x"}}
+
+    try:
+        resolve_agent_secrets(Wrong(), "wrong")
+    except RuntimeError as exc:
+        assert "CLAUDE_CODE_OAUTH_TOKEN" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected a RuntimeError")
+
+
+def test_hosted_status_and_stop_go_through_the_api(monkeypatch, capsys) -> None:
+    from rebase import cli
+
+    class FakeClient:
+        controls: list = []
+
+        def get_run(self, run_id):
+            return {"id": run_id, "status": "running", "parameters": {"sync_id": "abc"}}
+
+        def list_hillclimb_objects(self, run_id):
+            return {
+                "objects": [{"path": "run-1/searches/solar/status.json", "generation": "5"}, {"path": "run-1/run.yaml"}]
+            }
+
+        def get_hillclimb_object(self, run_id, path, *, etag=None):
+            body = json.dumps(
+                {
+                    "state": "running",
+                    "candidates": {"total": 4, "ok": 3},
+                    "budget": {"remaining_s": 120},
+                    "cost_usd": 0.5,
+                }
+            )
+            return body.encode(), '"5"'
+
+        def send_hillclimb_control(self, run_id, *, action, candidate_id=None, reason="", source="cli"):
+            FakeClient.controls.append(action)
+            return {"path": "control/x-stop.json"}
+
+    monkeypatch.setattr(cli, "Client", FakeClient)
+    assert main(["hillclimb", "status", "run-1"]) == 0
+    out = capsys.readouterr().out
+    assert "platform run: running" in out and "run-1/solar: running" in out and "candidates=4 (3 ok)" in out
+    assert main(["hillclimb", "stop", "run-1"]) == 0
+    assert FakeClient.controls == ["stop"]

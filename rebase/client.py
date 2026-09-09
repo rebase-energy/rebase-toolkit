@@ -21,6 +21,7 @@ from functools import wraps
 from pathlib import Path
 from types import FunctionType
 from typing import Any, Self
+from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
@@ -4763,6 +4764,46 @@ class Client:
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
         return self._request_dict("POST", f"/runs/{run_id}/cancel", expected="run response")
+
+    # -- hosted hillclimb searches: the platform proxies the synced bucket state --
+
+    def list_hillclimb_objects(self, run_id: str) -> dict[str, Any]:
+        """Every synced object of a hosted hillclimb search (path, size, generation)."""
+        return self._request_dict("GET", f"/runs/{run_id}/hillclimb/objects", expected="hillclimb objects response")
+
+    def get_hillclimb_object(
+        self, run_id: str, path: str, *, etag: str | None = None
+    ) -> tuple[bytes | None, str | None]:
+        """One synced object's bytes and its ETag (the GCS generation). With
+        ``etag`` from a previous call the platform answers 304 when nothing
+        changed, and this returns (None, etag)."""
+        headers = {"If-None-Match": etag if etag.startswith('"') else f'"{etag}"'} if etag else {}
+        response = self._request_response(
+            "GET",
+            f"/runs/{run_id}/hillclimb/objects/{quote(path.lstrip('/'), safe='/')}",
+            headers=headers,
+            timeout=120,
+        )
+        if response.status_code == 304:
+            return None, etag
+        return response.content, response.headers.get("ETag")
+
+    def send_hillclimb_control(
+        self,
+        run_id: str,
+        *,
+        action: str,
+        candidate_id: str | None = None,
+        reason: str = "",
+        source: str = "cli",
+    ) -> dict[str, Any]:
+        """Queue a stop or prune for a hosted search; the job applies it within seconds."""
+        payload: dict[str, Any] = {"action": action, "reason": reason, "source": source}
+        if candidate_id:
+            payload["candidate_id"] = candidate_id
+        return self._request_dict(
+            "POST", f"/runs/{run_id}/hillclimb/control", json=payload, expected="hillclimb control response"
+        )
 
     def get_run_logs(
         self,

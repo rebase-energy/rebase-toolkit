@@ -4,6 +4,36 @@
 
 ### Added
 
+- **The projects table shows a day of run history per project.** The workspace view
+  gains the same `History` bar chart the workflows table has, one row per project with
+  every run in the project folded into it, so a failure anywhere in the workspace in
+  the last 24 hours is one red bar on the first screen. Counted by the platform in the
+  database over the whole window (`run_history` on `GET /workspace/overview`); against
+  a platform without the aggregate the column shows `-` rather than a quiet day.
+- **Hosted hillclimb searches, revived.** `rebase hillclimb start` runs the
+  engine on the platform again (a long-running Cloud Run job) and gains
+  `--parallel-searches` (N engines under one run, sharing live knowledge),
+  `--parallel-operators`, `--policy`, and `--claude-secret`: the agents bill
+  the workspace secret named `hillclimb` when it exists (create it with
+  `rebase secret create hillclimb CLAUDE_CODE_OAUTH_TOKEN=-` and
+  `claude setup-token`), else the platform's own credentials. The job is sized
+  from searches x operators.
+- **`rebase hillclimb watch | chart | tree | graph [RUN_ID]`** open the
+  engine's own TUIs. Without a run id they read the local hillclimb dir,
+  exactly like the standalone commands; with one they read a live mirror of
+  the hosted search that the platform API feeds
+  (`GET /runs/{id}/hillclimb/objects`), and the TUI's stop / prune keys reach
+  the job through `POST /runs/{id}/hillclimb/control`. No Google credentials
+  or bucket name on the laptop: `status`, `stop` and `promote` go through the
+  same routes, and their `--bucket` flags are gone. `rebase hillclimb logs`
+  prints the engine logs of a hosted run.
+
+### Changed
+
+- The `hillclimb` extra now requires the engine at `>=0.3,<0.4` (the remote-state
+  viewer flag and the public fleet API live there) and no longer pulls
+  `google-cloud-storage` onto the client.
+
 - **Skipped scheduled fires leave a trace.** A fire the runner skipped — paused,
   before the schedule's `start`, or after its `end` — never created a run, so an
   ended or paused schedule looked exactly like one that had stopped firing.
