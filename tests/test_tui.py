@@ -6790,16 +6790,26 @@ def test_workflow_cron_state_treats_an_ended_window_as_stopped() -> None:
 def test_tui_build_timeline_attributes_log_lines_to_their_step() -> None:
     from rebase.tui import build_timeline
 
-    steps = [{"id": "s1", "name": "fetch", "prefect_task_run_id": "task-a", "status": "succeeded"}]
+    steps = [
+        {"id": "s1", "name": "fetch", "status": "succeeded"},
+        {"id": "s2", "name": "fetch-all", "status": "succeeded"},
+        {"id": "s3", "name": "notify", "prefect_task_run_id": "task-c", "status": "succeeded"},
+    ]
     logs = [
-        {"timestamp": "2026-09-09T10:00:01Z", "message": "in fetch", "severity": "INFO", "task_run_id": "task-a"},
-        {"timestamp": "2026-09-09T10:00:02Z", "message": "flow level", "severity": "INFO"},
+        {"timestamp": "2026-09-09T10:00:01Z", "message": "[fetch] in fetch", "severity": "INFO"},
+        {"timestamp": "2026-09-09T10:00:02Z", "message": "[fetch-all] in the longer one", "severity": "INFO"},
+        {"timestamp": "2026-09-09T10:00:03Z", "message": "by task id", "severity": "INFO", "task_run_id": "task-c"},
+        {"timestamp": "2026-09-09T10:00:04Z", "message": "flow level", "severity": "INFO"},
     ]
     rows = [row for row in build_timeline([], steps, logs) if row.kind == "log"]
-    assert [(row.message, row.scope, row.stage) for row in rows] == [
-        ("in fetch", "fetch", "fetch"),
-        ("flow level", "run", ""),
+    assert [(row.scope, row.stage) for row in rows] == [
+        ("fetch", "fetch"),
+        ("fetch-all", "fetch-all"),
+        ("notify", "notify"),
+        ("run", ""),
     ]
+    # The prefix stays in the message: it is what `rebase run logs` shows too.
+    assert rows[0].message == "[fetch] in fetch"
 
 
 def test_tui_run_drawer_diagnosis_includes_what_was_observed() -> None:

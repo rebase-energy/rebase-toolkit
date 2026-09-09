@@ -877,9 +877,8 @@ def _run_progress_reporter() -> _TerminalRunProgressReporter | _LineRunProgressR
 class _RunLogFollower:
     """Incrementally fetches run stdout/stderr and prints new lines via the reporter.
 
-    Lines that the log store attributes to a Prefect task run are prefixed with
-    the step's name once `note_steps` has seen that step -- steps run as tasks
-    and carry the same id -- so two steps' output can be told apart.
+    Lines emitted inside a step arrive already prefixed `[step-name]` -- the
+    runner stamps them at the source -- so nothing here has to know the steps.
     """
 
     def __init__(self, run: Run) -> None:
@@ -887,13 +886,6 @@ class _RunLogFollower:
         self._since: str | None = None
         self._active = True
         self._printed_message = False
-        self._step_names: dict[str, str] = {}
-
-    def note_steps(self, steps: Iterable[dict[str, Any]]) -> None:
-        for step in steps:
-            task_run_id = step.get("prefect_task_run_id")
-            if task_run_id:
-                self._step_names[str(task_run_id)] = str(step.get("name") or step.get("node_key") or task_run_id)
 
     def poll(self, reporter: _TerminalRunProgressReporter | _LineRunProgressReporter) -> None:
         if not self._active:
@@ -904,11 +896,11 @@ class _RunLogFollower:
             self._active = False
             return
         for entry in payload.get("entries") or []:
-            message = str(entry.get("message") or "")
-            step_name = self._step_names.get(str(entry.get("task_run_id") or ""))
-            if step_name:
-                message = f"[{step_name}] {message}"
-            reporter.log(str(entry.get("timestamp") or ""), message, str(entry.get("severity") or "INFO"))
+            reporter.log(
+                str(entry.get("timestamp") or ""),
+                str(entry.get("message") or ""),
+                str(entry.get("severity") or "INFO"),
+            )
         next_since = payload.get("next_since")
         if next_since:
             self._since = str(next_since)
@@ -962,12 +954,7 @@ def _stream_run_result(
 
         if steps_supported and not already_terminal:
             try:
-                steps = run.steps()
-                if log_follower is not None:
-                    # Teach the follower which Prefect task run is which step, so
-                    # the step's log lines print under its name.
-                    log_follower.note_steps(steps)
-                for step in steps:
+                for step in run.steps():
                     step_key = str(step.get("id") or step.get("node_key") or step.get("name") or "")
                     if not step_key:
                         continue

@@ -10,10 +10,12 @@
   `rebase workflow schedule show` now reports `last_skipped_at` and
   `last_skip_reason` (`paused`, `not_started`, `ended`), stamped by the runner on
   every skip.
-- **Log lines know their step.** The platform now returns the Prefect task run
-  behind each log line, and steps run as tasks, so `rebase run logs` prefixes a
-  step's output with `[step-name]` and the TUI's Activity pane fills the Scope
-  column for log rows instead of leaving it blank.
+- **Log lines know their step.** The runner now prefixes every line printed
+  inside a step with `[step-name]` -- steps are plain calls inside one flow run,
+  so the name in the message is the only attribution the log store can carry --
+  and the TUI's Activity pane reads that prefix to fill the Scope column for log
+  rows instead of leaving it blank. Log entries also carry `task_run_id` where
+  the store has one.
 - **What the platform observed reaches the reader.** A failed run's summary now
   ends with the measurement behind the diagnosis — `(used 611 of 512 MiB)`,
   `(exit code 1)`, `(TypeError)` — and the TUI's diagnosis block carries the whole

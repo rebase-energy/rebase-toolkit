@@ -1795,17 +1795,28 @@ def build_timeline(
                 url=artifact_browser_url(uri),
             )
         )
-    # Steps run as Prefect tasks, and the log store stamps each line with the
-    # task run it was emitted under -- the same id step_runs records. That is
-    # the only link between a log line and its step; timestamps alone cannot
-    # tell two steps' output apart.
+    # A line printed inside a step arrives as `[step-name] text`: steps are
+    # plain calls inside one flow run, not Prefect tasks, so the runner stamps
+    # the name into the message, the one field the log store keeps. That
+    # prefix -- or a task run id, when a store does have one -- is the only
+    # link between a log line and its step; timestamps alone cannot tell two
+    # steps' output apart. Longest names first so `fetch-all` is not read as `fetch`.
     step_by_task_run = {
         str(step["prefect_task_run_id"]): str(step.get("name") or step.get("node_key") or step["id"])
         for step in steps
         if step.get("prefect_task_run_id")
     }
+    prefixed_steps = sorted(step_names.values(), key=len, reverse=True)
+
+    def log_step(entry: dict[str, Any]) -> str:
+        message = str(entry.get("message") or "")
+        for name in prefixed_steps:
+            if message.startswith(f"[{name}] "):
+                return name
+        return step_by_task_run.get(str(entry.get("task_run_id") or ""), "")
+
     for entry in logs or []:
-        step_name = step_by_task_run.get(str(entry.get("task_run_id") or ""), "")
+        step_name = log_step(entry)
         rows.append(
             TimelineRow(
                 at=_parse_timestamp(entry.get("timestamp")),
