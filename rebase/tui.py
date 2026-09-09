@@ -1795,14 +1795,25 @@ def build_timeline(
                 url=artifact_browser_url(uri),
             )
         )
+    # Steps run as Prefect tasks, and the log store stamps each line with the
+    # task run it was emitted under -- the same id step_runs records. That is
+    # the only link between a log line and its step; timestamps alone cannot
+    # tell two steps' output apart.
+    step_by_task_run = {
+        str(step["prefect_task_run_id"]): str(step.get("name") or step.get("node_key") or step["id"])
+        for step in steps
+        if step.get("prefect_task_run_id")
+    }
     for entry in logs or []:
+        step_name = step_by_task_run.get(str(entry.get("task_run_id") or ""), "")
         rows.append(
             TimelineRow(
                 at=_parse_timestamp(entry.get("timestamp")),
-                stage="",
+                stage=step_name,
                 status=str(entry.get("severity") or "-"),
                 message=str(entry.get("message") or ""),
                 kind="log",
+                scope=step_name or "run",
                 record=dict(entry),
             )
         )
@@ -3195,10 +3206,13 @@ class RebaseTuiApp(App[None]):
         height: 1fr;
     }}
 
-    /* The workspaces take the room; the environments of the one under the cursor sit
-       beneath them, sized to their handful of rows. */
+    /* Both tables are sized to their rows, so the environments of the workspace under
+       the cursor sit directly beneath the workspaces rather than at the foot of the
+       screen. A long workspace list scrolls within its share of the height instead of
+       pushing the environments out of view. */
     #workspaces-table {{
-        height: 1fr;
+        height: auto;
+        max-height: 60%;
     }}
 
     #workspace-environments-table {{
@@ -6168,7 +6182,10 @@ class RebaseTuiApp(App[None]):
         # died and which knob to turn, in toolkit vocabulary.
         reason = run.get("failure_reason")
         if isinstance(reason, dict) and reason.get("message"):
-            output["diagnosis"] = {key: reason[key] for key in ("message", "hint") if reason.get(key)}
+            # `observed` is what the platform measured -- exit code, memory used
+            # against the limit, the exception and its traceback -- and is the
+            # part a reader acts on.
+            output["diagnosis"] = {key: reason[key] for key in ("message", "hint", "observed") if reason.get(key)}
         return [{"parameters": parameters}, output]
 
     def _run_drawer(self, run: dict[str, Any]) -> DetailDrawer:
@@ -6215,6 +6232,28 @@ class RebaseTuiApp(App[None]):
         )
 
     @staticmethod
+    def _event_drawer(row: TimelineRow) -> DetailDrawer | None:
+        """A run event that recorded more than its message, or None to fall back to the run.
+
+        Events carry `details` -- the error behind a failure, the attempt number
+        of a retry, the job or service a submit went to, the full diagnosis on a
+        reconcile -- which the API has always returned and nothing showed.
+        """
+        details = row.record.get("details")
+        if not isinstance(details, dict) or not details:
+            return None
+        status = str(row.record.get("status") or row.status or "-")
+        return DetailDrawer(
+            fields=[
+                DetailField("Event", str(row.record.get("stage") or row.stage or "-")),
+                DetailField("Status", status, status_style(status)),
+                DetailField("Time", str(row.record.get("created_at") or "-")),
+                DetailField("Message", str(row.record.get("message") or row.message or "-")),
+            ],
+            sections=[{"details": details}],
+        )
+
+    @staticmethod
     def _artifact_drawer(row: TimelineRow) -> DetailDrawer:
         artifact = row.record
         disposition = str(artifact.get("disposition") or row.status or "created")
@@ -6241,8 +6280,12 @@ class RebaseTuiApp(App[None]):
                 return self._task_drawer(row)
             if row is not None and row.kind == "artifact":
                 return self._artifact_drawer(row)
-            # Events, steps and log lines are observations within the run rather than
-            # richer resources of their own, so their detail action remains the run.
+            if row is not None and row.kind == "event":
+                drawer = self._event_drawer(row)
+                if drawer is not None:
+                    return drawer
+            # Steps, log lines and bare events are observations within the run rather
+            # than richer resources of their own, so their detail action remains the run.
             return None if self._run_detail is None else self._run_drawer(self._run_detail.run)
         key = focused.cursor_key if isinstance(focused, SelectableDataTable) else self._cursor_key(focused)
         if key is None:

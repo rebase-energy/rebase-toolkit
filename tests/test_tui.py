@@ -2047,6 +2047,10 @@ def test_tui_w_opens_switcher_and_changes_workspace(monkeypatch) -> None:
             # Its environments are underneath, the live one marked.
             assert [str(environments.get_cell_at(Coordinate(row, 1))) for row in range(2)] == ["dev", "prod"]
             assert str(environments.get_cell_at(Coordinate(0, 0))) == "*"
+            # Directly underneath: the workspaces table is sized to its rows rather than
+            # taking the screen and pushing the environments to the foot of it.
+            assert workspaces.region.height == workspaces.header_height + 2
+            assert environments.region.y == workspaces.region.bottom
 
             # Moving the cursor refills the second table for that workspace.
             workspaces.move_cursor(row=1)
@@ -6781,3 +6785,56 @@ def test_workflow_cron_state_treats_an_ended_window_as_stopped() -> None:
         "end": "2099-10-14T00:00:00+02:00",
     }
     assert format_schedule(window) == "*/5 * * * * 09-16→10-14"
+
+
+def test_tui_build_timeline_attributes_log_lines_to_their_step() -> None:
+    from rebase.tui import build_timeline
+
+    steps = [{"id": "s1", "name": "fetch", "prefect_task_run_id": "task-a", "status": "succeeded"}]
+    logs = [
+        {"timestamp": "2026-09-09T10:00:01Z", "message": "in fetch", "severity": "INFO", "task_run_id": "task-a"},
+        {"timestamp": "2026-09-09T10:00:02Z", "message": "flow level", "severity": "INFO"},
+    ]
+    rows = [row for row in build_timeline([], steps, logs) if row.kind == "log"]
+    assert [(row.message, row.scope, row.stage) for row in rows] == [
+        ("in fetch", "fetch", "fetch"),
+        ("flow level", "run", ""),
+    ]
+
+
+def test_tui_run_drawer_diagnosis_includes_what_was_observed() -> None:
+    from rebase.tui import RebaseTuiApp
+
+    run = {
+        "id": "r1",
+        "status": "failed",
+        "parameters": {},
+        "result": None,
+        "failure_reason": {"message": "out of memory", "hint": "raise memory", "observed": {"memory_used_mib": 611}},
+    }
+    sections = RebaseTuiApp._run_sections(run)
+    assert sections[1]["diagnosis"] == {
+        "message": "out of memory",
+        "hint": "raise memory",
+        "observed": {"memory_used_mib": 611},
+    }
+
+
+def test_tui_event_drawer_shows_details_and_falls_back_without_them() -> None:
+    from rebase.tui import RebaseTuiApp, TimelineRow
+
+    with_details = TimelineRow(
+        at=None,
+        stage="execute",
+        status="failed",
+        message="Execution failed.",
+        kind="event",
+        record={"stage": "execute", "status": "failed", "message": "Execution failed.", "details": {"error": "boom"}},
+    )
+    drawer = RebaseTuiApp._event_drawer(with_details)
+    assert drawer is not None
+    assert drawer.sections == [{"details": {"error": "boom"}}]
+    assert [field.label for field in drawer.fields] == ["Event", "Status", "Time", "Message"]
+
+    bare = TimelineRow(at=None, stage="accepted", status="completed", message="Accepted.", kind="event", record={})
+    assert RebaseTuiApp._event_drawer(bare) is None

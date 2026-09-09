@@ -4186,3 +4186,24 @@ def test_workflow_reads_back_the_effective_timeout_after_deploy(monkeypatch) -> 
     collect.deploy()
     assert collect.effective_timeout_seconds == 180
     assert collect.timeout_source == "derived"
+
+
+def test_run_failure_summary_carries_what_the_platform_observed() -> None:
+    from rebase.client import observed_summary, run_failure_summary
+
+    oom = {
+        "failure_reason": {
+            "code": "out_of_memory",
+            "message": "the container ran out of memory",
+            "hint": "raise cloud_run_memory",
+            "observed": {"memory_limit_mib": 512, "memory_used_mib": 611},
+        }
+    }
+    assert run_failure_summary(oom) == "The container ran out of memory. raise cloud_run_memory (used 611 of 512 MiB)"
+    exit_code = {"failure_reason": {"message": "container exited", "observed": {"exit_code": 1}}}
+    assert run_failure_summary(exit_code) == "Container exited (exit code 1)"
+    # The traceback is for the drawer, not the one-liner; unknown keys still show.
+    assert observed_summary({"exception_type": "TypeError", "traceback": "…", "node": "n1"}) == "TypeError, node=n1"
+    assert observed_summary({"timeout_seconds": 300, "elapsed_seconds": 301.2}) == "301.2s of a 300s bound"
+    assert observed_summary({}) is None
+    assert run_failure_summary({"failure_reason": {"message": "boom"}}) == "Boom"

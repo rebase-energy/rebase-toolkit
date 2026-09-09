@@ -5770,3 +5770,47 @@ def test_run_list_command_include_asks_for_the_bodies(monkeypatch, capsys) -> No
 
     assert main(["run", "list", "--json", "--include", "results"]) != 0
     assert "--include does not know results" in capsys.readouterr().err
+
+
+def test_event_detail_suffix_prints_what_the_event_recorded() -> None:
+    from rebase.cli import _event_detail_suffix
+
+    assert _event_detail_suffix({"message": "Execution failed", "details": {"error": "RuntimeError('x')"}}) == (
+        "— error: RuntimeError('x')"
+    )
+    assert _event_detail_suffix({"details": {"attempt": 2, "job_name": "job-1"}}) == "— attempt 2; job_name=job-1"
+    reconcile = {
+        "details": {
+            "failure_reason": {"code": "out_of_memory", "message": "out of memory", "observed": {"exit_code": 137}}
+        }
+    }
+    assert _event_detail_suffix(reconcile) == "— out of memory (exit code 137)"
+    assert _event_detail_suffix({"details": {}}) == ""
+    assert _event_detail_suffix({}) == ""
+    assert _event_detail_suffix({"details": {"error": "x" * 400}}, max_length=40).endswith("…")
+
+
+def test_run_log_follower_prefixes_lines_with_their_step() -> None:
+    from rebase.cli import _LineRunProgressReporter, _RunLogFollower
+
+    printed: list[tuple[str, str]] = []
+
+    class FakeRun:
+        def logs(self, since=None):
+            return {
+                "entries": [
+                    {"timestamp": "t1", "message": "inside step", "severity": "INFO", "task_run_id": "task-a"},
+                    {"timestamp": "t2", "message": "flow level", "severity": "INFO", "task_run_id": None},
+                ],
+                "next_since": "t2",
+                "source": "prefect",
+            }
+
+    class Reporter(_LineRunProgressReporter):
+        def log(self, timestamp, message, severity="INFO"):
+            printed.append((timestamp, message))
+
+    follower = _RunLogFollower(FakeRun())  # type: ignore[arg-type]
+    follower.note_steps([{"name": "fetch", "prefect_task_run_id": "task-a"}, {"name": "no-task"}])
+    follower.poll(Reporter())
+    assert printed == [("t1", "[fetch] inside step"), ("t2", "flow level")]

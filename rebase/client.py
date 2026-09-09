@@ -363,10 +363,50 @@ def run_failure_summary(run: dict[str, Any]) -> str | None:
             summary = message[0].upper() + message[1:]
             hint = reason.get("hint")
             if isinstance(hint, str) and hint:
-                return f"{summary}. {hint}"
-            return summary
+                summary = f"{summary}. {hint}"
+            observed = observed_summary(reason.get("observed"))
+            return f"{summary} ({observed})" if observed else summary
     error = run.get("error")
     return str(error) if error else None
+
+
+def observed_summary(observed: Any) -> str | None:
+    """The diagnosis's measurements as one short clause, or None.
+
+    ``failure_reason.observed`` carries what the platform actually saw --
+    exit code, memory limit and use, the exception type, the timeout and how
+    long the run took -- and is what turns "the container died" into
+    something a reader can act on. Known keys get a phrasing; unknown ones
+    fall back to ``key=value`` so a new server field is never hidden.
+    """
+    if not isinstance(observed, dict) or not observed:
+        return None
+    parts: list[str] = []
+    remaining = dict(observed)
+    exit_code = remaining.pop("exit_code", None)
+    if exit_code is not None:
+        parts.append(f"exit code {exit_code}")
+    limit = remaining.pop("memory_limit_mib", None)
+    used = remaining.pop("memory_used_mib", None)
+    if used is not None and limit is not None:
+        parts.append(f"used {used} of {limit} MiB")
+    elif limit is not None:
+        parts.append(f"memory limit {limit} MiB")
+    elif used is not None:
+        parts.append(f"used {used} MiB")
+    exception_type = remaining.pop("exception_type", None)
+    if exception_type:
+        parts.append(str(exception_type))
+    timeout = remaining.pop("timeout_seconds", None)
+    elapsed = remaining.pop("elapsed_seconds", None)
+    if timeout is not None and elapsed is not None:
+        parts.append(f"{elapsed}s of a {timeout}s bound")
+    elif timeout is not None:
+        parts.append(f"{timeout}s bound")
+    # The traceback is for the drawer and `run get`, not a one-line summary.
+    remaining.pop("traceback", None)
+    parts.extend(f"{key}={value}" for key, value in remaining.items() if value not in (None, "", [], {}))
+    return ", ".join(parts) or None
 
 
 def _response_error_message(response: requests.Response) -> str:

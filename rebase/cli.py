@@ -62,6 +62,7 @@ from rebase.client import (
     _git,
     _parse_github_remote,
     _validate_execution,
+    observed_summary,
     run_failure_summary,
     run_timing_summary,
     set_build_log_consumer,
@@ -633,6 +634,41 @@ def _raw_run_logs(run: dict[str, Any], events: list[dict[str, Any]], steps: list
     return {"run": run, "events": events, "steps": steps}
 
 
+def _event_detail_suffix(event: dict[str, Any], *, max_length: int = 160) -> str:
+    """What a run event's `details` add to its message, as one trailing clause.
+
+    The platform records the cause next to the message -- `{"error": ...}` on a
+    failure, `{"attempt": 2}` on a retry, the job or service name on a submit --
+    and returned it all along, but nothing printed it. Known keys get words;
+    anything else is shown as key=value so a new server field is never silently
+    dropped. Empty when there is nothing beyond the message.
+    """
+    details = event.get("details")
+    if not isinstance(details, dict) or not details:
+        return ""
+    parts: list[str] = []
+    remaining = dict(details)
+    error = remaining.pop("error", None)
+    if error:
+        parts.append(f"error: {error}")
+    attempt = remaining.pop("attempt", None)
+    if attempt is not None:
+        parts.append(f"attempt {attempt}")
+    reason = remaining.pop("failure_reason", None)
+    if isinstance(reason, dict):
+        observed = observed_summary(reason.get("observed"))
+        text = str(reason.get("message") or reason.get("code") or "")
+        if observed:
+            text = f"{text} ({observed})" if text else observed
+        if text:
+            parts.append(text)
+    parts.extend(f"{key}={value}" for key, value in remaining.items() if value not in (None, "", [], {}))
+    text = "; ".join(str(part) for part in parts)
+    if len(text) > max_length:
+        text = text[: max_length - 1] + "…"
+    return f"— {text}" if text else ""
+
+
 def _emit_event_to_reporter(
     reporter: _TerminalRunProgressReporter | _LineRunProgressReporter,
     event: dict[str, Any],
@@ -644,7 +680,8 @@ def _emit_event_to_reporter(
     if status == "running":
         reporter.update(message)
     elif status == "failed":
-        reporter.fail(message)
+        detail = _event_detail_suffix(event)
+        reporter.fail(f"{message} {detail}" if detail else message)
     elif status == "info":
         # An announcement introduces work rather than reporting on it, so it is neither a
         # transient spinner line nor a tick. Ticking it would claim something finished.
@@ -838,13 +875,25 @@ def _run_progress_reporter() -> _TerminalRunProgressReporter | _LineRunProgressR
 
 
 class _RunLogFollower:
-    """Incrementally fetches run stdout/stderr and prints new lines via the reporter."""
+    """Incrementally fetches run stdout/stderr and prints new lines via the reporter.
+
+    Lines that the log store attributes to a Prefect task run are prefixed with
+    the step's name once `note_steps` has seen that step -- steps run as tasks
+    and carry the same id -- so two steps' output can be told apart.
+    """
 
     def __init__(self, run: Run) -> None:
         self._run = run
         self._since: str | None = None
         self._active = True
         self._printed_message = False
+        self._step_names: dict[str, str] = {}
+
+    def note_steps(self, steps: Iterable[dict[str, Any]]) -> None:
+        for step in steps:
+            task_run_id = step.get("prefect_task_run_id")
+            if task_run_id:
+                self._step_names[str(task_run_id)] = str(step.get("name") or step.get("node_key") or task_run_id)
 
     def poll(self, reporter: _TerminalRunProgressReporter | _LineRunProgressReporter) -> None:
         if not self._active:
@@ -855,11 +904,11 @@ class _RunLogFollower:
             self._active = False
             return
         for entry in payload.get("entries") or []:
-            reporter.log(
-                str(entry.get("timestamp") or ""),
-                str(entry.get("message") or ""),
-                str(entry.get("severity") or "INFO"),
-            )
+            message = str(entry.get("message") or "")
+            step_name = self._step_names.get(str(entry.get("task_run_id") or ""))
+            if step_name:
+                message = f"[{step_name}] {message}"
+            reporter.log(str(entry.get("timestamp") or ""), message, str(entry.get("severity") or "INFO"))
         next_since = payload.get("next_since")
         if next_since:
             self._since = str(next_since)
@@ -913,7 +962,12 @@ def _stream_run_result(
 
         if steps_supported and not already_terminal:
             try:
-                for step in run.steps():
+                steps = run.steps()
+                if log_follower is not None:
+                    # Teach the follower which Prefect task run is which step, so
+                    # the step's log lines print under its name.
+                    log_follower.note_steps(steps)
+                for step in steps:
                     step_key = str(step.get("id") or step.get("node_key") or step.get("name") or "")
                     if not step_key:
                         continue
@@ -5139,6 +5193,8 @@ SCHEDULE_DETAIL_KEYS = [
     "paused",
     "paused_until",
     "next_run_at",
+    "last_skipped_at",
+    "last_skip_reason",
     "workflow_id",
     "version_id",
 ]
@@ -5157,6 +5213,10 @@ def _schedule_detail(workflow: dict[str, Any], schedule_data: dict[str, Any]) ->
         "paused": schedule_data.get("paused", False),
         "paused_until": schedule_data.get("paused_until"),
         "next_run_at": schedule_data.get("next_run_at"),
+        # The last fire the runner skipped and why. A skip creates no run, so
+        # this is what separates "ended as declared" from "stopped firing".
+        "last_skipped_at": schedule_data.get("last_skipped_at"),
+        "last_skip_reason": schedule_data.get("last_skip_reason"),
         "workflow_id": schedule_data.get("workflow_id"),
         "version_id": schedule_data.get("version_id"),
     }
@@ -6554,7 +6614,8 @@ def _timeline_table(run: dict[str, Any], events: list[dict[str, Any]], steps: li
         stamp = _parse_timeline_timestamp(event.get("created_at"))
         message = str(event.get("message") or "").rstrip(".")
         if stamp is not None and message:
-            entries.append((stamp, message))
+            detail = _event_detail_suffix(event)
+            entries.append((stamp, f"{message} {detail}" if detail else message))
     for step in steps:
         name = str(step.get("name") or "step")
         started = _parse_timeline_timestamp(step.get("started_at"))

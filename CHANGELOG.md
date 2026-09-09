@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Skipped scheduled fires leave a trace.** A fire the runner skipped — paused,
+  before the schedule's `start`, or after its `end` — never created a run, so an
+  ended or paused schedule looked exactly like one that had stopped firing.
+  `rebase workflow schedule show` now reports `last_skipped_at` and
+  `last_skip_reason` (`paused`, `not_started`, `ended`), stamped by the runner on
+  every skip.
+- **Log lines know their step.** The platform now returns the Prefect task run
+  behind each log line, and steps run as tasks, so `rebase run logs` prefixes a
+  step's output with `[step-name]` and the TUI's Activity pane fills the Scope
+  column for log rows instead of leaving it blank.
+- **What the platform observed reaches the reader.** A failed run's summary now
+  ends with the measurement behind the diagnosis — `(used 611 of 512 MiB)`,
+  `(exit code 1)`, `(TypeError)` — and the TUI's diagnosis block carries the whole
+  `observed` object, traceback included. Run events that recorded more than their
+  message (the error behind a failure, the attempt number of a retry, the job or
+  service a submit went to) show it: the CLI timeline and failure lines append it,
+  and pressing `p` on such an event in the TUI opens its details.
+
+### Fixed
+
+- Step retry warnings ("step X failed on attempt 1 of 3; retrying") were written
+  to the worker's own log, invisible to users; they now go to the run's log
+  stream next to the step's output.
+
 ## 0.9.0 — 2026-09-09
 
 ### Added
