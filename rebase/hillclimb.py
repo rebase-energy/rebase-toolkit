@@ -244,6 +244,7 @@ class _StateSync:
         self._seen_commands: set[str] = set()
         self._uploaded: dict[str, tuple[int, int]] = {}
         self._lock = threading.Lock()
+        self._manifest: dict[str, Any] = {}
 
     def start(self) -> None:
         self._thread.start()
@@ -287,13 +288,16 @@ class _StateSync:
                 uploaded += 1
         return uploaded
 
-    def write_manifest(self, **fields: Any) -> None:
+    def write_manifest(self, **fields: Any) -> dict[str, Any]:
         """``hosted.json`` at the prefix root: what the job is, for readers
-        that have only the run id."""
-        payload = {"bucket": self.bucket_name, "sync_id": self.sync_id, "prefix": self.prefix, **fields}
+        that have only the run id. Fields accumulate across calls, so the
+        finishing write keeps what the starting one recorded."""
+        self._manifest.update(fields)
+        payload = {"bucket": self.bucket_name, "sync_id": self.sync_id, "prefix": self.prefix, **self._manifest}
         self.bucket.blob(f"{self.prefix}/{MANIFEST_NAME}").upload_from_string(
             json.dumps(payload, sort_keys=True), content_type="application/json"
         )
+        return payload
 
     def pull_control(self) -> list[str]:
         """Download new control commands (stop/prune JSON files) into every

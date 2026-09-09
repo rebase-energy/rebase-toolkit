@@ -121,6 +121,10 @@ def test_state_sync_uploads_changes_only_and_tails_streams(tmp_path: Path, monke
         "target": "emflow://gefcom2014:solar",
         "parallel_searches": 2,
     }
+    # the finishing write keeps what the starting one recorded
+    sync.write_manifest(state="done", finished_at="2026-09-09T19:20:22+00:00")
+    manifest = json.loads(bucket.store["hillclimb/abc123/hosted.json"])
+    assert manifest["parallel_searches"] == 2 and manifest["state"] == "done"
 
 
 def test_state_sync_delivers_commands_to_running_searches_once(tmp_path: Path, monkeypatch) -> None:
