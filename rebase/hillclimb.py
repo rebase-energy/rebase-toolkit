@@ -505,6 +505,7 @@ def hosted_search(
     becomes the platform run's result. Agent auth: subscription billing when
     CLAUDE_CODE_OAUTH_TOKEN was injected, else api-key."""
     hillclimb = _require_hillclimb()
+    from hillclimb.api import run_fleet
     from hillclimb.config import Config
 
     home = Path(os.environ.get("HILLCLIMB_DIR") or Path(os.environ.get("HOME", "/hillclimb")) / "hillclimb")
@@ -593,7 +594,7 @@ def hosted_search(
             run_dir = outcome.run_dir
             error = outcome.error
         else:
-            fleet = hillclimb.api.run_fleet(
+            fleet = run_fleet(
                 target,
                 config=config,
                 parallel_searches=searches,
