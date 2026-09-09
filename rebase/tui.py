@@ -2071,9 +2071,26 @@ def format_schedule(value: Any, *, paused: bool = False) -> str:
     if not isinstance(value, dict):
         return "-"
     cron = str(value.get("cron") or "-")
-    if not value.get("active", True) or paused:
+    start, end = value.get("start"), value.get("end")
+    if start or end:
+        # The declared window, dates only: `*/5 * * * * 09-16→10-14`.
+        cron = f"{cron} {str(start)[5:10] if start else ''}→{str(end)[5:10] if end else ''}"
+    if not value.get("active", True) or paused or _window_ended(end):
         return f"{cron} ⏸"
     return cron
+
+
+def _window_ended(end: Any) -> bool:
+    """Whether a schedule's declared `end` has passed. No end, or an unreadable one, means no."""
+    if not end:
+        return False
+    try:
+        bound = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if bound.tzinfo is None:
+        bound = bound.replace(tzinfo=UTC)
+    return datetime.now(UTC) >= bound
 
 
 def _pause_in_effect(paused_until: Any) -> bool:
@@ -2100,6 +2117,11 @@ def workflow_cron_state(workflow: dict[str, Any]) -> str | None:
     if not isinstance(schedule, dict) or schedule.get("type", "cron") != "cron":
         return None
     if workflow.get("enabled") is False or not schedule.get("active", True):
+        return "stopped"
+    # A declared window that has run out is stopped by design: the code said
+    # when to stop, and the platform did. A future `start` is still "active" —
+    # it will fire, and next_run_at says when.
+    if _window_ended(schedule.get("end")):
         return "stopped"
     if workflow.get("paused") and _pause_in_effect(workflow.get("paused_until")):
         return "paused"

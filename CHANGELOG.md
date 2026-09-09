@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.9.0 — 2026-09-09
+
+### Added
+
+- **`rb.Cron(start=, end=)` — a schedule window declared in code.** A cron can
+  now say when it begins and when it stops: `rb.Cron("*/5 * * * *",
+  timezone="Europe/Stockholm", start="2026-09-16", end="2026-10-14")` fires only
+  inside the half-open `[start, end)` window, so `end="2026-10-14"` runs through
+  the whole of the 13th. Bounds take a date, a datetime, or an ISO 8601 string; a
+  bare date is the start of that day in the cron's timezone. The window is part
+  of the schedule definition — it deploys with the code and changes only on
+  redeploy — unlike `schedule pause --until`, which stays an operator's override
+  on top. A fire before `start` or at or after `end` is a skip, not a run or an
+  alert, and the first fire after `end` switches the platform schedule off for
+  good. An `end` in the past is refused at construction and again by the API,
+  because a schedule that can never fire again is a stale file; a `start` in
+  the past means "already started". `rebase workflow schedule set` takes
+  `--start`/`--end`, and `schedule list`/`show` and the TUI show `starts …`,
+  `active, ends …` and `ended …`. Needs a platform that knows the two keys;
+  older servers refuse them rather than storing a window they would not honour.
+
 ## 0.8.1 — 2026-09-08
 
 ### Fixed

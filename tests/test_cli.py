@@ -4546,6 +4546,64 @@ def test_workflow_schedule_set_command(monkeypatch, capsys) -> None:
     assert "Schedule Set" in capsys.readouterr().out
 
 
+def test_workflow_schedule_set_accepts_a_window(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    def fake_update_workflow(self, workflow_id, **kwargs):
+        observed["schedule"] = kwargs.get("schedule")
+        return {"id": workflow_id}
+
+    monkeypatch.setattr(Client, "update_workflow", fake_update_workflow)
+    monkeypatch.setattr(
+        Client,
+        "get_workflow_schedule",
+        lambda self, workflow_id: {
+            "workflow_id": workflow_id,
+            "version_id": "version-id",
+            "schedule": observed["schedule"],
+            "active": True,
+            "next_run_at": "2099-09-16T00:00:00+02:00",
+        },
+    )
+
+    args = ["workflow", "schedule", "set", "--id", "workflow-id", "--cron", "*/5 * * * *"]
+    args += ["--timezone", "Europe/Stockholm", "--start", "2099-09-16", "--end", "2099-10-14"]
+    assert main(args) == 0
+    assert observed["schedule"]["start"] == "2099-09-16T00:00:00+02:00"
+    assert observed["schedule"]["end"] == "2099-10-14T00:00:00+02:00"
+    out = capsys.readouterr().out
+    assert "2099-09-16T00:00:00+02:00" in out
+    assert "2099-10-14T00:00:00+02:00" in out
+
+    # A window that has already closed is refused on the laptop, before any request.
+    assert (
+        main(["workflow", "schedule", "set", "--id", "workflow-id", "--cron", "0 * * * *", "--end", "2020-01-01"]) == 1
+    )
+    assert "in the past" in capsys.readouterr().err
+
+
+def test_workflow_schedule_status_reflects_the_declared_window() -> None:
+    from rebase.cli import _format_schedule, _workflow_schedule_status
+
+    base = {"enabled": True, "paused": False, "next_run_at": "2099-01-01T00:00:00Z"}
+    starting = {**base, "schedule": {"type": "cron", "cron": "0 * * * *", "start": "2099-09-16T00:00:00+02:00"}}
+    assert _workflow_schedule_status(starting) == "starts 2099-09-16"
+    ending = {**base, "schedule": {"type": "cron", "cron": "0 * * * *", "end": "2099-10-14T00:00:00+02:00"}}
+    assert _workflow_schedule_status(ending) == "active, ends 2099-10-14"
+    ended = {**base, "schedule": {"type": "cron", "cron": "0 * * * *", "end": "2020-01-01T00:00:00+00:00"}}
+    assert _workflow_schedule_status(ended) == "ended 2020-01-01"
+    # A pause inside the window still reads as a pause.
+    paused = {**ending, "paused": True, "paused_until": None}
+    assert _workflow_schedule_status(paused) == "paused"
+
+    assert _format_schedule(starting["schedule"]) == "0 * * * * (2099-09-16 →)"
+    assert _format_schedule({"type": "cron", "cron": "0 * * * *", "start": "2099-09-16", "end": "2099-10-14"}) == (
+        "0 * * * * (2099-09-16 → 2099-10-14)"
+    )
+    assert _format_schedule({"type": "cron", "cron": "0 * * * *"}) == "0 * * * *"
+
+
 def test_workflow_schedule_set_requires_cron(monkeypatch, capsys) -> None:
     assert main(["workflow", "schedule", "set", "--id", "workflow-id"]) == 1
     assert "--cron is required" in capsys.readouterr().err

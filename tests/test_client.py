@@ -1,6 +1,6 @@
 import json
 import sys
-from datetime import timedelta
+from datetime import UTC, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -1818,6 +1818,40 @@ def test_project_deploy_registers_step_workflow_graph(monkeypatch) -> None:
         "weather": {"type": "node_output", "node_key": "load_weather"},
         "horizon_hours": {"type": "parameter", "name": "horizon_hours"},
     }
+
+
+def test_cron_window_resolves_bounds_in_the_cron_timezone() -> None:
+    from datetime import date, datetime
+
+    schedule = rb.Cron("*/5 * * * *", timezone="Europe/Stockholm", start="2099-09-16", end="2099-10-14").to_dict()
+    # A bare date is the start of that day in the cron's timezone (CEST here).
+    assert schedule["start"] == "2099-09-16T00:00:00+02:00"
+    assert schedule["end"] == "2099-10-14T00:00:00+02:00"
+
+    # date and datetime objects work too; an aware datetime is kept as given.
+    assert rb.Cron("0 * * * *", end=date(2099, 1, 1)).to_dict()["end"] == "2099-01-01T00:00:00+00:00"
+    aware = datetime(2099, 1, 1, 8, 0, tzinfo=UTC)
+    assert rb.Cron("0 * * * *", timezone="Europe/Stockholm", end=aware).to_dict()["end"] == "2099-01-01T08:00:00+00:00"
+    assert rb.Cron("0 * * * *", end="2099-01-01T08:00:00Z").to_dict()["end"] == "2099-01-01T08:00:00+00:00"
+
+    # Without a window the payload is unchanged, so older servers see what they always saw.
+    assert "start" not in rb.Cron("0 * * * *").to_dict()
+    assert "end" not in rb.Cron("0 * * * *").to_dict()
+
+
+def test_cron_window_rejects_what_can_never_fire() -> None:
+    with pytest.raises(ValueError, match="in the past"):
+        rb.Cron("0 * * * *", end="2020-01-01")
+    with pytest.raises(ValueError, match="start .* must be before end"):
+        rb.Cron("0 * * * *", start="2099-02-01", end="2099-01-01")
+    with pytest.raises(ValueError, match="ISO 8601"):
+        rb.Cron("0 * * * *", end="someday")
+    with pytest.raises(TypeError):
+        rb.Cron("0 * * * *", end=5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="unknown timezone"):
+        rb.Cron("0 * * * *", timezone="Nope/Nope", start="2099-01-01")
+    # A past start is fine: it means "already started", and a redeploy must not break.
+    assert rb.Cron("0 * * * *", start="2020-01-01").to_dict()["start"] == "2020-01-01T00:00:00+00:00"
 
 
 def test_project_workflow_deploy_sends_cron_schedule(monkeypatch) -> None:

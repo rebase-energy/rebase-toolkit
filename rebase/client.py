@@ -16,11 +16,12 @@ import time
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from types import FunctionType
 from typing import Any, Self
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
@@ -397,7 +398,57 @@ def _response_error_message(response: requests.Response) -> str:
     return response.text or f"HTTP {response.status_code} with an empty response body"
 
 
+def _schedule_bound(value: str | date | datetime | None, *, timezone: str | None, field_name: str) -> str | None:
+    """Resolve a window bound to a tz-aware ISO 8601 string, or None.
+
+    A bare date means the start of that day; a naive datetime or date is read
+    in the cron's timezone (UTC when none is set), an aware datetime is kept.
+    Resolved here, on the laptop, so the platform only ever stores an absolute
+    instant and a DAG reads the same whoever inspects it.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed: date | datetime = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                parsed = date.fromisoformat(text)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{field_name} must be an ISO 8601 date or datetime like '2026-10-14' or "
+                    f"'2026-10-14T08:00:00+02:00', got {value!r}"
+                ) from exc
+    elif isinstance(value, datetime | date):
+        parsed = value
+    else:
+        raise TypeError(f"{field_name} must be a date, datetime, or ISO 8601 string")
+    if not isinstance(parsed, datetime):
+        parsed = datetime.combine(parsed, datetime.min.time())
+    if parsed.tzinfo is None:
+        try:
+            zone = ZoneInfo(timezone) if timezone else UTC
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"unknown timezone {timezone!r}") from exc
+        parsed = parsed.replace(tzinfo=zone)
+    return parsed.isoformat()
+
+
 class Cron:
+    """A five-field cron schedule, optionally confined to a ``[start, end)`` window.
+
+    ``start`` and ``end`` are part of the schedule definition, so they deploy
+    with the code and change only on redeploy — unlike ``rebase workflow
+    schedule pause --until``, which is an operator's override on top. The
+    window is half-open: the schedule fires at or after ``start`` and never at
+    or after ``end``, so ``end="2026-10-14"`` runs through the whole of the 13th.
+    A ``start`` in the past means "already started"; an ``end`` in the past is
+    refused, because a schedule that can never fire again is a stale file.
+    """
+
     def __init__(
         self,
         cron: str,
@@ -405,6 +456,8 @@ class Cron:
         timezone: str | None = None,
         day_or: bool = True,
         active: bool = True,
+        start: str | date | datetime | None = None,
+        end: str | date | datetime | None = None,
     ) -> None:
         if not cron or len(cron.split()) != 5:
             raise ValueError("cron must be a five-field cron expression")
@@ -412,6 +465,16 @@ class Cron:
         self.timezone = timezone
         self.day_or = day_or
         self.active = active
+        self.start = _schedule_bound(start, timezone=timezone, field_name="start")
+        self.end = _schedule_bound(end, timezone=timezone, field_name="end")
+        if (
+            self.start is not None
+            and self.end is not None
+            and datetime.fromisoformat(self.start) >= datetime.fromisoformat(self.end)
+        ):
+            raise ValueError(f"start ({self.start}) must be before end ({self.end})")
+        if self.end is not None and datetime.fromisoformat(self.end) <= datetime.now(UTC):
+            raise ValueError(f"end ({self.end}) is in the past; remove the schedule or move its end")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -422,6 +485,8 @@ class Cron:
                 "timezone": self.timezone,
                 "day_or": self.day_or,
                 "active": self.active,
+                "start": self.start,
+                "end": self.end,
             }.items()
             if value is not None
         }

@@ -1839,10 +1839,21 @@ def _workflow_table(workflows: list[dict[str, Any]], *, project_names: dict[str,
     return table
 
 
+def _schedule_window_label(schedule: dict[str, Any]) -> str:
+    """The declared start/end window as `2026-09-16 → 2026-10-14`, `→ 2026-10-14`, `2026-09-16 →`, or ''."""
+    start, end = schedule.get("start"), schedule.get("end")
+    if not start and not end:
+        return ""
+    return f"{str(start)[:10] if start else ''} → {str(end)[:10] if end else ''}".strip()
+
+
 def _format_schedule(schedule: Any) -> str:
     if not isinstance(schedule, dict):
         return "-"
     cron = str(schedule.get("cron") or "-")
+    window = _schedule_window_label(schedule)
+    if window:
+        cron = f"{cron} ({window})"
     if not schedule.get("active", True):
         return f"{cron} (paused)"
     return cron
@@ -5122,6 +5133,8 @@ SCHEDULE_DETAIL_KEYS = [
     "cron",
     "timezone",
     "day_or",
+    "start",
+    "end",
     "active",
     "paused",
     "paused_until",
@@ -5138,6 +5151,8 @@ def _schedule_detail(workflow: dict[str, Any], schedule_data: dict[str, Any]) ->
         "cron": schedule.get("cron"),
         "timezone": schedule.get("timezone"),
         "day_or": schedule.get("day_or", True),
+        "start": schedule.get("start"),
+        "end": schedule.get("end"),
         "active": schedule_data.get("active"),
         "paused": schedule_data.get("paused", False),
         "paused_until": schedule_data.get("paused_until"),
@@ -5160,11 +5175,26 @@ _PAUSE_DURATION_RE = re.compile(r"^\s*(\d+)\s*(m|h|d|w)\s*$")
 _PAUSE_DURATION_UNITS = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
 
 
+def _schedule_bound(value: Any) -> datetime | None:
+    """Parse a stored start/end bound; None when absent or unreadable."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 def _workflow_schedule_status(workflow: dict[str, Any]) -> str:
-    """A schedule's state as configured: active, paused (with any resume time), or stopped."""
+    """A schedule's state as configured: active, starts/ends (declared window), paused, or stopped."""
     schedule = workflow.get("schedule") or {}
     if workflow.get("enabled") is False or not schedule.get("active", True):
         return "stopped"
+    now = datetime.now(UTC)
+    end = _schedule_bound(schedule.get("end"))
+    if end is not None and now >= end:
+        return f"ended {str(schedule.get('end'))[:10]}"
     if workflow.get("paused"):
         until = workflow.get("paused_until")
         if not until:
@@ -5177,6 +5207,11 @@ def _workflow_schedule_status(workflow: dict[str, Any]) -> str:
             expiry = expiry.replace(tzinfo=UTC)
         if datetime.now(UTC) < expiry:
             return f"paused until {str(until)[:10]}"
+    start = _schedule_bound(schedule.get("start"))
+    if start is not None and now < start:
+        return f"starts {str(schedule.get('start'))[:10]}"
+    if end is not None:
+        return f"active, ends {str(schedule.get('end'))[:10]}"
     return "active"
 
 
@@ -5287,6 +5322,16 @@ def workflow_schedule_set_command(
         bool, typer.Option("--day-and", "-d", help="Require day-of-month AND day-of-week to match (default OR).")
     ] = False,
     inactive: Annotated[bool, typer.Option("--inactive", "-i", help="Register the schedule paused.")] = False,
+    start: Annotated[
+        str | None,
+        typer.Option(
+            "--start", "-s", help="First fire at or after this date/time, e.g. 2026-09-16 (read in --timezone)."
+        ),
+    ] = None,
+    end: Annotated[
+        str | None,
+        typer.Option("--end", "-e", help="No fire at or after this date/time, e.g. 2026-10-14 (read in --timezone)."),
+    ] = None,
     project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
     workflow_id: Annotated[str | None, typer.Option("--id", help="Exact workflow ID.")] = None,
     json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
@@ -5297,7 +5342,9 @@ def workflow_schedule_set_command(
     client = Client()
     workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
     try:
-        schedule = Cron(cron, timezone=timezone, day_or=not day_and, active=not inactive).to_dict()
+        schedule = Cron(
+            cron, timezone=timezone, day_or=not day_and, active=not inactive, start=start, end=end
+        ).to_dict()
     except ValueError as exc:
         raise RebaseWorkflowError(str(exc)) from exc
     client.update_workflow(str(workflow["id"]), schedule=schedule)

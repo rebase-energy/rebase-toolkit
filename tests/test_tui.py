@@ -6759,3 +6759,25 @@ def test_tui_timer_leaves_the_project_alone_on_an_unchanged_overview() -> None:
             assert [group.name for group in app.project_targets.ephemeral] == ["collect"]
 
     asyncio.run(scenario())
+
+
+def test_workflow_cron_state_treats_an_ended_window_as_stopped() -> None:
+    from rebase.tui import format_schedule, workflow_cron_state
+
+    base = {"enabled": True, "paused": False, "next_run_at": "2099-01-01T00:00:00Z"}
+    ended = {**base, "schedule": {"type": "cron", "cron": "*/5 * * * *", "end": "2020-01-01T00:00:00+00:00"}}
+    assert workflow_cron_state(ended) == "stopped"
+    assert format_schedule(ended["schedule"]) == "*/5 * * * * →01-01 ⏸"
+
+    # A future start is still active — it will fire, and next_run_at says when.
+    starting = {**base, "schedule": {"type": "cron", "cron": "*/5 * * * *", "start": "2099-09-16T00:00:00+02:00"}}
+    assert workflow_cron_state(starting) == "active"
+    assert format_schedule(starting["schedule"]) == "*/5 * * * * 09-16→"
+
+    window = {
+        "type": "cron",
+        "cron": "*/5 * * * *",
+        "start": "2099-09-16T00:00:00+02:00",
+        "end": "2099-10-14T00:00:00+02:00",
+    }
+    assert format_schedule(window) == "*/5 * * * * 09-16→10-14"
