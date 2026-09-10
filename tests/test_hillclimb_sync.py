@@ -211,6 +211,21 @@ def test_summarize_run_aggregates_every_search(tmp_path: Path) -> None:
     lower = hillclimb.summarize_run(run_dir, target="t", sync_id=None, bucket=None, higher_is_better=False)
     assert lower["selected"]["candidate_id"] == "c003" and lower["gcs_prefix"] is None
 
+    # the engine's own metadata decides the direction, per search
+    for search in ("solar", "solar-2"):
+        (run_dir / "searches" / search / "search.yaml").write_text("search_id: x\nhigher_is_better: false\n")
+    by_meta = hillclimb.summarize_run(run_dir, target="t", sync_id=None, bucket=None)
+    assert by_meta["selected"]["candidate_id"] == "c003"
+
+
+def test_summarize_run_marks_dead_engines_crashed(tmp_path: Path) -> None:
+    runs_dir = tmp_path / "runs"
+    run_dir = _run_tree(runs_dir, state="running")
+    live = hillclimb.summarize_run(run_dir, target="t", sync_id=None, bucket=None)
+    assert live["searches"][0]["state"] == "running"
+    dead = hillclimb.summarize_run(run_dir, target="t", sync_id=None, bucket=None, engines_exited=True)
+    assert dead["searches"][0]["state"] == "crashed" and dead["state"] == "parked"
+
 
 def test_request_stop_everywhere_writes_engine_shaped_commands(tmp_path: Path) -> None:
     runs_dir = tmp_path / "runs"

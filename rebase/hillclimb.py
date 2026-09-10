@@ -45,9 +45,16 @@ SYNC_INTERVAL_S = 30
 #: per-candidate streams and logs are synced as tails: the viewers show the
 #: last few thousand characters, and an agent stream can run to megabytes
 TAIL_BYTES = 256 * 1024
-#: after the search budget, how long the stub waits for a fleet's engines
-#: (holdout evaluation + distillation run past the budget) before killing them
+#: after the search budget plus the engine's agent timeout (an operator that
+#: started inside the budget may run that long past it), how much longer the
+#: stub waits for a fleet's engines (holdout evaluation, distillation) before
+#: parking them
 FLEET_GRACE_S = 900
+#: default of the engine's budget.agent_timeout_s, used when the config has none
+DEFAULT_AGENT_TIMEOUT_S = 1800
+#: a parking engine kills its agent subprocess and writes the journal and the
+#: final status; give it that long after SIGTERM before SIGKILL
+ENGINE_PARK_GRACE_S = 60.0
 #: the workspace secret `rebase hillclimb start` attaches by default
 DEFAULT_SECRET_NAME = "hillclimb"
 AGENT_CREDENTIAL_ENVS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "HF_TOKEN")
@@ -391,6 +398,19 @@ def _search_statuses(run_dir: Path) -> dict[str, dict[str, Any]]:
     return statuses
 
 
+def _search_higher_is_better(search_dir: Path, default: bool) -> bool:
+    """The metric direction the engine recorded in search.yaml."""
+    path = search_dir / "search.yaml"
+    try:
+        import yaml
+
+        meta = yaml.safe_load(path.read_text()) or {}
+    except (OSError, ValueError, ModuleNotFoundError):
+        return default
+    value = meta.get("higher_is_better") if isinstance(meta, dict) else None
+    return bool(value) if isinstance(value, bool) else default
+
+
 def _better(candidate: dict[str, Any], incumbent: dict[str, Any] | None, *, higher_is_better: bool) -> bool:
     if incumbent is None:
         return True
@@ -403,11 +423,20 @@ def _better(candidate: dict[str, Any], incumbent: dict[str, Any] | None, *, high
 
 
 def summarize_run(
-    run_dir: Path, *, target: str, sync_id: str | None, bucket: str | None, higher_is_better: bool = True
+    run_dir: Path,
+    *,
+    target: str,
+    sync_id: str | None,
+    bucket: str | None,
+    higher_is_better: bool = True,
+    engines_exited: bool = False,
 ) -> dict[str, Any]:
     """The platform run's result for a hosted run dir: every search's state
     and cost from its last status record, the best selected candidate across
-    them, and the summed agent cost the platform settles credits from."""
+    them (by the metric direction each search recorded), and the summed agent
+    cost the platform settles credits from. With ``engines_exited`` a status
+    still claiming ``running`` belongs to an engine that died without parking
+    and reads as ``crashed``, the engine's own word for it."""
     statuses = _search_statuses(run_dir)
     searches: list[dict[str, Any]] = []
     selected: dict[str, Any] | None = None
@@ -419,10 +448,14 @@ def summarize_run(
             search_cost = 0.0
         cost_usd += search_cost
         chosen = status.get("selected") or None
+        state = status.get("state", "unknown")
+        if engines_exited and state == "running":
+            state = "crashed"
+        direction = _search_higher_is_better(run_dir / "searches" / search_id, higher_is_better)
         searches.append(
             {
                 "ref": f"{run_dir.name}/{search_id}",
-                "state": status.get("state", "unknown"),
+                "state": state,
                 "cost_usd": search_cost,
                 "candidates": status.get("candidates"),
                 "best": status.get("best"),
@@ -430,7 +463,7 @@ def summarize_run(
                 "error": status.get("last_error"),
             }
         )
-        if chosen and _better(chosen, selected, higher_is_better=higher_is_better):
+        if chosen and _better(chosen, selected, higher_is_better=direction):
             selected = {**chosen, "search_ref": f"{run_dir.name}/{search_id}"}
     states = [entry["state"] for entry in searches]
     if not states:
@@ -561,6 +594,10 @@ def hosted_search(
 
     terminating = threading.Event()
     fleet = None
+    engines_exited = False
+    agent_timeout_s = float(
+        getattr(getattr(config, "budget", None), "agent_timeout_s", None) or DEFAULT_AGENT_TIMEOUT_S
+    )
 
     def on_sigterm(signum, frame):  # noqa: ARG001 — signal handler signature
         # The platform is about to kill the container (timeout or cancel).
@@ -611,11 +648,18 @@ def hosted_search(
             )
             run_dir = fleet.run_dir
             print(f"Fleet {fleet.run_id}: {searches} engines x {operators} operators")
-            exits = fleet.wait(poll_s=5.0, deadline_s=float(budget_s) + FLEET_GRACE_S)
+            # an operator that started inside the budget may run the whole
+            # agent timeout past it, then holdout scoring and distillation
+            deadline_s = float(budget_s) + agent_timeout_s + FLEET_GRACE_S
+            exits = fleet.wait(poll_s=5.0, deadline_s=deadline_s)
             if fleet.alive():
-                print(f"[fleet] {len(fleet.alive())} engine(s) still running past the budget grace; terminating")
-                request_stop_everywhere(runs_dir, reason="budget grace exceeded")
-                fleet.terminate()
+                print(
+                    f"[fleet] {len(fleet.alive())} engine(s) still running {int(deadline_s)}s after start; parking them"
+                )
+                request_stop_everywhere(runs_dir, reason="hosted run deadline exceeded")
+                fleet.terminate(grace_s=ENGINE_PARK_GRACE_S)
+                exits = {proc.pid: proc.poll() for proc in fleet.procs}
+            engines_exited = True
             failed = [pid for pid, code in exits.items() if code not in (0, 2, None)]
             if failed:
                 error = f"{len(failed)} engine(s) exited with an error; see logs/"
@@ -624,7 +668,7 @@ def hosted_search(
             sync.stop()
 
     assert run_dir is not None
-    result = summarize_run(run_dir, target=target, sync_id=sync_id, bucket=bucket)
+    result = summarize_run(run_dir, target=target, sync_id=sync_id, bucket=bucket, engines_exited=engines_exited)
     if error and not result.get("error"):
         result["error"] = error
     if sync is not None:
