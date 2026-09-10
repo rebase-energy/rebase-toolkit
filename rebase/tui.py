@@ -110,6 +110,18 @@ DELETABLE_TABLES: dict[str, DeletableKind] = {
 }
 #: What a multi-item delete asks the user to type. Compared case-insensitively.
 CONFIRM_WORD = "delete"
+#: What `x` is about to do to a row: stop what runs, or start what is stopped.
+PauseIntent = Literal["stop", "start"]
+#: The client method behind each (kind, intent). A pairing older than the routes
+#: lacks the project and function ones, and `x` says so instead of failing.
+PAUSE_METHODS: dict[tuple[DeletableKind, PauseIntent], str] = {
+    ("project", "stop"): "pause_project",
+    ("project", "start"): "resume_project",
+    ("workflow", "stop"): "pause_workflow",
+    ("workflow", "start"): "resume_workflow",
+    ("function", "stop"): "pause_function",
+    ("function", "start"): "resume_function",
+}
 MARK_STYLE = f"bold {BRAND_AMBER}"
 
 #: Textual's stock dark theme, with its orange accent swapped for the brand green.
@@ -179,6 +191,8 @@ HISTORY_STATUS_RANK = {
 #: Runs per status per hour, by row: a target id for a deployed row, an
 #: `EphemeralGroup.row_key` for a one-off row. Hours are keyed by their UTC start.
 RunHistory = dict[str, dict[datetime, dict[str, int]]]
+#: One row's share of a `RunHistory`: runs per status, by the UTC start of the hour.
+HourlyRuns = dict[datetime, dict[str, int]]
 #: Concurrent requests used to collect a project's per-workflow step graphs.
 STEP_GRAPH_FANOUT_WORKERS = 8
 #: The run, its events, its steps and its tasks: four independent reads behind one
@@ -193,16 +207,24 @@ REVEAL_LEVELS: tuple[tuple[str, ...], ...] = (
 #: Header text per table. Local, so a table shows its header the moment it is on screen
 #: and keeps it while the rows are still on their way. See `_setup_tables`.
 TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
+    # How the project is doing comes first after its name — status, the last run, the
+    # day of runs behind it, the next one — and the four counts of what it contains
+    # sit at the far right: they change when something is deployed, not while it runs,
+    # so they are the columns to lose to a narrow terminal's scrollbar.
     "projects-table": (
         "Project",
+        "Status",
+        "Last run",
+        # The whole project's day of runs in one bar chart, so a failure anywhere in
+        # the workspace is one red bar on the first screen. After Last run, as in the
+        # workflows table: the one run, then the day of runs before it.
+        HISTORY_COLUMN,
+        "Next run",
+        "Created",
         "Functions",
         "Workflows",
         "Cron jobs",
         "Endpoints",
-        "Status",
-        "Last run",
-        "Next run",
-        "Created",
     ),
     "workspace-profiles-table": ("Active", "Profile", "Workspace", "Workspace ID", "API URL"),
     "workspaces-table": ("Active", "Workspace", "Workspace ID", "Role"),
@@ -424,6 +446,10 @@ class ProjectSummary:
     cron_status: str | None = None
     #: Soonest automatic resume among the paused crons, when one is timed.
     paused_until: str | None = None
+    #: Every run in the project over the History window, per status per hour. None
+    #: when the platform did not say — an older overview without the aggregate — which
+    #: draws as "-" rather than as a quiet day; an empty dict is a quiet day.
+    history: HourlyRuns | None = None
 
 
 @dataclass(frozen=True)
@@ -436,6 +462,9 @@ class OverviewCounts:
     next_runs: dict[str, str] = field(default_factory=dict)
     cron_statuses: dict[str, str] = field(default_factory=dict)
     paused_untils: dict[str, str] = field(default_factory=dict)
+    #: Per-project run history, or None when the platform offered none. See
+    #: `ProjectSummary.history`.
+    histories: RunHistory | None = None
 
 
 @dataclass(frozen=True)
@@ -817,6 +846,25 @@ def history_from_buckets(buckets: list[dict[str, Any]], target_ids: dict[tuple[s
     return history
 
 
+def history_by_project(buckets: list[dict[str, Any]]) -> RunHistory:
+    """The project table's History counts, keyed by project id.
+
+    From the workspace overview's `run_history` aggregate, which the platform groups per
+    project rather than per target: every run in the project lands on its row, so there
+    is no attribution to do, only the folding into hours. Rows without a project, or
+    without a positive count, are dropped as in `history_from_buckets`.
+    """
+    history: RunHistory = {}
+    for row in buckets:
+        when = _parse_timestamp(row.get("bucket"))
+        count = row.get("runs")
+        project_id = row.get("project_id")
+        if when is None or not project_id or not isinstance(count, int) or count <= 0:
+            continue
+        _record_history(history, str(project_id), when, str(row.get("status") or "unknown"), count)
+    return history
+
+
 def history_from_runs(
     runs: list[dict[str, Any]],
     target_ids: dict[tuple[str, str], str],
@@ -1043,6 +1091,7 @@ class RebaseTuiData:
                 next_run_at=counts.next_runs.get(str(project["id"])),
                 cron_status=counts.cron_statuses.get(str(project["id"])),
                 paused_until=counts.paused_untils.get(str(project["id"])),
+                history=None if counts.histories is None else counts.histories.get(str(project["id"]), {}),
             )
             for project in projects
         ]
@@ -1070,11 +1119,16 @@ class RebaseTuiData:
         projects = payload.get("projects") or []
         if self.project is not None and not any(project.get("name") == self.project for project in projects):
             raise RebaseWorkflowError(f"project not found: {self.project}")
+        # The history bars come only from the composite: the aggregate has no route of
+        # its own, and a platform without it draws the column as "-" rather than as a
+        # day of quiet. `None` and `[]` are different answers here — see `history_by_project`.
+        buckets = payload.get("run_history")
         counts = self._counts_from_rows(
             workflows=payload.get("workflows") or [],
             functions=payload.get("functions") or [],
             endpoints=payload.get("endpoints") or [],
             latest_runs=payload.get("latest_runs_by_project") or [],
+            run_history=buckets if isinstance(buckets, list) else None,
         )
         return WorkspaceOverviewData(
             projects=projects,
@@ -1156,6 +1210,7 @@ class RebaseTuiData:
         functions: list[dict[str, Any]],
         endpoints: list[dict[str, Any]],
         latest_runs: list[dict[str, Any]],
+        run_history: list[dict[str, Any]] | None = None,
     ) -> OverviewCounts:
         """The counts themselves, over rows someone else read.
 
@@ -1173,6 +1228,7 @@ class RebaseTuiData:
             next_runs=next_runs,
             cron_statuses=cron_statuses,
             paused_untils=paused_untils,
+            histories=None if run_history is None else history_by_project(run_history),
         )
 
     @staticmethod
@@ -2152,6 +2208,31 @@ def workflow_cron_state(workflow: dict[str, Any]) -> str | None:
     return "active" if workflow.get("next_run_at") else "stopped"
 
 
+def project_status_text(summary: ProjectSummary) -> Text:
+    """The projects table's Status cell.
+
+    An operator's stop on the project comes before the cron rollup: with the
+    project stopped the platform reports no next fire for any of its workflows, so
+    the rollup alone would read "stopped" in the colour of a schedule switched off
+    in code. Amber says "someone stopped this, and can start it again".
+    """
+    if summary.project.get("paused_at"):
+        return Text("stopped", style=BRAND_AMBER)
+    return cron_status_text(summary.cron_status, summary.paused_until)
+
+
+def target_state(item: dict[str, Any]) -> str:
+    """A function's State: its operator pause first, then the deploy-owned flag."""
+    if item.get("paused_at"):
+        return "paused"
+    return format_bool(item.get("enabled"))
+
+
+def target_state_text(item: dict[str, Any]) -> Text:
+    state = target_state(item)
+    return Text(state, style=BRAND_AMBER if state == "paused" else "")
+
+
 def cron_status_text(status: str | None, paused_until: str | None = None) -> Text:
     if status is None:
         return Text("-")
@@ -2781,6 +2862,113 @@ class DeleteConfirmScreen(ModalScreen[bool]):
         return f'Type "{CONFIRM_WORD}" to confirm, then enter. Escape cancels.'
 
 
+class ConfirmScreen(ModalScreen[bool]):
+    """A yes-or-no gate for something reversible: stopping or starting rows.
+
+    Lighter than `DeleteConfirmScreen` on purpose. A stop is undone by a start, so a
+    keypress is enough; what the dialog owes the reader is the list of what is about
+    to change and, for a project, how far the stop reaches.
+    """
+
+    BINDINGS = [
+        Binding("enter,y", "confirm", "Confirm"),
+        Binding("escape,n", "cancel", "Cancel"),
+    ]
+    CSS = f"""
+    ConfirmScreen {{
+        align: center middle;
+        background: #101412 70%;
+    }}
+
+    #confirm-dialog {{
+        width: 78;
+        height: auto;
+        padding: 1 2;
+        background: #101412;
+        border: solid {BRAND_AMBER};
+    }}
+
+    #confirm-dialog.start {{
+        border: solid {BRAND_MAIN_GREEN};
+    }}
+
+    #confirm-title {{
+        text-style: bold;
+        padding-bottom: 1;
+    }}
+
+    #confirm-names {{
+        color: {BRAND_AMBER};
+        padding: 1 0;
+    }}
+
+    #confirm-hint {{
+        color: {BRAND_MEDIUM_GRAY};
+        padding-top: 1;
+    }}
+    """
+    NAME_PREVIEW = DeleteConfirmScreen.NAME_PREVIEW
+
+    def __init__(self, *, kind: DeletableKind, intent: PauseIntent, names: list[str]) -> None:
+        super().__init__()
+        self.kind = kind
+        self.intent = intent
+        self.names = names
+
+    @property
+    def title_text(self) -> str:
+        verb = "Stop" if self.intent == "stop" else "Start"
+        if len(self.names) == 1:
+            return f"{verb} {self.kind} {self.names[0]}?"
+        return f"{verb} {len(self.names)} {self.kind}s?"
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog", classes=self.intent):
+            yield Static(
+                Text(self.title_text, style=BRAND_AMBER if self.intent == "stop" else BRAND_MAIN_GREEN),
+                id="confirm-title",
+            )
+            yield Static(self._body_text(), id="confirm-body")
+            yield Static(self._names_preview(), id="confirm-names")
+            yield Static("enter or y confirms · escape cancels", id="confirm-hint")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+    def _body_text(self) -> str:
+        if self.kind == "project":
+            if self.intent == "stop":
+                return (
+                    "Every schedule, trigger, endpoint call and run by hand in the project is "
+                    "refused until it is started again. Workflows and functions keep their own "
+                    "pause state."
+                )
+            return (
+                "Schedules, triggers and endpoints in the project run again. Anything paused on its own stays paused."
+            )
+        if self.kind == "workflow":
+            if self.intent == "stop":
+                return "The schedule stops firing until the workflow is started again. Runs by hand still work."
+            return "The schedule fires again."
+        if self.intent == "stop":
+            return (
+                "Runs, map calls, endpoint invocations and shells are refused until the function "
+                "is started again. A deploy does not lift this."
+            )
+        return "The function accepts runs again."
+
+    def _names_preview(self) -> str:
+        shown = self.names[: self.NAME_PREVIEW]
+        lines = [f"  {name}" for name in shown]
+        remaining = len(self.names) - len(shown)
+        if remaining > 0:
+            lines.append(f"  ... and {remaining} more")
+        return "\n".join(lines)
+
+
 class OpenSourceChoiceScreen(ModalScreen[ProjectDeclaration | None]):
     """Asks which file to open when several declare the same project.
 
@@ -3143,6 +3331,7 @@ class RebaseTuiApp(App[None]):
         # lists `show=False` bindings too. Ten hints did not fit the width, so the ones
         # you move around with kept their places and the rest went one keystroke away.
         Binding("d", "delete_selection", "Delete", show=False),
+        Binding("x", "toggle_selection_paused", "Stop or start (project, workflow schedule, function)", show=False),
         Binding("o", "open_source", "Open source, or a bucket in the cloud console", show=False),
         Binding("g", "open_github", "Open deployed code on GitHub", show=False),
         Binding("w", "switch_workspace", "Switch workspace", show=False),
@@ -3982,6 +4171,8 @@ class RebaseTuiApp(App[None]):
         projects = self.query_one("#projects-table", DataTable)
         projects.cursor_type = "row"
         projects.zebra_stripes = False
+        # Room for the History column's time axis under its name.
+        projects.header_height = 2
 
         for table_id in ("buckets-table", "secrets-table"):
             resource = self.query_one(f"#{table_id}", DataTable)
@@ -4098,7 +4289,7 @@ class RebaseTuiApp(App[None]):
             return True
         if self.screen.selections:
             return True
-        if any(worker.group == "tui-delete" for worker in self.workers):
+        if any(worker.group in {"tui-delete", "tui-pause"} for worker in self.workers):
             return True
         return monotonic() - self._last_key_at < KEYPRESS_QUIET_SECONDS
 
@@ -4694,6 +4885,108 @@ class RebaseTuiApp(App[None]):
             DeleteConfirmScreen(kind=kind, names=[name for _, name in items]),
             lambda confirmed: self._on_delete_confirmed(bool(confirmed), kind, items, table),
         )
+
+    def action_toggle_selection_paused(self) -> None:
+        """Stop the marked rows, or start them: whichever they are not. Bound to `x`.
+
+        Same rows as `d` -- the highlighted project, or the workflows and functions of the
+        open project -- and the same reading of marks versus cursor. One direction per
+        press: a selection that mixes stopped and running rows is refused rather than
+        guessed at, since "toggle each" would leave the reader unsure what happened.
+        """
+        table = self._delete_table()
+        if table is None:
+            self.notify("Nothing here can be stopped or started.", severity="warning")
+            return
+        kind = DELETABLE_TABLES[str(table.id)]
+        keys = table.marked_keys or [key for key in (table.cursor_key,) if key is not None]
+        if keys and all(str(key).startswith(EPHEMERAL_ROW_PREFIX) for key in keys):
+            self.notify("A one-off run registers no target, so there is nothing to stop.", severity="warning")
+            return
+        items: list[tuple[str, str]] = []
+        intents: set[PauseIntent] = set()
+        for key in keys:
+            name = self._delete_label(kind, key)
+            if name is None:
+                continue
+            intent = self._pause_intent(kind, key)
+            if intent is None:
+                self.notify(f"{name} has no schedule, so there is nothing to stop.", severity="warning")
+                return
+            items.append((key, name))
+            intents.add(intent)
+        if not items:
+            self.notify(f"No {kind} selected.", severity="warning")
+            return
+        if len(intents) > 1:
+            self.notify("The marked rows mix stopped and running items; mark only one kind.", severity="warning")
+            return
+        intent = intents.pop()
+        if not callable(getattr(self.data.client, PAUSE_METHODS[kind, intent], None)):
+            self.notify(f"This client cannot stop or start a {kind}; update rebase-toolkit.", severity="warning")
+            return
+        self.push_screen(
+            ConfirmScreen(kind=kind, intent=intent, names=[name for _, name in items]),
+            lambda confirmed: self._on_pause_confirmed(bool(confirmed), kind, intent, items),
+        )
+
+    def _project_paused(self) -> bool:
+        """Whether the open project is stopped, as it was when it was opened."""
+        return bool(self.selected_project and self.selected_project.get("paused_at"))
+
+    def _pause_intent(self, kind: DeletableKind, key: str) -> PauseIntent | None:
+        """What `x` would do to one row; None when the row has nothing to stop.
+
+        A project or function is stopped iff its `paused_at` is set. A workflow is
+        stopped iff its schedule pause is in effect -- an expired timed pause reads as
+        running, as the runner treats it -- and a workflow with no cron schedule has
+        nothing `x` could stop, which mirrors the CLI's `workflow pause`.
+        """
+        if kind == "project":
+            summary = self._project_rows.get(key)
+            if summary is None:
+                return None
+            return "start" if summary.project.get("paused_at") else "stop"
+        if kind == "function":
+            function = self._function_rows.get(key)
+            if function is None:
+                return None
+            return "start" if function.get("paused_at") else "stop"
+        workflow = self._workflow_rows.get(key)
+        if workflow is None or workflow_cron_state(workflow) is None:
+            return None
+        paused = bool(workflow.get("paused")) and _pause_in_effect(workflow.get("paused_until"))
+        return "start" if paused else "stop"
+
+    def _on_pause_confirmed(
+        self, confirmed: bool, kind: DeletableKind, intent: PauseIntent, items: list[tuple[str, str]]
+    ) -> None:
+        if not confirmed:
+            return
+        # Nothing is redrawn ahead of the answer: unlike a delete, the row stays, and
+        # what it should now say -- the Status rollup, the schedule's pause mark -- is
+        # exactly what the reload computes. One extra round trip buys a screen that
+        # never claims a state the platform did not confirm.
+        self.run_worker(self._toggle_paused(kind, intent, items), name="pause", group="tui-pause", exclusive=True)
+
+    async def _toggle_paused(self, kind: DeletableKind, intent: PauseIntent, items: list[tuple[str, str]]) -> None:
+        method = getattr(self.data.client, PAUSE_METHODS[kind, intent])
+        results = await asyncio.gather(
+            *(asyncio.to_thread(method, object_id) for object_id, _ in items), return_exceptions=True
+        )
+        done = [name for (_, name), result in zip(items, results, strict=True) if not isinstance(result, BaseException)]
+        failures = [
+            f"{name}: {result}"
+            for (_, name), result in zip(items, results, strict=True)
+            if isinstance(result, BaseException)
+        ]
+        verb = "Stopped" if intent == "stop" else "Started"
+        if done:
+            label = done[0] if len(done) == 1 else f"{len(done)} {kind}s"
+            self.notify(f"{verb} {label}.")
+        for failure in failures:
+            self.notify(f"{verb[:-3]} failed — {failure}", severity="error")
+        self.action_refresh()
 
     def _open_source_target(self) -> dict[str, Any] | None:
         """The project `o` acts on: the highlighted row, or the one already open."""
@@ -5386,6 +5679,11 @@ class RebaseTuiApp(App[None]):
             )
 
         projects = self._fill_table("projects-table")
+        # One scale for the whole table, so a bar's height compares across projects.
+        history_now = datetime.now(UTC)
+        history_mean = history_scale(
+            {project_id: summary.history for project_id, summary in self._project_rows.items() if summary.history}
+        )
         for project_id, summary in self._project_rows.items():
             project = summary.project
             last_run = summary.last_run or {}
@@ -5399,14 +5697,19 @@ class RebaseTuiApp(App[None]):
             )
             projects.add_row(
                 str(project.get("name", "-")),
+                project_status_text(summary),
+                last_run_cell,
+                # A dash when the platform sent no aggregate at all: a row of dots would
+                # claim a quiet day the platform never vouched for.
+                history_text(summary.history, now=history_now, scale=history_mean)
+                if summary.history is not None
+                else "-",
+                self._countdown(summary.next_run_at),
+                self._time(project.get("created_at")),
                 str(summary.function_count),
                 str(summary.workflow_count),
                 str(summary.cron_count),
                 str(summary.endpoint_count),
-                cron_status_text(summary.cron_status, summary.paused_until),
-                last_run_cell,
-                self._countdown(summary.next_run_at),
-                self._time(project.get("created_at")),
                 key=project_id,
             )
 
@@ -5478,7 +5781,7 @@ class RebaseTuiApp(App[None]):
                 format_step_workflows(steps),
                 format_step_keys(steps),
                 format_execution(function),
-                format_bool(function.get("enabled")),
+                target_state_text(function),
                 format_endpoint(self._target_endpoints("function", function_id)),
                 self._time(self._last_runs.get(function_id)),
                 compact_id(function.get("current_version_id")),
@@ -5511,7 +5814,8 @@ class RebaseTuiApp(App[None]):
                 ORIGIN_DEPLOYED,
                 format_schedule(
                     workflow.get("schedule"),
-                    paused=bool(workflow.get("paused")) and _pause_in_effect(workflow.get("paused_until")),
+                    paused=(bool(workflow.get("paused")) and _pause_in_effect(workflow.get("paused_until")))
+                    or self._project_paused(),
                 ),
                 self._time(workflow.get("next_run_at")),
                 self._time(self._last_runs.get(workflow_id)),
@@ -6337,7 +6641,7 @@ class RebaseTuiApp(App[None]):
             return DetailDrawer(
                 fields=[
                     DetailField("Function", str(item.get("name", "-"))),
-                    DetailField("State", format_bool(item.get("enabled"))),
+                    DetailField("State", target_state(item)),
                 ],
                 sections=[
                     detail_payload(
@@ -6507,6 +6811,8 @@ class RebaseTuiApp(App[None]):
             title = title.replace("Rebase TUI", f"Rebase TUI @ {platform}", 1)
         if self.current_view == "project" and self.selected_project is not None:
             title = f"{title} / {self.selected_project.get('name', '-')}"
+            if self.selected_project.get("paused_at"):
+                title = f"{title} · stopped"
         if self._marked_count:
             title = f"{title} - {self._marked_count} marked"
         if self._terminal_select:

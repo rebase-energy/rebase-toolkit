@@ -4991,6 +4991,48 @@ def test_workflow_trigger_pause_and_resume_toggle_active(monkeypatch, capsys) ->
     assert "Trigger Resumed" in capsys.readouterr().out
 
 
+def test_project_pause_and_resume_commands(monkeypatch, capsys) -> None:
+    calls: list[tuple[str, str]] = []
+    project = {"id": "project-id", "name": "energy", "environment": "dev", "paused_at": None}
+
+    def fake_pause(self, project_id):
+        calls.append(("pause", project_id))
+        return {**project, "paused_at": "2026-09-10T12:00:00Z"}
+
+    def fake_resume(self, project_id):
+        calls.append(("resume", project_id))
+        return project
+
+    monkeypatch.setattr(Client, "get_project", lambda self, project_id: {**project, "id": project_id})
+    monkeypatch.setattr(Client, "pause_project", fake_pause)
+    monkeypatch.setattr(Client, "resume_project", fake_resume)
+
+    assert main(["project", "pause", "--id", "project-id"]) == 0
+    assert "Project Stopped" in capsys.readouterr().out
+    assert main(["project", "resume", "--id", "project-id", "--json"]) == 0
+    assert '"paused_at": null' in capsys.readouterr().out
+    assert calls == [("pause", "project-id"), ("resume", "project-id")]
+
+
+def test_function_pause_and_resume_commands(monkeypatch, capsys) -> None:
+    calls: list[tuple[str, str]] = []
+    function = {"id": "function-id", "name": "normalize", "project_id": "project-id", "enabled": True}
+
+    monkeypatch.setattr(Client, "get_function", lambda self, function_id: {**function, "id": function_id})
+    monkeypatch.setattr(
+        Client, "pause_function", lambda self, fid: (calls.append(("pause", fid)), {**function, "paused_at": "x"})[1]
+    )
+    monkeypatch.setattr(
+        Client, "resume_function", lambda self, fid: (calls.append(("resume", fid)), {**function, "paused_at": None})[1]
+    )
+
+    assert main(["function", "pause", "--id", "function-id"]) == 0
+    assert "Function Stopped" in capsys.readouterr().out
+    assert main(["function", "resume", "--id", "function-id"]) == 0
+    assert "Function Started" in capsys.readouterr().out
+    assert calls == [("pause", "function-id"), ("resume", "function-id")]
+
+
 def test_workflow_trigger_pause_without_trigger_errors(monkeypatch, capsys) -> None:
     _stub_workflow_lookup(monkeypatch)
     _stub_workflow_trigger(monkeypatch, None)

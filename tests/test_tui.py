@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import pytest
+from rich.text import Text
 from textual._xterm_parser import XTermParser
 from textual.coordinate import Coordinate
 from textual.events import MouseMove
@@ -48,9 +49,14 @@ from rebase.editor import EditorCommand
 from rebase.tui import (
     AUTO_REFRESH_FAILURE_LIMIT,
     COUNTDOWN_WIDTH,
+    HISTORY_BLOCKS,
+    HISTORY_COLUMN,
+    HISTORY_EMPTY,
     HISTORY_HOURS,
     MARK_STYLE,
     NEXT_RUN_COLUMN,
+    TABLE_COLUMNS,
+    ConfirmScreen,
     DeleteConfirmScreen,
     DetailDrawer,
     OpenSourceChoiceScreen,
@@ -114,6 +120,7 @@ class FakeClient:
         self.latest_run_calls = 0
         self.latest_runs_by_project: list[dict[str, Any]] = []
         self.deleted: list[tuple[str, str, bool]] = []
+        self.paused: list[tuple[str, str, str]] = []
         self.delete_lock = threading.Lock()
         self.batch_calls: list[list[str]] = []
         self.function_calls: list[str | None] = []
@@ -261,6 +268,39 @@ class FakeClient:
         with self.delete_lock:
             self.deleted.append(("workflow", workflow_id, force))
             self.workflows = [item for item in self.workflows if item["id"] != workflow_id]
+
+    # Stop/start: the flag flips on the fixture row, so the refresh that follows shows it.
+    def _set_paused(self, rows: list[dict[str, Any]], object_id: str, field: str, value: Any) -> dict[str, Any]:
+        with self.delete_lock:
+            for item in rows:
+                if item["id"] == object_id:
+                    item[field] = value
+                    return dict(item)
+        raise RebaseWorkflowError(f"not found: {object_id}")
+
+    def pause_project(self, project_id: str) -> dict[str, Any]:
+        self.paused.append(("project", project_id, "pause"))
+        return self._set_paused(self.projects, project_id, "paused_at", "2026-09-10T12:00:00Z")
+
+    def resume_project(self, project_id: str) -> dict[str, Any]:
+        self.paused.append(("project", project_id, "resume"))
+        return self._set_paused(self.projects, project_id, "paused_at", None)
+
+    def pause_workflow(self, workflow_id: str, *, until: str | None = None) -> dict[str, Any]:
+        self.paused.append(("workflow", workflow_id, "pause"))
+        return self._set_paused(self.workflows, workflow_id, "paused", True)
+
+    def resume_workflow(self, workflow_id: str) -> dict[str, Any]:
+        self.paused.append(("workflow", workflow_id, "resume"))
+        return self._set_paused(self.workflows, workflow_id, "paused", False)
+
+    def pause_function(self, function_id: str) -> dict[str, Any]:
+        self.paused.append(("function", function_id, "pause"))
+        return self._set_paused(self.functions, function_id, "paused_at", "2026-09-10T12:00:00Z")
+
+    def resume_function(self, function_id: str) -> dict[str, Any]:
+        self.paused.append(("function", function_id, "resume"))
+        return self._set_paused(self.functions, function_id, "paused_at", None)
 
     def list_functions(self, *, project: str | None = None, project_id: str | None = None) -> list[dict[str, Any]]:
         assert project is None
@@ -894,18 +934,20 @@ def test_tui_project_row_puts_each_count_under_its_own_header() -> None:
             projects = app.query_one("#projects-table", SelectableDataTable)
             assert [str(column.label) for column in projects.columns.values()] == [
                 "Project",
+                "Status",
+                "Last run",
+                history_column_label().plain,
+                "Next run",
+                "Created",
                 "Functions",
                 "Workflows",
                 "Cron jobs",
                 "Endpoints",
-                "Status",
-                "Last run",
-                "Next run",
-                "Created",
             ]
-            # The count columns keep their order; the three time columns follow.
-            assert [str(cell) for cell in projects.get_row_at(0)][:5] == ["energy", "3", "2", "1", "1"]
-            assert [str(cell) for cell in projects.get_row_at(1)][:5] == ["trading", "0", "0", "0", "0"]
+            # The four counts sit at the far right, after the status and time columns.
+            assert [str(cell) for cell in projects.get_row_at(0)][-4:] == ["3", "2", "1", "1"]
+            assert [str(cell) for cell in projects.get_row_at(1)][-4:] == ["0", "0", "0", "0"]
+            assert [str(projects.get_row_at(row)[0]) for row in range(2)] == ["energy", "trading"]
 
     asyncio.run(scenario())
 
@@ -1273,6 +1315,77 @@ def test_composite_and_fanout_agree_on_the_project_table() -> None:
 
     assert composite.project_summaries == fanout.project_summaries
     assert composite.project_names == fanout.project_names
+
+
+class HistoryClient(CompositeClient):
+    """A platform whose workspace overview also carries the per-project run aggregate."""
+
+    def get_workspace_overview(self) -> dict[str, Any]:
+        payload = super().get_workspace_overview()
+        payload["run_history"] = [
+            {"project_id": "project-id", "bucket": _hour(0).isoformat(), "status": "succeeded", "runs": 6},
+            {"project_id": "project-id", "bucket": _hour(0).isoformat(), "status": "failed", "runs": 1},
+            {"project_id": "project-id", "bucket": _hour(5).isoformat(), "status": "succeeded", "runs": 6},
+            # No project: nothing to count it against.
+            {"project_id": None, "bucket": _hour(1).isoformat(), "status": "failed", "runs": 1},
+        ]
+        return payload
+
+
+def test_workspace_history_comes_from_the_platform_aggregate_when_it_is_sent() -> None:
+    """The whole project's runs fold into one row; a project without runs is a quiet
+    day, not an unknown one."""
+    overview = fake_tui_data(HistoryClient()).load_workspace_overview()
+
+    energy, trading = overview.project_summaries
+    assert energy.history == {_hour(0): {"succeeded": 6, "failed": 1}, _hour(5): {"succeeded": 6}}
+    assert trading.history == {}
+
+
+def test_workspace_history_is_unknown_without_the_aggregate() -> None:
+    """An older platform's overview says nothing about the day, so neither does the row."""
+    composite = fake_tui_data(CompositeClient()).load_workspace_overview()
+    fanout = fake_tui_data(FakeClient()).load_workspace_overview()
+
+    assert [summary.history for summary in composite.project_summaries] == [None, None]
+    assert [summary.history for summary in fanout.project_summaries] == [None, None]
+
+
+def test_projects_table_draws_a_history_bar_per_project() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(HistoryClient(), limit=5))
+
+        async with app.run_test(size=(160, 42)) as pilot:
+            await pilot.pause(0.3)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            column = TABLE_COLUMNS["projects-table"].index(HISTORY_COLUMN)
+            energy = projects.get_row_at(0)[column]
+            trading = projects.get_row_at(1)[column]
+            assert isinstance(energy, Text) and len(energy.plain) == HISTORY_HOURS
+            # The hour with the failure is red however many runs succeeded beside it.
+            assert energy.plain[-1] in HISTORY_BLOCKS
+            assert energy.plain[-6] in HISTORY_BLOCKS
+            assert energy.plain[-2] == HISTORY_EMPTY
+            # Odd hours take the darker shade of the same red, so either counts.
+            failed_styles = {status_style("failed"), shaded(status_style("failed"))}
+            assert any(span.style in failed_styles for span in energy.spans if span.end == HISTORY_HOURS)
+            # No runs at all is a quiet day, drawn as dots and not as a dash.
+            assert isinstance(trading, Text) and trading.plain == HISTORY_EMPTY * HISTORY_HOURS
+
+    asyncio.run(scenario())
+
+
+def test_projects_table_shows_a_dash_when_the_platform_has_no_history() -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(CompositeClient(), limit=5))
+
+        async with app.run_test(size=(160, 42)) as pilot:
+            await pilot.pause(0.3)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            column = TABLE_COLUMNS["projects-table"].index(HISTORY_COLUMN)
+            assert [str(projects.get_row_at(row)[column]) for row in range(2)] == ["-", "-"]
+
+    asyncio.run(scenario())
 
 
 def test_tui_app_mounts_and_renders_selected_workflow_run() -> None:
@@ -1722,10 +1835,11 @@ def test_tui_end_to_end_against_local_rebase_api() -> None:
 
                 projects = app.query_one("#projects-table", DataTable)
                 assert projects.row_count == 1
-                # Project, Functions, Workflows, Cron jobs, Endpoints. The Last run,
-                # Next run and Created columns follow; their values depend on when
-                # this ran, so the counts are what is asserted.
-                assert [str(cell) for cell in projects.get_row_at(0)][:5] == ["energy", "1", "1", "1", "1"]
+                # Project first, then Functions, Workflows, Cron jobs and Endpoints at
+                # the far right. The status and time columns between depend on when
+                # this ran, so the name and the counts are what is asserted.
+                row = [str(cell) for cell in projects.get_row_at(0)]
+                assert row[0] == "energy" and row[-4:] == ["1", "1", "1", "1"]
                 assert app.query_one("#workspace-view").styles.display == "block"
                 assert app.query_one("#project-view").styles.display == "none"
                 projects.focus()
@@ -2289,6 +2403,155 @@ def test_tui_c_copies_the_highlighted_rows_identifier() -> None:
                 await pilot.pause(0.1)
                 copied.append(app.clipboard)
             assert copied == ["event_id=event-id", "run_id=run-id", "step_id=step-id"]
+
+    asyncio.run(scenario())
+
+
+def _status_cell(app: RebaseTuiApp) -> str:
+    projects = app.query_one("#projects-table", SelectableDataTable)
+    return str(projects.get_row_at(0)[TABLE_COLUMNS["projects-table"].index("Status")])
+
+
+def test_tui_x_stops_and_starts_a_project_through_the_confirm_modal() -> None:
+    async def scenario() -> None:
+        client = FakeClient()
+        app = RebaseTuiApp(data=fake_tui_data(client, limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.pause(0.1)
+            assert _status_cell(app) == "active"
+
+            await pilot.press("x")
+            await pilot.pause(0.1)
+            screen = app.screen
+            assert isinstance(screen, ConfirmScreen)
+            assert screen.title_text == "Stop project energy?"
+            # Escape is a no: nothing is called.
+            await pilot.press("escape")
+            await pilot.pause(0.1)
+            assert client.paused == []
+
+            await pilot.press("x")
+            await pilot.pause(0.1)
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+            assert client.paused == [("project", "project-id", "pause")]
+            # The reload, not an optimistic edit, is what shows the new state.
+            assert _status_cell(app) == "stopped"
+
+            await pilot.press("x")
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, ConfirmScreen)
+            assert app.screen.title_text == "Start project energy?"
+            await pilot.press("y")
+            await pilot.pause(0.4)
+            assert client.paused[-1] == ("project", "project-id", "resume")
+            assert _status_cell(app) == "active"
+
+    asyncio.run(scenario())
+
+
+def test_tui_x_pauses_a_workflow_schedule_and_a_function() -> None:
+    async def scenario() -> None:
+        client = FakeClient()
+        client.workflows.append(
+            {"id": "adhoc-workflow-id", "project_id": "project-id", "name": "adhoc", "enabled": True}
+        )
+        app = RebaseTuiApp(data=fake_tui_data(client, project="energy", limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            workflows = app.query_one("#workflows-table", SelectableDataTable)
+            workflows.focus()
+            workflows.move_cursor(row=0)
+            await pilot.pause(0.1)
+            await pilot.press("x")
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+            assert client.paused == [("workflow", "workflow-id", "pause")]
+            schedule = TABLE_COLUMNS["workflows-table"].index("Schedule")
+            assert str(workflows.get_row_at(0)[schedule]).endswith("⏸")
+
+            # A workflow without a schedule has nothing to stop: a notice, no modal.
+            workflows.move_cursor(row=1)
+            await pilot.pause(0.1)
+            await pilot.press("x")
+            await pilot.pause(0.1)
+            assert not isinstance(app.screen, ConfirmScreen)
+            assert len(client.paused) == 1
+
+            functions = app.query_one("#functions-table", SelectableDataTable)
+            functions.focus()
+            functions.move_cursor(row=0)
+            await pilot.pause(0.1)
+            await pilot.press("x")
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, ConfirmScreen)
+            assert app.screen.title_text == "Stop function normalize?"
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+            assert client.paused[-1] == ("function", "function-id", "pause")
+            state = TABLE_COLUMNS["functions-table"].index("State")
+            assert str(functions.get_row_at(0)[state]) == "paused"
+
+    asyncio.run(scenario())
+
+
+def test_tui_x_refuses_a_selection_that_mixes_stopped_and_running_rows() -> None:
+    async def scenario() -> None:
+        client = FakeClient()
+        client.projects[1]["paused_at"] = "2026-09-10T12:00:00Z"
+        app = RebaseTuiApp(data=fake_tui_data(client, limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("shift+down")
+            await pilot.pause(0.1)
+            assert len(projects.marked_keys) == 2
+
+            await pilot.press("x")
+            await pilot.pause(0.1)
+            assert not isinstance(app.screen, ConfirmScreen)
+            assert client.paused == []
+
+    asyncio.run(scenario())
+
+
+def test_tui_x_reports_a_platform_that_refuses_and_keeps_the_row() -> None:
+    class Refusing(FakeClient):
+        def pause_project(self, project_id: str) -> dict[str, Any]:
+            raise RebaseWorkflowError("404 Not Found")
+
+    async def scenario() -> None:
+        client = Refusing()
+        app = RebaseTuiApp(data=fake_tui_data(client, limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.2)
+            projects = app.query_one("#projects-table", SelectableDataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("x")
+            await pilot.pause(0.1)
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+            assert _status_cell(app) == "active"
+            assert projects.row_count == 2
 
     asyncio.run(scenario())
 
@@ -3003,14 +3266,15 @@ def test_tui_tables_show_their_header_before_their_rows_arrive() -> None:
             assert projects.row_count == 2
             assert [str(column.label) for column in projects.columns.values()] == [
                 "Project",
+                "Status",
+                "Last run",
+                history_column_label().plain,
+                "Next run",
+                "Created",
                 "Functions",
                 "Workflows",
                 "Cron jobs",
                 "Endpoints",
-                "Status",
-                "Last run",
-                "Next run",
-                "Created",
             ]
 
             # Entering a project is the same story one level down.

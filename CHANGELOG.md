@@ -10,6 +10,20 @@
   the last 24 hours is one red bar on the first screen. Counted by the platform in the
   database over the whole window (`run_history` on `GET /workspace/overview`); against
   a platform without the aggregate the column shows `-` rather than a quiet day.
+- **Stop and start from the TUI.** `x` on a project stops the whole project — every
+  schedule, trigger, endpoint call and run by hand is refused until it is started again,
+  while its workflows and functions keep their own pause state; `x` on a workflow pauses
+  or resumes its schedule, and on a function stops or starts the function. Marked rows
+  go together, a confirm dialog lists them, and the projects table shows `stopped` in
+  amber for a stopped project. Needs a platform with `POST /projects/{id}/pause|resume`
+  and `/functions/{id}/pause|resume`.
+- **`rebase project pause | resume` and `rebase function pause | resume`.** The same
+  stops from the command line, beside `rebase workflow pause | resume`. A function pause
+  survives deploys, which disabling it in code does not.
+- **The projects table leads with how each project is doing.** `Status`, `Last run`,
+  `History`, `Next run` and `Created` now follow the project name, and the
+  `Functions`, `Workflows`, `Cron jobs` and `Endpoints` counts sit at the far right,
+  where a narrow terminal's scrollbar takes the columns that only change on deploy.
 - **Hosted hillclimb searches, revived.** `rebase hillclimb start` runs the
   engine on the platform again (a long-running Cloud Run job) and gains
   `--parallel-searches` (N engines under one run, sharing live knowledge),

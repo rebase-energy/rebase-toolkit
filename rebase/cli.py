@@ -4794,6 +4794,47 @@ def project_get_command(
     )
 
 
+PROJECT_PAUSE_DETAIL_KEYS = ["name", "id", "environment", "paused_at", "updated_at"]
+
+
+def _print_project_pause(project: dict[str, Any], *, json_output: bool, title: str) -> None:
+    if json_output:
+        _print_json(project)
+        return
+    console.print(_detail_table(title, project, preferred_keys=PROJECT_PAUSE_DETAIL_KEYS))
+
+
+@project_app.command("pause")
+def project_pause_command(
+    name: Annotated[str | None, typer.Argument(help="Project name. Omit when using --id.")] = None,
+    project_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact project ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Stop the whole project until it is resumed.
+
+    Every scheduled fire, trigger firing, endpoint call and run by hand in the
+    project is refused. Its workflows and functions keep their own pause state, so
+    'project resume' puts back exactly what was there.
+    """
+    client = Client()
+    project = _resolve_project_selector(client, name, project_id=project_id)
+    paused = client.pause_project(str(project["id"]))
+    _print_project_pause(paused, json_output=json_output, title="Project Stopped")
+
+
+@project_app.command("resume")
+def project_resume_command(
+    name: Annotated[str | None, typer.Argument(help="Project name. Omit when using --id.")] = None,
+    project_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact project ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Start a stopped project again."""
+    client = Client()
+    project = _resolve_project_selector(client, name, project_id=project_id)
+    resumed = client.resume_project(str(project["id"]))
+    _print_project_pause(resumed, json_output=json_output, title="Project Started")
+
+
 @project_app.command("delete")
 def project_delete_command(
     name: Annotated[
@@ -5078,6 +5119,49 @@ def function_delete_command(
         raise typer.Abort()
     client.delete_function(function["id"], force=force)
     console.print(f"[rebase.success]Deleted function {label}.[/rebase.success]")
+
+
+FUNCTION_PAUSE_DETAIL_KEYS = ["name", "id", "project_id", "enabled", "paused_at", "updated_at"]
+
+
+def _print_function_pause(function: dict[str, Any], *, json_output: bool, title: str) -> None:
+    if json_output:
+        _print_json(function)
+        return
+    console.print(_detail_table(title, function, preferred_keys=FUNCTION_PAUSE_DETAIL_KEYS))
+
+
+@function_app.command("pause")
+def function_pause_command(
+    name: Annotated[str | None, typer.Argument(help="Function name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    function_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact function ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Stop a function until it is resumed.
+
+    Runs, map calls, endpoint invocations and shells against it are refused. Unlike
+    disabling it in code, a deploy does not lift the pause. To remove a function for
+    good, take it out of the deploy instead.
+    """
+    client = Client()
+    function = _resolve_function_selector(client, name, function_id=function_id, project_name=project)
+    paused = client.pause_function(str(function["id"]))
+    _print_function_pause(paused, json_output=json_output, title="Function Stopped")
+
+
+@function_app.command("resume")
+def function_resume_command(
+    name: Annotated[str | None, typer.Argument(help="Function name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    function_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact function ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Start a stopped function again."""
+    client = Client()
+    function = _resolve_function_selector(client, name, function_id=function_id, project_name=project)
+    resumed = client.resume_function(str(function["id"]))
+    _print_function_pause(resumed, json_output=json_output, title="Function Started")
 
 
 app.add_typer(function_app, name="function")
@@ -7327,7 +7411,9 @@ def hillclimb_start_command(
     ] = None,
     parallel_searches: Annotated[
         int,
-        typer.Option("--parallel-searches", "-S", min=1, help="Independent searches under one hosted run (share knowledge)."),
+        typer.Option(
+            "--parallel-searches", "-S", min=1, help="Independent searches under one hosted run (share knowledge)."
+        ),
     ] = 1,
     parallel_operators: Annotated[
         int | None,
@@ -7470,7 +7556,9 @@ def hillclimb_chart_command(
         str | None, typer.Option("--search", "-s", help="latest, <run-id>, or <run-id>/<search-id>.")
     ] = None,
     detail: Annotated[bool, typer.Option("--detail", "-d", help="Draw the exploration tree on the curve.")] = False,
-    cost: Annotated[bool, typer.Option("--cost", "-c", help="Plot agent cost instead of wall-clock on the x axis.")] = False,
+    cost: Annotated[
+        bool, typer.Option("--cost", "-c", help="Plot agent cost instead of wall-clock on the x axis.")
+    ] = False,
 ) -> None:
     """The hillclimb chart: best score so far across searches, every candidate a dot."""
     _hillclimb_tui("chart", run_id, search=search, detail=detail, cost=cost)

@@ -4756,6 +4756,25 @@ class Client:
         """Lift a workflow's pause so scheduled runs fire again."""
         return self._request_dict("POST", f"/workflows/{workflow_id}/resume", expected="workflow response")
 
+    def pause_project(self, project_id: str) -> dict[str, Any]:
+        """Stop a whole project: no schedule, trigger, endpoint call or run by hand
+        goes through until it is resumed. Its workflows and functions keep their own
+        pause state. No expiry: a project stays stopped until `resume_project`."""
+        return self._request_dict("POST", f"/projects/{project_id}/pause", expected="project response")
+
+    def resume_project(self, project_id: str) -> dict[str, Any]:
+        """Lift a project's pause."""
+        return self._request_dict("POST", f"/projects/{project_id}/resume", expected="project response")
+
+    def pause_function(self, function_id: str) -> dict[str, Any]:
+        """Stop a function: runs, map calls, endpoint invocations and shells are refused
+        until it is resumed. Unlike `enabled`, a deploy does not lift it."""
+        return self._request_dict("POST", f"/functions/{function_id}/pause", expected="function response")
+
+    def resume_function(self, function_id: str) -> dict[str, Any]:
+        """Lift a function's pause."""
+        return self._request_dict("POST", f"/functions/{function_id}/resume", expected="function response")
+
     def get_workflow_trigger(self, workflow_id: str) -> dict[str, Any]:
         return self._request_dict("GET", f"/workflows/{workflow_id}/trigger", expected="workflow trigger response")
 
