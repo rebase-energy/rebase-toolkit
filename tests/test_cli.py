@@ -5830,3 +5830,45 @@ def test_event_detail_suffix_prints_what_the_event_recorded() -> None:
     assert _event_detail_suffix({"details": {}}) == ""
     assert _event_detail_suffix({}) == ""
     assert _event_detail_suffix({"details": {"error": "x" * 400}}, max_length=40).endswith("…")
+
+
+def test_run_get_reports_a_batched_run(monkeypatch, capsys) -> None:
+    """A batched run says so in one line; a solo run says nothing extra."""
+    from rebase.cli import _batch_line
+
+    assert _batch_line({"trigger_context": {"reason": "schedule"}}) is None
+    assert _batch_line({"trigger_context": None}) is None
+    assert _batch_line({}) is None
+    assert (
+        _batch_line({"trigger_context": {"batch": "fingrid", "batch_position": 3, "batch_size": 10}})
+        == "Fired as 3 of 10 in batch 'fingrid'."
+    )
+    # An older platform sends the key without the counters; still worth saying.
+    assert _batch_line({"trigger_context": {"batch": "fingrid"}}) == "Fired as part of batch 'fingrid'."
+
+
+def test_workflow_table_shows_the_batch_column_only_when_something_is_batched() -> None:
+    from rebase.cli import _workflow_table
+
+    # Nothing batched: no column at all, so an unbatched workspace keeps the
+    # width it had before batching existed.
+    plain = _workflow_table(
+        [{"id": "w1", "name": "collect-ote-dam", "project_id": "p"}],
+        project_names={"p": "grid-pipeline"},
+    )
+    assert "Batch" not in [str(column.header) for column in plain.columns]
+
+    table = _workflow_table(
+        [
+            {"id": "w1", "name": "collect-fingrid-wind", "batch": "fingrid", "project_id": "p"},
+            {"id": "w2", "name": "collect-ote-dam", "project_id": "p"},
+        ],
+        project_names={"p": "grid-pipeline"},
+    )
+    headers = [str(column.header) for column in table.columns]
+    assert "Batch" in headers
+    rows = [[str(cell) for cell in row] for row in zip(*[column._cells for column in table.columns], strict=True)]
+    batch_index = headers.index("Batch")
+    assert rows[0][batch_index] == "fingrid"
+    # Blank, not "-": no batch is the default, not missing data.
+    assert rows[1][batch_index] == ""

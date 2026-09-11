@@ -1864,19 +1864,33 @@ def _workflow_table(workflows: list[dict[str, Any]], *, project_names: dict[str,
     table.add_column("Execution")
     table.add_column("Enabled")
     table.add_column("Schedule")
+    # Only when something is batched. This table is already at the width an
+    # 80-column terminal truncates the Name column at, and batching is opt-in:
+    # a always-on column would cost every workspace that does not use it a
+    # readable first column to show a blank.
+    show_batch = any(workflow.get("batch") for workflow in workflows)
+    if show_batch:
+        table.add_column("Batch")
     table.add_column("ID", style="rebase.muted")
     table.add_column("Updated", style="rebase.muted")
     for workflow in workflows:
         project_id = str(workflow.get("project_id", ""))
-        table.add_row(
+        row = [
             str(workflow.get("name", "-")),
             project_names.get(project_id, project_id or "-"),
             _execution_label(workflow),
             _format_value(workflow.get("enabled")),
             _format_schedule(workflow.get("schedule")),
+        ]
+        if show_batch:
+            # Blank, not "-": an unbatched workflow beside batched ones has no
+            # batch by choice, which is not the same as data that failed to load.
+            row.append(str(workflow.get("batch") or ""))
+        row += [
             str(workflow.get("id", "-")),
             _format_value(workflow.get("updated_at")),
-        )
+        ]
+        table.add_row(*row)
     return table
 
 
@@ -5212,6 +5226,7 @@ def workflow_get_command(
                 "mode",
                 "isolation",
                 "enabled",
+                "batch",
                 "timeout_seconds",
                 "effective_timeout_seconds",
                 "timeout_source",
@@ -5264,6 +5279,7 @@ SCHEDULE_DETAIL_KEYS = [
     "paused",
     "paused_until",
     "next_run_at",
+    "batch",
     "last_skipped_at",
     "last_skip_reason",
     "workflow_id",
@@ -5284,6 +5300,9 @@ def _schedule_detail(workflow: dict[str, Any], schedule_data: dict[str, Any]) ->
         "paused": schedule_data.get("paused", False),
         "paused_until": schedule_data.get("paused_until"),
         "next_run_at": schedule_data.get("next_run_at"),
+        # Co-scheduled workflows sharing this key run in one container, so the
+        # cron alone no longer says what a fire will start.
+        "batch": workflow.get("batch"),
         # The last fire the runner skipped and why. A skip creates no run, so
         # this is what separates "ended as declared" from "stopped firing".
         "last_skipped_at": schedule_data.get("last_skipped_at"),
@@ -6712,6 +6731,26 @@ def _timeline_table(run: dict[str, Any], events: list[dict[str, Any]], steps: li
     return table
 
 
+def _batch_line(run: dict[str, Any]) -> str | None:
+    """`Fired as 3 of 10 in batch 'fingrid'.` for a run that shared a container.
+
+    Batching is an execution detail, not an entity: the batch has no row of its
+    own anywhere, so this one line beside the run is the whole of what a user
+    needs to know about it — that siblings shared the container, and which key
+    put them there.
+    """
+    context = run.get("trigger_context")
+    if not isinstance(context, dict):
+        return None
+    batch = context.get("batch")
+    if not batch:
+        return None
+    position, size = context.get("batch_position"), context.get("batch_size")
+    if isinstance(position, int) and isinstance(size, int):
+        return f"Fired as {position} of {size} in batch {batch!r}."
+    return f"Fired as part of batch {batch!r}."
+
+
 @run_app.command("get")
 def run_get_command(
     run_id: Annotated[
@@ -6743,6 +6782,7 @@ def run_get_command(
                 "function_id",
                 "backend_run_id",
                 "prefect_flow_run_id",
+                "batch_execution_id",
                 "parameters",
                 "result",
                 "error",
@@ -6753,6 +6793,9 @@ def run_get_command(
             ],
         )
     )
+    batch_line = _batch_line(run)
+    if batch_line:
+        console.print(batch_line, style="rebase.muted", highlight=False)
     # The composed story: chronological timeline plus where the time went.
     # Both degrade silently — an older API without events still shows the
     # detail table above.

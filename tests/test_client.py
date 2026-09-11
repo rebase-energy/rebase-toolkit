@@ -4207,3 +4207,90 @@ def test_run_failure_summary_carries_what_the_platform_observed() -> None:
     assert observed_summary({"timeout_seconds": 300, "elapsed_seconds": 301.2}) == "301.2s of a 300s bound"
     assert observed_summary({}) is None
     assert run_failure_summary({"failure_reason": {"message": "boom"}}) == "Boom"
+
+
+def test_register_and_update_workflow_send_batch(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed.clear()
+        observed.update(kwargs["json"])
+        return FakeResponse({"id": "workflow-id", "name": "sync"})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.register_workflow(name="sync", source_code="def sync(): pass", batch="fingrid")
+    assert observed["batch"] == "fingrid"
+
+    # Omitted on register still sends the key: no batch is the default, not an
+    # absence for the service to guess at.
+    client.register_workflow(name="sync", source_code="def sync(): pass")
+    assert observed["batch"] is None
+
+    # On update, None must survive the drop-None filter, or deleting `batch=`
+    # from a decorator would leave the workflow sharing a container it no
+    # longer declares.
+    client.update_workflow("workflow-id", batch=None)
+    assert observed["batch"] is None
+    client.update_workflow("workflow-id", batch="entsoe")
+    assert observed["batch"] == "entsoe"
+    client.update_workflow("workflow-id", source_code="def sync(): pass")
+    assert "batch" not in observed
+
+
+def test_batch_key_is_validated_before_any_request(monkeypatch) -> None:
+    """A bad key is caught where it was written, not as a 422 halfway through a deploy."""
+    called: list[str] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        called.append(url)
+        return FakeResponse({"id": "workflow-id", "name": "sync"})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    for bad in ("Fingrid", "fin grid", "fingrid!", "", "x" * 41):
+        with pytest.raises(ValueError, match="batch must be"):
+            client.register_workflow(name="sync", source_code="def sync(): pass", batch=bad)
+    assert called == []
+
+    for good in ("fingrid", "entsoe-15m", "a_b-9", "x" * 40):
+        rb.Workflow(name="sync", batch=good, data={"name": "sync"})
+
+
+def test_workflow_declares_its_batch_and_deploy_sends_it(monkeypatch) -> None:
+    registered: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        if method == "GET" and url.endswith("/workflows"):
+            return FakeResponse([])
+        if method == "GET" and "/projects" in url:
+            return FakeResponse([{"id": "project-id", "name": "grid-pipeline"}])
+        if method == "POST" and url.endswith("/workflows"):
+            registered.append(kwargs["json"])
+            return FakeResponse({"id": "workflow-id", "name": "collect_fingrid_wind", "batch": "fingrid"})
+        return FakeResponse({"id": "project-id", "name": "grid-pipeline"})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://w.example.com")
+    project = rb.Project("grid-pipeline", client=client)
+
+    @project.workflow(schedule=rb.Cron("5,20,35,50 * * * *"), batch="fingrid")
+    def collect_fingrid_wind() -> None: ...
+
+    assert collect_fingrid_wind.batch == "fingrid"
+
+    collect_fingrid_wind.deploy()
+    assert registered and registered[0]["batch"] == "fingrid"
+
+
+def test_adopt_deployed_keeps_a_declared_batch_an_old_service_does_not_echo() -> None:
+    """An old service ignores `batch`; the declared key is still the local truth."""
+    workflow = rb.Workflow(name="sync", batch="fingrid", data={"name": "sync"})
+    workflow._adopt_deployed({"id": "workflow-id", "name": "sync"}, None)
+    assert workflow.batch == "fingrid"
+
+    # A service that knows the field is authoritative, including when it clears it.
+    workflow._adopt_deployed({"id": "workflow-id", "name": "sync", "batch": None}, None)
+    assert workflow.batch is None

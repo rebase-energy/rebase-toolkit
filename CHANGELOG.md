@@ -4,6 +4,20 @@
 
 ### Added
 
+- **`batch="<key>"` on a workflow: co-scheduled workflows share one container.**
+  Workflows in one project that carry the same batch key *and* the same cron have
+  their scheduled firings executed together — one cold start, one concurrency
+  slot, one process, so a source's rate-limit pacer can be module-level and cover
+  every endpoint of that source. Each member is still its own run row with its own
+  steps, logs, status and `timeout_seconds`; the batch is an execution detail, not
+  an entity, and it never gets a row of its own. A run that was batched carries
+  `batch_execution_id` and `batch`/`batch_position`/`batch_size` in its
+  `trigger_context`; `rebase run get` prints "Fired as 3 of 10 in batch 'fingrid'",
+  the TUI's Trigger column shows `schedule · fingrid 3/10`, and both the CLI and
+  TUI workflow tables gain a `Batch` column. No key, no batching — the default is
+  unchanged. **Needs a platform with batch dispatch**: an older one ignores the
+  field, so this is safe to deploy against either.
+
 - **The projects table shows a day of run history per project.** The workspace view
   gains the same `History` bar chart the workflows table has, one row per project with
   every run in the project folded into it, so a failure anywhere in the workspace in
