@@ -15,8 +15,15 @@
   `trigger_context`; `rebase run get` prints "Fired as 3 of 10 in batch 'fingrid'",
   the TUI's Trigger column shows `schedule · fingrid 3/10`, and both the CLI and
   TUI workflow tables gain a `Batch` column. No key, no batching — the default is
-  unchanged. **Needs a platform with batch dispatch**: an older one ignores the
-  field, so this is safe to deploy against either.
+  unchanged. The platform states the assumptions the key brings on the workflow
+  (`batch_note`: who it shares with and in what order, that the container is
+  bound at the workspace ceiling while the run keeps its own timeout, what cancel
+  does); `rebase workflow get` and `schedule show` print it, and `deploy` warns
+  when a key is declared on a built version, where it does nothing. A batched
+  run's `run get` says what a requested cancel means for it. **Needs a platform
+  with batch dispatch**: the platform's workflow schemas refuse unknown fields,
+  so this client fails every deploy with a 422 against a platform without it —
+  upgrade the platform first.
 
 - **The projects table shows a day of run history per project.** The workspace view
   gains the same `History` bar chart the workflows table has, one row per project with

@@ -5845,6 +5845,14 @@ def test_run_get_reports_a_batched_run(monkeypatch, capsys) -> None:
     )
     # An older platform sends the key without the counters; still worth saying.
     assert _batch_line({"trigger_context": {"batch": "fingrid"}}) == "Fired as part of batch 'fingrid'."
+    # A requested cancel on a batched run cannot stop the shared container, so
+    # the line says what it does instead -- but not once the run is over.
+    context = {"batch": "fingrid", "batch_position": 3, "batch_size": 10}
+    pending = _batch_line({"trigger_context": context, "cancel_requested": True, "status": "running"})
+    assert pending is not None and pending.startswith("Fired as 3 of 10 in batch 'fingrid'. Cancel requested:")
+    assert _batch_line({"trigger_context": context, "cancel_requested": True, "status": "cancelled"}) == (
+        "Fired as 3 of 10 in batch 'fingrid'."
+    )
 
 
 def test_workflow_table_shows_the_batch_column_only_when_something_is_batched() -> None:

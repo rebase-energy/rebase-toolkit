@@ -4294,3 +4294,43 @@ def test_adopt_deployed_keeps_a_declared_batch_an_old_service_does_not_echo() ->
     # A service that knows the field is authoritative, including when it clears it.
     workflow._adopt_deployed({"id": "workflow-id", "name": "sync", "batch": None}, None)
     assert workflow.batch is None
+
+
+def test_deploy_warns_when_a_declared_batch_does_nothing(recwarn) -> None:
+    """The platform overriding a declaration is said at deploy, like a derived timeout.
+
+    A batched workflow whose key takes effect gets its note on the object for
+    `workflow get`, without a warning: the user asked for exactly that.
+    """
+    import warnings
+
+    workflow = rb.Workflow(name="sync", batch="fingrid", data={"name": "sync"})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        workflow._adopt_deployed(
+            {
+                "id": "w",
+                "name": "sync",
+                "batch": "fingrid",
+                "batch_effective": True,
+                "batch_note": "shares a container",
+            },
+            None,
+        )
+    assert workflow.batch_effective is True
+    assert workflow.batch_note == "shares a container"
+    assert caught == []
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        workflow._adopt_deployed(
+            {
+                "id": "w",
+                "name": "sync",
+                "batch": "fingrid",
+                "batch_effective": False,
+                "batch_note": "built; never shares",
+            },
+            None,
+        )
+    assert [str(w.message) for w in caught] == ["workflow 'sync': built; never shares"]

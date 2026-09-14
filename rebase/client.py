@@ -6890,6 +6890,11 @@ class Workflow:
         # None is the default and means today's behaviour: its own container.
         # Only workflows with the *same* batch key and the *same* cron share one.
         self.batch: str | None = _validate_batch(batch) if batch is not None else (data.get("batch") if data else None)
+        # What the platform decided about batching that the user did not write:
+        # whether the key takes effect on this version, and the assumptions it
+        # makes (order, container bound, cancel). Echoed after deploy.
+        self.batch_effective: bool | None = data.get("batch_effective") if data else None
+        self.batch_note: str | None = data.get("batch_note") if data else None
         self.resource_policy: dict[str, Any] = {}
 
         if fn is not None:
@@ -7166,10 +7171,16 @@ class Workflow:
         # still the truth locally, and `deploy --plan` should keep showing it.
         if "batch" in workflow:
             self.batch = workflow.get("batch")
+        self.batch_effective = workflow.get("batch_effective")
+        self.batch_note = workflow.get("batch_note")
         if self.timeout_source == "default" and self.timeout_note:
             # The run is bounded at a number the user never chose. Say so once,
             # at deploy, rather than letting a slow step discover it at 3 a.m.
             warnings.warn(f"workflow {self.name!r}: {self.timeout_note}", stacklevel=3)
+        if self.batch and self.batch_effective is False and self.batch_note:
+            # The one case where the platform overrides a declaration: the key
+            # was written and does nothing. Say so at deploy, like the timeout.
+            warnings.warn(f"workflow {self.name!r}: {self.batch_note}", stacklevel=3)
 
     def spawn(self, **parameters: Any) -> Run:
         if self.id is None:

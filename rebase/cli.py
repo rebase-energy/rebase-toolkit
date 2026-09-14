@@ -5227,6 +5227,7 @@ def workflow_get_command(
                 "isolation",
                 "enabled",
                 "batch",
+                "batch_note",
                 "timeout_seconds",
                 "effective_timeout_seconds",
                 "timeout_source",
@@ -5303,6 +5304,7 @@ def _schedule_detail(workflow: dict[str, Any], schedule_data: dict[str, Any]) ->
         # Co-scheduled workflows sharing this key run in one container, so the
         # cron alone no longer says what a fire will start.
         "batch": workflow.get("batch"),
+        "batch_note": workflow.get("batch_note"),
         # The last fire the runner skipped and why. A skip creates no run, so
         # this is what separates "ended as declared" from "stopped firing".
         "last_skipped_at": schedule_data.get("last_skipped_at"),
@@ -6732,6 +6734,20 @@ def _timeline_table(run: dict[str, Any], events: list[dict[str, Any]], steps: li
 
 
 def _batch_line(run: dict[str, Any]) -> str | None:
+    line = _batch_fired_line(run)
+    if line is None:
+        return None
+    if run.get("cancel_requested") and str(run.get("status")) not in {"cancelled", "failed", "succeeded"}:
+        # Cancelling a batched run cannot stop the shared container. Say what
+        # it does instead, beside the one line that says the run was batched.
+        line += (
+            " Cancel requested: it is skipped if it has not started; "
+            "if it is running it finishes or hits its own timeout."
+        )
+    return line
+
+
+def _batch_fired_line(run: dict[str, Any]) -> str | None:
     """`Fired as 3 of 10 in batch 'fingrid'.` for a run that shared a container.
 
     Batching is an execution detail, not an entity: the batch has no row of its
@@ -6783,6 +6799,7 @@ def run_get_command(
                 "backend_run_id",
                 "prefect_flow_run_id",
                 "batch_execution_id",
+                "cancel_requested",
                 "parameters",
                 "result",
                 "error",
