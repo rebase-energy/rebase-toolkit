@@ -746,6 +746,25 @@ def _validate_deploy_source(source: str | None) -> DeploySource | None:
     return source
 
 
+#: A batch key names a set of workflows whose scheduled firings share one
+#: container. Kept to the character class a Prefect deployment name and a Cloud
+#: Run label both accept unescaped, so the key can be used verbatim in both.
+_BATCH_KEY_PATTERN = re.compile(r"^[a-z0-9_-]{1,40}$")
+
+
+def _validate_batch(batch: str | None | object) -> str | None:
+    """Check a batch key client-side, where the error can name the decorator argument.
+
+    The service validates it too; catching it here turns a 422 on deploy into a
+    message at the point the key was written.
+    """
+    if batch is None:
+        return None
+    if not isinstance(batch, str) or not _BATCH_KEY_PATTERN.match(batch):
+        raise ValueError(f"batch must be 1-40 characters of lowercase letters, digits, '-' or '_'; got {batch!r}")
+    return batch
+
+
 def _normalize_path(path: str | None, *, field_name: str = "path") -> str:
     value = (path or "/").strip()
     if not value:
@@ -4484,6 +4503,7 @@ class Client:
         cloud_run_cpu: str | None = None,
         cloud_run_memory: str | None = None,
         timeout_seconds: int | None = None,
+        batch: str | None = None,
     ) -> dict[str, Any]:
         environment = _resolve_environment(self, environment)
         path = "/workflows"
@@ -4515,6 +4535,7 @@ class Client:
             "cloud_run_cpu": cloud_run_cpu,
             "cloud_run_memory": cloud_run_memory,
             "timeout_seconds": timeout_seconds,
+            "batch": _validate_batch(batch),
             "enabled": enabled,
             "endpoint": _coerce_endpoint(endpoint).to_payload() if endpoint is not None else None,
             "environment": environment,
@@ -4572,6 +4593,7 @@ class Client:
         cloud_run_cpu: str | None | object = _UNSET,
         cloud_run_memory: str | None | object = _UNSET,
         timeout_seconds: int | None | object = _UNSET,
+        batch: str | None | object = _UNSET,
     ) -> dict[str, Any]:
         execution_payload: dict[str, Any] = {}
         if mode is not None or isolation is not None or run_type is not None:
@@ -4624,6 +4646,12 @@ class Client:
             payload["cloud_run_memory"] = cloud_run_memory
         if timeout_seconds is not _UNSET:
             payload["timeout_seconds"] = timeout_seconds
+        if batch is not _UNSET:
+            # _UNSET, not None, like the fields above: None means "leave the
+            # batch", which must survive the drop-None filter, or removing
+            # `batch=` from a decorator would silently keep the old key and the
+            # workflow would keep sharing a container it no longer declares.
+            payload["batch"] = _validate_batch(batch)
         if build:
             payload["build"] = build
         return self._request_dict("PATCH", f"/workflows/{workflow_id}", json=payload, expected="workflow response")
@@ -5473,6 +5501,7 @@ class Project:
         cpu: float | int | str | None = None,
         memory: int | float | str | None = None,
         timeout_seconds: int | None = None,
+        batch: str | None = None,
         resources: dict[str, Any] | None = None,
         backend: str | None = None,
     ) -> Callable[[Callable[..., Any]], Workflow]:
@@ -5505,6 +5534,7 @@ class Project:
                 cpu=cpu,
                 memory=memory,
                 timeout_seconds=timeout_seconds,
+                batch=batch,
                 resources=resources,
             )
             self._workflows.append(workflow)
@@ -6796,6 +6826,7 @@ class Workflow:
         cpu: float | int | str | None = None,
         memory: int | float | str | None = None,
         timeout_seconds: int | None = None,
+        batch: str | None = None,
         resources: dict[str, Any] | None = None,
         backend: str | None = None,
     ) -> None:
@@ -6855,6 +6886,15 @@ class Workflow:
         self.effective_timeout_seconds: int | None = data.get("effective_timeout_seconds") if data else None
         self.timeout_source: str | None = data.get("timeout_source") if data else None
         self.timeout_note: str | None = data.get("timeout_note") if data else None
+        # The batch this workflow's scheduled firings share a container with.
+        # None is the default and means today's behaviour: its own container.
+        # Only workflows with the *same* batch key and the *same* cron share one.
+        self.batch: str | None = _validate_batch(batch) if batch is not None else (data.get("batch") if data else None)
+        # What the platform decided about batching that the user did not write:
+        # whether the key takes effect on this version, and the assumptions it
+        # makes (order, container bound, cancel). Echoed after deploy.
+        self.batch_effective: bool | None = data.get("batch_effective") if data else None
+        self.batch_note: str | None = data.get("batch_note") if data else None
         self.resource_policy: dict[str, Any] = {}
 
         if fn is not None:
@@ -7063,6 +7103,7 @@ class Workflow:
                 cloud_run_cpu=self.cloud_run_cpu,
                 cloud_run_memory=self.cloud_run_memory,
                 timeout_seconds=self.timeout_seconds,
+                batch=self.batch,
                 enabled=self.enabled,
                 endpoint=self.endpoint,
                 build=build,
@@ -7092,6 +7133,7 @@ class Workflow:
             cloud_run_cpu=self.cloud_run_cpu,
             cloud_run_memory=self.cloud_run_memory,
             timeout_seconds=self.timeout_seconds,
+            batch=self.batch,
             enabled=self.enabled,
             endpoint=self.endpoint,
             build=build,
@@ -7124,10 +7166,21 @@ class Workflow:
         self.effective_timeout_seconds = workflow.get("effective_timeout_seconds")
         self.timeout_source = workflow.get("timeout_source")
         self.timeout_note = workflow.get("timeout_note")
+        # A service without batch dispatch echoes no `batch`, so keep what was
+        # declared rather than reading the absence as "no batch": the key is
+        # still the truth locally, and `deploy --plan` should keep showing it.
+        if "batch" in workflow:
+            self.batch = workflow.get("batch")
+        self.batch_effective = workflow.get("batch_effective")
+        self.batch_note = workflow.get("batch_note")
         if self.timeout_source == "default" and self.timeout_note:
             # The run is bounded at a number the user never chose. Say so once,
             # at deploy, rather than letting a slow step discover it at 3 a.m.
             warnings.warn(f"workflow {self.name!r}: {self.timeout_note}", stacklevel=3)
+        if self.batch and self.batch_effective is False and self.batch_note:
+            # The one case where the platform overrides a declaration: the key
+            # was written and does nothing. Say so at deploy, like the timeout.
+            warnings.warn(f"workflow {self.name!r}: {self.batch_note}", stacklevel=3)
 
     def spawn(self, **parameters: Any) -> Run:
         if self.id is None:
