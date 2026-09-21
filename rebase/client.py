@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import requests
 
 from rebase.auth import AuthError, load_access_token
+from rebase.client_identity import identity_headers
 from rebase.config import DEFAULT_SERVER_URL, active_environment, load_profile, local_workspace_id
 from rebase.image import DEFAULT_PYTHON_VERSION, Image
 from rebase.runtime import current_run
@@ -2727,7 +2728,8 @@ class Client:
         return True
 
     def _request_headers(self, *, auth: bool, headers: dict[str, str] | None = None) -> dict[str, str]:
-        resolved_headers = dict(headers or {})
+        # Which client this is, not what it is doing -- see rebase/client_identity.py.
+        resolved_headers = {**identity_headers(), **(headers or {})}
         if auth:
             bearer_token = self._bearer_token()
             if bearer_token:

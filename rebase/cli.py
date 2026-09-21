@@ -67,6 +67,7 @@ from rebase.client import (
     run_timing_summary,
     set_build_log_consumer,
 )
+from rebase.client_identity import CLIENT_CLI, CLIENT_TUI, command_path, set_client
 from rebase.config import (
     DEFAULT_PLATFORM,
     DEFAULT_PROFILE,
@@ -7694,6 +7695,18 @@ def _parse_logo_variant(args: list[str]) -> tuple[int, list[str]]:
     return variant, remaining
 
 
+def _identify_client(group: Any, args: list[str], *, prefix: str = "") -> None:
+    """Tell the platform this is the CLI, and which command -- see rebase/client_identity.py."""
+    command: str | None = None
+    try:
+        command = command_path(typer.main.get_command(group), args, prefix=prefix)
+    except Exception:
+        # Identification is telemetry; it must never be why a command fails.
+        command = None
+    # The TUI is a long-lived session, not a command that ran: its own client.
+    set_client(CLIENT_TUI if command == "tui" else CLIENT_CLI, command=command)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     # Pinned for the life of the process, so a long-running TUI keeps reading and
@@ -7716,8 +7729,10 @@ def main(argv: list[str] | None = None) -> int:
             _print_run_help()
             return 0
         if len(args) > 1 and args[0] == "run" and args[1] in RUN_INSPECTION_COMMANDS:
+            _identify_client(run_app, args[1:], prefix="run")
             result = run_app(args=args[1:], prog_name="rebase run", standalone_mode=False)
         else:
+            _identify_client(app, args)
             result = app(args=args, prog_name="rebase", standalone_mode=False)
         # With standalone_mode=False click returns typer.Exit codes instead of raising.
         return int(result) if isinstance(result, int) else 0
