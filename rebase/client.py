@@ -2777,6 +2777,19 @@ class Client:
             raise RebaseWorkflowError(f"expected {expected}")
         return response
 
+    def end_client_session(self) -> None:
+        """Tell the platform this process is done, so its session has an exact end.
+
+        Best effort, for long-lived clients (the TUI): the server otherwise learns a
+        session's length only from a last-seen stamp it moves once a minute, which
+        makes a quick look at the TUI a session of no length. Never raises -- an
+        exit must not fail because usage could not be recorded.
+        """
+        try:
+            self.request_no_content("POST", "/client-sessions/end", timeout=5)
+        except Exception:
+            return
+
     def request_no_content(self, method: str, path: str, *, auth: bool = True, **kwargs: Any) -> None:
         """Like :meth:`request`, for endpoints that answer 204 with an empty body.
 
