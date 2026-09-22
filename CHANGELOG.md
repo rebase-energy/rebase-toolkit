@@ -1,9 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 — 2026-09-22
 
 ### Added
 
+- **Every request says which client it is.** Requests now carry the client (`cli`,
+  `tui` or `sdk`), the toolkit version, the CLI command path and an id minted once per
+  process, so the platform can count one `rebase deploy` as one deploy and one TUI
+  session as one session. Only registered command names are ever sent — never a file
+  path, a target or a secret name — and identification can never be why a command
+  fails. The TUI also says goodbye when it exits (`q` and Ctrl-C alike, best effort),
+  so a short session has its real length instead of the last once-a-minute stamp.
 - **The projects table shows a day of run history per project.** The workspace view
   gains the same `History` bar chart the workflows table has, one row per project with
   every run in the project folded into it, so a failure anywhere in the workspace in
