@@ -1505,12 +1505,12 @@ def test_tui_app_shows_workflow_provenance_the_endpoint_column_and_the_target_ta
             functions = app.query_one("#functions-table", DataTable)
             # A GitHub-backed workflow names its source and deployed commit. The table
             # shortens the SHA; the drawer below keeps the copyable value intact.
-            assert str(workflows.get_cell_at(Coordinate(0, 6))) == "GitHub"
-            assert str(workflows.get_cell_at(Coordinate(0, 7))) == "01234567..."
+            assert str(workflows.get_cell_at(Coordinate(0, 7))) == "GitHub"
+            assert str(workflows.get_cell_at(Coordinate(0, 8))) == "01234567..."
 
             # Endpoint sits after the schedule columns in the workflow table and after
             # the step-graph columns in the function table.
-            assert str(workflows.get_cell_at(Coordinate(0, 10))) == "POST /forecast"
+            assert str(workflows.get_cell_at(Coordinate(0, 11))) == "POST /forecast"
             assert str(functions.get_cell_at(Coordinate(0, 6))) == "-"
 
             # The workflow's endpoint, with the full URL the column has no room for.
@@ -1577,8 +1577,8 @@ def test_tui_marks_rebase_hosted_workflow_without_a_git_commit() -> None:
             await pilot.pause(0.3)
 
             workflows = app.query_one("#workflows-table", DataTable)
-            assert str(workflows.get_cell_at(Coordinate(0, 6))) == "Rebase"
-            assert str(workflows.get_cell_at(Coordinate(0, 7))) == "-"
+            assert str(workflows.get_cell_at(Coordinate(0, 7))) == "Rebase"
+            assert str(workflows.get_cell_at(Coordinate(0, 8))) == "-"
 
             workflows.focus()
             workflows.move_cursor(row=0)
@@ -5130,7 +5130,7 @@ def test_functions_table_shows_when_each_function_last_ran() -> None:
             wf_labels = [str(column.label) for column in workflows.columns.values()]
             # Straight after Origin, so they fit a terminal that clips the table's right
             # edge; and next to Next run, the schedule's two ends side by side.
-            assert wf_labels[2:5] == ["Schedule", "Next run", "Last run"]
+            assert wf_labels[2:6] == ["Schedule", "Batch", "Next run", "Last run"]
             # History follows Last run: the one run, then the day of runs before it. Its
             # header carries the time axis on a second line, which needs the room.
             history = next(label for label in wf_labels if label.startswith("History\n"))
@@ -5668,11 +5668,13 @@ def test_tui_one_off_runs_get_a_row_and_open_like_any_target() -> None:
             # A one-off has no schedule or next run, no deployed source, commit, state,
             # endpoint or version — only what it ran as and when.
             one_off = rows[1]
-            assert one_off[2:4] == ["-", "-"]
-            assert len(one_off[5]) == HISTORY_HOURS
-            assert one_off[6:8] == ["-", "-"]
-            assert one_off[8] == "quick"
-            assert one_off[9:13] == ["-", "-", "-", "-"]
+            # Schedule, Batch and Next run: a one-off is not scheduled, so it is
+            # in no batch either.
+            assert one_off[2:5] == ["-", "-", "-"]
+            assert len(one_off[6]) == HISTORY_HOURS
+            assert one_off[7:9] == ["-", "-"]
+            assert one_off[9] == "quick"
+            assert one_off[10:14] == ["-", "-", "-", "-"]
 
             workflows.focus()
             workflows.move_cursor(row=1)
@@ -5798,14 +5800,14 @@ def test_tui_paints_the_targets_before_the_slower_detail_arrives() -> None:
                 "collect",
             ]
             # The Last run column is what it is still waiting on.
-            assert str(workflows.get_row_at(0)[4]) == "-"
+            assert str(workflows.get_row_at(0)[5]) == "-"
 
             client.release_detail.set()
             for _ in range(50):
                 await pilot.pause(0.05)
-                if str(workflows.get_row_at(0)[4]) != "-":
+                if str(workflows.get_row_at(0)[5]) != "-":
                     break
-            assert str(workflows.get_row_at(0)[4]) != "-"
+            assert str(workflows.get_row_at(0)[5]) != "-"
 
     asyncio.run(scenario())
 
@@ -5833,10 +5835,10 @@ def test_tui_refresh_keeps_the_complete_frame_until_slow_detail_arrives() -> Non
             workflows = app.query_one("#workflows-table", SelectableDataTable)
             for _ in range(50):
                 await pilot.pause(0.05)
-                if str(workflows.get_cell_at(Coordinate(0, 6))) == "GitHub":
+                if str(workflows.get_cell_at(Coordinate(0, 7))) == "GitHub":
                     break
             before = [str(cell) for cell in workflows.get_row_at(0)]
-            assert before[6:8] == ["GitHub", "01234567..."]
+            assert before[7:9] == ["GitHub", "01234567..."]
             assert before[4] != "-"
 
             # Hold the detail phase of a refresh open. The old implementation painted
@@ -5887,7 +5889,7 @@ def test_tui_second_paint_keeps_the_row_you_already_opened() -> None:
             client.release_detail.set()
             for _ in range(50):
                 await pilot.pause(0.05)
-                if str(workflows.get_row_at(0)[4]) != "-":
+                if str(workflows.get_row_at(0)[5]) != "-":
                     break
 
             # Still on the same row, and its runs are still on screen.
@@ -7112,3 +7114,33 @@ def test_tui_event_drawer_shows_details_and_falls_back_without_them() -> None:
 
     bare = TimelineRow(at=None, stage="accepted", status="completed", message="Accepted.", kind="event", record={})
     assert RebaseTuiApp._event_drawer(bare) is None
+
+
+def test_format_trigger_names_the_batch_a_run_shared() -> None:
+    """Batching has no row of its own, so a batched run carries its own trace."""
+    from rebase.tui import format_trigger
+
+    assert format_trigger({"trigger_source": "schedule"}) == "schedule"
+    assert format_trigger({"trigger_source": "api", "trigger_context": {"reason": "api"}}) == "api"
+    assert format_trigger({}) == "-"
+    assert (
+        format_trigger(
+            {
+                "trigger_source": "schedule",
+                "trigger_context": {"batch": "fingrid", "batch_position": 3, "batch_size": 10},
+            }
+        )
+        == "schedule · fingrid 3/10"
+    )
+    # An older platform sends the key without the counters.
+    assert (
+        format_trigger({"trigger_source": "schedule", "trigger_context": {"batch": "fingrid"}}) == "schedule · fingrid"
+    )
+
+
+def test_workflows_table_has_a_batch_column_after_schedule() -> None:
+    from rebase.tui import TABLE_COLUMNS
+
+    columns = TABLE_COLUMNS["workflows-table"]
+    assert "Batch" in columns
+    assert columns.index("Batch") == columns.index("Schedule") + 1

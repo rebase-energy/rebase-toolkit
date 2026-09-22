@@ -253,6 +253,7 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
         "Name",
         "Origin",
         "Schedule",
+        "Batch",
         "Next run",
         "Last run",
         HISTORY_COLUMN,
@@ -2143,6 +2144,27 @@ def format_execution(value: dict[str, Any]) -> str:
     if mode is not None:
         return f"{mode}/{isolation}" if isolation is not None else str(mode)
     return str(value.get("run_type") or "-")
+
+
+def format_trigger(run: dict[str, Any]) -> str:
+    """The Trigger cell: `schedule`, or `schedule · fingrid 3/10` for a batched run.
+
+    Batching has no row of its own by design, so a batched run has to carry its
+    own trace. Here rather than in a detail pane: the reader's question is "why
+    did this one run", the Trigger column already answers it, and "which of the
+    ten in the container" is the same question one level down.
+    """
+    source = str(run.get("trigger_source") or "-")
+    context = run.get("trigger_context")
+    if not isinstance(context, dict):
+        return source
+    batch = context.get("batch")
+    if not batch:
+        return source
+    position, size = context.get("batch_position"), context.get("batch_size")
+    if isinstance(position, int) and isinstance(size, int):
+        return f"{source} · {batch} {position}/{size}"
+    return f"{source} · {batch}"
 
 
 def format_schedule(value: Any, *, paused: bool = False) -> str:
@@ -5817,6 +5839,9 @@ class RebaseTuiApp(App[None]):
                     paused=(bool(workflow.get("paused")) and _pause_in_effect(workflow.get("paused_until")))
                     or self._project_paused(),
                 ),
+                # Blank for the overwhelming majority that have no batch: a
+                # column of dashes here would read as data the loader missed.
+                str(workflow.get("batch") or ""),
                 self._time(workflow.get("next_run_at")),
                 self._time(self._last_runs.get(workflow_id)),
                 history_text(targets.run_history.get(workflow_id, {}), now=history_now, scale=history_mean),
@@ -5836,6 +5861,7 @@ class RebaseTuiApp(App[None]):
             workflows.add_row(
                 group.name,
                 ORIGIN_ONE_OFF,
+                "-",
                 "-",
                 "-",
                 self._time(group.last_run),
@@ -5892,7 +5918,7 @@ class RebaseTuiApp(App[None]):
             table.add_row(
                 compact_id(run_id),
                 status_text(run.get("status")),
-                str(run.get("trigger_source") or "-"),
+                format_trigger(run),
                 self._time(run.get("created_at")),
                 self._time(run.get("started_at")),
                 self._time(run.get("finished_at")),
