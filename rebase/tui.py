@@ -6844,4 +6844,9 @@ def run_tui(
     client: Client | None = None,
     refresh_interval: float = AUTO_REFRESH_SECONDS,
 ) -> None:
-    RebaseTuiApp(client=client, project=project, limit=limit, refresh_interval=refresh_interval).run()
+    app = RebaseTuiApp(client=client, project=project, limit=limit, refresh_interval=refresh_interval)
+    try:
+        app.run()
+    finally:
+        # Ctrl-C and `q` alike: the session ends when the screen does.
+        app.data.client.end_client_session()
