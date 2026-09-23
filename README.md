@@ -323,6 +323,51 @@ Deploy a file from the command line:
 rebase deploy workflow.py
 ```
 
+The CLI prints a final deployment report, including when a deployment stops
+partway. Each selected function, workflow, app, or model is marked `succeeded`,
+`failed`, `uncertain`, or `unattempted`; shared steps have their own rows.
+Counts describe the last outcome for each target in this invocation. Success
+means the control plane acknowledged the definition, not that a runtime is
+ready. Deployment still stops at the first error, and an incomplete CLI deploy
+exits nonzero (1 for deployment errors, 130 for interruption).
+
+Within one deployment attempt, the SDK caches project/function/workflow lookups
+and secret references. Shared steps with the same resolved definition are written
+once; changed definitions are written again. Caches are discarded when the attempt
+ends, and uncertain-write reconciliation always reads fresh API state.
+
+Workflow creation and updates, and function writes during deployment, use a
+300-second HTTP timeout. During deployment, reads retry transient connection/
+timeout failures and HTTP 429/500/502/503/504 responses up to three attempts with
+bounded backoff. Writes retry only connection timeouts
+that occur before a connection is established. After an ambiguous workflow or function
+write, the SDK probes the deployed definition up to three times, checking the
+resource and its pinned version together. It accepts success only if
+all submitted definition fields match after accounting for the API's Python
+image and job-isolation defaults, and the environment selector agrees. Otherwise
+the outcome stays `uncertain`. An absent workflow is not proof that a timed-out create failed.
+Build submissions cannot be confirmed from the definition alone.
+
+SDK deploy methods keep their existing return values and expose a
+`deployment_report` after an attempt. Deployment errors subclass
+`RebaseWorkflowError` and carry the same report:
+
+```python
+try:
+    project.deploy()
+except rb.DeploymentError as exc:
+    print(exc.report.counts)
+    for result in exc.report.results:
+        print(result.project, result.name, result.status, result.error)
+    raise
+else:
+    print(project.deployment_report.counts)
+```
+
+Deployments are not atomic: successful earlier writes remain in place after
+a failure. Reruns still redeploy unchanged targets. Inspect uncertain outcomes
+before retrying; there is no blanket retry of workflow creation or run submission.
+
 Run a function from local source and force the interactive backend:
 
 ```bash

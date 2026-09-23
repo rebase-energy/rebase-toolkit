@@ -61,6 +61,7 @@ from rebase.client import (
     _flatten_config,
     _git,
     _parse_github_remote,
+    _plan_deployment,
     _validate_execution,
     observed_summary,
     run_failure_summary,
@@ -92,6 +93,7 @@ from rebase.config import (
     write_profile,
 )
 from rebase.contract import Freshness, validate_frame
+from rebase.deployment import DeploymentReport, _deployment_scope
 from rebase.editor import NO_EDITOR_HINT, build_argv, resolve_editor, run_foreground, spawn_detached
 from rebase.locate import describe_failure, find_project_declarations, is_risky_root, project_folder
 from rebase.shell import close_message as _shell_close_message
@@ -1014,6 +1016,39 @@ def deploy_file(
     deploy_source: str | None = None,
     environment: str = "dev",
 ) -> list[DeployRow]:
+    with _deployment_scope() as report:
+        try:
+            return _deploy_file(path, object_names=object_names, deploy_source=deploy_source, environment=environment)
+        finally:
+            _print_deployment_report(report)
+
+
+def _print_deployment_report(report: DeploymentReport) -> None:
+    if not report.results:
+        return
+    output = error_console if report.error else console
+    table = Table(title="Deployment results", box=box.ASCII)
+    for column in ("Type", "Target", "Environment", "Status", "Error"):
+        table.add_column(column)
+    for result in report.results:
+        table.add_row(
+            Text(result.target_type),
+            Text(f"{result.project}/{result.name}" if result.project else result.name),
+            Text(result.environment),
+            result.status,
+            Text(result.error or ""),
+        )
+    output.print(table)
+    output.print("Deployment: " + ", ".join(f"{count} {status}" for status, count in report.counts.items()))
+
+
+def _deploy_file(
+    path: str | Path,
+    *,
+    object_names: Iterable[str] | None = None,
+    deploy_source: str | None = None,
+    environment: str = "dev",
+) -> list[DeployRow]:
     module = _load_module(Path(path))
     selected_names = set(object_names or [])
 
@@ -1046,6 +1081,9 @@ def deploy_file(
                 "project would skip it. Declare it with the project decorators "
                 "(@project.function(...), @project.workflow(...)) or move it to its own file."
             )
+        with _deployment_scope() as report:
+            for _, project in projects:
+                _plan_deployment(report, project, environment)
         for name, project in projects:
             if deploy_source is None:
                 project.deploy(environment=environment)
@@ -1082,6 +1120,9 @@ def deploy_file(
             "rb.workflow(...), rb.function(...), rb.asgi_app(...), rb.Predictor, rb.Optimizer, or rb.Agent instance."
         )
 
+    with _deployment_scope() as report:
+        for _, deployable in deployables:
+            _plan_deployment(report, deployable, environment)
     for name, deployable in deployables:
         if deploy_source is None:
             deployable.deploy(environment=environment)

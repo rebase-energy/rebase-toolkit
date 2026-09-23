@@ -8,6 +8,24 @@ import pytest
 from rebase.client import _dataset_registry
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+_USER_CONFIG = Path.home() / ".rebase" / "config.json"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_home(monkeypatch, tmp_path):
+    """Never read or overwrite the developer's profile or login session."""
+    home = tmp_path / "isolated-user-home"
+    home.mkdir()
+    # tmp_path can itself live under the real home. Hide its global profile
+    # from workspace-marker discovery after HOME has moved into the sandbox.
+    is_file = Path.is_file
+    monkeypatch.setattr(Path, "is_file", lambda path: path != _USER_CONFIG and is_file(path))
+    monkeypatch.setenv("HOME", str(home))
+    # pathlib/expanduser use USERPROFILE on Windows, not HOME.
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    for name in ("REBASE_CONFIG_PATH", "REBASE_AUTH_FILE", "REBASE_WORKFLOWS_AUTH_FILE"):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)
