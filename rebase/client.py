@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import requests
 
 from rebase.auth import AuthError, load_access_token
+from rebase.client_identity import identity_headers
 from rebase.config import DEFAULT_SERVER_URL, active_environment, load_profile, local_workspace_id
 from rebase.deployment import (
     DeploymentReport,
@@ -2809,7 +2810,8 @@ class Client:
         return True
 
     def _request_headers(self, *, auth: bool, headers: dict[str, str] | None = None) -> dict[str, str]:
-        resolved_headers = dict(headers or {})
+        # Which client this is, not what it is doing -- see rebase/client_identity.py.
+        resolved_headers = {**identity_headers(), **(headers or {})}
         if auth:
             bearer_token = self._bearer_token()
             if bearer_token:
@@ -2904,6 +2906,19 @@ class Client:
         if not isinstance(response, list):
             raise RebaseWorkflowError(f"expected {expected}")
         return response
+
+    def end_client_session(self) -> None:
+        """Tell the platform this process is done, so its session has an exact end.
+
+        Best effort, for long-lived clients (the TUI): the server otherwise learns a
+        session's length only from a last-seen stamp it moves once a minute, which
+        makes a quick look at the TUI a session of no length. Never raises -- an
+        exit must not fail because usage could not be recorded.
+        """
+        try:
+            self.request_no_content("POST", "/client-sessions/end", timeout=5)
+        except Exception:
+            return
 
     def request_no_content(self, method: str, path: str, *, auth: bool = True, **kwargs: Any) -> None:
         """Like :meth:`request`, for endpoints that answer 204 with an empty body.

@@ -109,7 +109,7 @@ def test_hosted_search_fleet_uses_the_api_submodule(tmp_path: Path, monkeypatch)
     fleet = calls["run_fleet"]
     assert fleet["parallel_searches"] == 2 and fleet["parallel_operators"] == 1 and fleet["policy"] == "gepa"
     assert fleet["budget"] == 300 and fleet["holdout"] is True
-    assert calls["wait"]["deadline_s"] == 300 + hillclimb.FLEET_GRACE_S
+    assert calls["wait"]["deadline_s"] == 300 + hillclimb.DEFAULT_AGENT_TIMEOUT_S + hillclimb.FLEET_GRACE_S
     assert "run_search" not in calls
     assert result["state"] == "parked" and result["cost_usd"] == 4.0
     assert [s["state"] for s in result["searches"]] == ["done", "parked"]

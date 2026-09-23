@@ -9,7 +9,15 @@ import requests
 from http_stub import patch_client_http
 
 import rebase as rb
+from rebase.client_identity import identity_headers
 from rebase.config import DEFAULT_API_URL, DEFAULT_SERVER_URL, set_active_environment, write_profile
+
+
+def _without_identity(headers: dict[str, str]) -> dict[str, str]:
+    """Drop the client-identity headers every request carries (tests/test_client_identity.py
+    covers them), so these tests keep asserting exactly the headers they are about."""
+    identity = set(identity_headers()) | {"X-Rebase-Command"}
+    return {name: value for name, value in headers.items() if name not in identity}
 
 
 class FakeResponse:
@@ -58,7 +66,7 @@ def test_client_sends_bearer_token(monkeypatch) -> None:
     def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
         observed["method"] = method
         observed["url"] = url
-        observed["headers"] = kwargs["headers"]
+        observed["headers"] = _without_identity(kwargs["headers"])
         return FakeResponse([])
 
     patch_client_http(monkeypatch, fake_request)
@@ -107,7 +115,7 @@ def test_stream_request_parses_ndjson(monkeypatch) -> None:
     def fake_request(method: str, url: str, **kwargs: Any) -> FakeStreamResponse:
         observed["method"] = method
         observed["url"] = url
-        observed["headers"] = kwargs["headers"]
+        observed["headers"] = _without_identity(kwargs["headers"])
         observed["stream"] = kwargs["stream"]
         observed["timeout"] = kwargs["timeout"]
         return response
@@ -740,7 +748,7 @@ def test_client_get_project_requests_project_endpoint(monkeypatch) -> None:
     def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
         observed["method"] = method
         observed["url"] = url
-        observed["headers"] = kwargs["headers"]
+        observed["headers"] = _without_identity(kwargs["headers"])
         return FakeResponse({"id": "project-id", "name": "energy"})
 
     patch_client_http(monkeypatch, fake_request)
@@ -761,7 +769,7 @@ def test_client_lists_run_events_from_events_endpoint(monkeypatch) -> None:
     def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
         observed["method"] = method
         observed["url"] = url
-        observed["headers"] = kwargs["headers"]
+        observed["headers"] = _without_identity(kwargs["headers"])
         return FakeResponse([{"id": "event-id", "message": "Accepted run request."}])
 
     patch_client_http(monkeypatch, fake_request)
@@ -782,7 +790,7 @@ def test_client_lists_runs_with_filters(monkeypatch) -> None:
     def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
         observed["method"] = method
         observed["url"] = url
-        observed["headers"] = kwargs["headers"]
+        observed["headers"] = _without_identity(kwargs["headers"])
         observed["params"] = kwargs["params"]
         return FakeResponse([{"id": "run-id", "status": "succeeded"}])
 
@@ -969,7 +977,7 @@ def test_client_sends_workspace_header_from_local_profile(monkeypatch, tmp_path)
     observed: dict[str, Any] = {}
 
     def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
-        observed["headers"] = kwargs["headers"]
+        observed["headers"] = _without_identity(kwargs["headers"])
         return FakeResponse([])
 
     patch_client_http(monkeypatch, fake_request)
@@ -997,7 +1005,7 @@ def test_client_prefers_explicit_access_token_over_profile_api_key(monkeypatch, 
     observed: dict[str, Any] = {}
 
     def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
-        observed["headers"] = kwargs["headers"]
+        observed["headers"] = _without_identity(kwargs["headers"])
         return FakeResponse([])
 
     patch_client_http(monkeypatch, fake_request)
