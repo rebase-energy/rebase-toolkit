@@ -70,6 +70,16 @@
 
 ### Fixed
 
+- **Workflow deployment reliability and partial-outcome reporting (#28).**
+  Workflow creation and updates, including shared-step/function deployments, now
+  use the 300-second deployment timeout.
+  Deployment reads and writes known not to have connected get bounded retries;
+  ambiguous workflow and function writes are checked against the resource and its
+  pinned version without replaying them. The CLI reports succeeded, failed,
+  uncertain, and unattempted targets even after an error or interruption. SDK deployments expose a
+  `DeploymentReport`, and `DeploymentError` carries it while remaining compatible
+  with `RebaseWorkflowError`. Shared-step outcomes are reported separately.
+
 - Step retry warnings ("step X failed on attempt 1 of 3; retrying") were written
   to the worker's own log, invisible to users; they now go to the run's log
   stream next to the step's output.
