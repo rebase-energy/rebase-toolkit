@@ -331,6 +331,11 @@ means the control plane acknowledged the definition, not that a runtime is
 ready. Deployment still stops at the first error, and an incomplete CLI deploy
 exits nonzero (1 for deployment errors, 130 for interruption).
 
+Within one deployment attempt, the SDK caches project/function/workflow lookups
+and secret references. Shared steps with the same resolved definition are written
+once; changed definitions are written again. Caches are discarded when the attempt
+ends, and uncertain-write reconciliation always reads fresh API state.
+
 Workflow creation and updates, and function writes during deployment, use a
 300-second HTTP timeout. During deployment, reads retry transient connection/
 timeout failures and HTTP 429/500/502/503/504 responses up to three attempts with

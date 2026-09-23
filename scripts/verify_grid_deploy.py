@@ -87,6 +87,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--record-only", action="store_true", help="Record a baseline without asserting fixed behavior")
     args = parser.parse_args()
+    args.output = args.output.resolve()
     import sys
 
     grid = args.grid_repo.resolve()
@@ -187,7 +188,7 @@ def main() -> None:
                 payload = kwargs.get("json", {})
                 if method == "GET":
                     if path == "/projects":
-                        if self.scenario == "lookup_500" and len(self.landed) == 171 and not self.fired:
+                        if self.scenario == "lookup_500" and not self.fired:
                             self.fired = True
                             return self.response({"detail": "injected project lookup failure"}, 500)
                         return self.response([{"id": "p", "name": project.name, "description": project.description}])
@@ -232,7 +233,8 @@ def main() -> None:
                     image_spec = self.functions[name].get("image_spec")
                     if isinstance(image_spec, dict) and image_spec.get("kind") == "python":
                         image_spec.setdefault("runtime", "python")
-                    if self.scenario == "step_lost_response" and self.function_writes == 116:
+                    if self.scenario == "step_lost_response" and self.function_writes == 2:
+                        self.fired = True
                         raise requests.ConnectionError("injected shared-step connection reset after commit")
                     return self.response(self.functions[name])
                 if method == "PATCH" and category == "asgi-apps":
@@ -248,6 +250,7 @@ def main() -> None:
                         self.fired = True
                         raise requests.ConnectTimeout("injected before connection")
                     if name == self.fault_name and self.scenario == "unconfirmed_500":
+                        self.fired = True
                         return self.response({"detail": "injected uncommitted server failure"}, 500)
                     # A 45-second registration exceeds the old 30-second timeout.
                     if fault and self.scenario == "slow_write" and kwargs["timeout"] < 45:
@@ -311,6 +314,7 @@ def main() -> None:
                     "landed": len(server.landed),
                     "workflow_writes": server.workflow_writes,
                     "function_writes": server.function_writes,
+                    "fault_injected": server.fired,
                     "unique_landed": len(set(server.landed)),
                     "workflow_statuses": dict(workflow_statuses),
                     "requests": sum(server.calls.values()),
@@ -336,6 +340,9 @@ def main() -> None:
             for outcome in outcomes:
                 assert outcome["workflow_timeouts"] == [300], outcome
                 assert outcome["landed"] == outcome["unique_landed"], outcome
+                assert outcome["requests"] < len(targets) + 48, outcome
+                if outcome["scenario"] not in {"clean", "slow_write"}:
+                    assert outcome["fault_injected"], outcome
                 if outcome["scenario"] == "unconfirmed_500":
                     assert outcome["landed"] == 105 and outcome["workflow_writes"] == 106, outcome
                     assert outcome["workflow_statuses"] == {
@@ -346,6 +353,7 @@ def main() -> None:
                     assert outcome["error"] and outcome["error"].startswith("DeploymentError:"), outcome
                 else:
                     assert outcome["error"] is None and outcome["landed"] == len(targets), outcome
+                    assert outcome["function_writes"] == len(project._steps), outcome
                     assert outcome["workflow_statuses"] == {"succeeded": len(targets)}, outcome
                     extra_attempt = int(outcome["scenario"] == "connect_timeout")
                     assert outcome["workflow_writes"] == len(targets) + extra_attempt, outcome

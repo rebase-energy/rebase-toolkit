@@ -78,6 +78,9 @@
 ### Fixed
 
 - **Workflow deployment reliability and partial-outcome reporting (#28).**
+  Cache metadata lookups and secret references for one deployment attempt, and
+  reuse acknowledged shared-step definitions instead of rewriting them for every
+  workflow. Changed definitions still deploy; reconciliation uses fresh reads.
   Workflow creation and updates, including shared-step/function deployments, now
   use the 300-second deployment timeout.
   Deployment reads and writes known not to have connected get bounded retries;

@@ -17,6 +17,7 @@ import time
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from functools import wraps
@@ -34,7 +35,9 @@ from rebase.config import DEFAULT_SERVER_URL, active_environment, load_profile, 
 from rebase.deployment import (
     DeploymentReport,
     DeploymentResult,
+    _cache_context,
     _deployment_scope,
+    _DeploymentCache,
     _mark_uncertain,
     _report_context,
     _target_context,
@@ -2825,6 +2828,53 @@ class Client:
             resolved_headers["X-Rebase-GitOps-Release"] = release_id
         return resolved_headers
 
+    def _deployment_cache(self, environment: str | None = None) -> _DeploymentCache | None:
+        caches = _cache_context.get()
+        if caches is None:
+            return None
+        # Client identity prevents sharing between credentials/HTTP sessions.
+        key = (
+            self,
+            self.api_url,
+            self.workspace_id,
+            _resolve_environment(self, environment),
+            self.api_key,
+            self.access_token,
+        )
+        return caches.setdefault(key, _DeploymentCache())
+
+    def _deployment_lookup(self, path: str, read: Callable[[], Any], *, environment: str | None = None) -> Any:
+        cache = self._deployment_cache(environment)
+        if cache is None:
+            return read()
+        if path not in cache.lookups:
+            cache.lookups[path] = deepcopy(read())
+        return deepcopy(cache.lookups[path])
+
+    def _invalidate_deployment_lookup(self, method: str, path: str, environment: str) -> None:
+        cache = self._deployment_cache(environment)
+        if cache is None or method.upper() in {"GET", "HEAD"}:
+            return
+        parts = path.strip("/").split("/")
+        if parts[0] == "projects":
+            if len(parts) <= 2:
+                cache.lookups.pop("/projects", None)
+                if method.upper() == "DELETE" or path == "/projects/batch-delete":
+                    cache.lookups.clear()
+                    cache.steps.clear()
+            else:
+                cache.lookups.pop(path, None)
+        elif parts[0] in {"functions", "workflows"}:
+            for key in list(cache.lookups):
+                if key.endswith("/" + parts[0]):
+                    cache.lookups.pop(key)
+            if parts[0] == "functions":
+                cache.steps.pop("/" + "/".join(parts[:2]), None)
+        elif parts[0] == "secrets":
+            for key in list(cache.lookups):
+                if key.startswith("/secrets/"):
+                    cache.lookups.pop(key)
+
     def request(
         self, method: str, path: str, *, auth: bool = True, **kwargs: Any
     ) -> dict[str, Any] | list[dict[str, Any]]:
@@ -2841,6 +2891,7 @@ class Client:
         caller_headers = kwargs.pop("headers", {})
         headers = self._request_headers(auth=auth, headers=caller_headers)
         timeout = kwargs.pop("timeout", 30)
+        self._invalidate_deployment_lookup(method, path, headers["X-Rebase-Environment"])
         read_only = method.upper() in {"GET", "HEAD"}
         attempts = DEPLOY_REQUEST_ATTEMPTS if deploying else 1
         refreshed_token = False
@@ -3077,7 +3128,10 @@ class Client:
         return self._request_dict("PUT", "/secrets", json={"name": name, "values": values}, expected="secret response")
 
     def get_secret(self, name: str) -> dict[str, Any]:
-        return self._request_dict("GET", f"/secrets/{name}", expected="secret response")
+        return self._deployment_lookup(
+            f"/secrets/{name}",
+            lambda: self._request_dict("GET", f"/secrets/{name}", expected="secret response"),
+        )
 
     def delete_secret(self, name: str) -> dict[str, Any]:
         return self._request_dict("DELETE", f"/secrets/{name}", expected="secret response")
@@ -3811,7 +3865,11 @@ class Client:
         self.request_no_content("DELETE", f"/workflows/{workflow_id}", params={"force": str(force).lower()})
 
     def find_project(self, name: str, *, environment_name: str | None = None) -> dict[str, Any] | None:
-        projects = self.list_projects(environment_name=environment_name) if environment_name else self.list_projects()
+        projects = self._deployment_lookup(
+            "/projects",
+            lambda: self.list_projects(environment_name=environment_name) if environment_name else self.list_projects(),
+            environment=environment_name,
+        )
         return _find_named(projects, name)
 
     def _resolve_project_id(self, project: str | None, project_id: str | None) -> str | None:
@@ -3870,9 +3928,8 @@ class Client:
             return []
         if resolved_project_id is None:
             return self._list_workspace_functions()
-        return self._request_list(
-            "GET", f"/projects/{resolved_project_id}/functions", expected="function list response"
-        )
+        path = f"/projects/{resolved_project_id}/functions"
+        return self._deployment_lookup(path, lambda: self._request_list("GET", path, expected="function list response"))
 
     def _list_workspace_functions(self) -> list[dict[str, Any]]:
         """Every function in the workspace, in one request where the API allows it.
@@ -4588,7 +4645,7 @@ class Client:
         if project is not None and resolved_project_id is None:
             return []
         path = f"/projects/{resolved_project_id}/workflows" if resolved_project_id is not None else "/workflows"
-        return self._request_list("GET", path, expected="workflow list response")
+        return self._deployment_lookup(path, lambda: self._request_list("GET", path, expected="workflow list response"))
 
     def get_workflow(self, workflow_id: str) -> dict[str, Any]:
         return self._request_dict("GET", f"/workflows/{workflow_id}", expected="workflow response")
@@ -4655,6 +4712,41 @@ class Client:
         return None
 
     def _write_definition(self, method: str, path: str, payload: dict[str, Any], *, target_type: str) -> dict[str, Any]:
+        cache = self._deployment_cache()
+        target = _target_context.get()
+        reuse_step = (
+            cache is not None and target is not None and target.target_type == "step" and "build" not in payload
+        )
+        # POST includes the name and optional nulls; PATCH omits them. Compare
+        # the resolved wire definition, including image, source and resources.
+        definition = {key: value for key, value in payload.items() if key != "name" and value is not None}
+        if cache is not None and reuse_step and method == "PATCH" and "name" not in payload:
+            previous = cache.steps.get(path)
+            if previous is not None and previous[0] == definition:
+                return deepcopy(previous[1])
+        inventories = (
+            {key: deepcopy(value) for key, value in cache.lookups.items() if key.endswith(f"/{target_type}s")}
+            if cache is not None
+            else {}
+        )
+        result = self._write_definition_uncached(method, path, payload, target_type=target_type)
+        if cache is not None and result.get("id"):
+            for key, inventory in inventories.items():
+                matches = [item for item in inventory if item.get("id") == result["id"]]
+                if matches:
+                    inventory = [
+                        {**item, **deepcopy(result)} if item.get("id") == result["id"] else item for item in inventory
+                    ]
+                elif method == "POST" and key in {path, f"/{target_type}s"}:
+                    inventory.append({**deepcopy(payload), **deepcopy(result)})
+                cache.lookups[key] = inventory
+            if reuse_step:
+                cache.steps[f"/functions/{result['id']}"] = (deepcopy(definition), deepcopy(result))
+        return result
+
+    def _write_definition_uncached(
+        self, method: str, path: str, payload: dict[str, Any], *, target_type: str
+    ) -> dict[str, Any]:
         try:
             return self._request_dict(
                 method,

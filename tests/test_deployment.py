@@ -575,3 +575,204 @@ def test_reconciliation_rejects_missing_job_isolation(client):
     assert (
         client._confirmed_definition(resource, {"mode": "job", "isolation": "shared"}, target_type="workflow") is None
     )
+
+
+@pytest.fixture
+def cached_fleet(client, monkeypatch):
+    monkeypatch.setattr(rb.Function, "_source_metadata_for_deploy", lambda *args: {"git_dirty": False})
+    project = rb.Project("fleet", client=client)
+
+    @project.step(name="shared")
+    def shared():
+        return 1
+
+    @project.workflow(name="first")
+    def first():
+        return shared()
+
+    @project.workflow(name="second")
+    def second():
+        return shared()
+
+    calls = Counter()
+    stored = {"functions": {}, "workflows": {}}
+
+    def http(method, url, **kwargs):
+        path = url.removeprefix(client.api_url)
+        calls[(method, path)] += 1
+        if path == "/projects":
+            return response([{"id": "p", "name": "fleet"}])
+        if path.startswith("/secrets/"):
+            return response({"secret_refs": {"KEY": "reference"}})
+        parts = path.strip("/").split("/")
+        kind = parts[-1] if parts[0] == "projects" else parts[0]
+        if method == "GET":
+            return response(list(stored[kind].values()) if parts[0] == "projects" else stored[kind][parts[1]])
+        payload = kwargs["json"]
+        name = payload["name"] if method == "POST" else parts[1]
+        resource = stored[kind].setdefault(name, {"id": name, "name": name})
+        resource.update(payload, current_version_id=name + "-version")
+        return response(resource)
+
+    patch_client_http(monkeypatch, http)
+    return project, shared, calls, stored
+
+
+def test_grid_shaped_fleet_reuses_steps_and_lookups_only_within_invocation(cached_fleet, client):
+    project, shared, calls, stored = cached_fleet
+    shared.secrets = ["bundle"]
+    for target in project._workflows:
+        target.secrets = ["bundle"]
+    project.deploy()
+    assert calls[("POST", "/projects/p/functions")] == 1
+    assert calls[("PATCH", "/functions/shared")] == 0
+    assert calls[("GET", "/projects")] == 1
+    assert calls[("GET", "/projects/p/functions")] == 1
+    assert calls[("GET", "/projects/p/workflows")] == 1
+    assert calls[("GET", "/secrets/bundle")] == 1
+    assert project.deployment_report.counts == {"succeeded": 3, "failed": 0, "uncertain": 0, "unattempted": 0}
+    # A later invocation must refresh every lookup and perform one new step write.
+    project.deploy()
+    assert calls[("PATCH", "/functions/shared")] == 1
+    assert calls[("GET", "/projects")] == 2
+    assert calls[("GET", "/projects/p/functions")] == 2
+    assert calls[("GET", "/projects/p/workflows")] == 2
+    assert calls[("GET", "/secrets/bundle")] == 2
+
+
+@pytest.mark.parametrize(
+    "attribute,value",
+    [
+        ("source_code", "def shared(): return 2"),
+        ("image_spec", {"kind": "python", "python_version": "3.13"}),
+        ("env", {"FLAG": "changed"}),
+        ("secrets", {"KEY": "different-reference"}),
+        ("cloud_run_cpu", "2"),
+        ("default_parameters", {"value": 2}),
+        ("enabled", False),
+    ],
+)
+def test_changed_step_definition_is_written_including_return_to_previous_value(cached_fleet, attribute, value):
+    from copy import deepcopy
+
+    project, shared, calls, stored = cached_fleet
+    original = deepcopy(getattr(shared, attribute))
+    with _deployment_scope():
+        rb.Function.deploy(shared)
+        setattr(shared, attribute, value)
+        rb.Function.deploy(shared)
+        setattr(shared, attribute, original)
+        rb.Function.deploy(shared)
+        rb.Function.deploy(shared)
+    assert calls[("POST", "/projects/p/functions")] == 1
+    assert calls[("PATCH", "/functions/shared")] == 2
+
+
+def test_intervening_function_write_invalidates_step_reuse(cached_fleet, client):
+    _, shared, calls, stored = cached_fleet
+    with _deployment_scope():
+        rb.Function.deploy(shared)
+        client.update_function(shared.id, source_code="def shared(): return 999")
+        rb.Function.deploy(shared)
+    assert calls[("PATCH", "/functions/shared")] == 2
+    assert stored["functions"]["shared"]["source_code"] == shared.source_code
+
+
+def test_lookup_cache_isolated_by_environment_workspace_and_client(client, monkeypatch):
+    calls = []
+
+    def http(method, url, **kwargs):
+        headers = kwargs["headers"]
+        calls.append(headers.copy())
+        return response([{"id": str(len(calls)), "name": "fleet"}])
+
+    patch_client_http(monkeypatch, http)
+    with _deployment_scope():
+        assert client.find_project("fleet")["id"] == "1"
+        assert client.find_project("fleet")["id"] == "1"
+        assert client.find_project("fleet", environment_name="staging")["id"] == "2"
+        assert client.find_project("fleet", environment_name="staging")["id"] == "2"
+        client.workspace_id = "other"
+        assert client.find_project("fleet")["id"] == "3"
+        other = rb.Client(api_key="other", api_url=client.api_url, workspace_id="other")
+        found = other.find_project("fleet")
+        assert found is not None and found["id"] == "4"
+    assert len(calls) == 4
+
+
+def test_failed_invocation_drops_cache_and_returned_data_cannot_poison_it(cached_fleet, client):
+    _, _, calls, _ = cached_fleet
+    with pytest.raises(RuntimeError), _deployment_scope():
+        item = client.find_project("fleet")
+        item["name"] = "mutated"
+        assert client.find_project("fleet")["name"] == "fleet"
+        raise RuntimeError("interrupted deployment")
+    with _deployment_scope():
+        assert client.find_project("fleet")["name"] == "fleet"
+    assert calls[("GET", "/projects")] == 2
+
+
+def test_secret_mutation_invalidates_cached_reference(client, monkeypatch):
+    current = {"secret_refs": {"KEY": "old"}}
+    calls = Counter()
+
+    def http(method, url, **kwargs):
+        calls[method] += 1
+        if method == "PUT":
+            current["secret_refs"]["KEY"] = "new"
+        return response(current)
+
+    patch_client_http(monkeypatch, http)
+    with _deployment_scope():
+        assert client.get_secret("bundle")["secret_refs"]["KEY"] == "old"
+        client.set_secret("bundle", {"KEY": "value"})
+        assert client.get_secret("bundle")["secret_refs"]["KEY"] == "new"
+    assert calls["GET"] == 2
+
+
+def test_tests_use_temporary_home_for_profiles_and_auth(tmp_path):
+    from pathlib import Path
+
+    from rebase.auth import auth_file_path
+    from rebase.config import config_path, write_profile
+
+    assert Path.home().is_relative_to(tmp_path)
+    assert Path("~").expanduser() == Path.home()
+    assert config_path().is_relative_to(tmp_path)
+    assert auth_file_path().is_relative_to(tmp_path)
+    write_profile(profile="isolated", api_url="https://example.invalid", workspace={"id": "test"})
+    assert config_path().is_file()
+
+
+def test_cached_inventory_never_confirms_a_lost_create_response(cached_fleet, client, monkeypatch):
+    project, shared, calls, stored = cached_fleet
+    original_http = rb.Client._http_request
+    discarded = False
+
+    def lose_reply(self, method, path, **kwargs):
+        nonlocal discarded
+        reply = original_http(self, method, path, **kwargs)
+        if method == "POST" and path == "/projects/p/functions" and not discarded:
+            discarded = True
+            raise requests.ReadTimeout("lost committed create reply")
+        return reply
+
+    monkeypatch.setattr(rb.Client, "_http_request", lose_reply)
+    project.deploy()
+    assert discarded
+    assert calls[("POST", "/projects/p/functions")] == 1
+    assert calls[("GET", "/projects/p/functions")] == 2  # inventory + fresh reconciliation
+    assert calls[("GET", "/functions/shared")] == 1
+    assert calls[("PATCH", "/functions/shared")] == 0
+    assert project.deployment_report.counts["succeeded"] == 3
+
+
+def test_cached_step_response_cannot_be_mutated_through_a_target(cached_fleet):
+    _, shared, calls, _ = cached_fleet
+    with _deployment_scope():
+        rb.Function.deploy(shared)
+        shared.data["current_version_id"] = "corrupted"
+        rb.Function.deploy(shared)
+        assert shared.data["current_version_id"] == "shared-version"
+    assert calls[("POST", "/projects/p/functions")] == 1
+    assert calls[("PATCH", "/functions/shared")] == 0

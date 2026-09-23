@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 DeploymentStatus = Literal["succeeded", "failed", "uncertain", "unattempted"]
 
@@ -58,6 +58,18 @@ _report_context: ContextVar[DeploymentReport | None] = ContextVar("rebase_deploy
 _target_context: ContextVar[DeploymentResult | None] = ContextVar("rebase_deployment_target", default=None)
 
 
+@dataclass
+class _DeploymentCache:
+    lookups: dict[str, Any] = field(default_factory=dict)
+    steps: dict[str, tuple[dict[str, Any], dict[str, Any]]] = field(default_factory=dict)
+
+
+# Keep caches outside the public report and discard them even on interruption.
+_cache_context: ContextVar[dict[tuple[Any, ...], _DeploymentCache] | None] = ContextVar(
+    "rebase_deployment_cache", default=None
+)
+
+
 @contextmanager
 def _deployment_scope() -> Iterator[DeploymentReport]:
     existing = _report_context.get()
@@ -66,9 +78,11 @@ def _deployment_scope() -> Iterator[DeploymentReport]:
         return
     report = DeploymentReport()
     token = _report_context.set(report)
+    cache_token = _cache_context.set({})
     try:
         yield report
     finally:
+        _cache_context.reset(cache_token)
         _report_context.reset(token)
 
 
