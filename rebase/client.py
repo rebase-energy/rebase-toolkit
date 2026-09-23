@@ -16,14 +16,16 @@ import textwrap
 import time
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import suppress
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
+from threading import local as thread_local
 from types import FunctionType
-from typing import Any, Self
+from typing import Any, Self, cast
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -36,9 +38,12 @@ from rebase.deployment import (
     DeploymentReport,
     DeploymentResult,
     _cache_context,
+    _DefinitionPrepared,
     _deployment_scope,
     _DeploymentCache,
     _mark_uncertain,
+    _prepare_context,
+    _PreparedDefinition,
     _report_context,
     _target_context,
 )
@@ -98,7 +103,7 @@ def _environment_scoped_deploy(method: Callable[..., Any]) -> Callable[..., Any]
         try:
             with _deployment_scope() as report:
                 self.deployment_report = report
-                result = _plan_deployment(report, self, environment)
+                result = _plan_deployment(report, self, environment, only=kwargs.get("only"))
                 target_token = _target_context.set(result)
                 if result is not None:
                     # Shared steps may be written more than once in a deploy.
@@ -118,7 +123,10 @@ def _environment_scoped_deploy(method: Callable[..., Any]) -> Callable[..., Any]
                     raise
                 else:
                     if result is not None:
-                        result.status = "succeeded"
+                        if isinstance(deployed, _PreparedDefinition):
+                            return deployed
+                        if result.status != "unchanged":
+                            result.status = "succeeded"
                         result.id = getattr(self, "id", None)
                         result.error = None
                     return deployed
@@ -130,10 +138,17 @@ def _environment_scoped_deploy(method: Callable[..., Any]) -> Callable[..., Any]
     return scoped
 
 
-def _plan_deployment(report: DeploymentReport, target: Any, environment: str) -> DeploymentResult | None:
+def _plan_deployment(
+    report: DeploymentReport, target: Any, environment: str, *, only: Sequence[str] | None = None
+) -> DeploymentResult | None:
     """Plan selected targets up front so an aborted suffix remains visible."""
     if isinstance(target, Project):
-        for child in (*target._functions, *target._workflows, *target._asgi_apps):
+        children = (
+            target._selected_workflows(only)
+            if only is not None
+            else (*target._functions, *target._workflows, *target._asgi_apps)
+        )
+        for child in children:
             if not isinstance(child, Step):
                 _plan_deployment(report, child, environment)
         return None
@@ -4712,6 +4727,8 @@ class Client:
         return None
 
     def _write_definition(self, method: str, path: str, payload: dict[str, Any], *, target_type: str) -> dict[str, Any]:
+        if _prepare_context.get() and target_type == "workflow":
+            raise _DefinitionPrepared(_PreparedDefinition(method, path, deepcopy(payload), target_type))
         cache = self._deployment_cache()
         target = _target_context.get()
         reuse_step = (
@@ -4723,13 +4740,23 @@ class Client:
         if cache is not None and reuse_step and method == "PATCH" and "name" not in payload:
             previous = cache.steps.get(path)
             if previous is not None and previous[0] == definition:
+                if previous[2] and target is not None:
+                    target.status = "unchanged"
                 return deepcopy(previous[1])
         inventories = (
             {key: deepcopy(value) for key, value in cache.lookups.items() if key.endswith(f"/{target_type}s")}
             if cache is not None
             else {}
         )
-        result = self._write_definition_uncached(method, path, payload, target_type=target_type)
+        match = None
+        if method == "PATCH" and (reuse_step or target_type == "workflow"):
+            match = self._compare_definitions([_PreparedDefinition(method, path, payload, target_type)]).get(path)
+        if match is not None:
+            if target is not None:
+                target.status = "unchanged"
+            result = match
+        else:
+            result = self._write_definition_uncached(method, path, payload, target_type=target_type)
         if cache is not None and result.get("id"):
             for key, inventory in inventories.items():
                 matches = [item for item in inventory if item.get("id") == result["id"]]
@@ -4741,8 +4768,52 @@ class Client:
                     inventory.append({**deepcopy(payload), **deepcopy(result)})
                 cache.lookups[key] = inventory
             if reuse_step:
-                cache.steps[f"/functions/{result['id']}"] = (deepcopy(definition), deepcopy(result))
+                cache.steps[f"/functions/{result['id']}"] = (deepcopy(definition), deepcopy(result), match is not None)
         return result
+
+    def _compare_definitions(self, definitions: list[_PreparedDefinition]) -> dict[str, dict[str, Any]]:
+        matches: dict[str, dict[str, Any]] = {}
+        for kind in ("function", "workflow"):
+            pending = [item for item in definitions if item.target_type == kind and item.method == "PATCH"]
+            route = f"/{kind}s/compare-deployments"
+            cache = self._deployment_cache()
+            if cache is not None and cache.lookups.get(route) is False:
+                continue
+            for offset in range(0, len(pending), 100):
+                batch = pending[offset : offset + 100]
+                try:
+                    response = self._request_dict(
+                        "POST",
+                        route,
+                        json={
+                            "items": [{"id": item.path.rsplit("/", 1)[1], "definition": item.payload} for item in batch]
+                        },
+                        timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
+                        expected="deployment comparison response",
+                    )
+                except RebaseWorkflowError as exc:
+                    if exc.status_code not in {404, 405}:
+                        raise
+                    if cache is not None:
+                        cache.lookups[route] = False
+                    break
+                rows = response.get("items")
+                if not isinstance(rows, list) or len(rows) != len(batch):
+                    raise RebaseWorkflowError("Incomplete deployment comparison response")
+                for item, row in zip(batch, rows, strict=True):
+                    expected_id = item.path.rsplit("/", 1)[1]
+                    if not isinstance(row, dict) or row.get("id") != expected_id:
+                        raise RebaseWorkflowError("Mismatched deployment comparison response")
+                    if row.get("unchanged") is True:
+                        resource = row.get("resource")
+                        if (
+                            not isinstance(resource, dict)
+                            or resource.get("id") != expected_id
+                            or not resource.get("current_version_id")
+                        ):
+                            raise RebaseWorkflowError("Unconfirmed deployment comparison response")
+                        matches[item.path] = cast(dict[str, Any], resource)
+        return matches
 
     def _write_definition_uncached(
         self, method: str, path: str, payload: dict[str, Any], *, target_type: str
@@ -5623,12 +5694,100 @@ class Project:
     def _client(self) -> Client:
         return self.client or default_client()
 
+    def _submit_workflows(self, workflows, prepared, matches, *, environment, jobs):
+        thread_state = thread_local()
+        clients = []
+
+        def submit_one(workflow, definition):
+            original = workflow._client
+            if not hasattr(thread_state, "clients"):
+                thread_state.clients = {}
+            if original not in thread_state.clients:
+                client = copy(original)
+                client._session = None
+                client._session_pid = None
+                client._absent_routes = set(original._absent_routes)
+                client._etags = {}
+                thread_state.clients[original] = client
+                clients.append(client)
+            client = thread_state.clients[original]
+            token = _cache_context.set(None)
+            try:
+                return workflow.deploy(
+                    environment=environment,
+                    _prepared=definition,
+                    _matched=matches.get(definition.path),
+                    _write_client=client,
+                )
+            finally:
+                _cache_context.reset(token)
+
+        if jobs == 1:
+            for workflow, definition in zip(workflows, prepared, strict=True):
+                workflow.deploy(environment=environment, _prepared=definition, _matched=matches.get(definition.path))
+            return
+        remaining = iter(zip(workflows, prepared, strict=True))
+        executor = ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="rebase-deploy")
+        pending = set()
+        failure = None
+        try:
+            while True:
+                while failure is None and len(pending) < jobs:
+                    pair = next(remaining, None)
+                    if pair is None:
+                        break
+                    context = contextvars.copy_context()
+                    pending.add(executor.submit(context.run, partial(submit_one, pair[0], pair[1])))
+                if not pending:
+                    break
+                completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    try:
+                        future.result()
+                    except BaseException as exc:
+                        if failure is None:
+                            failure = exc
+            if failure is not None:
+                raise failure
+        finally:
+            # Cancellation stops new submissions. Already-issued writes finish
+            # and reconcile their outcomes before the final report is printed.
+            executor.shutdown(wait=True, cancel_futures=True)
+            for client in clients:
+                if client._session is not None:
+                    client._session.close()
+
+    def _selected_workflows(self, only: Sequence[str] | None) -> list[Workflow]:
+        if only is None:
+            all_names = [workflow.name for workflow in self._workflows]
+            if len(set(all_names)) != len(all_names):
+                raise RebaseWorkflowError(f"Workflow names must be unique in project {self.name!r}")
+            return list(self._workflows)
+        names = {only} if isinstance(only, str) else set(only)
+        if not names:
+            raise RebaseWorkflowError("only must select at least one workflow")
+        for name in sorted(names):
+            matches = [workflow for workflow in self._workflows if workflow.name == name]
+            if len(matches) != 1:
+                reason = "Unknown" if not matches else "Ambiguous"
+                raise RebaseWorkflowError(f"{reason} workflow {name!r} in project {self.name!r}")
+        return [workflow for workflow in self._workflows if workflow.name in names]
+
     @_environment_scoped_deploy
     def deploy(
-        self, *, replace: bool = False, deploy_source: str | None = None, environment: str | None = None
+        self,
+        *,
+        replace: bool = False,
+        deploy_source: str | None = None,
+        environment: str | None = None,
+        only: Sequence[str] | None = None,
+        jobs: int = 1,
     ) -> Self:
+        if not isinstance(jobs, int) or isinstance(jobs, bool) or not 1 <= jobs <= 16:
+            raise RebaseWorkflowError("jobs must be an integer between 1 and 16")
         environment = _resolve_environment(self._client, environment)
-        for workflow in self._workflows:
+        workflows = self._selected_workflows(only)
+        for workflow in workflows:
             workflow._validate_schedule_defaults()
         resolved_deploy_source = _validate_deploy_source(deploy_source)
         preflight_datasets(self._client)
@@ -5642,18 +5801,33 @@ class Project:
             environment_name=environment,
         )
         self.id = project["id"]
-        for function in self._functions:
+        for function in self._functions if only is None else []:
             if isinstance(function, Step):
                 continue  # Steps are deployed automatically via their workflow
             function.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
-        for workflow in self._workflows:
-            workflow.deploy(
+        prepared = [
+            workflow._prepare_deployment(
                 replace=replace,
                 deploy_source=resolved_deploy_source,
                 environment=environment,
                 _skip_dataset_preflight=True,
             )
-        for asgi_app in self._asgi_apps:
+            for workflow in workflows
+        ]
+        grouped: dict[Client, list[_PreparedDefinition]] = {}
+        for workflow, definition in zip(workflows, prepared, strict=True):
+            grouped.setdefault(workflow._client, []).append(definition)
+        matches = {client: client._compare_definitions(definitions) for client, definitions in grouped.items()}
+        changed_workflows, changed_definitions = [], []
+        for workflow, definition in zip(workflows, prepared, strict=True):
+            match = matches[workflow._client].get(definition.path)
+            if match is not None:
+                workflow.deploy(environment=environment, _prepared=definition, _matched=match)
+            else:
+                changed_workflows.append(workflow)
+                changed_definitions.append(definition)
+        self._submit_workflows(changed_workflows, changed_definitions, {}, environment=environment, jobs=jobs)
+        for asgi_app in self._asgi_apps if only is None else []:
             asgi_app.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
         return self
 
@@ -7357,7 +7531,58 @@ class Workflow:
             )
 
     @_environment_scoped_deploy
+    def _prepare_deployment(
+        self, *, replace=False, deploy_source=None, environment=None, _skip_dataset_preflight=False
+    ):
+        token = _prepare_context.set(True)
+        try:
+            try:
+                self._deploy_definition(
+                    replace=replace,
+                    deploy_source=deploy_source,
+                    environment=environment,
+                    _skip_dataset_preflight=_skip_dataset_preflight,
+                )
+            except _DefinitionPrepared as captured:
+                return captured.definition
+            raise RebaseWorkflowError("Workflow preparation did not produce a definition")
+        finally:
+            _prepare_context.reset(token)
+
+    @_environment_scoped_deploy
     def deploy(
+        self,
+        *,
+        replace: bool = False,
+        deploy_source: str | None = None,
+        environment: str | None = None,
+        _skip_dataset_preflight: bool = False,
+        _prepared: _PreparedDefinition | None = None,
+        _matched: dict[str, Any] | None = None,
+        _write_client: Client | None = None,
+    ) -> Workflow:
+        if _prepared is None:
+            return self._deploy_definition(
+                replace=replace,
+                deploy_source=deploy_source,
+                environment=environment,
+                _skip_dataset_preflight=_skip_dataset_preflight,
+            )
+        prepared = _prepared
+        match = _matched
+        if match is not None:
+            result = _target_context.get()
+            if result is not None:
+                result.status = "unchanged"
+            deployed = match
+        else:
+            deployed = (_write_client or self._client)._write_definition_uncached(
+                prepared.method, prepared.path, prepared.payload, target_type="workflow"
+            )
+        self._adopt_deployed(deployed, prepared.payload.get("step_graph"))
+        return self
+
+    def _deploy_definition(
         self,
         *,
         replace: bool = False,

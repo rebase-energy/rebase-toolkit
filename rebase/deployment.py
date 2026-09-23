@@ -8,7 +8,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-DeploymentStatus = Literal["succeeded", "failed", "uncertain", "unattempted"]
+DeploymentStatus = Literal["succeeded", "unchanged", "failed", "uncertain", "unattempted"]
 
 
 @dataclass
@@ -40,7 +40,7 @@ class DeploymentReport:
     def counts(self) -> dict[str, int]:
         counts = dict.fromkeys(("succeeded", "failed", "uncertain", "unattempted"), 0)
         for result in self.results:
-            counts[result.status] += 1
+            counts[result.status] = counts.get(result.status, 0) + 1
         return counts
 
     def _plan(
@@ -61,7 +61,7 @@ _target_context: ContextVar[DeploymentResult | None] = ContextVar("rebase_deploy
 @dataclass
 class _DeploymentCache:
     lookups: dict[str, Any] = field(default_factory=dict)
-    steps: dict[str, tuple[dict[str, Any], dict[str, Any]]] = field(default_factory=dict)
+    steps: dict[str, tuple[dict[str, Any], dict[str, Any], bool]] = field(default_factory=dict)
 
 
 # Keep caches outside the public report and discard them even on interruption.
@@ -91,3 +91,21 @@ def _mark_uncertain(message: str) -> None:
     if target is not None:
         target.status = "uncertain"
         target.error = message
+
+
+@dataclass(frozen=True)
+class _PreparedDefinition:
+    method: str
+    path: str
+    payload: dict[str, Any]
+    target_type: str
+
+
+class _DefinitionPrepared(BaseException):
+    """Internal control flow: stop serialization before sending a workflow write."""
+
+    def __init__(self, definition: _PreparedDefinition):
+        self.definition = definition
+
+
+_prepare_context: ContextVar[bool] = ContextVar("rebase_prepare_workflow", default=False)
