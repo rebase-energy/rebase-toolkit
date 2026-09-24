@@ -341,7 +341,9 @@ def test_retry_after_deployment_failure_gets_a_fresh_report(client, monkeypatch)
     with pytest.raises(rb.DeploymentError) as caught:
         project.deploy()
     old_report = caught.value.report
-    monkeypatch.setattr(client, "update_workflow", lambda workflow_id, **kwargs: {"id": workflow_id})
+    monkeypatch.setattr(
+        client, "_write_definition_uncached", lambda method, path, payload, **kwargs: {"id": path.rsplit("/", 1)[-1]}
+    )
     assert project.deploy() is project
     assert project.deployment_report is not old_report
     assert project.deployment_report.counts == {"succeeded": 4, "failed": 0, "uncertain": 0, "unattempted": 0}
@@ -776,3 +778,38 @@ def test_cached_step_response_cannot_be_mutated_through_a_target(cached_fleet):
         assert shared.data["current_version_id"] == "shared-version"
     assert calls[("POST", "/projects/p/functions")] == 1
     assert calls[("PATCH", "/functions/shared")] == 0
+
+
+def test_project_only_selects_workflow_and_required_steps(client, monkeypatch):
+    project = rb.Project("fleet", client=client)
+    project._workflows = [workflow(client, "first"), workflow(client, "second")]
+    calls = []
+    monkeypatch.setattr(client, "ensure_project", lambda *a, **kw: {"id": "p"})
+    monkeypatch.setattr(client, "find_workflow", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        client,
+        "_write_definition_uncached",
+        lambda method, path, payload, **kw: calls.append(payload["name"]) or {"id": "w"},
+    )
+    project.deploy(only=["second"])
+    assert calls == ["second"]
+    assert project.deployment_report is not None
+    assert [r.name for r in project.deployment_report.results] == ["second"]
+
+
+@pytest.mark.parametrize("names", [["missing"], []])
+def test_project_only_rejects_invalid_selection_before_writes(client, names):
+    project = rb.Project("fleet", client=client)
+    project._workflows = [workflow(client, "first")]
+    with pytest.raises(rb.RebaseWorkflowError):
+        project.deploy(only=names)
+
+
+def test_cli_only_requires_project_disambiguation(client, monkeypatch):
+    from types import SimpleNamespace
+
+    first = rb.Project("first", client=client)
+    second = rb.Project("second", client=client)
+    monkeypatch.setattr(cli, "_load_module", lambda path: SimpleNamespace(first=first, second=second))
+    with pytest.raises(rb.RebaseWorkflowError, match="exactly one project"):
+        cli.deploy_file("unused.py", only=["workflow"])

@@ -1015,10 +1015,19 @@ def deploy_file(
     object_names: Iterable[str] | None = None,
     deploy_source: str | None = None,
     environment: str = "dev",
+    only: list[str] | None = None,
+    jobs: int = 1,
 ) -> list[DeployRow]:
     with _deployment_scope() as report:
         try:
-            return _deploy_file(path, object_names=object_names, deploy_source=deploy_source, environment=environment)
+            return _deploy_file(
+                path,
+                object_names=object_names,
+                deploy_source=deploy_source,
+                environment=environment,
+                only=only,
+                jobs=jobs,
+            )
         finally:
             _print_deployment_report(report)
 
@@ -1048,6 +1057,8 @@ def _deploy_file(
     object_names: Iterable[str] | None = None,
     deploy_source: str | None = None,
     environment: str = "dev",
+    only: list[str] | None = None,
+    jobs: int = 1,
 ) -> list[DeployRow]:
     module = _load_module(Path(path))
     selected_names = set(object_names or [])
@@ -1059,6 +1070,15 @@ def _deploy_file(
             (name, project) for name, project in projects if name in selected_names or project.name in selected_names
         ]
 
+    if only is not None:
+        if len(projects) != 1:
+            raise RebaseWorkflowError("--only requires exactly one project; select it with --name.")
+        projects[0][1]._selected_workflows(only)
+    if jobs != 1 and not projects:
+        raise RebaseWorkflowError("--jobs requires a project deployment.")
+    selection: dict[str, Any] = {"only": only} if only is not None else {}
+    if jobs != 1:
+        selection["jobs"] = jobs
     deployed: list[DeployRow] = []
     if projects:
         # A file with a top-level Project deploys only what is attached to it.
@@ -1083,22 +1103,22 @@ def _deploy_file(
             )
         with _deployment_scope() as report:
             for _, project in projects:
-                _plan_deployment(report, project, environment)
+                _plan_deployment(report, project, environment, only=only)
         for name, project in projects:
             if deploy_source is None:
-                project.deploy(environment=environment)
+                project.deploy(environment=environment, **selection)
             else:
-                project.deploy(deploy_source=deploy_source, environment=environment)
+                project.deploy(deploy_source=deploy_source, environment=environment, **selection)
             deployed.append(("project", project.name or name, project.id))
-            for function in project._functions:
+            for function in project._functions if only is None else []:
                 endpoint_url = _deployed_endpoint_url(function)
                 if endpoint_url is not None:
                     deployed.append(("function", function.name or "-", function.id, endpoint_url))
-            for workflow in project._workflows:
+            for workflow in project._selected_workflows(only):
                 endpoint_url = _deployed_endpoint_url(workflow)
                 if endpoint_url is not None:
                     deployed.append(("workflow", workflow.name or "-", workflow.id, endpoint_url))
-            for asgi_app in project._asgi_apps:
+            for asgi_app in project._asgi_apps if only is None else []:
                 endpoint_url = _deployed_endpoint_url(asgi_app)
                 if endpoint_url is not None:
                     deployed.append(("asgi_app", asgi_app.name or "-", asgi_app.id, endpoint_url))
@@ -6288,6 +6308,20 @@ def deploy_command(
             help="Deploy only the top-level variable name or Rebase target name. Can be passed more than once.",
         ),
     ] = None,
+    only: Annotated[
+        list[str] | None,
+        typer.Option("--only", "-o", help="Deploy a workflow within the selected project; repeat to select more."),
+    ] = None,
+    jobs: Annotated[
+        int,
+        typer.Option(
+            "--jobs",
+            "-j",
+            min=1,
+            max=16,
+            help="Maximum concurrent workflow writes (default: 1). Preparation stays serial.",
+        ),
+    ] = 1,
     source: Annotated[
         str | None,
         typer.Option("--source", "-s", help="Override deploy source for this command: rebase or github."),
@@ -6303,6 +6337,8 @@ def deploy_command(
     environment = environment or getattr(client, "environment_name", "dev")
     policy = _environment_policy(client, environment)
     if _policy_requires_gitops(policy):
+        if (only is not None or jobs != 1) and not sync:
+            raise RebaseWorkflowError("--only/--jobs are supported for direct deployments and authorized --sync only.")
         if source == "rebase":
             raise RebaseWorkflowError("protected environments require GitHub-backed source; remove `--source rebase`.")
         if sync:
@@ -6313,6 +6349,8 @@ def deploy_command(
                 object_names=name,
                 deploy_source=source or "github",
                 environment=environment,
+                **({"only": only} if only is not None else {}),
+                **({"jobs": jobs} if jobs != 1 else {}),
             )
             console.print(_deploy_table(deployed))
             return
@@ -6350,6 +6388,7 @@ def deploy_command(
                     "mode": "direct",
                     "file": str(file),
                     "object_names": ", ".join(name or []) if name else "all",
+                    "workflows": ", ".join(only) if only else "all",
                 },
             )
         )
@@ -6358,7 +6397,14 @@ def deploy_command(
     # deploy of a new image is a silent blocking call of up to 30 minutes.
     set_build_log_consumer(_build_log_printer())
     try:
-        deployed = deploy_file(file, object_names=name, deploy_source=source, environment=environment)
+        deployed = deploy_file(
+            file,
+            object_names=name,
+            deploy_source=source,
+            environment=environment,
+            **({"only": only} if only is not None else {}),
+            **({"jobs": jobs} if jobs != 1 else {}),
+        )
     finally:
         set_build_log_consumer(None)
     console.print(_deploy_table(deployed))

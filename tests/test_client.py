@@ -1778,7 +1778,9 @@ def test_project_deploy_registers_step_workflow_graph(monkeypatch) -> None:
         return {"id": "workflow-id", "name": kwargs["name"], "current_version_id": "workflow-version-id"}
 
     monkeypatch.setattr(client, "register_function", fake_register_function)
-    monkeypatch.setattr(client, "register_workflow", fake_register_workflow)
+    monkeypatch.setattr(
+        client, "_write_definition_uncached", lambda method, path, payload, **kw: fake_register_workflow(**payload)
+    )
 
     project = rb.Project("energy-forecasting", client=client)
 
@@ -1867,7 +1869,11 @@ def test_project_workflow_deploy_sends_cron_schedule(monkeypatch) -> None:
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
     monkeypatch.setattr(client, "find_workflow", lambda name, *, project=None: None)
-    monkeypatch.setattr(client, "register_workflow", lambda **kwargs: observed_workflow.update(kwargs) or {"id": "id"})
+    monkeypatch.setattr(
+        client,
+        "_write_definition_uncached",
+        lambda method, path, kwargs, **extra: observed_workflow.update(kwargs) or {"id": "id"},
+    )
 
     project = rb.Project("energy-forecasting", client=client)
 
@@ -1979,7 +1985,11 @@ def test_project_workflow_deploy_sends_trigger(monkeypatch) -> None:
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
     monkeypatch.setattr(client, "find_workflow", lambda name, *, project=None: None)
-    monkeypatch.setattr(client, "register_workflow", lambda **kwargs: observed_workflow.update(kwargs) or {"id": "id"})
+    monkeypatch.setattr(
+        client,
+        "_write_definition_uncached",
+        lambda method, path, kwargs, **extra: observed_workflow.update(kwargs) or {"id": "id"},
+    )
 
     project = rb.Project("energy-forecasting", client=client)
 
@@ -3187,8 +3197,10 @@ def _compiled_graph(monkeypatch, build) -> dict[str, Any]:
     )
     monkeypatch.setattr(
         client,
-        "register_workflow",
-        lambda **kwargs: observed.update(kwargs) or {"id": "workflow-id", "current_version_id": "v"},
+        "_write_definition_uncached",
+        lambda method, path, kwargs, **extra: (
+            observed.update(kwargs) or {"id": "workflow-id", "current_version_id": "v"}
+        ),
     )
 
     project = rb.Project("energy-forecasting", client=client)

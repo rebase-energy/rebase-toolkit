@@ -4,6 +4,49 @@ Python client and toolkit for the Rebase Platform.
 
 The toolkit is intentionally small by default: it contains the API-key client, SDK handles for functions and workflows, and optional entry points for Rebase's energy data/modeling packages. It does not run a database or platform backend locally.
 
+## Deploying a workflow fleet
+
+`rebase deploy` compares prepared workflow and shared-step definitions with the
+platform and reports matching targets as `unchanged`. Re-running the same command
+reads fresh state and deploys the remaining changes after a partial failure.
+
+```bash
+rebase deploy deploy/rebase/grid_pipeline.py
+rebase deploy deploy/rebase/grid_pipeline.py --only collect-entsoe-total_load
+rebase deploy deploy/rebase/grid_pipeline.py --jobs 4
+```
+
+Repeat `--only` to select several workflows. If the file declares several projects,
+select one with `--name`. Selection includes the workflows' required shared steps;
+other workflows, standalone functions, and ASGI apps are excluded. Names are checked
+before any deployment writes. Deploy files still execute when imported, so their
+own setup code can run regardless of selection.
+
+The SDK exposes the same options:
+
+```python
+project.deploy(only=["collect-entsoe-total_load"], jobs=4, environment="dev")
+```
+
+`jobs` bounds independent workflow writes, from 1 to 16 (default 1). Source tracing,
+resource resolution, image preparation, and shared-step deployment happen serially
+first. A failure stops new submissions and waits for in-flight writes to finish or
+be reconciled, preserving `succeeded`, `unchanged`, `failed`, `uncertain`, and
+`unattempted` outcomes. A lost response is never an instruction to replay a write.
+Re-run to reconcile current state; there is no checkpoint or `--continue` file to
+trust. Inspect unresolved `uncertain` targets before further action.
+
+Skipping requires backend support for batch deployment comparison. Older backends
+fall back to normal deployment. The backend uses content identity for hosted source
+and retains repository commits where they select executable code. Deployment
+provenance is recorded separately; historical versions retain their original
+source metadata. Custom image build payloads conservatively use normal deployment.
+Standalone functions and ASGI apps retain their existing deployment paths.
+
+`--only` and `--jobs` apply to direct project deployments and authorized GitOps
+`--sync` calls. They are rejected for GitOps deployment requests because that
+request format does not carry partial-project selection.
+
 ## Install
 
 During early development, install directly from GitHub into a clean `uv` environment:

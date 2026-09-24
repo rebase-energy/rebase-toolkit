@@ -186,6 +186,30 @@ def main() -> None:
                 category = path.split("/")[1]
                 self.calls[f"{method} {category}"] += 1
                 payload = kwargs.get("json", {})
+                if path.endswith("/compare-deployments"):
+                    # Compare the fake platform's resource plus immutable version.
+                    # Backend normalization is tested separately against the API.
+                    resources = self.functions if category == "functions" else self.workflows
+                    versions = self.function_versions if category == "functions" else self.versions
+                    rows = []
+                    for item in payload["items"]:
+                        resource = resources[item["id"]]
+                        observed = {**versions.get(resource.get("current_version_id"), {}), **resource}
+                        desired = copy.deepcopy(item["definition"])
+                        if desired.get("source_mode") == "rebase_hosted":
+                            for key in list(desired):
+                                if key.startswith(("git_", "repo_")) or key == "source_path":
+                                    desired.pop(key)
+                        desired.pop("environment", None)
+                        if desired.get("mode") == "job" and observed.get("isolation") is None:
+                            desired["isolation"] = None
+                        if isinstance(desired.get("image_spec"), dict):
+                            desired["image_spec"].setdefault("runtime", "python")
+                        unchanged = all(key in observed and observed[key] == value for key, value in desired.items())
+                        rows.append(
+                            {"id": item["id"], "unchanged": unchanged, "resource": resource if unchanged else None}
+                        )
+                    return self.response({"items": rows})
                 if method == "GET":
                     if path == "/projects":
                         if self.scenario == "lookup_500" and not self.fired:
@@ -289,6 +313,11 @@ def main() -> None:
                 "update_lost_response",
                 "create_lost_response",
                 "unconfirmed_500",
+                "unchanged",
+                "single_change",
+                "unrelated_commit",
+                "resume",
+                "parallel",
             ):
                 server = ControlPlane(scenario)
                 patches.enter_context(
@@ -298,12 +327,41 @@ def main() -> None:
                         lambda _self, method, path, _server=server, **kwargs: _server.request(method, path, **kwargs),
                     )
                 )
+                incremental = scenario in {"unchanged", "single_change", "unrelated_commit", "resume"}
+                old_defaults = None
+                if incremental:
+                    server.scenario = "unconfirmed_500" if scenario == "resume" else "clean"
+                    try:
+                        project.deploy(environment="dev", only=targets)
+                    except rb.DeploymentError:
+                        if scenario != "resume":
+                            raise
+                    server.scenario = "clean"
+                    server.calls.clear()
+                    server.landed.clear()
+                    server.workflow_writes = server.function_writes = 0
+                    server.timeouts.clear()
+                    if scenario == "single_change":
+                        old_defaults = project._workflows[0].default_parameters
+                        project._workflows[0].default_parameters = {**old_defaults, "verification": True}
                 started = time.monotonic()
                 error = None
                 try:
-                    project.deploy(environment="dev")
+                    if scenario == "unrelated_commit":
+                        with patch.object(
+                            sdk, "_git_metadata_for", lambda fn: {**metadata_for(fn), "git_commit_sha": "f" * 40}
+                        ):
+                            project.deploy(environment="dev", only=targets)
+                    else:
+                        project.deploy(
+                            environment="dev",
+                            **({"only": targets} if incremental else {}),
+                            **({"jobs": 4} if scenario == "parallel" else {}),
+                        )
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
+                if old_defaults is not None:
+                    project._workflows[0].default_parameters = old_defaults
                 report = getattr(project, "deployment_report", None)
                 workflow_statuses = (
                     Counter(r.status for r in report.results if r.target_type == "workflow") if report else {}
@@ -338,10 +396,21 @@ def main() -> None:
         args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         if not args.record_only:
             for outcome in outcomes:
+                if outcome["scenario"] in {"unchanged", "single_change", "unrelated_commit", "resume"}:
+                    expected = {
+                        "unchanged": 0,
+                        "single_change": 1,
+                        "unrelated_commit": 0,
+                        "resume": len(targets) - 105,
+                    }[outcome["scenario"]]
+                    assert outcome["error"] is None, outcome
+                    assert outcome["workflow_writes"] == expected and outcome["function_writes"] == 0, outcome
+                    assert outcome["workflow_statuses"].get("unchanged", 0) == len(targets) - expected, outcome
+                    continue
                 assert outcome["workflow_timeouts"] == [300], outcome
                 assert outcome["landed"] == outcome["unique_landed"], outcome
                 assert outcome["requests"] < len(targets) + 48, outcome
-                if outcome["scenario"] not in {"clean", "slow_write"}:
+                if outcome["scenario"] not in {"clean", "slow_write", "parallel"}:
                     assert outcome["fault_injected"], outcome
                 if outcome["scenario"] == "unconfirmed_500":
                     assert outcome["landed"] == 105 and outcome["workflow_writes"] == 106, outcome
