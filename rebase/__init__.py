@@ -1,3 +1,5 @@
+# Package root of the Rebase SDK/CLI. Its dev branch is watched by the ecosystem push lane:
+# a push is delivered with deployability checks and gated by the toolkit.compute contract tests.
 from rebase import data, modeling, sources
 from rebase.artifacts import Artifact, ArtifactReportingError, artifact
 from rebase.client import (
