@@ -25,6 +25,7 @@ class FakeConfig:
 def _fake_engine(monkeypatch, tmp_path: Path, calls: dict):
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.delenv("HILLCLIMB_DIR", raising=False)
     monkeypatch.delenv("REBASE_HILLCLIMB_ARTIFACTS_BUCKET", raising=False)
     monkeypatch.setenv("REBASE_HILLCLIMB_MAX_COST_USD", "7.5")

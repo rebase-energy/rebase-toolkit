@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Select workflows within a project with `rebase deploy --only` or `Project.deploy(only=...)`, including required shared steps.
+- Skip unchanged workflows and shared steps using backend batch comparison, report `unchanged`, and reconcile fresh state on re-runs. Older backends retain the existing write path.
+- Add opt-in bounded workflow write concurrency with `--jobs` / `jobs`, after serial preparation and shared-step resolution. In-flight outcomes remain visible on failure or interruption.
+
 ## 0.10.0 — 2026-09-22
 
 ### Added
@@ -76,6 +82,19 @@
   and pressing `p` on such an event in the TUI opens its details.
 
 ### Fixed
+
+- **Workflow deployment reliability and partial-outcome reporting (#28).**
+  Cache metadata lookups and secret references for one deployment attempt, and
+  reuse acknowledged shared-step definitions instead of rewriting them for every
+  workflow. Changed definitions still deploy; reconciliation uses fresh reads.
+  Workflow creation and updates, including shared-step/function deployments, now
+  use the 300-second deployment timeout.
+  Deployment reads and writes known not to have connected get bounded retries;
+  ambiguous workflow and function writes are checked against the resource and its
+  pinned version without replaying them. The CLI reports succeeded, failed,
+  uncertain, and unattempted targets even after an error or interruption. SDK deployments expose a
+  `DeploymentReport`, and `DeploymentError` carries it while remaining compatible
+  with `RebaseWorkflowError`. Shared-step outcomes are reported separately.
 
 - Step retry warnings ("step X failed on attempt 1 of 3; retrying") were written
   to the worker's own log, invisible to users; they now go to the run's log

@@ -68,6 +68,7 @@ def test_find_local_config_ignores_the_global_config(tmp_path: Path, monkeypatch
     home = tmp_path / "home"
     _write_global(home / ".rebase" / "config.json", {"default_profile": "default"})
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(home / ".rebase" / "config.json"))
     workdir = home / "repos" / "unmarked"
     workdir.mkdir(parents=True)

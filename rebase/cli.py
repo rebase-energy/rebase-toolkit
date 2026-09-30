@@ -61,6 +61,7 @@ from rebase.client import (
     _flatten_config,
     _git,
     _parse_github_remote,
+    _plan_deployment,
     _validate_execution,
     observed_summary,
     run_failure_summary,
@@ -92,6 +93,7 @@ from rebase.config import (
     write_profile,
 )
 from rebase.contract import Freshness, validate_frame
+from rebase.deployment import DeploymentReport, _deployment_scope
 from rebase.editor import NO_EDITOR_HINT, build_argv, resolve_editor, run_foreground, spawn_detached
 from rebase.locate import describe_failure, find_project_declarations, is_risky_root, project_folder
 from rebase.shell import close_message as _shell_close_message
@@ -1013,6 +1015,50 @@ def deploy_file(
     object_names: Iterable[str] | None = None,
     deploy_source: str | None = None,
     environment: str = "dev",
+    only: list[str] | None = None,
+    jobs: int = 1,
+) -> list[DeployRow]:
+    with _deployment_scope() as report:
+        try:
+            return _deploy_file(
+                path,
+                object_names=object_names,
+                deploy_source=deploy_source,
+                environment=environment,
+                only=only,
+                jobs=jobs,
+            )
+        finally:
+            _print_deployment_report(report)
+
+
+def _print_deployment_report(report: DeploymentReport) -> None:
+    if not report.results:
+        return
+    output = error_console if report.error else console
+    table = Table(title="Deployment results", box=box.ASCII)
+    for column in ("Type", "Target", "Environment", "Status", "Error"):
+        table.add_column(column)
+    for result in report.results:
+        table.add_row(
+            Text(result.target_type),
+            Text(f"{result.project}/{result.name}" if result.project else result.name),
+            Text(result.environment),
+            result.status,
+            Text(result.error or ""),
+        )
+    output.print(table)
+    output.print("Deployment: " + ", ".join(f"{count} {status}" for status, count in report.counts.items()))
+
+
+def _deploy_file(
+    path: str | Path,
+    *,
+    object_names: Iterable[str] | None = None,
+    deploy_source: str | None = None,
+    environment: str = "dev",
+    only: list[str] | None = None,
+    jobs: int = 1,
 ) -> list[DeployRow]:
     module = _load_module(Path(path))
     selected_names = set(object_names or [])
@@ -1024,6 +1070,15 @@ def deploy_file(
             (name, project) for name, project in projects if name in selected_names or project.name in selected_names
         ]
 
+    if only is not None:
+        if len(projects) != 1:
+            raise RebaseWorkflowError("--only requires exactly one project; select it with --name.")
+        projects[0][1]._selected_workflows(only)
+    if jobs != 1 and not projects:
+        raise RebaseWorkflowError("--jobs requires a project deployment.")
+    selection: dict[str, Any] = {"only": only} if only is not None else {}
+    if jobs != 1:
+        selection["jobs"] = jobs
     deployed: list[DeployRow] = []
     if projects:
         # A file with a top-level Project deploys only what is attached to it.
@@ -1046,21 +1101,24 @@ def deploy_file(
                 "project would skip it. Declare it with the project decorators "
                 "(@project.function(...), @project.workflow(...)) or move it to its own file."
             )
+        with _deployment_scope() as report:
+            for _, project in projects:
+                _plan_deployment(report, project, environment, only=only)
         for name, project in projects:
             if deploy_source is None:
-                project.deploy(environment=environment)
+                project.deploy(environment=environment, **selection)
             else:
-                project.deploy(deploy_source=deploy_source, environment=environment)
+                project.deploy(deploy_source=deploy_source, environment=environment, **selection)
             deployed.append(("project", project.name or name, project.id))
-            for function in project._functions:
+            for function in project._functions if only is None else []:
                 endpoint_url = _deployed_endpoint_url(function)
                 if endpoint_url is not None:
                     deployed.append(("function", function.name or "-", function.id, endpoint_url))
-            for workflow in project._workflows:
+            for workflow in project._selected_workflows(only):
                 endpoint_url = _deployed_endpoint_url(workflow)
                 if endpoint_url is not None:
                     deployed.append(("workflow", workflow.name or "-", workflow.id, endpoint_url))
-            for asgi_app in project._asgi_apps:
+            for asgi_app in project._asgi_apps if only is None else []:
                 endpoint_url = _deployed_endpoint_url(asgi_app)
                 if endpoint_url is not None:
                     deployed.append(("asgi_app", asgi_app.name or "-", asgi_app.id, endpoint_url))
@@ -1082,6 +1140,9 @@ def deploy_file(
             "rb.workflow(...), rb.function(...), rb.asgi_app(...), rb.Predictor, rb.Optimizer, or rb.Agent instance."
         )
 
+    with _deployment_scope() as report:
+        for _, deployable in deployables:
+            _plan_deployment(report, deployable, environment)
     for name, deployable in deployables:
         if deploy_source is None:
             deployable.deploy(environment=environment)
@@ -6247,6 +6308,20 @@ def deploy_command(
             help="Deploy only the top-level variable name or Rebase target name. Can be passed more than once.",
         ),
     ] = None,
+    only: Annotated[
+        list[str] | None,
+        typer.Option("--only", "-o", help="Deploy a workflow within the selected project; repeat to select more."),
+    ] = None,
+    jobs: Annotated[
+        int,
+        typer.Option(
+            "--jobs",
+            "-j",
+            min=1,
+            max=16,
+            help="Maximum concurrent workflow writes (default: 1). Preparation stays serial.",
+        ),
+    ] = 1,
     source: Annotated[
         str | None,
         typer.Option("--source", "-s", help="Override deploy source for this command: rebase or github."),
@@ -6262,6 +6337,8 @@ def deploy_command(
     environment = environment or getattr(client, "environment_name", "dev")
     policy = _environment_policy(client, environment)
     if _policy_requires_gitops(policy):
+        if (only is not None or jobs != 1) and not sync:
+            raise RebaseWorkflowError("--only/--jobs are supported for direct deployments and authorized --sync only.")
         if source == "rebase":
             raise RebaseWorkflowError("protected environments require GitHub-backed source; remove `--source rebase`.")
         if sync:
@@ -6272,6 +6349,8 @@ def deploy_command(
                 object_names=name,
                 deploy_source=source or "github",
                 environment=environment,
+                **({"only": only} if only is not None else {}),
+                **({"jobs": jobs} if jobs != 1 else {}),
             )
             console.print(_deploy_table(deployed))
             return
@@ -6309,6 +6388,7 @@ def deploy_command(
                     "mode": "direct",
                     "file": str(file),
                     "object_names": ", ".join(name or []) if name else "all",
+                    "workflows": ", ".join(only) if only else "all",
                 },
             )
         )
@@ -6317,7 +6397,14 @@ def deploy_command(
     # deploy of a new image is a silent blocking call of up to 30 minutes.
     set_build_log_consumer(_build_log_printer())
     try:
-        deployed = deploy_file(file, object_names=name, deploy_source=source, environment=environment)
+        deployed = deploy_file(
+            file,
+            object_names=name,
+            deploy_source=source,
+            environment=environment,
+            **({"only": only} if only is not None else {}),
+            **({"jobs": jobs} if jobs != 1 else {}),
+        )
     finally:
         set_build_log_consumer(None)
     console.print(_deploy_table(deployed))

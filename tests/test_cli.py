@@ -3099,6 +3099,7 @@ def test_main_pins_a_non_default_platform_into_the_environment(monkeypatch, tmp_
     home = tmp_path / "home"
     (home / ".rebase").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.delenv("REBASE_PLATFORM", raising=False)
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(tmp_path / "config.json"))
     monkeypatch.setenv("REBASE_AUTH_FILE", str(tmp_path / "auth.json"))

@@ -15,6 +15,7 @@ from rebase.client import (
     Client,
     Cron,
     Dataset,
+    DeploymentError,
     EndpointConfig,
     Environment,
     ExecutionMode,
@@ -51,6 +52,7 @@ from rebase.contract import (
     Freshness,
     ValidationReport,
 )
+from rebase.deployment import DeploymentReport, DeploymentResult
 from rebase.public import (
     asgi_app,
     deploy,
@@ -83,6 +85,9 @@ __all__ = [
     "ContractViolation",
     "Cron",
     "Dataset",
+    "DeploymentError",
+    "DeploymentReport",
+    "DeploymentResult",
     "Duration",
     "EndpointConfig",
     "Environment",

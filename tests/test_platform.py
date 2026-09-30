@@ -24,6 +24,7 @@ def home(tmp_path: Path, monkeypatch) -> Path:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     for name in ("REBASE_PLATFORM", "REBASE_CONFIG_PATH", "REBASE_AUTH_FILE", "REBASE_WORKFLOWS_AUTH_FILE"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))

@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import tempfile
@@ -15,12 +16,16 @@ import textwrap
 import time
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import suppress
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
+from threading import local as thread_local
 from types import FunctionType
-from typing import Any, Self
+from typing import Any, Self, cast
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -29,6 +34,19 @@ import requests
 from rebase.auth import AuthError, load_access_token
 from rebase.client_identity import identity_headers
 from rebase.config import DEFAULT_SERVER_URL, active_environment, load_profile, local_workspace_id
+from rebase.deployment import (
+    DeploymentReport,
+    DeploymentResult,
+    _cache_context,
+    _DefinitionPrepared,
+    _deployment_scope,
+    _DeploymentCache,
+    _mark_uncertain,
+    _prepare_context,
+    _PreparedDefinition,
+    _report_context,
+    _target_context,
+)
 from rebase.image import DEFAULT_PYTHON_VERSION, Image
 from rebase.runtime import current_run
 from rebase.source_bundle import SourceBundle, build_source_bundle
@@ -83,11 +101,68 @@ def _environment_scoped_deploy(method: Callable[..., Any]) -> Callable[..., Any]
         kwargs["environment"] = environment
         token = _environment_context.set(environment)
         try:
-            return method(self, *args, **kwargs)
+            with _deployment_scope() as report:
+                self.deployment_report = report
+                result = _plan_deployment(report, self, environment, only=kwargs.get("only"))
+                target_token = _target_context.set(result)
+                if result is not None:
+                    # Shared steps may be written more than once in a deploy.
+                    result.status = "unattempted"
+                    result.error = None
+                try:
+                    deployed = method(self, *args, **kwargs)
+                except BaseException as exc:
+                    message = str(exc) or type(exc).__name__
+                    report.error = message
+                    if result is not None:
+                        if result.status != "uncertain":
+                            result.status = "failed"
+                        result.error = result.error or message
+                    if isinstance(exc, RebaseWorkflowError) and not isinstance(exc, DeploymentError):
+                        raise DeploymentError(message, report=report, status_code=exc.status_code) from exc
+                    raise
+                else:
+                    if result is not None:
+                        if isinstance(deployed, _PreparedDefinition):
+                            return deployed
+                        if result.status != "unchanged":
+                            result.status = "succeeded"
+                        result.id = getattr(self, "id", None)
+                        result.error = None
+                    return deployed
+                finally:
+                    _target_context.reset(target_token)
         finally:
             _environment_context.reset(token)
 
     return scoped
+
+
+def _plan_deployment(
+    report: DeploymentReport, target: Any, environment: str, *, only: Sequence[str] | None = None
+) -> DeploymentResult | None:
+    """Plan selected targets up front so an aborted suffix remains visible."""
+    if isinstance(target, Project):
+        children = (
+            target._selected_workflows(only)
+            if only is not None
+            else (*target._functions, *target._workflows, *target._asgi_apps)
+        )
+        for child in children:
+            if not isinstance(child, Step):
+                _plan_deployment(report, child, environment)
+        return None
+    if isinstance(target, Workflow):
+        for step in target._collect_steps():
+            _plan_deployment(report, step, environment)
+    target_type = "asgi_app" if isinstance(target, ASGIApp) else type(target).__name__.lower()
+    return report._plan(
+        target,
+        target_type=target_type,
+        name=str(target.name),
+        project=getattr(target, "project", None),
+        environment=environment,
+    )
 
 
 _trace_stack: list[_WorkflowTrace] = []
@@ -104,6 +179,7 @@ DEFAULT_API_KEY_PERMISSIONS = [
     "runs:read",
 ]
 DEPLOY_REQUEST_TIMEOUT_SECONDS = 300
+DEPLOY_REQUEST_ATTEMPTS = 3
 # (connect, read) for POST /runs/ephemeral: the server executes quick runs inside
 # the request and enforces a 300 s run cap, so the read timeout is that plus
 # headroom. The old default of 30 s failed any run longer than half a minute.
@@ -119,6 +195,30 @@ class RebaseWorkflowError(RuntimeError):
 
 
 RebaseError = RebaseWorkflowError
+
+
+class DeploymentError(RebaseWorkflowError):
+    """An incomplete deployment, with outcomes collected before it stopped."""
+
+    def __init__(self, message: str, *, report: DeploymentReport, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.report = report
+        self.status_code = status_code
+
+
+class _DeploymentRequestError(RebaseWorkflowError):
+    def __init__(self, message: str, *, uncertain: bool, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.uncertain = uncertain
+        self.status_code = status_code
+
+
+def _deploy_retry_delay(attempt: int, response: requests.Response | None = None) -> float:
+    delay = 2**attempt + random.uniform(0, 0.25)
+    if response is not None:
+        with suppress(AttributeError, ValueError):
+            delay = max(delay, float(response.headers.get("Retry-After", "0")))
+    return min(delay, 10.0)
 
 
 class EndpointConfig:
@@ -2743,27 +2843,123 @@ class Client:
             resolved_headers["X-Rebase-GitOps-Release"] = release_id
         return resolved_headers
 
+    def _deployment_cache(self, environment: str | None = None) -> _DeploymentCache | None:
+        caches = _cache_context.get()
+        if caches is None:
+            return None
+        # Client identity prevents sharing between credentials/HTTP sessions.
+        key = (
+            self,
+            self.api_url,
+            self.workspace_id,
+            _resolve_environment(self, environment),
+            self.api_key,
+            self.access_token,
+        )
+        return caches.setdefault(key, _DeploymentCache())
+
+    def _deployment_lookup(self, path: str, read: Callable[[], Any], *, environment: str | None = None) -> Any:
+        cache = self._deployment_cache(environment)
+        if cache is None:
+            return read()
+        if path not in cache.lookups:
+            cache.lookups[path] = deepcopy(read())
+        return deepcopy(cache.lookups[path])
+
+    def _invalidate_deployment_lookup(self, method: str, path: str, environment: str) -> None:
+        cache = self._deployment_cache(environment)
+        if cache is None or method.upper() in {"GET", "HEAD"}:
+            return
+        parts = path.strip("/").split("/")
+        if parts[0] == "projects":
+            if len(parts) <= 2:
+                cache.lookups.pop("/projects", None)
+                if method.upper() == "DELETE" or path == "/projects/batch-delete":
+                    cache.lookups.clear()
+                    cache.steps.clear()
+            else:
+                cache.lookups.pop(path, None)
+        elif parts[0] in {"functions", "workflows"}:
+            for key in list(cache.lookups):
+                if key.endswith("/" + parts[0]):
+                    cache.lookups.pop(key)
+            if parts[0] == "functions":
+                cache.steps.pop("/" + "/".join(parts[:2]), None)
+        elif parts[0] == "secrets":
+            for key in list(cache.lookups):
+                if key.startswith("/secrets/"):
+                    cache.lookups.pop(key)
+
     def request(
         self, method: str, path: str, *, auth: bool = True, **kwargs: Any
     ) -> dict[str, Any] | list[dict[str, Any]]:
         return self._request_response(method, path, auth=auth, **kwargs).json()
 
     def _request_response(self, method: str, path: str, *, auth: bool = True, **kwargs: Any) -> requests.Response:
-        """Send one authenticated request, including the disk-token retry and error mapping."""
+        """Retry deployment reads and writes known not to have connected.
+
+        Other writes may already have committed. Never replay them here: callers
+        with a read-back contract can reconcile an uncertain response instead.
+        Run submission and other non-deployment requests retain their behavior.
+        """
+        deploying = kwargs.pop("_deployment_request", False) or _report_context.get() is not None
         caller_headers = kwargs.pop("headers", {})
         headers = self._request_headers(auth=auth, headers=caller_headers)
         timeout = kwargs.pop("timeout", 30)
-        response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
-        if getattr(response, "status_code", None) == 401 and auth and self._invalidate_cached_token():
-            headers = self._request_headers(auth=auth, headers=caller_headers)
-            response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            error = RebaseWorkflowError(_response_error_message(response))
-            error.status_code = response.status_code
-            raise error from exc
-        return response
+        self._invalidate_deployment_lookup(method, path, headers["X-Rebase-Environment"])
+        read_only = method.upper() in {"GET", "HEAD"}
+        attempts = DEPLOY_REQUEST_ATTEMPTS if deploying else 1
+        refreshed_token = False
+        for attempt in range(attempts):
+            try:
+                response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
+                if (
+                    getattr(response, "status_code", None) == 401
+                    and auth
+                    and not refreshed_token
+                    and self._invalidate_cached_token()
+                ):
+                    refreshed_token = True
+                    headers = self._request_headers(auth=auth, headers=caller_headers)
+                    response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                if not deploying:
+                    raise
+                safe_to_retry = read_only or isinstance(exc, requests.ConnectTimeout)
+                if safe_to_retry and attempt + 1 < attempts:
+                    time.sleep(_deploy_retry_delay(attempt))
+                    continue
+                uncertain = not safe_to_retry
+                message = f"{method} {path}: {type(exc).__name__}: {exc}"
+                if uncertain:
+                    message += " (write outcome uncertain)"
+                    _mark_uncertain(message)
+                raise _DeploymentRequestError(message, uncertain=uncertain) from exc
+            except KeyboardInterrupt:
+                if deploying and not read_only:
+                    _mark_uncertain(f"{method} {path}: interrupted while awaiting a write response")
+                raise
+            if (
+                deploying
+                and read_only
+                and getattr(response, "status_code", None) in {429, 500, 502, 503, 504}
+                and attempt + 1 < attempts
+            ):
+                time.sleep(_deploy_retry_delay(attempt, response))
+                continue
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                message = _response_error_message(response)
+                if deploying and not read_only and (response.status_code >= 500 or response.status_code == 408):
+                    message = f"{method} {path}: {message} (write outcome uncertain)"
+                    _mark_uncertain(message)
+                    raise _DeploymentRequestError(message, uncertain=True, status_code=response.status_code) from exc
+                error = RebaseWorkflowError(message)
+                error.status_code = response.status_code
+                raise error from exc
+            return response
+        raise AssertionError("request attempts exhausted without a result")
 
     def _request_dict(self, method: str, path: str, *, expected: str, **kwargs: Any) -> dict[str, Any]:
         response = self.request(method, path, **kwargs)
@@ -2947,7 +3143,10 @@ class Client:
         return self._request_dict("PUT", "/secrets", json={"name": name, "values": values}, expected="secret response")
 
     def get_secret(self, name: str) -> dict[str, Any]:
-        return self._request_dict("GET", f"/secrets/{name}", expected="secret response")
+        return self._deployment_lookup(
+            f"/secrets/{name}",
+            lambda: self._request_dict("GET", f"/secrets/{name}", expected="secret response"),
+        )
 
     def delete_secret(self, name: str) -> dict[str, Any]:
         return self._request_dict("DELETE", f"/secrets/{name}", expected="secret response")
@@ -3681,7 +3880,11 @@ class Client:
         self.request_no_content("DELETE", f"/workflows/{workflow_id}", params={"force": str(force).lower()})
 
     def find_project(self, name: str, *, environment_name: str | None = None) -> dict[str, Any] | None:
-        projects = self.list_projects(environment_name=environment_name) if environment_name else self.list_projects()
+        projects = self._deployment_lookup(
+            "/projects",
+            lambda: self.list_projects(environment_name=environment_name) if environment_name else self.list_projects(),
+            environment=environment_name,
+        )
         return _find_named(projects, name)
 
     def _resolve_project_id(self, project: str | None, project_id: str | None) -> str | None:
@@ -3740,9 +3943,8 @@ class Client:
             return []
         if resolved_project_id is None:
             return self._list_workspace_functions()
-        return self._request_list(
-            "GET", f"/projects/{resolved_project_id}/functions", expected="function list response"
-        )
+        path = f"/projects/{resolved_project_id}/functions"
+        return self._deployment_lookup(path, lambda: self._request_list("GET", path, expected="function list response"))
 
     def _list_workspace_functions(self) -> list[dict[str, Any]]:
         """Every function in the workspace, in one request where the API allows it.
@@ -4013,6 +4215,8 @@ class Client:
             payload["buckets"] = buckets
         if build:
             payload["build"] = build
+        if _report_context.get() is not None:
+            return self._write_definition("POST", f"/projects/{project_id}/functions", payload, target_type="function")
         return self._request_dict(
             "POST", f"/projects/{project_id}/functions", json=payload, expected="function response"
         )
@@ -4092,6 +4296,8 @@ class Client:
         payload.update(execution_payload)
         if build:
             payload["build"] = build
+        if _report_context.get() is not None:
+            return self._write_definition("PATCH", f"/functions/{function_id}", payload, target_type="function")
         return self._request_dict("PATCH", f"/functions/{function_id}", json=payload, expected="function response")
 
     def run_function(self, function_id: str, parameters: dict[str, Any] | None = None) -> Run:
@@ -4454,7 +4660,7 @@ class Client:
         if project is not None and resolved_project_id is None:
             return []
         path = f"/projects/{resolved_project_id}/workflows" if resolved_project_id is not None else "/workflows"
-        return self._request_list("GET", path, expected="workflow list response")
+        return self._deployment_lookup(path, lambda: self._request_list("GET", path, expected="workflow list response"))
 
     def get_workflow(self, workflow_id: str) -> dict[str, Any]:
         return self._request_dict("GET", f"/workflows/{workflow_id}", expected="workflow response")
@@ -4462,6 +4668,204 @@ class Client:
     def find_workflow(self, name: str, *, project: str | None = None) -> dict[str, Any] | None:
         workflows = self.list_workflows(project=project) if project is not None else self.list_workflows()
         return _find_named(workflows, name)
+
+    def _confirmed_definition(
+        self, resource: dict[str, Any], payload: dict[str, Any], *, target_type: str
+    ) -> dict[str, Any] | None:
+        """Confirm persisted fields using the resource and its pinned version."""
+        if "build" in payload or not resource.get("id"):
+            return None
+        # Environment is a request selector, not a persisted resource field.
+        if "environment" in payload and payload["environment"] != _resolve_environment(self, None):
+            return None
+        expected = {key: value for key, value in payload.items() if key != "environment"}
+        missing = expected.keys() - resource.keys()
+        version: dict[str, Any] = {}
+        if missing:
+            version_id = resource.get("current_version_id")
+            if not version_id:
+                return None
+            version = self._request_dict(
+                "GET",
+                f"/{target_type}s/{resource['id']}/versions/{version_id}",
+                expected=f"{target_type} version response",
+                _deployment_request=True,
+            )
+            if version.get("id") != version_id or version.get(f"{target_type}_id") != resource["id"]:
+                return None
+            # A concurrent deploy must not let us combine fields from two versions.
+            current = self._request_dict(
+                "GET", f"/{target_type}s/{resource['id']}", expected="resource response", _deployment_request=True
+            )
+            if current.get("id") != resource["id"] or current.get("current_version_id") != version_id:
+                return None
+            resource = current
+        observed = {**version, **resource}
+        if (
+            expected.get("mode") == observed.get("mode") == "job"
+            and expected.get("isolation") == "shared"
+            and "isolation" in observed
+            and observed["isolation"] is None
+            and observed.get("run_type") == "long"
+        ):
+            # Job responses expose no warm-runner isolation; the SDK sends the
+            # default shared value for its legacy long/job execution policy.
+            expected["isolation"] = None
+        requested_image = expected.get("image_spec")
+        stored_image = observed.get("image_spec")
+        if (
+            isinstance(requested_image, dict)
+            and requested_image.get("kind") == "python"
+            and "runtime" not in requested_image
+            and isinstance(stored_image, dict)
+            and stored_image.get("runtime") == "python"
+        ):
+            # The API adds this default to legacy Python image specifications.
+            observed["image_spec"] = {key: value for key, value in stored_image.items() if key != "runtime"}
+        if all(key in observed and observed[key] == value for key, value in expected.items()):
+            return resource
+        return None
+
+    def _write_definition(self, method: str, path: str, payload: dict[str, Any], *, target_type: str) -> dict[str, Any]:
+        if _prepare_context.get() and target_type == "workflow":
+            raise _DefinitionPrepared(_PreparedDefinition(method, path, deepcopy(payload), target_type))
+        cache = self._deployment_cache()
+        target = _target_context.get()
+        reuse_step = (
+            cache is not None and target is not None and target.target_type == "step" and "build" not in payload
+        )
+        # POST includes the name and optional nulls; PATCH omits them. Compare
+        # the resolved wire definition, including image, source and resources.
+        definition = {key: value for key, value in payload.items() if key != "name" and value is not None}
+        if cache is not None and reuse_step and method == "PATCH" and "name" not in payload:
+            previous = cache.steps.get(path)
+            if previous is not None and previous[0] == definition:
+                if previous[2] and target is not None:
+                    target.status = "unchanged"
+                return deepcopy(previous[1])
+        inventories = (
+            {key: deepcopy(value) for key, value in cache.lookups.items() if key.endswith(f"/{target_type}s")}
+            if cache is not None
+            else {}
+        )
+        match = None
+        if method == "PATCH" and (reuse_step or target_type == "workflow"):
+            match = self._compare_definitions([_PreparedDefinition(method, path, payload, target_type)]).get(path)
+        if match is not None:
+            if target is not None:
+                target.status = "unchanged"
+            result = match
+        else:
+            result = self._write_definition_uncached(method, path, payload, target_type=target_type)
+        if cache is not None and result.get("id"):
+            for key, inventory in inventories.items():
+                matches = [item for item in inventory if item.get("id") == result["id"]]
+                if matches:
+                    inventory = [
+                        {**item, **deepcopy(result)} if item.get("id") == result["id"] else item for item in inventory
+                    ]
+                elif method == "POST" and key in {path, f"/{target_type}s"}:
+                    inventory.append({**deepcopy(payload), **deepcopy(result)})
+                cache.lookups[key] = inventory
+            if reuse_step:
+                cache.steps[f"/functions/{result['id']}"] = (deepcopy(definition), deepcopy(result), match is not None)
+        return result
+
+    def _compare_definitions(self, definitions: list[_PreparedDefinition]) -> dict[str, dict[str, Any]]:
+        matches: dict[str, dict[str, Any]] = {}
+        for kind in ("function", "workflow"):
+            pending = [item for item in definitions if item.target_type == kind and item.method == "PATCH"]
+            route = f"/{kind}s/compare-deployments"
+            cache = self._deployment_cache()
+            if cache is not None and cache.lookups.get(route) is False:
+                continue
+            for offset in range(0, len(pending), 100):
+                batch = pending[offset : offset + 100]
+                try:
+                    response = self._request_dict(
+                        "POST",
+                        route,
+                        json={
+                            "items": [{"id": item.path.rsplit("/", 1)[1], "definition": item.payload} for item in batch]
+                        },
+                        timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
+                        expected="deployment comparison response",
+                    )
+                except RebaseWorkflowError as exc:
+                    if exc.status_code not in {404, 405}:
+                        raise
+                    if cache is not None:
+                        cache.lookups[route] = False
+                    break
+                rows = response.get("items")
+                if not isinstance(rows, list) or len(rows) != len(batch):
+                    raise RebaseWorkflowError("Incomplete deployment comparison response")
+                for item, row in zip(batch, rows, strict=True):
+                    expected_id = item.path.rsplit("/", 1)[1]
+                    if not isinstance(row, dict) or row.get("id") != expected_id:
+                        raise RebaseWorkflowError("Mismatched deployment comparison response")
+                    if row.get("unchanged") is True:
+                        resource = row.get("resource")
+                        if (
+                            not isinstance(resource, dict)
+                            or resource.get("id") != expected_id
+                            or not resource.get("current_version_id")
+                        ):
+                            raise RebaseWorkflowError("Unconfirmed deployment comparison response")
+                        matches[item.path] = cast(dict[str, Any], resource)
+        return matches
+
+    def _write_definition_uncached(
+        self, method: str, path: str, payload: dict[str, Any], *, target_type: str
+    ) -> dict[str, Any]:
+        try:
+            return self._request_dict(
+                method,
+                path,
+                json=payload,
+                timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
+                _deployment_request=True,
+                expected="resource response",
+            )
+        except _DeploymentRequestError as exc:
+            if not exc.uncertain:
+                raise
+            # A timeout/5xx may follow a successful commit. Probe the persisted
+            # definition, but never assume absence means it is safe to POST again.
+            for attempt in range(DEPLOY_REQUEST_ATTEMPTS):
+                if attempt:
+                    time.sleep(_deploy_retry_delay(attempt - 1))
+                try:
+                    if method == "PATCH":
+                        resource = self._request_dict(
+                            "GET", path, expected="resource response", _deployment_request=True
+                        )
+                    else:
+                        candidates = self._request_list(
+                            "GET", path, expected="resource list response", _deployment_request=True
+                        )
+                        matches = [item for item in candidates if item.get("name") == payload["name"]]
+                        if len(matches) != 1 or not matches[0].get("id"):
+                            continue
+                        resource = self._request_dict(
+                            "GET",
+                            f"/{target_type}s/{matches[0]['id']}",
+                            expected="resource response",
+                            _deployment_request=True,
+                        )
+                    # The resource omits versioned fields such as step_graph.
+                    # Check its pinned version too; missing fields remain uncertain.
+                    confirmed = self._confirmed_definition(resource, payload, target_type=target_type)
+                    if confirmed is not None:
+                        target = _target_context.get()
+                        if target is not None:
+                            target.status = "unattempted"
+                            target.error = None
+                        return confirmed
+                except (RebaseWorkflowError, requests.RequestException, ValueError):
+                    # Preserve the original write failure if read-back is unavailable.
+                    continue
+            raise
 
     def register_workflow(
         self,
@@ -4545,7 +4949,7 @@ class Client:
         }
         if build:
             payload["build"] = build
-        return self._request_dict("POST", path, json=payload, expected="workflow response")
+        return self._write_definition("POST", path, payload, target_type="workflow")
 
     def update_workflow(
         self,
@@ -4641,7 +5045,7 @@ class Client:
             payload["timeout_seconds"] = timeout_seconds
         if build:
             payload["build"] = build
-        return self._request_dict("PATCH", f"/workflows/{workflow_id}", json=payload, expected="workflow response")
+        return self._write_definition("PATCH", f"/workflows/{workflow_id}", payload, target_type="workflow")
 
     def run_workflow(self, workflow_id: str, parameters: dict[str, Any] | None = None) -> Run:
         response = self._request_dict(
@@ -5258,6 +5662,8 @@ class Client:
 
 
 class Project:
+    deployment_report: DeploymentReport | None = None
+
     def __init__(
         self,
         name: str,
@@ -5288,12 +5694,100 @@ class Project:
     def _client(self) -> Client:
         return self.client or default_client()
 
+    def _submit_workflows(self, workflows, prepared, matches, *, environment, jobs):
+        thread_state = thread_local()
+        clients = []
+
+        def submit_one(workflow, definition):
+            original = workflow._client
+            if not hasattr(thread_state, "clients"):
+                thread_state.clients = {}
+            if original not in thread_state.clients:
+                client = copy(original)
+                client._session = None
+                client._session_pid = None
+                client._absent_routes = set(original._absent_routes)
+                client._etags = {}
+                thread_state.clients[original] = client
+                clients.append(client)
+            client = thread_state.clients[original]
+            token = _cache_context.set(None)
+            try:
+                return workflow.deploy(
+                    environment=environment,
+                    _prepared=definition,
+                    _matched=matches.get(definition.path),
+                    _write_client=client,
+                )
+            finally:
+                _cache_context.reset(token)
+
+        if jobs == 1:
+            for workflow, definition in zip(workflows, prepared, strict=True):
+                workflow.deploy(environment=environment, _prepared=definition, _matched=matches.get(definition.path))
+            return
+        remaining = iter(zip(workflows, prepared, strict=True))
+        executor = ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="rebase-deploy")
+        pending = set()
+        failure = None
+        try:
+            while True:
+                while failure is None and len(pending) < jobs:
+                    pair = next(remaining, None)
+                    if pair is None:
+                        break
+                    context = contextvars.copy_context()
+                    pending.add(executor.submit(context.run, partial(submit_one, pair[0], pair[1])))
+                if not pending:
+                    break
+                completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    try:
+                        future.result()
+                    except BaseException as exc:
+                        if failure is None:
+                            failure = exc
+            if failure is not None:
+                raise failure
+        finally:
+            # Cancellation stops new submissions. Already-issued writes finish
+            # and reconcile their outcomes before the final report is printed.
+            executor.shutdown(wait=True, cancel_futures=True)
+            for client in clients:
+                if client._session is not None:
+                    client._session.close()
+
+    def _selected_workflows(self, only: Sequence[str] | None) -> list[Workflow]:
+        if only is None:
+            all_names = [workflow.name for workflow in self._workflows]
+            if len(set(all_names)) != len(all_names):
+                raise RebaseWorkflowError(f"Workflow names must be unique in project {self.name!r}")
+            return list(self._workflows)
+        names = {only} if isinstance(only, str) else set(only)
+        if not names:
+            raise RebaseWorkflowError("only must select at least one workflow")
+        for name in sorted(names):
+            matches = [workflow for workflow in self._workflows if workflow.name == name]
+            if len(matches) != 1:
+                reason = "Unknown" if not matches else "Ambiguous"
+                raise RebaseWorkflowError(f"{reason} workflow {name!r} in project {self.name!r}")
+        return [workflow for workflow in self._workflows if workflow.name in names]
+
     @_environment_scoped_deploy
     def deploy(
-        self, *, replace: bool = False, deploy_source: str | None = None, environment: str | None = None
+        self,
+        *,
+        replace: bool = False,
+        deploy_source: str | None = None,
+        environment: str | None = None,
+        only: Sequence[str] | None = None,
+        jobs: int = 1,
     ) -> Self:
+        if not isinstance(jobs, int) or isinstance(jobs, bool) or not 1 <= jobs <= 16:
+            raise RebaseWorkflowError("jobs must be an integer between 1 and 16")
         environment = _resolve_environment(self._client, environment)
-        for workflow in self._workflows:
+        workflows = self._selected_workflows(only)
+        for workflow in workflows:
             workflow._validate_schedule_defaults()
         resolved_deploy_source = _validate_deploy_source(deploy_source)
         preflight_datasets(self._client)
@@ -5307,18 +5801,33 @@ class Project:
             environment_name=environment,
         )
         self.id = project["id"]
-        for function in self._functions:
+        for function in self._functions if only is None else []:
             if isinstance(function, Step):
                 continue  # Steps are deployed automatically via their workflow
             function.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
-        for workflow in self._workflows:
-            workflow.deploy(
+        prepared = [
+            workflow._prepare_deployment(
                 replace=replace,
                 deploy_source=resolved_deploy_source,
                 environment=environment,
                 _skip_dataset_preflight=True,
             )
-        for asgi_app in self._asgi_apps:
+            for workflow in workflows
+        ]
+        grouped: dict[Client, list[_PreparedDefinition]] = {}
+        for workflow, definition in zip(workflows, prepared, strict=True):
+            grouped.setdefault(workflow._client, []).append(definition)
+        matches = {client: client._compare_definitions(definitions) for client, definitions in grouped.items()}
+        changed_workflows, changed_definitions = [], []
+        for workflow, definition in zip(workflows, prepared, strict=True):
+            match = matches[workflow._client].get(definition.path)
+            if match is not None:
+                workflow.deploy(environment=environment, _prepared=definition, _matched=match)
+            else:
+                changed_workflows.append(workflow)
+                changed_definitions.append(definition)
+        self._submit_workflows(changed_workflows, changed_definitions, {}, environment=environment, jobs=jobs)
+        for asgi_app in self._asgi_apps if only is None else []:
             asgi_app.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
         return self
 
@@ -5529,6 +6038,8 @@ class Project:
 
 
 class ASGIApp:
+    deployment_report: DeploymentReport | None = None
+
     def __init__(
         self,
         fn: Callable[..., Any] | None = None,
@@ -5708,6 +6219,8 @@ class ASGIApp:
 
 
 class Function:
+    deployment_report: DeploymentReport | None = None
+
     def __init__(
         self,
         fn: Callable[..., Any] | None = None,
@@ -6244,6 +6757,7 @@ def _write_huggingface_provenance_files(
 
 
 class Model(_EmflowModel):
+    deployment_report: DeploymentReport | None = None
     _operation_name: str | None = None
     _emflow_init_mode = "name"
     _not_deployable_message = MODEL_NOT_DIRECTLY_DEPLOYABLE_ERROR
@@ -6781,6 +7295,8 @@ class Step(Function):
 
 
 class Workflow:
+    deployment_report: DeploymentReport | None = None
+
     def __init__(
         self,
         fn: Callable[..., Any] | None = None,
@@ -7015,7 +7531,58 @@ class Workflow:
             )
 
     @_environment_scoped_deploy
+    def _prepare_deployment(
+        self, *, replace=False, deploy_source=None, environment=None, _skip_dataset_preflight=False
+    ):
+        token = _prepare_context.set(True)
+        try:
+            try:
+                self._deploy_definition(
+                    replace=replace,
+                    deploy_source=deploy_source,
+                    environment=environment,
+                    _skip_dataset_preflight=_skip_dataset_preflight,
+                )
+            except _DefinitionPrepared as captured:
+                return captured.definition
+            raise RebaseWorkflowError("Workflow preparation did not produce a definition")
+        finally:
+            _prepare_context.reset(token)
+
+    @_environment_scoped_deploy
     def deploy(
+        self,
+        *,
+        replace: bool = False,
+        deploy_source: str | None = None,
+        environment: str | None = None,
+        _skip_dataset_preflight: bool = False,
+        _prepared: _PreparedDefinition | None = None,
+        _matched: dict[str, Any] | None = None,
+        _write_client: Client | None = None,
+    ) -> Workflow:
+        if _prepared is None:
+            return self._deploy_definition(
+                replace=replace,
+                deploy_source=deploy_source,
+                environment=environment,
+                _skip_dataset_preflight=_skip_dataset_preflight,
+            )
+        prepared = _prepared
+        match = _matched
+        if match is not None:
+            result = _target_context.get()
+            if result is not None:
+                result.status = "unchanged"
+            deployed = match
+        else:
+            deployed = (_write_client or self._client)._write_definition_uncached(
+                prepared.method, prepared.path, prepared.payload, target_type="workflow"
+            )
+        self._adopt_deployed(deployed, prepared.payload.get("step_graph"))
+        return self
+
+    def _deploy_definition(
         self,
         *,
         replace: bool = False,

@@ -4,6 +4,49 @@ Python client and toolkit for the Rebase Platform.
 
 The toolkit is intentionally small by default: it contains the API-key client, SDK handles for functions and workflows, and optional entry points for Rebase's energy data/modeling packages. It does not run a database or platform backend locally.
 
+## Deploying a workflow fleet
+
+`rebase deploy` compares prepared workflow and shared-step definitions with the
+platform and reports matching targets as `unchanged`. Re-running the same command
+reads fresh state and deploys the remaining changes after a partial failure.
+
+```bash
+rebase deploy deploy/rebase/grid_pipeline.py
+rebase deploy deploy/rebase/grid_pipeline.py --only collect-entsoe-total_load
+rebase deploy deploy/rebase/grid_pipeline.py --jobs 4
+```
+
+Repeat `--only` to select several workflows. If the file declares several projects,
+select one with `--name`. Selection includes the workflows' required shared steps;
+other workflows, standalone functions, and ASGI apps are excluded. Names are checked
+before any deployment writes. Deploy files still execute when imported, so their
+own setup code can run regardless of selection.
+
+The SDK exposes the same options:
+
+```python
+project.deploy(only=["collect-entsoe-total_load"], jobs=4, environment="dev")
+```
+
+`jobs` bounds independent workflow writes, from 1 to 16 (default 1). Source tracing,
+resource resolution, image preparation, and shared-step deployment happen serially
+first. A failure stops new submissions and waits for in-flight writes to finish or
+be reconciled, preserving `succeeded`, `unchanged`, `failed`, `uncertain`, and
+`unattempted` outcomes. A lost response is never an instruction to replay a write.
+Re-run to reconcile current state; there is no checkpoint or `--continue` file to
+trust. Inspect unresolved `uncertain` targets before further action.
+
+Skipping requires backend support for batch deployment comparison. Older backends
+fall back to normal deployment. The backend uses content identity for hosted source
+and retains repository commits where they select executable code. Deployment
+provenance is recorded separately; historical versions retain their original
+source metadata. Custom image build payloads conservatively use normal deployment.
+Standalone functions and ASGI apps retain their existing deployment paths.
+
+`--only` and `--jobs` apply to direct project deployments and authorized GitOps
+`--sync` calls. They are rejected for GitOps deployment requests because that
+request format does not carry partial-project selection.
+
 ## Install
 
 During early development, install directly from GitHub into a clean `uv` environment:
@@ -322,6 +365,51 @@ Deploy a file from the command line:
 ```bash
 rebase deploy workflow.py
 ```
+
+The CLI prints a final deployment report, including when a deployment stops
+partway. Each selected function, workflow, app, or model is marked `succeeded`,
+`failed`, `uncertain`, or `unattempted`; shared steps have their own rows.
+Counts describe the last outcome for each target in this invocation. Success
+means the control plane acknowledged the definition, not that a runtime is
+ready. Deployment still stops at the first error, and an incomplete CLI deploy
+exits nonzero (1 for deployment errors, 130 for interruption).
+
+Within one deployment attempt, the SDK caches project/function/workflow lookups
+and secret references. Shared steps with the same resolved definition are written
+once; changed definitions are written again. Caches are discarded when the attempt
+ends, and uncertain-write reconciliation always reads fresh API state.
+
+Workflow creation and updates, and function writes during deployment, use a
+300-second HTTP timeout. During deployment, reads retry transient connection/
+timeout failures and HTTP 429/500/502/503/504 responses up to three attempts with
+bounded backoff. Writes retry only connection timeouts
+that occur before a connection is established. After an ambiguous workflow or function
+write, the SDK probes the deployed definition up to three times, checking the
+resource and its pinned version together. It accepts success only if
+all submitted definition fields match after accounting for the API's Python
+image and job-isolation defaults, and the environment selector agrees. Otherwise
+the outcome stays `uncertain`. An absent workflow is not proof that a timed-out create failed.
+Build submissions cannot be confirmed from the definition alone.
+
+SDK deploy methods keep their existing return values and expose a
+`deployment_report` after an attempt. Deployment errors subclass
+`RebaseWorkflowError` and carry the same report:
+
+```python
+try:
+    project.deploy()
+except rb.DeploymentError as exc:
+    print(exc.report.counts)
+    for result in exc.report.results:
+        print(result.project, result.name, result.status, result.error)
+    raise
+else:
+    print(project.deployment_report.counts)
+```
+
+Deployments are not atomic: successful earlier writes remain in place after
+a failure. Reruns still redeploy unchanged targets. Inspect uncertain outcomes
+before retrying; there is no blanket retry of workflow creation or run submission.
 
 Run a function from local source and force the interactive backend:
 
