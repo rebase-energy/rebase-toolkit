@@ -5328,6 +5328,8 @@ SCHEDULE_DETAIL_KEYS = [
     "next_run_at",
     "last_skipped_at",
     "last_skip_reason",
+    "pending_firings",
+    "oldest_pending_fired_at",
     "workflow_id",
     "version_id",
 ]
@@ -5335,7 +5337,7 @@ SCHEDULE_DETAIL_KEYS = [
 
 def _schedule_detail(workflow: dict[str, Any], schedule_data: dict[str, Any]) -> dict[str, Any]:
     schedule = schedule_data.get("schedule") or {}
-    return {
+    detail = {
         "workflow": workflow.get("name"),
         "cron": schedule.get("cron"),
         "timezone": schedule.get("timezone"),
@@ -5353,6 +5355,12 @@ def _schedule_detail(workflow: dict[str, Any], schedule_data: dict[str, Any]) ->
         "workflow_id": schedule_data.get("workflow_id"),
         "version_id": schedule_data.get("version_id"),
     }
+    # Cron slots deferred at the workspace's concurrency cap and still waiting
+    # for a slot. Shown only when there are some: an empty queue is the norm.
+    if schedule_data.get("pending_firings"):
+        detail["pending_firings"] = schedule_data["pending_firings"]
+        detail["oldest_pending_fired_at"] = schedule_data.get("oldest_pending_fired_at")
+    return detail
 
 
 def _require_schedule(client: Client, workflow: dict[str, Any]) -> dict[str, Any]:

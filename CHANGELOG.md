@@ -4,6 +4,7 @@
 
 - Select workflows within a project with `rebase deploy --only` or `Project.deploy(only=...)`, including required shared steps.
 - Skip unchanged workflows and shared steps using backend batch comparison, report `unchanged`, and reconcile fresh state on re-runs. Older backends retain the existing write path.
+- `rebase workflow schedule show` and the TUI workflows table show scheduled firings waiting for a free run slot (`pending_firings`), which the backend now queues instead of dropping when the workspace is at its concurrency cap (#36).
 - Add opt-in bounded workflow write concurrency with `--jobs` / `jobs`, after serial preparation and shared-step resolution. In-flight outcomes remain visible on failure or interruption.
 
 ## 0.10.0 — 2026-09-22

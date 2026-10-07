@@ -2145,7 +2145,7 @@ def format_execution(value: dict[str, Any]) -> str:
     return str(value.get("run_type") or "-")
 
 
-def format_schedule(value: Any, *, paused: bool = False) -> str:
+def format_schedule(value: Any, *, paused: bool = False, waiting: int = 0) -> str:
     if not isinstance(value, dict):
         return "-"
     cron = str(value.get("cron") or "-")
@@ -2154,8 +2154,9 @@ def format_schedule(value: Any, *, paused: bool = False) -> str:
         # The declared window, dates only: `*/5 * * * * 09-16→10-14`.
         cron = f"{cron} {str(start)[5:10] if start else ''}→{str(end)[5:10] if end else ''}"
     if not value.get("active", True) or paused or _window_ended(end):
-        return f"{cron} ⏸"
-    return cron
+        cron = f"{cron} ⏸"
+    # Slots deferred at the workspace's concurrency cap, still waiting to run.
+    return f"{cron} · {waiting} waiting" if waiting else cron
 
 
 def _window_ended(end: Any) -> bool:
@@ -5816,6 +5817,7 @@ class RebaseTuiApp(App[None]):
                     workflow.get("schedule"),
                     paused=(bool(workflow.get("paused")) and _pause_in_effect(workflow.get("paused_until")))
                     or self._project_paused(),
+                    waiting=int(workflow.get("pending_firings") or 0),
                 ),
                 self._time(workflow.get("next_run_at")),
                 self._time(self._last_runs.get(workflow_id)),

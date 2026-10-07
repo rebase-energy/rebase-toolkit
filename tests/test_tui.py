@@ -7051,6 +7051,17 @@ def test_workflow_cron_state_treats_an_ended_window_as_stopped() -> None:
     assert format_schedule(window) == "*/5 * * * * 09-16→10-14"
 
 
+def test_format_schedule_marks_waiting_firings() -> None:
+    from rebase.tui import format_schedule
+
+    schedule = {"type": "cron", "cron": "21 * * * *"}
+    assert format_schedule(schedule, waiting=3) == "21 * * * * · 3 waiting"
+    assert format_schedule(schedule, waiting=0) == "21 * * * *"
+    assert format_schedule(schedule) == "21 * * * *"
+    # Paused and waiting: the firings will be skipped, but they are still there.
+    assert format_schedule(schedule, paused=True, waiting=2) == "21 * * * * ⏸ · 2 waiting"
+
+
 def test_tui_build_timeline_attributes_log_lines_to_their_step() -> None:
     from rebase.tui import build_timeline
 
