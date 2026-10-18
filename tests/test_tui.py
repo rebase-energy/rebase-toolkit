@@ -7367,3 +7367,58 @@ def test_tui_event_drawer_shows_details_and_falls_back_without_them() -> None:
 
     bare = TimelineRow(at=None, stage="accepted", status="completed", message="Accepted.", kind="event", record={})
     assert RebaseTuiApp._event_drawer(bare) is None
+
+
+def test_quitting_does_not_wait_for_loads_still_out(monkeypatch) -> None:
+    """`q` during a slow request hung the terminal until Python joined that thread."""
+    release = threading.Event()
+    stuck = threading.Thread(target=release.wait, args=(5,))
+    stuck.start()
+    exits: list[int] = []
+    try:
+        tui_module.leave_without_waiting(0, exit_process=exits.append)
+    finally:
+        release.set()
+        stuck.join()
+
+    assert exits == [0]
+
+
+def test_quitting_returns_normally_when_nothing_is_out() -> None:
+    exits: list[int] = []
+    tui_module.leave_without_waiting(0, exit_process=exits.append)
+    assert exits == []
+
+
+def test_ending_the_session_never_holds_the_terminal() -> None:
+    release = threading.Event()
+
+    class SlowGoodbye:
+        def end_client_session(self) -> None:
+            release.wait(5)
+
+    started = tui_module.monotonic()
+    try:
+        tui_module.end_session_briefly(SlowGoodbye(), budget=0.1)
+    finally:
+        release.set()
+
+    assert tui_module.monotonic() - started < 1
+
+
+def test_the_tuis_executor_does_not_hold_asyncio_run_open() -> None:
+    """`asyncio.run` waits up to five minutes on the default executor's threads at exit."""
+    release = threading.Event()
+
+    async def leave_a_load_out() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(tui_module.AbandoningExecutor())
+        loop.run_in_executor(None, release.wait, 5)
+
+    started = tui_module.monotonic()
+    try:
+        asyncio.run(leave_a_load_out())
+    finally:
+        release.set()
+
+    assert tui_module.monotonic() - started < 1

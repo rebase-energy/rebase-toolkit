@@ -6,7 +6,9 @@ import json
 import math
 import os
 import subprocess
+import sys
 import textwrap
+import threading
 import webbrowser
 from collections import Counter
 from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator, Sequence
@@ -3834,6 +3836,8 @@ class RebaseTuiApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        # Before any load starts: every `asyncio.to_thread` below runs on this executor.
+        asyncio.get_running_loop().set_default_executor(AbandoningExecutor(thread_name_prefix="rebase-tui"))
         self._setup_tables()
         if not is_default_platform():
             self.query_one(RebaseHeader).add_class("-platform")
@@ -6955,4 +6959,50 @@ def run_tui(
         app.run()
     finally:
         # Ctrl-C and `q` alike: the session ends when the screen does.
-        app.data.client.end_client_session()
+        end_session_briefly(app.data.client)
+    leave_without_waiting(app.return_code or 0)
+
+
+class AbandoningExecutor(ThreadPoolExecutor):
+    """The TUI's default executor, which does not wait for its threads when it shuts down.
+
+    `asyncio.run` ends by shutting the default executor down and waiting for it, for up
+    to five minutes. A load still waiting on the platform when `q` is pressed would hold
+    the closed screen there until it answered. Queued work is cancelled; requests already
+    out are left to `leave_without_waiting`.
+    """
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        super().shutdown(wait=False, cancel_futures=True)
+
+
+#: How long quitting waits for the platform to record the session's end.
+SESSION_END_BUDGET_SECONDS = 0.5
+
+
+def end_session_briefly(client: Any, *, budget: float = SESSION_END_BUDGET_SECONDS) -> None:
+    """Say goodbye to the platform, but never hold the terminal for it.
+
+    The request is best effort and has a 5 s timeout of its own; on a slow platform
+    that was 5 s of a blank terminal after `q`. A daemon thread is abandoned at exit.
+    """
+    thread = threading.Thread(target=client.end_client_session, name="rebase-session-end", daemon=True)
+    thread.start()
+    thread.join(budget)
+
+
+def leave_without_waiting(code: int, *, exit_process: Callable[[int], Any] = os._exit) -> None:
+    """Exit now if loads the closed screen started are still waiting on the platform.
+
+    Every load runs in an executor thread, and Python joins those at exit, so `q`
+    during a slow request left the terminal hanging until each one answered or hit
+    its 30 s timeout, and Ctrl-C then printed a traceback from the join. Their answers
+    have nowhere to go once the screen is gone. Nothing is waiting: a normal return.
+    """
+    main = threading.main_thread()
+    if not any(thread is not main and not thread.daemon and thread.is_alive() for thread in threading.enumerate()):
+        return
+    for stream in (sys.stdout, sys.stderr):
+        with suppress(Exception):
+            stream.flush()
+    exit_process(code)
