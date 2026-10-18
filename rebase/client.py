@@ -180,6 +180,12 @@ DEFAULT_API_KEY_PERMISSIONS = [
 ]
 DEPLOY_REQUEST_TIMEOUT_SECONDS = 300
 DEPLOY_REQUEST_ATTEMPTS = 3
+# A 429 is the platform refusing a request before doing any of it -- the bucket
+# data routes are budgeted per workspace, and over budget they answer 429 with a
+# Retry-After -- so any request can be sent again after the wait, writes included.
+# Up to this many waits, each no longer than this; past that the 429 is the error.
+RATE_LIMIT_ATTEMPTS = 4
+RATE_LIMIT_MAX_WAIT_SECONDS = 60.0
 # (connect, read) for POST /runs/ephemeral: the server executes quick runs inside
 # the request and enforces a 300 s run cap, so the read timeout is that plus
 # headroom. The old default of 30 s failed any run longer than half a minute.
@@ -211,6 +217,16 @@ class _DeploymentRequestError(RebaseWorkflowError):
         super().__init__(message)
         self.uncertain = uncertain
         self.status_code = status_code
+
+
+def _retry_after_seconds(response: requests.Response) -> float | None:
+    """How long a 429 asks us to wait, or None when it is too long to wait out."""
+    try:
+        wait = float(response.headers.get("Retry-After", "1"))
+    except (AttributeError, ValueError):
+        wait = 1.0
+    wait = max(wait, 0.0)
+    return wait if wait <= RATE_LIMIT_MAX_WAIT_SECONDS else None
 
 
 def _deploy_retry_delay(attempt: int, response: requests.Response | None = None) -> float:
@@ -2921,6 +2937,14 @@ class Client:
                 ):
                     refreshed_token = True
                     headers = self._request_headers(auth=auth, headers=caller_headers)
+                    response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
+                throttled = 0
+                while getattr(response, "status_code", None) == 429 and throttled < RATE_LIMIT_ATTEMPTS:
+                    wait = _retry_after_seconds(response)
+                    if wait is None:
+                        break
+                    throttled += 1
+                    time.sleep(wait)
                     response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
             except (requests.Timeout, requests.ConnectionError) as exc:
                 if not deploying:
