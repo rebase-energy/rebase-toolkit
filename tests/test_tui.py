@@ -2172,8 +2172,8 @@ def test_tui_w_opens_switcher_and_changes_workspace(monkeypatch) -> None:
             assert [str(environments.get_cell_at(Coordinate(row, 1))) for row in range(2)] == ["dev", "staging"]
             assert str(environments.get_cell_at(Coordinate(0, 0))) == ""
 
-            # Enter on the workspace hands the cursor down; enter on an environment switches.
-            await pilot.press("enter")
+            # Tab hands the cursor down; enter on an environment switches to it.
+            await pilot.press("tab")
             await pilot.pause(0.1)
             assert environments.has_focus
             environments.move_cursor(row=1)
@@ -2201,6 +2201,250 @@ def test_tui_w_opens_switcher_and_changes_workspace(monkeypatch) -> None:
             assert profile["workspace_id"] == "workspace-dev"
             assert profile["workspace_name"] == "Development"
             assert config_module.active_environment("workspace-dev") == "staging"
+
+    asyncio.run(scenario())
+
+
+class SlowEnvironmentsClient(WorkspaceClient):
+    """Environments that answer only when the test says so, and count every ask.
+
+    Shared state lives on the class because the TUI clones a client per workspace.
+    """
+
+    release = threading.Event()
+    asked: list[str] = []
+    failing: set[str] = set()
+
+    def list_environments(self) -> list[dict[str, Any]]:
+        type(self).asked.append(self.workspace_id)
+        if not type(self).release.wait(timeout=5):
+            raise RuntimeError("environments were never released")
+        if self.workspace_id in type(self).failing:
+            raise RebaseWorkflowError("platform timed out")
+        return super().list_environments()
+
+    def with_environment(self, environment_name: str) -> SlowEnvironmentsClient:
+        return SlowEnvironmentsClient(self.workspace_id, environment_name)
+
+    def with_workspace(self, workspace_id: str, *, environment_name: str | None = None) -> SlowEnvironmentsClient:
+        return SlowEnvironmentsClient(workspace_id, environment_name or "dev")
+
+
+@pytest.fixture
+def slow_environments() -> Iterator[type[SlowEnvironmentsClient]]:
+    SlowEnvironmentsClient.release = threading.Event()
+    SlowEnvironmentsClient.asked = []
+    SlowEnvironmentsClient.failing = set()
+    yield SlowEnvironmentsClient
+    # Never leave a worker thread parked on the event after the app is gone.
+    SlowEnvironmentsClient.release.set()
+
+
+def test_tui_enter_on_a_workspace_switches_before_its_environments_load(slow_environments) -> None:
+    """A slow environments route used to leave enter on a workspace doing nothing."""
+
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(slow_environments("workspace-prod"), limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            await pilot.press("w")
+            await pilot.pause(0.3)
+
+            workspaces = app.query_one("#workspaces-table", DataTable)
+            environments = app.query_one("#workspace-environments-table", DataTable)
+            workspaces.move_cursor(row=1)
+            await pilot.pause(0.1)
+            # Still out: the table says so instead of reading as a workspace with none.
+            assert environments.row_count == 1
+            assert str(environments.get_cell_at(Coordinate(0, 1))) == "loading…"
+
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            assert app.current_view == "workspace"
+            assert app.data.client.workspace_id == "workspace-dev"
+            assert app.data.environment_name == "dev"
+            assert app.title == "Rebase TUI - Workspace: Development (dev)"
+
+    asyncio.run(scenario())
+
+
+def test_tui_enter_on_a_workspace_opens_the_environment_last_used_there(slow_environments) -> None:
+    async def scenario() -> None:
+        config_module.set_active_environment("workspace-dev", "staging")
+        slow_environments.release.set()
+        app = RebaseTuiApp(data=fake_tui_data(slow_environments("workspace-prod"), limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            await pilot.press("w")
+            await pilot.pause(0.3)
+            app.query_one("#workspaces-table", DataTable).move_cursor(row=1)
+            await pilot.pause(0.1)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            assert app.data.client.workspace_id == "workspace-dev"
+            assert app.data.environment_name == "staging"
+
+    asyncio.run(scenario())
+
+
+def test_tui_switcher_loading_row_is_not_an_environment(slow_environments) -> None:
+    async def scenario() -> None:
+        app = RebaseTuiApp(data=fake_tui_data(slow_environments("workspace-prod"), limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            await pilot.press("w")
+            await pilot.pause(0.3)
+            app.query_one("#workspaces-table", DataTable).move_cursor(row=1)
+            await pilot.pause(0.1)
+            app.query_one("#workspace-environments-table", DataTable).focus()
+            await pilot.press("enter")
+            await pilot.pause(0.2)
+
+            assert app.current_view == "workspace-switcher"
+            assert app.data.client.workspace_id == "workspace-prod"
+
+    asyncio.run(scenario())
+
+
+def test_tui_switcher_says_when_environments_fail_and_still_switches(slow_environments) -> None:
+    async def scenario() -> None:
+        slow_environments.failing = {"workspace-dev"}
+        slow_environments.release.set()
+        app = RebaseTuiApp(data=fake_tui_data(slow_environments("workspace-prod"), limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            await pilot.press("w")
+            await pilot.pause(0.3)
+            workspaces = app.query_one("#workspaces-table", DataTable)
+            workspaces.move_cursor(row=1)
+            await pilot.pause(0.4)
+
+            environments = app.query_one("#workspace-environments-table", DataTable)
+            assert environments.row_count == 1
+            assert str(environments.get_cell_at(Coordinate(0, 1))) == "could not load: platform timed out"
+
+            workspaces.focus()
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            assert app.data.client.workspace_id == "workspace-dev"
+
+    asyncio.run(scenario())
+
+
+def test_tui_switcher_asks_once_per_workspace_and_only_where_the_cursor_rests(slow_environments) -> None:
+    async def scenario() -> None:
+        slow_environments.release.set()
+        app = RebaseTuiApp(data=fake_tui_data(slow_environments("workspace-prod"), limit=5))
+
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            # The workspace view asks for its own environments too; count from the switcher.
+            del slow_environments.asked[:]
+            await pilot.press("w")
+            await pilot.pause(0.3)
+            assert slow_environments.asked == ["workspace-prod"]
+
+            workspaces = app.query_one("#workspaces-table", DataTable)
+            environments = app.query_one("#workspace-environments-table", DataTable)
+            # Through a row and back before it settles: nothing new is asked.
+            workspaces.move_cursor(row=1)
+            await pilot.pause(0.05)
+            workspaces.move_cursor(row=0)
+            await pilot.pause(0.4)
+            assert slow_environments.asked == ["workspace-prod"]
+            assert [str(environments.get_cell_at(Coordinate(row, 1))) for row in range(2)] == ["dev", "prod"]
+
+            # Resting on it asks once; coming back to it is drawn from what came back.
+            workspaces.move_cursor(row=1)
+            await pilot.pause(0.4)
+            workspaces.move_cursor(row=0)
+            await pilot.pause(0.1)
+            workspaces.move_cursor(row=1)
+            await pilot.pause(0.1)
+            assert slow_environments.asked == ["workspace-prod", "workspace-dev"]
+            assert [str(environments.get_cell_at(Coordinate(row, 1))) for row in range(2)] == ["dev", "staging"]
+
+            # Refresh forgets them, for an environment created since.
+            await pilot.press("r")
+            await pilot.pause(0.4)
+            assert slow_environments.asked.count("workspace-prod") == 2
+
+    asyncio.run(scenario())
+
+
+def _open_first_project_while_it_hangs(app: RebaseTuiApp, release: threading.Event, *, fail: bool = False) -> None:
+    """Make opening a project wait on *release*, the way a slow platform does."""
+    load = app.data.load_project_composite
+
+    def slow(project: dict[str, Any], *, conditional: bool = False) -> Any:
+        if not release.wait(timeout=5):
+            raise RuntimeError("project was never released")
+        if fail:
+            raise RebaseWorkflowError("platform timed out")
+        return load(project, conditional=conditional)
+
+    app.data.load_project_composite = slow  # type: ignore[method-assign]
+
+
+def test_tui_project_says_it_is_loading_until_its_targets_arrive() -> None:
+    """A slow platform used to open a project onto empty tables that read as broken."""
+
+    async def scenario() -> None:
+        release = threading.Event()
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
+        try:
+            async with app.run_test(size=(140, 42)) as pilot:
+                await pilot.pause(0.3)
+                _open_first_project_while_it_hangs(app, release)
+                projects = app.query_one("#projects-table", DataTable)
+                projects.focus()
+                projects.move_cursor(row=0)
+                await pilot.press("enter")
+                await pilot.pause(0.2)
+
+                workflows = app.query_one("#workflows-table", DataTable)
+                functions = app.query_one("#functions-table", DataTable)
+                for table in (workflows, functions):
+                    assert table.row_count == 1
+                    assert str(table.get_cell_at(Coordinate(0, 0))) == "loading…"
+                # Enter on it is not a target, so nothing opens.
+                await pilot.press("enter")
+                await pilot.pause(0.1)
+                assert app.selected_target is None
+
+                release.set()
+                await pilot.pause(0.3)
+                assert workflows.row_count == 1
+                assert str(workflows.get_cell_at(Coordinate(0, 0))) != "loading…"
+        finally:
+            release.set()
+
+    asyncio.run(scenario())
+
+
+def test_tui_project_drops_its_loading_rows_when_the_load_fails() -> None:
+    async def scenario() -> None:
+        release = threading.Event()
+        release.set()
+        app = RebaseTuiApp(data=fake_tui_data(FakeClient(), limit=5))
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause(0.3)
+            _open_first_project_while_it_hangs(app, release, fail=True)
+            projects = app.query_one("#projects-table", DataTable)
+            projects.focus()
+            projects.move_cursor(row=0)
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+
+            assert app.query_one("#workflows-table", DataTable).row_count == 0
+            assert app.query_one("#functions-table", DataTable).row_count == 0
+            assert any("platform timed out" in n.message for n in app._notifications)
 
     asyncio.run(scenario())
 

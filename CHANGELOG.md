@@ -6,6 +6,7 @@
 - Skip unchanged workflows and shared steps using backend batch comparison, report `unchanged`, and reconcile fresh state on re-runs. Older backends retain the existing write path.
 - `rebase workflow schedule show` and the TUI workflows table show scheduled firings waiting for a free run slot (`pending_firings`), which the backend now queues instead of dropping when the workspace is at its concurrency cap (#36).
 - Add opt-in bounded workflow write concurrency with `--jobs` / `jobs`, after serial preparation and shared-step resolution. In-flight outcomes remain visible on failure or interruption.
+- The TUI workspace switcher switches on enter on a workspace, opening the environment last used there (or `dev`), instead of waiting for its environments to load; Tab down to pick another environment. The environments table shows `loading…` or why the list failed, keeps each workspace's environments for the session (`r` refetches), and fetches only for the row the cursor rests on.
 
 ## 0.10.0 — 2026-09-22
 
