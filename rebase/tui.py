@@ -238,7 +238,10 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "workspace-profiles-table": ("Active", "Profile", "Workspace", "Workspace ID", "API URL"),
     "workspaces-table": ("Active", "Workspace", "Workspace ID", "Role"),
     "workspace-environments-table": ("Active", "Environment", "Deploy mode", "Protected"),
-    "buckets-table": ("Bucket", "URI", "Created", "Updated"),
+    # How much a bucket holds is the first thing to know about it, so it comes before
+    # where it lives. There is no Updated: that was when the bucket's record changed,
+    # which says nothing about its data and in practice always matched Created.
+    "buckets-table": ("Bucket", "Size", "Objects", "URI", "Created"),
     "secrets-table": ("Secret", "Keys"),
     # `Origin` sits second in both: you read what a thing is called, then what kind of
     # thing it is, and every column after it is one a one-off has no answer for.
@@ -1939,6 +1942,13 @@ def format_bytes(value: Any) -> str:
             return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
     return "-"
+
+
+def format_count(value: Any) -> str:
+    """A count with thousands separators, leaving absent or invalid values visibly unknown."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return "-"
+    return f"{value:,}"
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
@@ -5744,9 +5754,10 @@ class RebaseTuiApp(App[None]):
         for key, item in bucket_rows.items():
             buckets.add_row(
                 str(item.get("name", "-")),
+                Text(format_bytes(item.get("size_bytes")), justify="right"),
+                Text(format_count(item.get("object_count")), justify="right"),
                 str(item.get("uri") or "-"),
                 self._time(item.get("created_at")),
-                self._time(item.get("updated_at")),
                 key=key,
             )
 

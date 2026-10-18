@@ -405,6 +405,8 @@ class EnvironmentClient(FakeClient):
                     f"https://console.cloud.google.com/storage/browser/rb-{self.environment_name}-data-abc123"
                     "?project=rebase-prod"
                 ),
+                # Prod's bucket is younger than storage's first daily usage sample.
+                **({"size_bytes": 30660945574, "object_count": 239985} if self.environment_name == "dev" else {}),
             }
         ]
 
@@ -574,9 +576,14 @@ def test_tui_environment_resources_and_switcher() -> None:
 
             assert app.title.endswith("(dev)")
             assert str(app.query_one("#buckets-table", DataTable).get_cell_at(Coordinate(0, 0))) == "dev-data"
-            assert str(app.query_one("#buckets-table", DataTable).get_cell_at(Coordinate(0, 1))) == (
-                "gs://rb-dev-data-abc123"
-            )
+            buckets = app.query_one("#buckets-table", DataTable)
+            # What it holds first, then where it lives.
+            assert [str(cell) for cell in buckets.get_row_at(0)[:4]] == [
+                "dev-data",
+                "28.6 GiB",
+                "239,985",
+                "gs://rb-dev-data-abc123",
+            ]
             assert str(app.query_one("#secrets-table", DataTable).get_cell_at(Coordinate(0, 0))) == "dev-api"
 
             await pilot.press("v")
@@ -589,7 +596,11 @@ def test_tui_environment_resources_and_switcher() -> None:
             assert app.environment_name == "prod"
             assert app.data.environment_name == "prod"
             assert app.title.endswith("(prod)")
-            assert str(app.query_one("#buckets-table", DataTable).get_cell_at(Coordinate(0, 0))) == "prod-data"
+            assert [str(cell) for cell in app.query_one("#buckets-table", DataTable).get_row_at(0)[:3]] == [
+                "prod-data",
+                "-",
+                "-",
+            ]
             # The pick is this process's: exported for anything it starts, written nowhere.
             assert os.environ["REBASE_ENVIRONMENT"] == "prod"
             assert os.environ["REBASE_WORKSPACE"] == "workspace-id"

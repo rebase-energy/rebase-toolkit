@@ -8,6 +8,7 @@
 - Add opt-in bounded workflow write concurrency with `--jobs` / `jobs`, after serial preparation and shared-step resolution. In-flight outcomes remain visible on failure or interruption.
 - The TUI workspace switcher switches on enter on a workspace, opening the environment last used there (or `dev`), instead of waiting for its environments to load; Tab down to pick another environment. The environments table shows `loading…` or why the list failed, keeps each workspace's environments for the session (`r` refetches), and fetches only for the row the cursor rests on.
 - Quitting the TUI hands the terminal back at once. Loads still waiting on the platform used to hold the process open until they answered or timed out (up to 30 s, or five minutes inside `asyncio.run`), and Ctrl-C then printed a threading traceback; the goodbye request now gets 0.5 s.
+- The TUI buckets table opens with each bucket's size and object count (`Bucket | Size | Objects | URI | Created`), from the `size_bytes` and `object_count` the platform now reports. Both are storage's daily sample, so up to a day old, and `-` for a bucket younger than its first sample or against a platform that does not report them. The `Updated` column is gone: it was the bucket record's, not its data's.
 
 ## 0.10.0 — 2026-09-22
 
