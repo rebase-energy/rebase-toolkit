@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`rebase workflow schedule backend set <name> --to prefect|cloud_tasks` and `backend show`.**
+  Which path fires a workflow's cron: Prefect, or the push-based `cloud_tasks` path the
+  platform runs next to it while it is evaluated. Operational, like pause: no new
+  version. The platform refuses `cloud_tasks` unless the workspace allows it
+  (`rebase workspace compute-policy set --cloud-tasks-schedules`), the workflow is
+  job-mode, and its cron reads the same on both scheduling engines. `schedule show`
+  and `schedule list` now say which path a workflow is on, and `schedule show` reports
+  the newest scheduled run's slot and how many seconds after the slot it was created,
+  the same measure on either path. Needs a platform with
+  `POST /workflows/{id}/schedule/backend`.
+
 ## 0.10.0 — 2026-09-22
 
 ### Added

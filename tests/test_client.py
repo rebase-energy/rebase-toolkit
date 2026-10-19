@@ -4215,3 +4215,42 @@ def test_run_failure_summary_carries_what_the_platform_observed() -> None:
     assert observed_summary({"timeout_seconds": 300, "elapsed_seconds": 301.2}) == "301.2s of a 300s bound"
     assert observed_summary({}) is None
     assert run_failure_summary({"failure_reason": {"message": "boom"}}) == "Boom"
+
+
+def test_set_workflow_schedule_backend_posts_the_choice(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["json"] = kwargs.get("json")
+        return FakeResponse({"id": "workflow-id", "schedule_backend": "cloud_tasks"})
+
+    patch_client_http(monkeypatch, fake_request)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    workflow = client.set_workflow_schedule_backend("workflow-id", "cloud_tasks")
+
+    assert observed["method"] == "POST"
+    assert observed["url"] == "https://workflows.example.com/workflows/workflow-id/schedule/backend"
+    assert observed["json"] == {"backend": "cloud_tasks"}
+    assert workflow["schedule_backend"] == "cloud_tasks"
+
+
+def test_update_workspace_compute_policy_sends_the_cloud_tasks_switch_only_when_given(monkeypatch) -> None:
+    observed: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed.append({"method": method, "url": url, "json": kwargs.get("json")})
+        return FakeResponse({"workspace_id": "ws", "cloud_tasks_schedules_enabled": True})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.update_workspace_compute_policy(cloud_tasks_schedules_enabled=False)
+    client.update_workspace_compute_policy(max_cloud_run_instances=3)
+
+    assert observed[0]["method"] == "PATCH"
+    assert observed[0]["url"] == "https://workflows.example.com/workspace/compute-policy"
+    assert observed[0]["json"] == {"cloud_tasks_schedules_enabled": False}
+    assert observed[1]["json"] == {"max_cloud_run_instances": 3}

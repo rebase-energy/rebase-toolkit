@@ -4771,6 +4771,19 @@ class Client:
         """Lift a workflow's pause so scheduled runs fire again."""
         return self._request_dict("POST", f"/workflows/{workflow_id}/resume", expected="workflow response")
 
+    def set_workflow_schedule_backend(self, workflow_id: str, backend: str) -> dict[str, Any]:
+        """Choose which path fires the workflow's cron: ``prefect`` (the default) or
+        ``cloud_tasks``, the push-based path being evaluated next to it. Operational,
+        like pause: no new version. The platform refuses ``cloud_tasks`` unless the
+        workspace allows it (`update_workspace_compute_policy(cloud_tasks_schedules_enabled=True)`),
+        the workflow is job-mode, and its cron reads the same on both engines."""
+        return self._request_dict(
+            "POST",
+            f"/workflows/{workflow_id}/schedule/backend",
+            json={"backend": backend},
+            expected="workflow response",
+        )
+
     def pause_project(self, project_id: str) -> dict[str, Any]:
         """Stop a whole project: no schedule, trigger, endpoint call or run by hand
         goes through until it is resumed. Its workflows and functions keep their own
@@ -4889,6 +4902,7 @@ class Client:
         max_cloud_run_concurrency: int | None = None,
         max_cloud_run_cpu_milli: int | None = None,
         max_cloud_run_memory_mib: int | None = None,
+        cloud_tasks_schedules_enabled: bool | None = None,
     ) -> dict[str, Any]:
         # No _UNSET sentinel here, unlike update_workspace_notifications: these are
         # NOT NULL integers with no clear-to-null semantics, so plain "None means not
@@ -4908,6 +4922,8 @@ class Client:
             payload["max_cloud_run_cpu_milli"] = max_cloud_run_cpu_milli
         if max_cloud_run_memory_mib is not None:
             payload["max_cloud_run_memory_mib"] = max_cloud_run_memory_mib
+        if cloud_tasks_schedules_enabled is not None:
+            payload["cloud_tasks_schedules_enabled"] = cloud_tasks_schedules_enabled
         return self._request_dict(
             "PATCH", "/workspace/compute-policy", json=payload, expected="workspace compute policy response"
         )

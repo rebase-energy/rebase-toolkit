@@ -5830,3 +5830,88 @@ def test_event_detail_suffix_prints_what_the_event_recorded() -> None:
     assert _event_detail_suffix({"details": {}}) == ""
     assert _event_detail_suffix({}) == ""
     assert _event_detail_suffix({"details": {"error": "x" * 400}}, max_length=40).endswith("…")
+
+
+def _schedule_on(backend: str, workflow_id: str = "workflow-id") -> dict[str, Any]:
+    return {
+        "workflow_id": workflow_id,
+        "version_id": "version-id",
+        "schedule": {"type": "cron", "cron": "*/15 * * * *", "timezone": "UTC"},
+        "active": True,
+        "next_run_at": "2026-10-19T10:30:00Z",
+        "schedule_backend": backend,
+        "last_fired_at": "2026-10-19T10:15:00Z",
+        "last_fire_latency_seconds": 2.5,
+    }
+
+
+def test_workflow_schedule_show_reports_the_backend_and_the_latest_fire(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    monkeypatch.setattr(Client, "get_workflow_schedule", lambda self, workflow_id: _schedule_on("cloud_tasks"))
+
+    assert main(["workflow", "schedule", "show", "--id", "workflow-id"]) == 0
+
+    output = capsys.readouterr().out
+    assert "cloud_tasks" in output
+    assert "2026-10-19T10:15:00Z" in output
+    assert "2.5" in output
+
+
+def test_workflow_schedule_backend_set_switches_then_shows_the_schedule(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    def fake_set(self, workflow_id: str, backend: str) -> dict[str, Any]:
+        observed["workflow_id"] = workflow_id
+        observed["backend"] = backend
+        return {"id": workflow_id, "schedule_backend": backend}
+
+    monkeypatch.setattr(Client, "set_workflow_schedule_backend", fake_set)
+    monkeypatch.setattr(
+        Client,
+        "get_workflow_schedule",
+        lambda self, workflow_id: _schedule_on(observed.get("backend", "prefect")),
+    )
+
+    assert main(["workflow", "schedule", "backend", "set", "--id", "workflow-id", "--to", "cloud_tasks"]) == 0
+
+    assert observed == {"workflow_id": "workflow-id", "backend": "cloud_tasks"}
+    output = capsys.readouterr().out
+    assert "Schedule Backend Set" in output
+    assert "cloud_tasks" in output
+
+
+def test_workflow_schedule_backend_set_refuses_an_unknown_path(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    called: list[str] = []
+    monkeypatch.setattr(Client, "set_workflow_schedule_backend", lambda self, wid, backend: called.append(backend))
+
+    assert main(["workflow", "schedule", "backend", "set", "--id", "workflow-id", "--to", "celery"]) != 0
+    assert called == []
+    assert "prefect, cloud_tasks" in capsys.readouterr().err
+
+
+def test_workflow_schedule_backend_show_prints_the_backend(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    monkeypatch.setattr(Client, "get_workflow_schedule", lambda self, workflow_id: _schedule_on("prefect"))
+
+    assert main(["workflow", "schedule", "backend", "show", "--id", "workflow-id"]) == 0
+    output = capsys.readouterr().out
+    assert "Schedule Backend" in output and "prefect" in output
+
+
+def test_workspace_compute_policy_set_sends_the_cloud_tasks_switch(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_update(self, **kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        return {"workspace_id": "ws", "cloud_tasks_schedules_enabled": kwargs["cloud_tasks_schedules_enabled"]}
+
+    monkeypatch.setattr(Client, "update_workspace_compute_policy", fake_update)
+
+    assert main(["workspace", "compute-policy", "set", "--cloud-tasks-schedules"]) == 0
+    assert observed == {"cloud_tasks_schedules_enabled": True}
+    assert "cloud_tasks_schedules_enabled" in capsys.readouterr().out
+
+    assert main(["workspace", "compute-policy", "set", "--no-cloud-tasks-schedules"]) == 0
+    assert observed == {"cloud_tasks_schedules_enabled": False}

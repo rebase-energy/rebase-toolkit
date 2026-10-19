@@ -3075,6 +3075,7 @@ COMPUTE_POLICY_DETAIL_KEYS = [
     "max_cloud_run_memory_mib",
     "cloud_run_enabled",
     "gpu_allowed",
+    "cloud_tasks_schedules_enabled",
     "updated_at",
 ]
 
@@ -3130,6 +3131,17 @@ def workspace_compute_policy_set_command(
         int | None,
         typer.Option("--max-memory-mib", help="Ceiling for a target's memory, in MiB (1024 = 1 GiB)."),
     ] = None,
+    cloud_tasks_schedules: Annotated[
+        bool | None,
+        typer.Option(
+            "--cloud-tasks-schedules/--no-cloud-tasks-schedules",
+            "-c",
+            help=(
+                "Whether the workspace's job-mode workflows may be moved to the push-based cloud_tasks "
+                "scheduling path (rebase workflow schedule backend set)."
+            ),
+        ),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Update the workspace's compute limits.
@@ -3148,10 +3160,12 @@ def workspace_compute_policy_set_command(
         and max_concurrency is None
         and max_cpu_milli is None
         and max_memory_mib is None
+        and cloud_tasks_schedules is None
     ):
         raise RebaseWorkflowError(
             "nothing to update; pass --max-run-timeout-seconds, --max-concurrent-runs, "
-            "--max-instances, --max-concurrency, --max-cpu-milli, or --max-memory-mib"
+            "--max-instances, --max-concurrency, --max-cpu-milli, --max-memory-mib, "
+            "or --cloud-tasks-schedules/--no-cloud-tasks-schedules"
         )
     kwargs: dict[str, Any] = {}
     if max_run_timeout_seconds is not None:
@@ -3168,6 +3182,8 @@ def workspace_compute_policy_set_command(
         kwargs["max_cloud_run_cpu_milli"] = max_cpu_milli
     if max_memory_mib is not None:
         kwargs["max_cloud_run_memory_mib"] = max_memory_mib
+    if cloud_tasks_schedules is not None:
+        kwargs["cloud_tasks_schedules_enabled"] = cloud_tasks_schedules
     policy = Client().update_workspace_compute_policy(**kwargs)
     if json_output:
         _print_json(policy)
@@ -5265,6 +5281,9 @@ SCHEDULE_DETAIL_KEYS = [
     "paused",
     "paused_until",
     "next_run_at",
+    "backend",
+    "last_fired_at",
+    "last_fire_latency_seconds",
     "last_skipped_at",
     "last_skip_reason",
     "workflow_id",
@@ -5285,6 +5304,12 @@ def _schedule_detail(workflow: dict[str, Any], schedule_data: dict[str, Any]) ->
         "paused": schedule_data.get("paused", False),
         "paused_until": schedule_data.get("paused_until"),
         "next_run_at": schedule_data.get("next_run_at"),
+        # Which path fires the cron (prefect, or the push-based cloud_tasks path),
+        # and the newest scheduled run: its slot and how many seconds after the
+        # slot its run was created -- the same measure on both paths.
+        "backend": schedule_data.get("schedule_backend", "prefect"),
+        "last_fired_at": schedule_data.get("last_fired_at"),
+        "last_fire_latency_seconds": schedule_data.get("last_fire_latency_seconds"),
         # The last fire the runner skipped and why. A skip creates no run, so
         # this is what separates "ended as declared" from "stopped firing".
         "last_skipped_at": schedule_data.get("last_skipped_at"),
@@ -5634,6 +5659,7 @@ def workflow_schedule_list_command(
     table.add_column("Timezone")
     table.add_column("Status")
     table.add_column("Next run")
+    table.add_column("Backend")
     table.add_column("ID", style="rebase.muted")
     for workflow in scheduled:
         schedule = workflow.get("schedule") or {}
@@ -5643,10 +5669,72 @@ def workflow_schedule_list_command(
             _format_value(schedule.get("timezone")),
             _workflow_schedule_status(workflow),
             _format_value(workflow.get("next_run_at")),
+            str(workflow.get("schedule_backend") or "prefect"),
             str(workflow.get("id", "-")),
         )
     console.print(table)
 
+
+SCHEDULE_BACKENDS = ("prefect", "cloud_tasks")
+
+schedule_backend_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Which path fires a workflow's cron: prefect, or the push-based cloud_tasks path.",
+)
+
+
+@schedule_backend_app.command("show")
+def workflow_schedule_backend_show_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show which path fires the workflow's cron, and its latest fire's latency."""
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    schedule_data = _require_schedule(client, workflow)
+    if json_output:
+        _print_json(schedule_data)
+        return
+    detail = _schedule_detail(workflow, schedule_data)
+    console.print(_detail_table("Schedule Backend", detail, preferred_keys=SCHEDULE_DETAIL_KEYS))
+
+
+@schedule_backend_app.command("set")
+def workflow_schedule_backend_set_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    backend: Annotated[str, typer.Option("--to", "-t", help="prefect or cloud_tasks.")] = "",
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Move a workflow's cron between the two scheduling paths: --to prefect | cloud_tasks.
+
+    cloud_tasks is the push-based path being evaluated next to Prefect: the workspace
+    must allow it (rebase workspace compute-policy set --cloud-tasks-schedules), the
+    workflow must be job-mode, and its cron must read the same on both engines. The
+    switch is operational, like pause: no new version. prefect puts it back.
+    """
+    if backend not in SCHEDULE_BACKENDS:
+        raise RebaseWorkflowError(f"--to must be one of {', '.join(SCHEDULE_BACKENDS)}, not {backend!r}")
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    _require_schedule(client, workflow)
+    client.set_workflow_schedule_backend(str(workflow["id"]), backend)
+    refreshed = client.get_workflow_schedule(str(workflow["id"]))
+    if json_output:
+        _print_json(refreshed)
+        return
+    console.print(
+        _detail_table(
+            "Schedule Backend Set", _schedule_detail(workflow, refreshed), preferred_keys=SCHEDULE_DETAIL_KEYS
+        )
+    )
+
+
+schedule_app.add_typer(schedule_backend_app, name="backend")
 
 trigger_app = typer.Typer(
     add_completion=False,
