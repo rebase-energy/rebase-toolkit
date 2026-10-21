@@ -4,6 +4,33 @@
 
 ### Added
 
+- **Step graphs follow the data.** A workflow body now compiles to a graph whose
+  edges are the outputs each step reads (schema 2), so steps that pass nothing
+  between them are independent and an engine that can run them side by side does.
+  `step.after(other())(...)` orders a step without a data edge, `step.map(items, ...)`
+  runs a step once per item of another step's output (or a workflow parameter, or a
+  literal list), `step.when(cond)(...)` runs a step only when a step output or
+  workflow parameter is truthy (`equals=` to compare), and `rb.when(cond, then=a(...),
+  otherwise=b(...))` picks one of two step calls. Steps take `retry_backoff`, `cpu`,
+  `memory` and `runtime` of their own.
+- **`rebase workflow engine set <name> --to runner|cloud_workflows` and `engine show`.**
+  Which engine executes a workflow's step graph: the in-process runner, or the Cloud
+  Workflows engine, which runs each step in its own container with its own retries
+  and size, independent steps side by side. Operational, like pause: no new version,
+  and runs in flight finish on the engine they started on. The workspace must allow
+  it (`rebase workspace compute-policy set --cloud-workflows`). Needs a platform with
+  `POST /workflows/{id}/engine`.
+- **`rebase workflow graph render <name> [--format plan|yaml]`.** What the Cloud
+  Workflows engine would run for the workflow: the levels of steps that run side by
+  side with each step's retry and timeout numbers, or the program that interprets
+  them. Read-only.
+
+### Changed
+
+- Step graphs are schema 2 (`schema_version: 2`, no `engine` key). Two steps with no
+  data between them are no longer forced into sequence; a body that relied on call
+  order alone for ordering should say so with `step.after`.
+
 - **`rebase workflow schedule backend set <name> --to prefect|cloud_tasks` and `backend show`.**
   Which path fires a workflow's cron: Prefect, or the push-based `cloud_tasks` path the
   platform runs next to it while it is evaluated. Operational, like pause: no new

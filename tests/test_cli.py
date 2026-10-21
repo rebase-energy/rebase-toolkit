@@ -5915,3 +5915,80 @@ def test_workspace_compute_policy_set_sends_the_cloud_tasks_switch(monkeypatch, 
 
     assert main(["workspace", "compute-policy", "set", "--no-cloud-tasks-schedules"]) == 0
     assert observed == {"cloud_tasks_schedules_enabled": False}
+
+
+def test_workflow_engine_set_switches_and_shows_the_engine(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    observed: dict[str, Any] = {}
+
+    def fake_set(self, workflow_id: str, engine: str) -> dict[str, Any]:
+        observed["workflow_id"] = workflow_id
+        observed["engine"] = engine
+        return {"id": workflow_id, "name": "sewind-forecast", "execution_engine": engine, "mode": "job"}
+
+    monkeypatch.setattr(Client, "set_workflow_execution_engine", fake_set)
+
+    assert main(["workflow", "engine", "set", "--id", "workflow-id", "--to", "cloud_workflows"]) == 0
+    assert observed == {"workflow_id": "workflow-id", "engine": "cloud_workflows"}
+    output = capsys.readouterr().out
+    assert "Execution Engine Set" in output and "cloud_workflows" in output
+
+    assert main(["workflow", "engine", "set", "--id", "workflow-id", "--to", "prefect"]) != 0
+    assert "runner, cloud_workflows" in capsys.readouterr().err
+
+
+def test_workflow_engine_show_prints_the_engine(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    assert main(["workflow", "engine", "show", "--id", "workflow-id"]) == 0
+    output = capsys.readouterr().out
+    assert "Execution Engine" in output and "runner" in output
+
+
+def test_workflow_graph_render_prints_the_levels(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    plan = {
+        "deadline_seconds": 700,
+        "concurrency": 2,
+        "levels": [["fetch"], ["a", "b"], ["each"]],
+        "nodes": {
+            "fetch": {"kind": "step", "retries": 0, "timeout_seconds": 60},
+            "a": {"kind": "step", "retries": 2, "timeout_seconds": 30, "backoff_seconds": 5},
+            "b": {"kind": "step", "retries": 0, "timeout_seconds": 30},
+            "each": {"kind": "map", "retries": 1, "timeout_seconds": 120},
+        },
+    }
+    monkeypatch.setattr(
+        Client,
+        "get_workflow_graph_plan",
+        lambda self, workflow_id, *, version_id=None: {
+            "workflow_id": workflow_id,
+            "version_id": version_id or "v1",
+            "execution_engine": "cloud_workflows",
+            "plan": plan,
+            "program_yaml": "main:\n  steps: []\n",
+        },
+    )
+
+    assert main(["workflow", "graph", "render", "--id", "workflow-id"]) == 0
+    output = capsys.readouterr().out
+    assert "level 2:" in output and "  a  retries=2  timeout=30s  backoff=5s" in output
+    assert "each  [map]" in output and "engine=cloud_workflows" in output
+
+    assert main(["workflow", "graph", "render", "--id", "workflow-id", "--format", "yaml"]) == 0
+    assert "main:" in capsys.readouterr().out
+
+
+def test_workspace_compute_policy_set_sends_the_cloud_workflows_switch(monkeypatch, capsys) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_update(self, **kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        return {"workspace_id": "ws", "cloud_workflows_enabled": kwargs["cloud_workflows_enabled"]}
+
+    monkeypatch.setattr(Client, "update_workspace_compute_policy", fake_update)
+
+    assert main(["workspace", "compute-policy", "set", "--cloud-workflows"]) == 0
+    assert observed == {"cloud_workflows_enabled": True}
+    assert "cloud_workflows_enabled" in capsys.readouterr().out
+    assert main(["workspace", "compute-policy", "set", "--no-cloud-workflows"]) == 0
+    assert observed == {"cloud_workflows_enabled": False}
