@@ -7070,7 +7070,13 @@ class Step(Function):
         pass by name. Two candidates need an explicit ``parameter=``."""
         if self.fn is None:
             raise RebaseWorkflowError("parameter is required to map a remote step handle")
-        candidates = [name for name in inspect.signature(self.fn).parameters if name not in given]
+        parameters = inspect.signature(self.fn).parameters
+        candidates = [name for name in parameters if name not in given]
+        # A parameter with a default is not what the item fills, unless it is
+        # the only one left.
+        required = [name for name in candidates if parameters[name].default is inspect.Parameter.empty]
+        if len(required) == 1:
+            return required[0]
         if len(candidates) == 1:
             return candidates[0]
         raise RebaseWorkflowError(
