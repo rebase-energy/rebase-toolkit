@@ -4004,6 +4004,39 @@ class Client:
             "GET", f"/projects/{resolved_project_id}/asgi-apps", expected="ASGI app list response"
         )
 
+    def get_asgi_app(self, asgi_app_id: str) -> dict[str, Any]:
+        return self._request_dict("GET", f"/asgi-apps/{asgi_app_id}", expected="ASGI app response")
+
+    def get_asgi_app_instances(
+        self,
+        asgi_app_id: str,
+        *,
+        since: str | datetime | None = None,
+        window_seconds: int | None = None,
+        limit: int | None = None,
+        include_requests: bool | None = None,
+    ) -> dict[str, Any]:
+        """Running instances and recent container events of a deployed ASGI app.
+
+        The platform's own view of the app's service: billed instance counts,
+        the instances seen in the last ``window_seconds`` with their lifecycle
+        (started, ready, requests served), and the container events behind
+        them. Pass the returned ``next_since`` back as ``since`` to receive
+        only newer events on the next call.
+        """
+        params: dict[str, Any] = {}
+        if since is not None:
+            params["since"] = since.isoformat() if isinstance(since, datetime) else since
+        if window_seconds is not None:
+            params["window_seconds"] = window_seconds
+        if limit is not None:
+            params["limit"] = limit
+        if include_requests is not None:
+            params["include_requests"] = "true" if include_requests else "false"
+        return self._request_dict(
+            "GET", f"/asgi-apps/{asgi_app_id}/instances", params=params or None, expected="ASGI app instances response"
+        )
+
     def find_asgi_app(self, name: str, *, project: str) -> dict[str, Any] | None:
         return _find_named(self.list_asgi_apps(project=project), name)
 

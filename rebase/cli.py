@@ -291,6 +291,13 @@ environment_app = typer.Typer(
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
+app_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Inspect deployed ASGI apps and the instances serving them.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
 endpoint_app = typer.Typer(
     add_completion=False,
     cls=AlphabeticalTyperGroup,
@@ -2125,6 +2132,24 @@ def _resolve_target_selector(
         if target.get("name") == name:
             return target
     raise RebaseWorkflowError(f"{target_type} not found: {project_name}/{name}")
+
+
+def _resolve_asgi_app_selector(
+    client: Client,
+    name: str | None,
+    *,
+    asgi_app_id: str | None = None,
+    project_name: str | None = None,
+) -> dict[str, Any]:
+    return _resolve_target_selector(
+        client,
+        name,
+        target_id=asgi_app_id,
+        project_name=project_name,
+        target_type="app",
+        get_by_id=client.get_asgi_app,
+        list_by_project=lambda project_id: client.list_asgi_apps(project_id=project_id),
+    )
 
 
 def _resolve_function_selector(
@@ -5227,6 +5252,300 @@ def function_resume_command(
 
 
 app.add_typer(function_app, name="function")
+
+
+# ---- ASGI apps
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _ago(value: Any, *, now: datetime) -> str:
+    moment = _parse_iso(value)
+    if moment is None:
+        return "-"
+    seconds = max(0, int((now - moment).total_seconds()))
+    if seconds < 90:
+        return f"{seconds}s ago"
+    if seconds < 5400:
+        return f"{seconds // 60}m ago"
+    return f"{seconds // 3600}h ago"
+
+
+def _duration(start: Any, end: Any) -> str:
+    first, second = _parse_iso(start), _parse_iso(end)
+    if first is None or second is None:
+        return "-"
+    return f"{(second - first).total_seconds():.0f}s"
+
+
+def _short_revision(value: Any, service_name: str | None) -> str:
+    if not isinstance(value, str):
+        return "-"
+    if service_name and value.startswith(f"{service_name}-"):
+        return value[len(service_name) + 1 :]
+    return value
+
+
+def _asgi_app_table(apps: list[dict[str, Any]]) -> Table:
+    table = Table(
+        title="Apps",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Name", style="rebase.value")
+    table.add_column("ID", style="rebase.muted")
+    table.add_column("Enabled")
+    table.add_column("Service", style="rebase.muted")
+    table.add_column("URL path", style="rebase.muted")
+    for app_data in apps:
+        table.add_row(
+            _format_value(app_data.get("name")),
+            _format_value(app_data.get("id")),
+            _format_value(app_data.get("enabled")),
+            _format_value(app_data.get("cloud_run_service_name")),
+            _format_value(app_data.get("url_path")),
+        )
+    return table
+
+
+def _instances_header(data: dict[str, Any], *, now: datetime) -> Text:
+    counts = data.get("counts") if isinstance(data.get("counts"), dict) else {}
+    text = Text()
+    text.append("Service ", style="rebase.muted")
+    text.append(str(data.get("service_name") or "-"), style="rebase.value")
+    if counts.get("source") == "cloud_monitoring":
+        text.append("   billed instances: ", style="rebase.muted")
+        text.append(f"{counts.get('active', 0)} active", style="rebase.value")
+        text.append(", ", style="rebase.muted")
+        text.append(f"{counts.get('idle', 0)} idle", style="rebase.value")
+        text.append(f"   (metric {_ago(counts.get('as_of'), now=now)}, lags ~1-2 min)", style="rebase.muted")
+    else:
+        text.append("   billed instances: unknown", style="rebase.muted")
+        if counts.get("message"):
+            text.append(f" — {counts['message']}", style="rebase.muted")
+    return text
+
+
+def _instances_table(data: dict[str, Any], *, now: datetime) -> Table:
+    service_name = data.get("service_name") if isinstance(data.get("service_name"), str) else None
+    window = data.get("window_seconds")
+    table = Table(
+        title=f"Instances seen in the last {window}s" if window else "Instances",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Instance", style="rebase.value")
+    table.add_column("Revision", style="rebase.muted")
+    table.add_column("Status")
+    table.add_column("Started")
+    table.add_column("Ready in")
+    table.add_column("Requests", justify="right")
+    table.add_column("Last seen")
+    instances = data.get("instances") if isinstance(data.get("instances"), list) else []
+    for inst in instances:
+        if not isinstance(inst, dict):
+            continue
+        status = str(inst.get("status") or "-")
+        style = {"starting": "rebase.warning", "serving": "rebase.success", "stopped": "rebase.muted"}.get(status, "")
+        table.add_row(
+            str(inst.get("instance_id") or "-")[:12],
+            _short_revision(inst.get("revision_name"), service_name),
+            Text(status, style=style),
+            _ago(inst.get("started_at") or inst.get("first_seen"), now=now),
+            _duration(inst.get("started_at"), inst.get("ready_at")),
+            str(inst.get("requests", 0)),
+            _ago(inst.get("last_seen"), now=now),
+        )
+    if not instances:
+        table.add_row(
+            Text("none — the service is scaled to zero or quiet", style="rebase.muted"), "", "", "", "", "", ""
+        )
+    return table
+
+
+def _events_table(events: list[dict[str, Any]], *, service_name: str | None, title: str) -> Table:
+    table = Table(
+        title=title,
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Time", style="rebase.muted")
+    table.add_column("Instance", style="rebase.muted")
+    table.add_column("Kind")
+    table.add_column("Message", overflow="fold")
+    for event in events:
+        moment = _parse_iso(event.get("timestamp"))
+        kind = str(event.get("kind") or "-")
+        style = {"system": "rebase.warning", "request": "rebase.value", "log": ""}.get(kind, "")
+        table.add_row(
+            moment.astimezone().strftime("%H:%M:%S") if moment else "-",
+            str(event.get("instance_id") or "-")[:12],
+            Text(kind, style=style),
+            str(event.get("message") or ""),
+        )
+    return table
+
+
+def _instances_view(data: dict[str, Any], events: list[dict[str, Any]], *, now: datetime, max_events: int) -> Group:
+    service_name = data.get("service_name") if isinstance(data.get("service_name"), str) else None
+    parts: list[Any] = [_instances_header(data, now=now), _instances_table(data, now=now)]
+    if data.get("message"):
+        parts.append(Text(str(data["message"]), style="rebase.warning"))
+    parts.append(
+        _events_table(
+            events[-max_events:], service_name=service_name, title=f"Last {min(len(events), max_events)} events"
+        )
+    )
+    return Group(*parts)
+
+
+@app_app.command("list")
+def app_list_command(
+    project: Annotated[str, typer.Option("--project", "-p", help="Project name.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List the ASGI apps deployed in a project."""
+    client = Client()
+    project_data = _resolve_project_by_name(client, project)
+    apps = client.list_asgi_apps(project_id=str(project_data["id"]))
+    if json_output:
+        _print_json(apps)
+        return
+    console.print(_asgi_app_table(apps))
+
+
+@app_app.command("get")
+def app_get_command(
+    name: Annotated[str | None, typer.Argument(help="App name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    asgi_app_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact app ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show an ASGI app's metadata."""
+    client = Client()
+    app_data = _resolve_asgi_app_selector(client, name, asgi_app_id=asgi_app_id, project_name=project)
+    if json_output:
+        _print_json(app_data)
+        return
+    console.print(
+        _detail_table(
+            "App",
+            app_data,
+            preferred_keys=[
+                "name",
+                "id",
+                "project_id",
+                "workspace_id",
+                "description",
+                "entrypoint",
+                "base_path",
+                "url_path",
+                "auth",
+                "enabled",
+                "cloud_run_min_instances",
+                "cloud_run_max_instances",
+                "cloud_run_concurrency",
+                "cloud_run_cpu",
+                "cloud_run_memory",
+                "cloud_run_timeout_seconds",
+                "cloud_run_service_name",
+                "cloud_run_url",
+                "current_version_id",
+                "created_at",
+                "updated_at",
+            ],
+        )
+    )
+
+
+@app_app.command("instances")
+def app_instances_command(
+    name: Annotated[str | None, typer.Argument(help="App name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    asgi_app_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact app ID.")] = None,
+    window_seconds: Annotated[
+        int, typer.Option("--window", "-w", help="List instances seen in the last N seconds.", min=10, max=3600)
+    ] = 120,
+    include_requests: Annotated[
+        bool, typer.Option("--requests/--no-requests", help="Show the app's request log among the events.")
+    ] = True,
+    watch: Annotated[bool, typer.Option("--watch", help="Keep polling and redraw until Ctrl-C.")] = False,
+    poll_interval: Annotated[
+        float, typer.Option("--poll-interval", help="Seconds between polls with --watch.", min=1.0)
+    ] = 3.0,
+    max_events: Annotated[int, typer.Option("--events", help="How many recent events to show.", min=1)] = 15,
+    json_output: Annotated[
+        bool, typer.Option("--json", "-j", help="Print machine-readable JSON output (one object per poll).")
+    ] = False,
+) -> None:
+    """Show the instances serving an ASGI app, and what they are doing.
+
+    Billed instance counts come from the platform's metrics (a minute or two
+    behind); the instance list and events come from the containers' own log
+    stream, seconds behind. With --watch the view redraws every poll, so a cold
+    start can be followed from "Starting new instance" to the first served request.
+    """
+    client = Client()
+    app_data = _resolve_asgi_app_selector(client, name, asgi_app_id=asgi_app_id, project_name=project)
+    app_id = str(app_data["id"])
+
+    def fetch(since: str | None) -> dict[str, Any]:
+        return client.get_asgi_app_instances(
+            app_id, since=since, window_seconds=window_seconds, include_requests=include_requests
+        )
+
+    data = fetch(None)
+    if json_output and not watch:
+        _print_json(data)
+        return
+
+    events: list[dict[str, Any]] = [e for e in data.get("events", []) if isinstance(e, dict)]
+    since = data.get("next_since") if isinstance(data.get("next_since"), str) else None
+    if not watch:
+        console.print(_instances_view(data, events, now=datetime.now(UTC), max_events=max_events))
+        return
+
+    if json_output:
+        _print_json(data)
+        while True:
+            time.sleep(poll_interval)
+            data = fetch(since)
+            since = data.get("next_since") if isinstance(data.get("next_since"), str) else since
+            _print_json(data)
+
+    with Live(
+        _instances_view(data, events, now=datetime.now(UTC), max_events=max_events),
+        console=console,
+        refresh_per_second=4,
+        transient=False,
+    ) as live:
+        while True:
+            time.sleep(poll_interval)
+            data = fetch(since)
+            new_events = [e for e in data.get("events", []) if isinstance(e, dict)]
+            events = (events + new_events)[-max(max_events, 200) :]
+            since = data.get("next_since") if isinstance(data.get("next_since"), str) else since
+            live.update(_instances_view(data, events, now=datetime.now(UTC), max_events=max_events), refresh=True)
+
+
+app.add_typer(app_app, name="app")
 
 
 @workflow_app.command("list")
