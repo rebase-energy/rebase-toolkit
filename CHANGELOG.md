@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `rebase app instances <name> --project <project>` shows the instances serving a deployed ASGI app — billed active/idle counts from the platform's metrics, each instance's start, readiness and request count from its container log stream, and the recent container events — and follows a cold start live with `--watch`. `rebase app list` and `rebase app get` list and inspect deployed apps without creating a project as a side effect. `Client.get_asgi_app` and `Client.get_asgi_app_instances` back them.
 - Select workflows within a project with `rebase deploy --only` or `Project.deploy(only=...)`, including required shared steps.
 - Skip unchanged workflows and shared steps using backend batch comparison, report `unchanged`, and reconcile fresh state on re-runs. Older backends retain the existing write path.
 - `rebase workflow schedule show` and the TUI workflows table show scheduled firings waiting for a free run slot (`pending_firings`), which the backend now queues instead of dropping when the workspace is at its concurrency cap (#36).
