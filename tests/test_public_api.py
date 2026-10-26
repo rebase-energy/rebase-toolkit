@@ -114,6 +114,18 @@ def test_step_helper_defaults_project() -> None:
     assert load_name.name == "load-name"
 
 
+def test_step_helper_takes_the_same_step_options_as_project_step() -> None:
+    @rb.step(cpu=2, memory="4Gi", retries=2, retry_backoff=5, timeout_seconds=60, runtime="service")
+    def heavy() -> dict:
+        return {}
+
+    assert heavy.own_resources == {"cpu": "2", "memory": "4Gi"}
+    assert heavy.runtime == "service"
+    assert heavy.retry_policy["retries"] == 2
+    step_options = set(inspect.signature(Project.step).parameters) - {"self"}
+    assert step_options <= set(inspect.signature(rb.step).parameters) | {"fn"}
+
+
 def test_step_public_signatures_do_not_expose_backend() -> None:
     assert "backend" not in inspect.signature(rb.step).parameters
     assert "backend" not in inspect.signature(Project.step).parameters

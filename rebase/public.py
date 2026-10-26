@@ -306,8 +306,12 @@ def step(
     default_parameters: dict[str, Any] | None = None,
     enabled: bool = True,
     retries: int = 0,
+    retry_backoff: int | float | None = None,
     timeout_seconds: int | float | None = None,
     cache: bool = False,
+    cpu: float | int | str | None = None,
+    memory: int | float | str | None = None,
+    runtime: str = "job",
     deploy_source: str | None = None,
 ) -> Callable[[Callable[..., Any]], Step]: ...
 
@@ -322,8 +326,12 @@ def step(
     default_parameters: dict[str, Any] | None = None,
     enabled: bool = True,
     retries: int = 0,
+    retry_backoff: int | float | None = None,
     timeout_seconds: int | float | None = None,
     cache: bool = False,
+    cpu: float | int | str | None = None,
+    memory: int | float | str | None = None,
+    runtime: str = "job",
     deploy_source: str | None = None,
 ) -> Step: ...
 
@@ -337,8 +345,12 @@ def step(
     default_parameters: dict[str, Any] | None = None,
     enabled: bool = True,
     retries: int = 0,
+    retry_backoff: int | float | None = None,
     timeout_seconds: int | float | None = None,
     cache: bool = False,
+    cpu: float | int | str | None = None,
+    memory: int | float | str | None = None,
+    runtime: str = "job",
     deploy_source: str | None = None,
 ) -> Callable[[Callable[..., Any]], Step] | Step:
     def decorator(callable_: Callable[..., Any]) -> Step:
@@ -350,8 +362,12 @@ def step(
             default_parameters=default_parameters,
             enabled=enabled,
             retries=retries,
+            retry_backoff=retry_backoff,
             timeout_seconds=timeout_seconds,
             cache=cache,
+            cpu=cpu,
+            memory=memory,
+            runtime=runtime,
             deploy_source=deploy_source,
         )
 
