@@ -102,6 +102,60 @@ def test_client_request_accepts_custom_timeout(monkeypatch) -> None:
     }
 
 
+class FakeThrottledResponse(FakeResponse):
+    """A 429 with a Retry-After, as the budgeted bucket data routes answer."""
+
+    status_code = 429
+    text = '{"detail":"workspace rebase-grid is over its bucket data budget; retry in 1 s"}'
+
+    def __init__(self, retry_after: str | None) -> None:
+        super().__init__({})
+        self.headers = {} if retry_after is None else {"Retry-After": retry_after}
+
+    def raise_for_status(self) -> None:
+        raise requests.HTTPError("429")
+
+
+def test_a_429_is_waited_out_and_the_request_sent_again(monkeypatch) -> None:
+    """Over budget means slowed, not failed: a 429 did no work, so resending is always safe."""
+    answers = [FakeThrottledResponse("2"), FakeThrottledResponse(None), FakeResponse({"urls": []})]
+    slept: list[float] = []
+    monkeypatch.setattr("rebase.client.time.sleep", slept.append)
+    patch_client_http(monkeypatch, lambda method, url, **kwargs: answers.pop(0))
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    assert client.request("POST", "/buckets/grid-store/signed-urls", json={"paths": ["a"]}) == {"urls": []}
+
+    assert slept == [2.0, 1.0], "Retry-After when given, a second otherwise"
+    assert answers == []
+
+
+def test_a_429_too_long_to_wait_out_is_the_error(monkeypatch) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr("rebase.client.time.sleep", slept.append)
+    patch_client_http(monkeypatch, lambda method, url, **kwargs: FakeThrottledResponse("600"))
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    with pytest.raises(rb.RebaseWorkflowError) as refused:
+        client.request("GET", "/buckets/grid-store/objects")
+
+    assert refused.value.status_code == 429
+    assert "over its bucket data budget" in str(refused.value)
+    assert slept == []
+
+
+def test_a_429_that_never_clears_stops_after_a_few_waits(monkeypatch) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr("rebase.client.time.sleep", slept.append)
+    patch_client_http(monkeypatch, lambda method, url, **kwargs: FakeThrottledResponse("1"))
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    with pytest.raises(rb.RebaseWorkflowError):
+        client.request("GET", "/buckets/grid-store/objects")
+
+    assert slept == [1.0] * rb.client.RATE_LIMIT_ATTEMPTS
+
+
 def test_stream_request_parses_ndjson(monkeypatch) -> None:
     observed: dict[str, Any] = {}
     response = FakeStreamResponse(
@@ -1778,7 +1832,9 @@ def test_project_deploy_registers_step_workflow_graph(monkeypatch) -> None:
         return {"id": "workflow-id", "name": kwargs["name"], "current_version_id": "workflow-version-id"}
 
     monkeypatch.setattr(client, "register_function", fake_register_function)
-    monkeypatch.setattr(client, "register_workflow", fake_register_workflow)
+    monkeypatch.setattr(
+        client, "_write_definition_uncached", lambda method, path, payload, **kw: fake_register_workflow(**payload)
+    )
 
     project = rb.Project("energy-forecasting", client=client)
 
@@ -1873,7 +1929,11 @@ def test_project_workflow_deploy_sends_cron_schedule(monkeypatch) -> None:
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
     monkeypatch.setattr(client, "find_workflow", lambda name, *, project=None: None)
-    monkeypatch.setattr(client, "register_workflow", lambda **kwargs: observed_workflow.update(kwargs) or {"id": "id"})
+    monkeypatch.setattr(
+        client,
+        "_write_definition_uncached",
+        lambda method, path, kwargs, **extra: observed_workflow.update(kwargs) or {"id": "id"},
+    )
 
     project = rb.Project("energy-forecasting", client=client)
 
@@ -1985,7 +2045,11 @@ def test_project_workflow_deploy_sends_trigger(monkeypatch) -> None:
     client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
     monkeypatch.setattr(client, "ensure_project", lambda name, **kwargs: {"id": "project-id", "name": name})
     monkeypatch.setattr(client, "find_workflow", lambda name, *, project=None: None)
-    monkeypatch.setattr(client, "register_workflow", lambda **kwargs: observed_workflow.update(kwargs) or {"id": "id"})
+    monkeypatch.setattr(
+        client,
+        "_write_definition_uncached",
+        lambda method, path, kwargs, **extra: observed_workflow.update(kwargs) or {"id": "id"},
+    )
 
     project = rb.Project("energy-forecasting", client=client)
 
@@ -3193,8 +3257,10 @@ def _compiled_graph(monkeypatch, build) -> dict[str, Any]:
     )
     monkeypatch.setattr(
         client,
-        "register_workflow",
-        lambda **kwargs: observed.update(kwargs) or {"id": "workflow-id", "current_version_id": "v"},
+        "_write_definition_uncached",
+        lambda method, path, kwargs, **extra: (
+            observed.update(kwargs) or {"id": "workflow-id", "current_version_id": "v"}
+        ),
     )
 
     project = rb.Project("energy-forecasting", client=client)

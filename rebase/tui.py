@@ -6,7 +6,9 @@ import json
 import math
 import os
 import subprocess
+import sys
 import textwrap
+import threading
 import webbrowser
 from collections import Counter
 from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator, Sequence
@@ -38,6 +40,7 @@ from textual.message import Message
 from textual.screen import ModalScreen
 from textual.selection import SELECT_ALL, Selection
 from textual.theme import BUILTIN_THEMES, Theme
+from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import (
     DataTable,
@@ -100,6 +103,12 @@ TargetType = Literal["function", "workflow"]
 ViewName = Literal["workspace", "project", "workspace-switcher", "profile-switcher"]
 #: The process variables a switch in the TUI exports, and puts back on the way out.
 SELECTION_VARIABLES = ("REBASE_WORKSPACE", "REBASE_ENVIRONMENT")
+#: Row key of the switcher's "loading…" or error line, which is not an environment.
+ENVIRONMENT_STATUS_KEY = "\0status"
+#: How long the switcher's cursor rests on a workspace before its environments are fetched.
+ENVIRONMENTS_DEBOUNCE_SECONDS = 0.2
+#: Row key of the "loading…" line a project's target tables show until it answers.
+TARGETS_LOADING_KEY = "\0loading"
 DeletableKind = Literal["project", "function", "workflow"]
 
 #: Tables whose rows `d` can delete, and the kind of object each row is.
@@ -229,7 +238,10 @@ TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
     "workspace-profiles-table": ("Active", "Profile", "Workspace", "Workspace ID", "API URL"),
     "workspaces-table": ("Active", "Workspace", "Workspace ID", "Role"),
     "workspace-environments-table": ("Active", "Environment", "Deploy mode", "Protected"),
-    "buckets-table": ("Bucket", "URI", "Created", "Updated"),
+    # How much a bucket holds is the first thing to know about it, so it comes before
+    # where it lives. There is no Updated: that was when the bucket's record changed,
+    # which says nothing about its data and in practice always matched Created.
+    "buckets-table": ("Bucket", "Size", "Objects", "URI", "Created"),
     "secrets-table": ("Secret", "Keys"),
     # `Origin` sits second in both: you read what a thing is called, then what kind of
     # thing it is, and every column after it is one a one-off has no answer for.
@@ -1932,6 +1944,13 @@ def format_bytes(value: Any) -> str:
     return "-"
 
 
+def format_count(value: Any) -> str:
+    """A count with thousands separators, leaving absent or invalid values visibly unknown."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return "-"
+    return f"{value:,}"
+
+
 def _parse_timestamp(value: Any) -> datetime | None:
     if value in {None, ""}:
         return None
@@ -2145,7 +2164,7 @@ def format_execution(value: dict[str, Any]) -> str:
     return str(value.get("run_type") or "-")
 
 
-def format_schedule(value: Any, *, paused: bool = False) -> str:
+def format_schedule(value: Any, *, paused: bool = False, waiting: int = 0) -> str:
     if not isinstance(value, dict):
         return "-"
     cron = str(value.get("cron") or "-")
@@ -2154,8 +2173,9 @@ def format_schedule(value: Any, *, paused: bool = False) -> str:
         # The declared window, dates only: `*/5 * * * * 09-16→10-14`.
         cron = f"{cron} {str(start)[5:10] if start else ''}→{str(end)[5:10] if end else ''}"
     if not value.get("active", True) or paused or _window_ended(end):
-        return f"{cron} ⏸"
-    return cron
+        cron = f"{cron} ⏸"
+    # Slots deferred at the workspace's concurrency cap, still waiting to run.
+    return f"{cron} · {waiting} waiting" if waiting else cron
 
 
 def _window_ended(end: Any) -> bool:
@@ -3719,6 +3739,13 @@ class RebaseTuiApp(App[None]):
         self._environment_rows: dict[str, dict[str, Any]] = {}
         #: Which workspace the environments table is showing, or was asked to show.
         self._switcher_workspace_id: str | None = None
+        #: Environments already fetched this session, by workspace id. The route can take
+        #: seconds, so moving the cursor back to a workspace should not ask again.
+        self._environment_cache: dict[str, dict[str, dict[str, Any]]] = {}
+        #: What the environments table says in place of rows: loading, or why it failed.
+        self._environment_status: str | None = None
+        #: The pending fetch for the row under the cursor, so a quick scroll asks once.
+        self._environment_timer: Timer | None = None
         #: The name of a workspace picked in the switcher. The profile only knows the
         #: name of the one it was set up with; a switch is this process's alone.
         self._workspace_name: str | None = None
@@ -3819,6 +3846,8 @@ class RebaseTuiApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        # Before any load starts: every `asyncio.to_thread` below runs on this executor.
+        asyncio.get_running_loop().set_default_executor(AbandoningExecutor(thread_name_prefix="rebase-tui"))
         self._setup_tables()
         if not is_default_platform():
             self.query_one(RebaseHeader).add_class("-platform")
@@ -4227,6 +4256,9 @@ class RebaseTuiApp(App[None]):
 
     def action_refresh(self) -> None:
         if self.current_view == "workspace-switcher":
+            # Refresh is the way to see an environment created since it was cached.
+            self._environment_cache = {}
+            self._switcher_workspace_id = None
             self._load_workspaces_in_background()
             return
         if self.current_view == "profile-switcher":
@@ -4496,7 +4528,7 @@ class RebaseTuiApp(App[None]):
             # workspace other than the one you are looking at.
             workspace_id = event.row_key.value
             if workspace_id is not None and workspace_id != self._switcher_workspace_id:
-                self._load_workspace_environments_in_background(str(workspace_id))
+                self._show_workspace_environments(str(workspace_id))
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         # Which table has the focus decides which graph the pane shows.
@@ -5722,9 +5754,10 @@ class RebaseTuiApp(App[None]):
         for key, item in bucket_rows.items():
             buckets.add_row(
                 str(item.get("name", "-")),
+                Text(format_bytes(item.get("size_bytes")), justify="right"),
+                Text(format_count(item.get("object_count")), justify="right"),
                 str(item.get("uri") or "-"),
                 self._time(item.get("created_at")),
-                self._time(item.get("updated_at")),
                 key=key,
             )
 
@@ -5816,6 +5849,7 @@ class RebaseTuiApp(App[None]):
                     workflow.get("schedule"),
                     paused=(bool(workflow.get("paused")) and _pause_in_effect(workflow.get("paused_until")))
                     or self._project_paused(),
+                    waiting=int(workflow.get("pending_firings") or 0),
                 ),
                 self._time(workflow.get("next_run_at")),
                 self._time(self._last_runs.get(workflow_id)),
@@ -6126,6 +6160,7 @@ class RebaseTuiApp(App[None]):
         self.project_targets = None
         self._set_project_error(None)
         self._clear_target_detail(clear_project=False)
+        self._show_targets_loading()
         self.run_worker(
             self._load_project_targets(summary.project),
             name="project-targets",
@@ -6133,6 +6168,22 @@ class RebaseTuiApp(App[None]):
             exclusive=True,
         )
         self._show_project_view()
+
+    def _show_targets_loading(self) -> None:
+        """Say the target tables are waiting on the platform, so slow does not read as empty.
+
+        The key is no target's, so selecting the row finds nothing and does nothing; the
+        first paint of the real rows replaces it.
+        """
+        self._function_rows = {}
+        self._workflow_rows = {}
+        for table_id in TARGET_TABLE_IDS:
+            table = self._fill_table(table_id)
+            table.add_row(
+                Text("loading…", style=BRAND_MEDIUM_GRAY),
+                *([""] * (len(TABLE_COLUMNS[table_id]) - 1)),
+                key=TARGETS_LOADING_KEY,
+            )
 
     def _show_workspace_view(self) -> None:
         self.current_view = "workspace"
@@ -6263,14 +6314,64 @@ class RebaseTuiApp(App[None]):
         if effective in rows:
             table.move_cursor(row=list(dict(ordered)).index(effective))
         elif table.row_count == 0:
+            self._cancel_environment_timer()
             self._environment_rows = {}
+            self._environment_status = None
             self._switcher_workspace_id = None
             self._fill_table("workspace-environments-table")
 
-    def _load_workspace_environments_in_background(self, workspace_id: str) -> None:
+    def _default_environment_for(self, workspace_id: str) -> str:
+        """The environment enter on a workspace opens: the live one, else the last used there.
+
+        A remembered environment the workspace is known not to have falls back to `dev`
+        rather than opening onto nothing.
+        """
+        if workspace_id == self._effective_workspace_id():
+            return self.environment_name
+        remembered = active_environment(workspace_id)
+        known = self._environment_cache.get(workspace_id)
+        if remembered and (known is None or remembered in known):
+            return remembered
+        return "dev"
+
+    def _cancel_environment_timer(self) -> None:
+        if self._environment_timer is not None:
+            self._environment_timer.stop()
+            self._environment_timer = None
+
+    def _show_workspace_environments(self, workspace_id: str) -> None:
+        """Fill the environments table for the workspace under the cursor.
+
+        A workspace fetched before is drawn at once. Otherwise the table says it is
+        loading, and the fetch waits for the cursor to settle: the first workspace on
+        opening is asked for straight away, while a scroll through the list asks only
+        for the row it stops on.
+        """
+        self._cancel_environment_timer()
+        first = self._switcher_workspace_id is None
         self._switcher_workspace_id = workspace_id
+        cached = self._environment_cache.get(workspace_id)
+        if cached is not None:
+            self._environment_rows = dict(cached)
+            self._environment_status = None
+            self._render_workspace_environments(workspace_id)
+            return
         self._environment_rows = {}
-        self._fill_table("workspace-environments-table")
+        self._environment_status = "loading…"
+        self._render_workspace_environments(workspace_id)
+        if first:
+            self._load_workspace_environments_in_background(workspace_id)
+        else:
+            self._environment_timer = self.set_timer(
+                ENVIRONMENTS_DEBOUNCE_SECONDS,
+                lambda: self._load_workspace_environments_in_background(workspace_id),
+            )
+
+    def _load_workspace_environments_in_background(self, workspace_id: str) -> None:
+        self._environment_timer = None
+        # The cursor may have moved on while the timer was waiting.
+        if self._switcher_workspace_id != workspace_id:
+            return
         self.run_worker(
             self._load_workspace_environments(workspace_id),
             name="workspace-environments",
@@ -6285,26 +6386,35 @@ class RebaseTuiApp(App[None]):
             return
         try:
             environments: Any = await asyncio.to_thread(load)
-        except RebaseWorkflowError as exc:
-            self._set_error(exc)
-            return
-        # The cursor may have moved on while the request was out.
-        if self._switcher_workspace_id != workspace_id:
+        except Exception as exc:
+            # Said in the table rather than raised: the workspace row above still
+            # switches, so a failed list is information, not a dead end.
+            if self._switcher_workspace_id == workspace_id:
+                self._environment_status = f"could not load: {exc}"
+                self._render_workspace_environments(workspace_id)
             return
         rows: dict[str, dict[str, Any]] = {}
         for item in environments if isinstance(environments, list) else []:
             name = item.get("name")
             if isinstance(name, str) and name:
                 rows[name] = item
+        self._environment_cache[workspace_id] = rows
+        # The cursor may have moved on while the request was out.
+        if self._switcher_workspace_id != workspace_id:
+            return
         self._environment_rows = rows
+        self._environment_status = None
         self._render_workspace_environments(workspace_id)
 
     def _render_workspace_environments(self, workspace_id: str) -> None:
         live = workspace_id == self._effective_workspace_id()
+        table = self._fill_table("workspace-environments-table")
+        if self._environment_status is not None:
+            table.add_row("", self._environment_status, "", "", key=ENVIRONMENT_STATUS_KEY)
+            return
         rows = dict(self._environment_rows)
         if live and self.environment_name not in rows:
             rows = {self.environment_name: {"name": self.environment_name}, **rows}
-        table = self._fill_table("workspace-environments-table")
         for name, item in rows.items():
             protected = item.get("protected")
             table.add_row(
@@ -6389,6 +6499,8 @@ class RebaseTuiApp(App[None]):
         self.profile_data = load_profile(self.profile_name)
         self._workspace_name = None
         self._workspace_rows = {}
+        # Another profile can be another platform, where the same ids mean other workspaces.
+        self._environment_cache = {}
         chosen_workspace_id = self.profile_data.get("workspace_id")
         workspace_id = chosen_workspace_id if isinstance(chosen_workspace_id, str) and chosen_workspace_id else None
         # Resolved here rather than left to the client: a switch earlier in this
@@ -6412,8 +6524,10 @@ class RebaseTuiApp(App[None]):
         self.data = RebaseTuiData(client, limit=self.limit)
         self.environment_name = environment
         self._export_selection()
+        self._cancel_environment_timer()
         self._switcher_workspace_id = None
         self._environment_rows = {}
+        self._environment_status = None
         self.workspace_overview = None
         self.project_targets = None
         self.selected_project = None
@@ -6765,12 +6879,15 @@ class RebaseTuiApp(App[None]):
         elif event.data_table.id == "workspace-profiles-table":
             self._select_workspace_profile(row_id)
         elif event.data_table.id == "workspaces-table":
-            # Picking a workspace opens its environments; the environment is what
-            # commits the switch, so nothing changes under you on a stray enter.
-            if row_id != self._switcher_workspace_id:
-                self._load_workspace_environments_in_background(str(row_id))
-            self.query_one("#workspace-environments-table", DataTable).focus()
-        elif event.data_table.id == "workspace-environments-table" and self._switcher_workspace_id:
+            # Enter on a workspace switches to it straight away, in the environment last
+            # used there. Waiting on its environments first left enter doing nothing while
+            # that route was slow; picking another environment is the table underneath.
+            self._use_workspace(str(row_id), self._default_environment_for(str(row_id)))
+        elif (
+            event.data_table.id == "workspace-environments-table"
+            and self._switcher_workspace_id
+            and row_id != ENVIRONMENT_STATUS_KEY
+        ):
             self._use_workspace(self._switcher_workspace_id, str(row_id))
 
     def _workspace_label(self) -> str:
@@ -6832,6 +6949,10 @@ class RebaseTuiApp(App[None]):
             if self._refresh_failures < AUTO_REFRESH_FAILURE_LIMIT:
                 return
         self._refresh_failures = 0
+        if self.project_targets is None:
+            # Nothing arrived, so the "loading…" rows would be a lie under the error.
+            for table_id in TARGET_TABLE_IDS:
+                self._fill_table(table_id)
         self._show_project_view()
         self._set_project_error(f"The Rebase API request failed. Press r to retry.\nError: {error}")
         self.notify(f"Rebase API request failed: {error}", severity="error")
@@ -6849,4 +6970,50 @@ def run_tui(
         app.run()
     finally:
         # Ctrl-C and `q` alike: the session ends when the screen does.
-        app.data.client.end_client_session()
+        end_session_briefly(app.data.client)
+    leave_without_waiting(app.return_code or 0)
+
+
+class AbandoningExecutor(ThreadPoolExecutor):
+    """The TUI's default executor, which does not wait for its threads when it shuts down.
+
+    `asyncio.run` ends by shutting the default executor down and waiting for it, for up
+    to five minutes. A load still waiting on the platform when `q` is pressed would hold
+    the closed screen there until it answered. Queued work is cancelled; requests already
+    out are left to `leave_without_waiting`.
+    """
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        super().shutdown(wait=False, cancel_futures=True)
+
+
+#: How long quitting waits for the platform to record the session's end.
+SESSION_END_BUDGET_SECONDS = 0.5
+
+
+def end_session_briefly(client: Any, *, budget: float = SESSION_END_BUDGET_SECONDS) -> None:
+    """Say goodbye to the platform, but never hold the terminal for it.
+
+    The request is best effort and has a 5 s timeout of its own; on a slow platform
+    that was 5 s of a blank terminal after `q`. A daemon thread is abandoned at exit.
+    """
+    thread = threading.Thread(target=client.end_client_session, name="rebase-session-end", daemon=True)
+    thread.start()
+    thread.join(budget)
+
+
+def leave_without_waiting(code: int, *, exit_process: Callable[[int], Any] = os._exit) -> None:
+    """Exit now if loads the closed screen started are still waiting on the platform.
+
+    Every load runs in an executor thread, and Python joins those at exit, so `q`
+    during a slow request left the terminal hanging until each one answered or hit
+    its 30 s timeout, and Ctrl-C then printed a traceback from the join. Their answers
+    have nowhere to go once the screen is gone. Nothing is waiting: a normal return.
+    """
+    main = threading.main_thread()
+    if not any(thread is not main and not thread.daemon and thread.is_alive() for thread in threading.enumerate()):
+        return
+    for stream in (sys.stdout, sys.stderr):
+        with suppress(Exception):
+            stream.flush()
+    exit_process(code)

@@ -3099,6 +3099,7 @@ def test_main_pins_a_non_default_platform_into_the_environment(monkeypatch, tmp_
     home = tmp_path / "home"
     (home / ".rebase").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.delenv("REBASE_PLATFORM", raising=False)
     monkeypatch.setenv("REBASE_CONFIG_PATH", str(tmp_path / "config.json"))
     monkeypatch.setenv("REBASE_AUTH_FILE", str(tmp_path / "auth.json"))
@@ -4477,6 +4478,45 @@ def test_workflow_schedule_show_command(monkeypatch, capsys) -> None:
     assert "0 * * * *" in output
     assert "Europe/Stockholm" in output
     assert "2026-07-11T11:00:00Z" in output
+
+
+def test_workflow_schedule_show_reports_waiting_firings(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    monkeypatch.setattr(
+        Client,
+        "get_workflow_schedule",
+        lambda self, workflow_id: {
+            "workflow_id": workflow_id,
+            "schedule": {"type": "cron", "cron": "21 * * * *"},
+            "active": True,
+            "next_run_at": "2026-10-05T13:21:00Z",
+            "pending_firings": 3,
+            "oldest_pending_fired_at": "2026-10-05T12:21:00Z",
+        },
+    )
+
+    assert main(["workflow", "schedule", "show", "--id", "workflow-id"]) == 0
+
+    output = capsys.readouterr().out
+    assert "pending_firings" in output
+    assert "2026-10-05T12:21:00Z" in output
+
+
+def test_workflow_schedule_show_hides_an_empty_queue(monkeypatch, capsys) -> None:
+    _stub_workflow_lookup(monkeypatch)
+    monkeypatch.setattr(
+        Client,
+        "get_workflow_schedule",
+        lambda self, workflow_id: {
+            "workflow_id": workflow_id,
+            "schedule": {"type": "cron", "cron": "21 * * * *"},
+            "active": True,
+            "pending_firings": 0,
+        },
+    )
+
+    assert main(["workflow", "schedule", "show", "--id", "workflow-id"]) == 0
+    assert "pending_firings" not in capsys.readouterr().out
 
 
 def test_workflow_schedule_show_without_schedule(monkeypatch, capsys) -> None:

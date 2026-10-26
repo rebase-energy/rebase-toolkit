@@ -151,9 +151,15 @@ class TestDeployHooks:
 
         monkeypatch.setattr(Project, "_client", property(lambda self: FakeClient()), raising=False)
         monkeypatch.setattr(FakeClient, "ensure_project", lambda self, name, **kw: {"id": "p"}, raising=False)
-        monkeypatch.setattr(
-            Workflow, "deploy", lambda self, **kw: calls.append(("wf", kw.get("_skip_dataset_preflight")))
-        )
+        from rebase.deployment import _PreparedDefinition
+
+        def prepare(workflow, **kw):
+            calls.append(("wf", kw.get("_skip_dataset_preflight")))
+            return _PreparedDefinition("POST", "/workflows", {}, "workflow")
+
+        monkeypatch.setattr(Workflow, "_prepare_deployment", prepare)
+        monkeypatch.setattr(Workflow, "deploy", lambda self, **kw: self)
+        monkeypatch.setattr(FakeClient, "_compare_definitions", lambda *args: {}, raising=False)
         project.deploy()
         preflight_calls = [c for c in calls if not isinstance(c, tuple)]
         workflow_calls = [c for c in calls if isinstance(c, tuple)]

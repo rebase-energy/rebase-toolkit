@@ -42,6 +42,18 @@
   the same measure on either path. Needs a platform with
   `POST /workflows/{id}/schedule/backend`.
 
+### Added
+
+- `rebase app instances <name> --project <project>` shows the instances serving a deployed ASGI app — billed active/idle counts from the platform's metrics, each instance's start, readiness and request count from its container log stream, and the recent container events — and follows a cold start live with `--watch`. `rebase app list` and `rebase app get` list and inspect deployed apps without creating a project as a side effect. `Client.get_asgi_app` and `Client.get_asgi_app_instances` back them.
+- Select workflows within a project with `rebase deploy --only` or `Project.deploy(only=...)`, including required shared steps.
+- Skip unchanged workflows and shared steps using backend batch comparison, report `unchanged`, and reconcile fresh state on re-runs. Older backends retain the existing write path.
+- `rebase workflow schedule show` and the TUI workflows table show scheduled firings waiting for a free run slot (`pending_firings`), which the backend now queues instead of dropping when the workspace is at its concurrency cap (#36).
+- Add opt-in bounded workflow write concurrency with `--jobs` / `jobs`, after serial preparation and shared-step resolution. In-flight outcomes remain visible on failure or interruption.
+- The TUI workspace switcher switches on enter on a workspace, opening the environment last used there (or `dev`), instead of waiting for its environments to load; Tab down to pick another environment. The environments table shows `loading…` or why the list failed, keeps each workspace's environments for the session (`r` refetches), and fetches only for the row the cursor rests on.
+- Quitting the TUI hands the terminal back at once. Loads still waiting on the platform used to hold the process open until they answered or timed out (up to 30 s, or five minutes inside `asyncio.run`), and Ctrl-C then printed a threading traceback; the goodbye request now gets 0.5 s.
+- The TUI buckets table opens with each bucket's size and object count (`Bucket | Size | Objects | URI | Created`), from the `size_bytes` and `object_count` the platform now reports. Both are storage's daily sample, so up to a day old, and `-` for a bucket younger than its first sample or against a platform that does not report them. The `Updated` column is gone: it was the bucket record's, not its data's.
+- A request the platform refuses with 429 and a `Retry-After` is waited out and sent again, up to four times and never longer than a minute per wait, writes included: a 429 did no work. The bucket data routes (signed URLs, object listing, stat, delete) are now budgeted per workspace on the platform, so a job over budget is slowed rather than failed.
+
 ## 0.10.0 — 2026-09-22
 
 ### Added
@@ -118,6 +130,19 @@
   and pressing `p` on such an event in the TUI opens its details.
 
 ### Fixed
+
+- **Workflow deployment reliability and partial-outcome reporting (#28).**
+  Cache metadata lookups and secret references for one deployment attempt, and
+  reuse acknowledged shared-step definitions instead of rewriting them for every
+  workflow. Changed definitions still deploy; reconciliation uses fresh reads.
+  Workflow creation and updates, including shared-step/function deployments, now
+  use the 300-second deployment timeout.
+  Deployment reads and writes known not to have connected get bounded retries;
+  ambiguous workflow and function writes are checked against the resource and its
+  pinned version without replaying them. The CLI reports succeeded, failed,
+  uncertain, and unattempted targets even after an error or interruption. SDK deployments expose a
+  `DeploymentReport`, and `DeploymentError` carries it while remaining compatible
+  with `RebaseWorkflowError`. Shared-step outcomes are reported separately.
 
 - Step retry warnings ("step X failed on attempt 1 of 3; retrying") were written
   to the worker's own log, invisible to users; they now go to the run's log
