@@ -3161,6 +3161,8 @@ COMPUTE_POLICY_DETAIL_KEYS = [
     "max_cloud_run_memory_mib",
     "cloud_run_enabled",
     "gpu_allowed",
+    "cloud_tasks_schedules_enabled",
+    "cloud_workflows_enabled",
     "updated_at",
 ]
 
@@ -3216,6 +3218,25 @@ def workspace_compute_policy_set_command(
         int | None,
         typer.Option("--max-memory-mib", help="Ceiling for a target's memory, in MiB (1024 = 1 GiB)."),
     ] = None,
+    cloud_tasks_schedules: Annotated[
+        bool | None,
+        typer.Option(
+            "--cloud-tasks-schedules/--no-cloud-tasks-schedules",
+            "-c",
+            help=(
+                "Whether the workspace's job-mode workflows may be moved to the push-based cloud_tasks "
+                "scheduling path (rebase workflow schedule backend set)."
+            ),
+        ),
+    ] = None,
+    cloud_workflows: Annotated[
+        bool | None,
+        typer.Option(
+            "--cloud-workflows/--no-cloud-workflows",
+            "-w",
+            help="Allow (or forbid) the workspace's step workflows on the Cloud Workflows engine.",
+        ),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Update the workspace's compute limits.
@@ -3234,10 +3255,13 @@ def workspace_compute_policy_set_command(
         and max_concurrency is None
         and max_cpu_milli is None
         and max_memory_mib is None
+        and cloud_tasks_schedules is None
+        and cloud_workflows is None
     ):
         raise RebaseWorkflowError(
             "nothing to update; pass --max-run-timeout-seconds, --max-concurrent-runs, "
-            "--max-instances, --max-concurrency, --max-cpu-milli, or --max-memory-mib"
+            "--max-instances, --max-concurrency, --max-cpu-milli, --max-memory-mib, "
+            "--cloud-tasks-schedules/--no-cloud-tasks-schedules, or --cloud-workflows/--no-cloud-workflows"
         )
     kwargs: dict[str, Any] = {}
     if max_run_timeout_seconds is not None:
@@ -3254,6 +3278,10 @@ def workspace_compute_policy_set_command(
         kwargs["max_cloud_run_cpu_milli"] = max_cpu_milli
     if max_memory_mib is not None:
         kwargs["max_cloud_run_memory_mib"] = max_memory_mib
+    if cloud_tasks_schedules is not None:
+        kwargs["cloud_tasks_schedules_enabled"] = cloud_tasks_schedules
+    if cloud_workflows is not None:
+        kwargs["cloud_workflows_enabled"] = cloud_workflows
     policy = Client().update_workspace_compute_policy(**kwargs)
     if json_output:
         _print_json(policy)
@@ -5645,6 +5673,9 @@ SCHEDULE_DETAIL_KEYS = [
     "paused",
     "paused_until",
     "next_run_at",
+    "backend",
+    "last_fired_at",
+    "last_fire_latency_seconds",
     "last_skipped_at",
     "last_skip_reason",
     "pending_firings",
@@ -5667,6 +5698,12 @@ def _schedule_detail(workflow: dict[str, Any], schedule_data: dict[str, Any]) ->
         "paused": schedule_data.get("paused", False),
         "paused_until": schedule_data.get("paused_until"),
         "next_run_at": schedule_data.get("next_run_at"),
+        # Which path fires the cron (prefect, or the push-based cloud_tasks path),
+        # and the newest scheduled run: its slot and how many seconds after the
+        # slot its run was created -- the same measure on both paths.
+        "backend": schedule_data.get("schedule_backend", "prefect"),
+        "last_fired_at": schedule_data.get("last_fired_at"),
+        "last_fire_latency_seconds": schedule_data.get("last_fire_latency_seconds"),
         # The last fire the runner skipped and why. A skip creates no run, so
         # this is what separates "ended as declared" from "stopped firing".
         "last_skipped_at": schedule_data.get("last_skipped_at"),
@@ -6022,6 +6059,7 @@ def workflow_schedule_list_command(
     table.add_column("Timezone")
     table.add_column("Status")
     table.add_column("Next run")
+    table.add_column("Backend")
     table.add_column("ID", style="rebase.muted")
     for workflow in scheduled:
         schedule = workflow.get("schedule") or {}
@@ -6031,10 +6069,188 @@ def workflow_schedule_list_command(
             _format_value(schedule.get("timezone")),
             _workflow_schedule_status(workflow),
             _format_value(workflow.get("next_run_at")),
+            str(workflow.get("schedule_backend") or "prefect"),
             str(workflow.get("id", "-")),
         )
     console.print(table)
 
+
+SCHEDULE_BACKENDS = ("prefect", "cloud_tasks")
+
+schedule_backend_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Which path fires a workflow's cron: prefect, or the push-based cloud_tasks path.",
+)
+
+
+@schedule_backend_app.command("show")
+def workflow_schedule_backend_show_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show which path fires the workflow's cron, and its latest fire's latency."""
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    schedule_data = _require_schedule(client, workflow)
+    if json_output:
+        _print_json(schedule_data)
+        return
+    detail = _schedule_detail(workflow, schedule_data)
+    console.print(_detail_table("Schedule Backend", detail, preferred_keys=SCHEDULE_DETAIL_KEYS))
+
+
+@schedule_backend_app.command("set")
+def workflow_schedule_backend_set_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    backend: Annotated[str, typer.Option("--to", "-t", help="prefect or cloud_tasks.")] = "",
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Move a workflow's cron between the two scheduling paths: --to prefect | cloud_tasks.
+
+    cloud_tasks is the push-based path being evaluated next to Prefect: the workspace
+    must allow it (rebase workspace compute-policy set --cloud-tasks-schedules), the
+    workflow must be job-mode, and its cron must read the same on both engines. The
+    switch is operational, like pause: no new version. prefect puts it back.
+    """
+    if backend not in SCHEDULE_BACKENDS:
+        raise RebaseWorkflowError(f"--to must be one of {', '.join(SCHEDULE_BACKENDS)}, not {backend!r}")
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    _require_schedule(client, workflow)
+    client.set_workflow_schedule_backend(str(workflow["id"]), backend)
+    refreshed = client.get_workflow_schedule(str(workflow["id"]))
+    if json_output:
+        _print_json(refreshed)
+        return
+    console.print(
+        _detail_table(
+            "Schedule Backend Set", _schedule_detail(workflow, refreshed), preferred_keys=SCHEDULE_DETAIL_KEYS
+        )
+    )
+
+
+schedule_app.add_typer(schedule_backend_app, name="backend")
+
+EXECUTION_ENGINES = ("runner", "cloud_workflows")
+ENGINE_DETAIL_KEYS = ("workflow", "execution_engine", "mode", "workflow_id", "current_version_id")
+
+engine_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Which engine executes a workflow's step graph: runner, or the Cloud Workflows engine.",
+)
+
+
+def _engine_detail(workflow: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "workflow": workflow.get("name"),
+        "execution_engine": workflow.get("execution_engine", "runner"),
+        "mode": workflow.get("mode"),
+        "workflow_id": workflow.get("id"),
+        "current_version_id": workflow.get("current_version_id"),
+    }
+
+
+@engine_app.command("show")
+def workflow_engine_show_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show which engine executes the workflow's step graph."""
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    if json_output:
+        _print_json(_engine_detail(workflow))
+        return
+    console.print(_detail_table("Execution Engine", _engine_detail(workflow), preferred_keys=ENGINE_DETAIL_KEYS))
+
+
+@engine_app.command("set")
+def workflow_engine_set_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    engine: Annotated[str, typer.Option("--to", "-t", help="runner or cloud_workflows.")] = "",
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Move a workflow's step graph between the engines: --to runner | cloud_workflows.
+
+    cloud_workflows runs each step in its own container, independent steps side
+    by side, with per-step retries and resources; the workspace must allow it
+    (rebase workspace compute-policy set --cloud-workflows) and the workflow must
+    be a job-mode step workflow. Operational, like pause: no new version, and
+    runs in flight finish on the engine they started on. runner puts it back.
+    """
+    if engine not in EXECUTION_ENGINES:
+        raise RebaseWorkflowError(f"--to must be one of {', '.join(EXECUTION_ENGINES)}, not {engine!r}")
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    updated = client.set_workflow_execution_engine(str(workflow["id"]), engine)
+    if json_output:
+        _print_json(_engine_detail(updated))
+        return
+    console.print(_detail_table("Execution Engine Set", _engine_detail(updated), preferred_keys=ENGINE_DETAIL_KEYS))
+
+
+workflow_app.add_typer(engine_app, name="engine")
+
+graph_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="A workflow's step graph as the engines see it.",
+)
+
+
+@graph_app.command("render")
+def workflow_graph_render_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    version_id: Annotated[str | None, typer.Option("--version", "-v", help="A version other than the current.")] = None,
+    output_format: Annotated[str, typer.Option("--format", "-f", help="plan (default) or yaml.")] = "plan",
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show what the Cloud Workflows engine would run for the workflow: the
+    levels of steps that run side by side and each step's retry and timeout
+    numbers (--format plan), or the program that interprets them (--format
+    yaml). Read-only: nothing is deployed or executed."""
+    if output_format not in ("plan", "yaml"):
+        raise RebaseWorkflowError(f"--format must be plan or yaml, not {output_format!r}")
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    rendered = client.get_workflow_graph_plan(str(workflow["id"]), version_id=version_id)
+    if json_output:
+        _print_json(rendered)
+        return
+    if output_format == "yaml":
+        console.print(rendered.get("program_yaml", ""), markup=False, highlight=False)
+        return
+    plan = rendered.get("plan") or {}
+    console.print(
+        f"{workflow.get('name')}  engine={rendered.get('execution_engine')}  "
+        f"version={rendered.get('version_id')}  deadline={plan.get('deadline_seconds')}s  "
+        f"concurrency={plan.get('concurrency')}"
+    )
+    nodes = plan.get("nodes") or {}
+    for index, level in enumerate(plan.get("levels") or [], start=1):
+        console.print(f"level {index}:")
+        for key in level:
+            node = nodes.get(key) or {}
+            kind = node.get("kind", "step")
+            extra = f"  retries={node.get('retries', 0)}  timeout={node.get('timeout_seconds')}s"
+            if node.get("backoff_seconds"):
+                extra += f"  backoff={node.get('backoff_seconds')}s"
+            console.print(f"  {key}{'  [' + kind + ']' if kind != 'step' else ''}{extra}", markup=False)
+
+
+workflow_app.add_typer(graph_app, name="graph")
 
 trigger_app = typer.Typer(
     add_completion=False,

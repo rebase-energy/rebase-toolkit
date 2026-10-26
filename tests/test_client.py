@@ -1859,8 +1859,8 @@ def test_project_deploy_registers_step_workflow_graph(monkeypatch) -> None:
     assert observed_workflow["mode"] == "interactive"
     assert observed_workflow["isolation"] == "shared"
     graph = observed_workflow["step_graph"]
-    assert graph["schema_version"] == 1
-    assert graph["engine"] == "prefect"
+    assert graph["schema_version"] == 2
+    assert "engine" not in graph, "the engine is a per-workflow switch on the platform, not a property of the graph"
     assert graph["return_binding"] == {
         "type": "dict",
         "items": {"forecast": {"type": "node_output", "node_key": "build_forecast"}},
@@ -1872,8 +1872,14 @@ def test_project_deploy_registers_step_workflow_graph(monkeypatch) -> None:
     assert load_node["function_id"] == "load-weather-id"
     assert load_node["function_version_id"] == "load-weather-version-id"
     assert load_node["input_bindings"] == {"site_id": {"type": "parameter", "name": "site_id"}}
-    assert load_node["retry_policy"] == {"retries": 2}
+    assert load_node["retry_policy"] == {
+        "retries": 2,
+        "backoff_seconds": 0.0,
+        "backoff_multiplier": 1.0,
+        "max_backoff_seconds": 0.0,
+    }
     assert load_node["timeout_seconds"] == 30
+    assert load_node["runtime"] == "job" and load_node["ordering_node_keys"] == []
 
     assert build_node["node_key"] == "build_forecast"
     assert build_node["function_version_id"] == "build-forecast-version-id"
@@ -3263,12 +3269,10 @@ def _compiled_graph(monkeypatch, build) -> dict[str, Any]:
     return observed["step_graph"]
 
 
-def test_steps_that_ignore_each_other_still_compile_to_a_chain(monkeypatch) -> None:
-    """Steps are sequential by contract, so the graph is a line even without data flow.
-
-    Two steps that pass nothing between them would otherwise be independent roots, and
-    "which step failed" stops having one answer the moment the graph forks.
-    """
+def test_steps_that_ignore_each_other_are_independent(monkeypatch) -> None:
+    """Dependencies follow the data: two steps that pass nothing between them are
+    two roots, which an engine that can run them side by side does. The
+    in-process runner still runs them in the order the body called them."""
 
     def build(project: Any) -> None:
         @project.step(name="capture-dk")
@@ -3286,13 +3290,13 @@ def test_steps_that_ignore_each_other_still_compile_to_a_chain(monkeypatch) -> N
     nodes = {node["node_key"]: node for node in _compiled_graph(monkeypatch, build)["nodes"]}
 
     assert nodes["capture_dk"]["upstream_node_keys"] == []
-    assert nodes["capture_se"]["upstream_node_keys"] == ["capture_dk"]
-    # Sequence only: nothing is passed between them, so no binding claims a value is.
+    assert nodes["capture_se"]["upstream_node_keys"] == []
     assert nodes["capture_se"]["input_bindings"] == {}
 
 
-def test_the_ordering_edge_is_added_to_the_data_edges_not_instead_of_them(monkeypatch) -> None:
-    """A step reaching back past its predecessor keeps both edges, and stays ordered."""
+def test_an_ordering_edge_is_asked_for_with_after_and_kept_apart_from_the_data_edges(monkeypatch) -> None:
+    """A step that must follow another without reading its output says so with
+    `.after`; the graph keeps that edge apart from the data edges."""
 
     def build(project: Any) -> None:
         @project.step(name="first")
@@ -3310,13 +3314,14 @@ def test_the_ordering_edge_is_added_to_the_data_edges_not_instead_of_them(monkey
         @project.workflow(name="reaches-back")
         def reaches_back() -> dict:
             one = first()
-            second()
-            return {"third": third(one)}
+            two = second()
+            return {"third": third.after(two)(one)}
 
     nodes = {node["node_key"]: node for node in _compiled_graph(monkeypatch, build)["nodes"]}
 
-    # "first" carries the value, "second" only the sequence — both are upstream.
+    # "first" carries the value, "second" only the sequence -- both are upstream.
     assert nodes["third"]["upstream_node_keys"] == ["first", "second"]
+    assert nodes["third"]["ordering_node_keys"] == ["second"]
     assert nodes["third"]["input_bindings"] == {"from_first": {"type": "node_output", "node_key": "first"}}
 
 
@@ -3344,7 +3349,10 @@ def test_graph_node_order_follows_the_body(monkeypatch) -> None:
     graph = _compiled_graph(monkeypatch, build)
     # The node key comes from the step's name, not the Python function's.
     assert [node["node_key"] for node in graph["nodes"]] == ["a", "b", "c"]
-    assert [node["upstream_node_keys"] for node in graph["nodes"]] == [[], ["a"], ["b"]]
+    # Nothing flows between them, so nothing orders them; the body's order is
+    # what the in-process runner follows and what the engine's levels preserve
+    # as a tie-break.
+    assert [node["upstream_node_keys"] for node in graph["nodes"]] == [[], [], []]
 
 
 def test_function_ephemeral_run_forwards_env_and_secrets(monkeypatch) -> None:
@@ -4281,3 +4289,81 @@ def test_run_failure_summary_carries_what_the_platform_observed() -> None:
     assert observed_summary({"timeout_seconds": 300, "elapsed_seconds": 301.2}) == "301.2s of a 300s bound"
     assert observed_summary({}) is None
     assert run_failure_summary({"failure_reason": {"message": "boom"}}) == "Boom"
+
+
+def test_set_workflow_schedule_backend_posts_the_choice(monkeypatch) -> None:
+    observed: dict[str, Any] = {}
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed["method"] = method
+        observed["url"] = url
+        observed["json"] = kwargs.get("json")
+        return FakeResponse({"id": "workflow-id", "schedule_backend": "cloud_tasks"})
+
+    patch_client_http(monkeypatch, fake_request)
+
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+    workflow = client.set_workflow_schedule_backend("workflow-id", "cloud_tasks")
+
+    assert observed["method"] == "POST"
+    assert observed["url"] == "https://workflows.example.com/workflows/workflow-id/schedule/backend"
+    assert observed["json"] == {"backend": "cloud_tasks"}
+    assert workflow["schedule_backend"] == "cloud_tasks"
+
+
+def test_update_workspace_compute_policy_sends_the_cloud_tasks_switch_only_when_given(monkeypatch) -> None:
+    observed: list[dict[str, Any]] = []
+
+    def fake_request(method: str, url: str, **kwargs: Any) -> FakeResponse:
+        observed.append({"method": method, "url": url, "json": kwargs.get("json")})
+        return FakeResponse({"workspace_id": "ws", "cloud_tasks_schedules_enabled": True})
+
+    patch_client_http(monkeypatch, fake_request)
+    client = rb.Client(api_key="rbw_test", api_url="https://workflows.example.com")
+
+    client.update_workspace_compute_policy(cloud_tasks_schedules_enabled=False)
+    client.update_workspace_compute_policy(max_cloud_run_instances=3)
+
+    assert observed[0]["method"] == "PATCH"
+    assert observed[0]["url"] == "https://workflows.example.com/workspace/compute-policy"
+    assert observed[0]["json"] == {"cloud_tasks_schedules_enabled": False}
+    assert observed[1]["json"] == {"max_cloud_run_instances": 3}
+
+
+def test_set_workflow_execution_engine_posts_the_engine(monkeypatch) -> None:
+    client = rb.Client(api_key="k", api_url="https://api.example")
+    seen: dict[str, Any] = {}
+
+    def fake_request(self, method, path, **kwargs):
+        seen.update(method=method, path=path, json=kwargs.get("json"))
+        return {"id": "wf", "execution_engine": kwargs["json"]["engine"]}
+
+    monkeypatch.setattr(rb.Client, "_request_dict", fake_request)
+    assert client.set_workflow_execution_engine("wf", "cloud_workflows")["execution_engine"] == "cloud_workflows"
+    assert seen == {"method": "POST", "path": "/workflows/wf/engine", "json": {"engine": "cloud_workflows"}}
+
+
+def test_get_workflow_graph_plan_reads_the_plan(monkeypatch) -> None:
+    client = rb.Client(api_key="k", api_url="https://api.example")
+    seen: dict[str, Any] = {}
+
+    def fake_request(self, method, path, **kwargs):
+        seen.update(method=method, path=path, params=kwargs.get("params"))
+        return {"plan": {"levels": []}, "program_yaml": ""}
+
+    monkeypatch.setattr(rb.Client, "_request_dict", fake_request)
+    assert client.get_workflow_graph_plan("wf", version_id="v2")["plan"] == {"levels": []}
+    assert seen == {"method": "GET", "path": "/workflows/wf/graph/plan", "params": {"version": "v2"}}
+
+
+def test_update_workspace_compute_policy_sends_the_cloud_workflows_flag(monkeypatch) -> None:
+    client = rb.Client(api_key="k", api_url="https://api.example")
+    seen: dict[str, Any] = {}
+
+    def fake_request(self, method, path, **kwargs):
+        seen.update(json=kwargs.get("json"))
+        return {}
+
+    monkeypatch.setattr(rb.Client, "_request_dict", fake_request)
+    client.update_workspace_compute_policy(cloud_workflows_enabled=True)
+    assert seen["json"] == {"cloud_workflows_enabled": True}

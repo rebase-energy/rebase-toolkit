@@ -43,6 +43,7 @@ from rebase.client import (
     Volume,
     Workflow,
     configure,
+    when,
 )
 from rebase.config import DEFAULT_API_URL, DEFAULT_SERVER_URL
 from rebase.contract import (
@@ -121,6 +122,7 @@ __all__ = [
     "ModelHandle",
     "OnUpdate",
     "OnWorkflow",
+    "when",
     "Optimizer",
     "OptimizerHandle",
     "Predictor",

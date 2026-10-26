@@ -2334,9 +2334,14 @@ def _assert_json_literal(value: Any) -> None:
         ) from exc
 
 
+class _RuntimeBranchingError(RebaseWorkflowError):
+    """The body used a traced value as if it were real; wrapped by the compiler
+    into the one message about static graphs."""
+
+
 class _TraceValue:
     def _unsupported(self, operation: str) -> RebaseWorkflowError:
-        return RebaseWorkflowError(
+        return _RuntimeBranchingError(
             f"Step workflows must be static. Runtime values cannot be used with {operation} during deployment."
         )
 
@@ -2366,11 +2371,23 @@ class StepPromise(_TraceValue):
         self.node_key = node_key
 
 
+class _MapItem(_TraceValue):
+    """One item of the list a ``step.map`` runs over, inside that step's inputs."""
+
+
+class _MapIndex(_TraceValue):
+    """The item's position, inside a ``step.map`` step's inputs."""
+
+
 def _binding_for(value: Any) -> dict[str, Any]:
     if isinstance(value, StepPromise):
         return {"type": "node_output", "node_key": value.node_key}
     if isinstance(value, _WorkflowParameter):
         return {"type": "parameter", "name": value.name}
+    if isinstance(value, _MapItem):
+        return {"type": "map_item"}
+    if isinstance(value, _MapIndex):
+        return {"type": "map_index"}
     if isinstance(value, dict):
         items: dict[str, dict[str, Any]] = {}
         for key, item in value.items():
@@ -2404,23 +2421,23 @@ def _binding_node_keys(binding: dict[str, Any]) -> set[str]:
 
 
 class _WorkflowTrace:
-    """Compiles a workflow body into a chain of step nodes.
+    """Compiles a workflow body into a graph of step nodes.
 
-    Steps are sequential by contract: each one runs after the one before it, whether or
-    not it consumes its output. The graph could express parallel roots — dependencies are
-    derived from data bindings, so two steps that ignore each other would have none — but
-    a chain is what makes a workflow legible: a straight line to draw, and one unambiguous
-    answer to "which step failed, and what never ran because of it". Independent work that
-    wants to run side by side belongs to tasks inside a step, not to steps.
+    Every node's dependencies are the steps whose outputs it reads (its data
+    bindings), plus any ordering edge the body asked for with ``step.after``.
+    Two steps that read nothing of each other have no edge, so an engine that
+    can run them side by side does (the Cloud Workflows engine); the in-process
+    runner still runs the nodes in the order the body called them. A
+    ``step.map`` is one node that fans out over a list; ``rb.when`` is a switch
+    between two conditioned steps.
     """
 
     def __init__(self, *, ephemeral: bool = False) -> None:
         self.ephemeral = ephemeral
         self.nodes: list[dict[str, Any]] = []
         self._node_keys: set[str] = set()
-        self._previous_node_key: str | None = None
 
-    def record_step(self, step: Step, args: tuple[Any, ...], kwargs: dict[str, Any]) -> StepPromise:
+    def _check_step(self, step: Step) -> str | None:
         step_name = str(step.name)
         if step.fn is None:
             raise RebaseWorkflowError(f"Step {step_name!r} cannot be used in a workflow without local source.")
@@ -2432,35 +2449,45 @@ class _WorkflowTrace:
         function_version_id = step.data.get("current_version_id")
         if not self.ephemeral and function_version_id is None:
             raise RebaseWorkflowError(f"Step {step_name!r} has no current function version after deployment.")
+        return function_version_id
 
-        signature = inspect.signature(step.fn)
-        bound = signature.bind(*args, **kwargs)
-        bound.apply_defaults()
-        input_bindings = {name: _binding_for(value) for name, value in bound.arguments.items()}
-        upstream_node_keys: set[str] = set()
+    def _node_for(
+        self,
+        step: Step,
+        input_bindings: dict[str, dict[str, Any]],
+        *,
+        function_version_id: str | None,
+        ordering: tuple[str, ...] = (),
+        condition: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        upstream_node_keys: set[str] = set(ordering)
         for binding in input_bindings.values():
             upstream_node_keys.update(_binding_node_keys(binding))
-        # The ordering edge, on top of whatever the data bindings imply. Kept separate from
-        # `input_bindings`, so the graph still shows which dependency carries a value and
-        # which is only sequence.
-        if self._previous_node_key is not None:
-            upstream_node_keys.add(self._previous_node_key)
-
-        node_key = _node_key_for(step_name, self._node_keys)
+        if condition is not None:
+            upstream_node_keys.update(_binding_node_keys(condition["binding"]))
+        node_key = _node_key_for(str(step.name), self._node_keys)
         self._node_keys.add(node_key)
-        node = {
+        node: dict[str, Any] = {
             "node_key": node_key,
-            "name": step_name,
+            "name": str(step.name),
             "function_id": step.id,
             "function_version_id": function_version_id,
             "entrypoint": step.entrypoint,
             "input_bindings": input_bindings,
             "upstream_node_keys": sorted(upstream_node_keys),
-            "retry_policy": {"retries": step.retries},
+            # Kept separate from the data edges, so the graph still shows which
+            # dependency carries a value and which is only sequence.
+            "ordering_node_keys": sorted(ordering),
+            "retry_policy": dict(step.retry_policy),
             "timeout_seconds": step.timeout_seconds,
             "cache_policy": {"enabled": step.cache},
-            "resource_policy": step.resources,
+            # The workflow's resources are the inherited layer; the step's own
+            # cpu/memory override them.
+            "resource_policy": {**(step.resources or {}), **step.own_resources},
+            "runtime": step.runtime,
         }
+        if condition is not None:
+            node["condition"] = condition
         if self.ephemeral:
             node.update(
                 {
@@ -2471,9 +2498,133 @@ class _WorkflowTrace:
                     "image_spec": step.image_spec,
                 }
             )
+        return node
+
+    def record_step(
+        self,
+        step: Step,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        ordering: tuple[str, ...] = (),
+        condition: dict[str, Any] | None = None,
+    ) -> StepPromise:
+        function_version_id = self._check_step(step)
+        signature = inspect.signature(step.fn)  # type: ignore[arg-type]
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        input_bindings = {name: _binding_for(value) for name, value in bound.arguments.items()}
+        node = self._node_for(
+            step, input_bindings, function_version_id=function_version_id, ordering=ordering, condition=condition
+        )
         self.nodes.append(node)
-        self._previous_node_key = node_key
+        return StepPromise(node["node_key"])
+
+    def record_map(
+        self,
+        step: Step,
+        items: Any,
+        *,
+        parameter: str,
+        kwargs: dict[str, Any],
+        max_concurrency: int | None,
+    ) -> StepPromise:
+        function_version_id = self._check_step(step)
+        if not isinstance(items, (StepPromise, _WorkflowParameter, list, tuple)):
+            raise RebaseWorkflowError(
+                f"step {step.name!r}.map needs a list to map over: another step's output, a workflow "
+                f"parameter, or a literal list; got {type(items).__name__}"
+            )
+        if isinstance(items, (list, tuple)) and any(isinstance(item, _TraceValue) for item in items):
+            raise RebaseWorkflowError(
+                f"step {step.name!r}.map: a literal list of items cannot mix in step outputs; map over the "
+                "step's output directly"
+            )
+        signature = inspect.signature(step.fn)  # type: ignore[arg-type]
+        if parameter not in signature.parameters:
+            raise RebaseWorkflowError(f"step {step.name!r} has no parameter {parameter!r} to map over")
+        if parameter in kwargs:
+            raise RebaseWorkflowError(f"step {step.name!r}.map: {parameter!r} is the mapped parameter")
+        bound = signature.bind(**{parameter: _MapItem()}, **kwargs)
+        bound.apply_defaults()
+        input_bindings = {name: _binding_for(value) for name, value in bound.arguments.items()}
+        node = self._node_for(step, input_bindings, function_version_id=function_version_id)
+        node["kind"] = "map"
+        node["items_binding"] = _binding_for(items)
+        node["upstream_node_keys"] = sorted(set(node["upstream_node_keys"]) | _binding_node_keys(node["items_binding"]))
+        if max_concurrency is not None:
+            if max_concurrency < 1:
+                raise RebaseWorkflowError("max_concurrency must be at least 1")
+            node["max_concurrency"] = int(max_concurrency)
+        self.nodes.append(node)
+        return StepPromise(node["node_key"])
+
+    def record_switch(self, condition: dict[str, Any], then: StepPromise, otherwise: StepPromise) -> StepPromise:
+        branches: dict[str, dict[str, Any]] = {}
+        for promise, negate in ((then, False), (otherwise, True)):
+            if not isinstance(promise, StepPromise):
+                raise RebaseWorkflowError("rb.when needs two step calls, then=step(...) and otherwise=step(...)")
+            node = next((n for n in self.nodes if n["node_key"] == promise.node_key), None)
+            if node is None or node.get("kind", "step") != "step":
+                raise RebaseWorkflowError("rb.when branches must be plain steps called in this workflow")
+            if "condition" in node:
+                raise RebaseWorkflowError(f"step {node['name']!r} already runs under a condition")
+            node["condition"] = {**condition, "negate": negate}
+            node["upstream_node_keys"] = sorted(
+                set(node["upstream_node_keys"]) | _binding_node_keys(condition["binding"])
+            )
+            branches[promise.node_key] = node
+        node_key = _node_key_for("when", self._node_keys)
+        self._node_keys.add(node_key)
+        self.nodes.append(
+            {
+                "kind": "switch",
+                "node_key": node_key,
+                "name": node_key,
+                "function_id": None,
+                "function_version_id": None,
+                "entrypoint": None,
+                "input_bindings": {},
+                "upstream_node_keys": sorted(
+                    {then.node_key, otherwise.node_key} | _binding_node_keys(condition["binding"])
+                ),
+                "ordering_node_keys": [],
+                "retry_policy": {"retries": 0},
+                "timeout_seconds": None,
+                "cache_policy": {"enabled": False},
+                "resource_policy": {},
+                "runtime": "job",
+                "condition": condition,
+                "then_node_key": then.node_key,
+                "otherwise_node_key": otherwise.node_key,
+            }
+        )
         return StepPromise(node_key)
+
+
+def _condition_binding(condition: Any, *, equals: Any) -> dict[str, Any]:
+    if not isinstance(condition, (StepPromise, _WorkflowParameter)):
+        raise RebaseWorkflowError(
+            "a condition must be a step's output or a workflow parameter; comparisons on them are not "
+            "evaluated at deploy time -- use equals=... to compare"
+        )
+    spec: dict[str, Any] = {"binding": _binding_for(condition), "op": "truthy"}
+    if equals is not _UNSET:
+        _assert_json_literal(equals)
+        spec = {"binding": _binding_for(condition), "op": "eq", "value": equals}
+    return spec
+
+
+def when(condition: Any, *, then: Any, otherwise: Any, equals: Any = _UNSET) -> StepPromise:
+    """Choose between two step calls at run time: ``then`` when ``condition``
+    (a step output or workflow parameter) is truthy -- or equal to ``equals``
+    -- else ``otherwise``. Both calls are made in the body; only the taken one
+    runs, and the result is the taken one's output. Deploy-time only, like
+    every step call in a workflow body."""
+    trace = _current_trace()
+    if trace is None:
+        raise RebaseWorkflowError("rb.when is only meaningful inside a workflow body")
+    return trace.record_switch(_condition_binding(condition, equals=equals), then, otherwise)
 
 
 def _current_trace() -> _WorkflowTrace | None:
@@ -5232,6 +5383,40 @@ class Client:
         """Lift a workflow's pause so scheduled runs fire again."""
         return self._request_dict("POST", f"/workflows/{workflow_id}/resume", expected="workflow response")
 
+    def set_workflow_schedule_backend(self, workflow_id: str, backend: str) -> dict[str, Any]:
+        """Choose which path fires the workflow's cron: ``prefect`` (the default) or
+        ``cloud_tasks``, the push-based path being evaluated next to it. Operational,
+        like pause: no new version. The platform refuses ``cloud_tasks`` unless the
+        workspace allows it (`update_workspace_compute_policy(cloud_tasks_schedules_enabled=True)`),
+        the workflow is job-mode, and its cron reads the same on both engines."""
+        return self._request_dict(
+            "POST",
+            f"/workflows/{workflow_id}/schedule/backend",
+            json={"backend": backend},
+            expected="workflow response",
+        )
+
+    def set_workflow_execution_engine(self, workflow_id: str, engine: str) -> dict[str, Any]:
+        """Choose which engine executes the workflow's step graph: ``runner`` (the
+        default: one container walks it) or ``cloud_workflows`` (one Cloud
+        Workflows execution per run, one Cloud Run Job execution per step).
+        Operational, like pause: no new version, and runs in flight finish on the
+        engine they started on. The platform refuses ``cloud_workflows`` unless
+        the workspace allows it (`update_workspace_compute_policy(cloud_workflows_enabled=True)`)
+        and the workflow is a job-mode step workflow."""
+        return self._request_dict(
+            "POST", f"/workflows/{workflow_id}/engine", json={"engine": engine}, expected="workflow response"
+        )
+
+    def get_workflow_graph_plan(self, workflow_id: str, *, version_id: str | None = None) -> dict[str, Any]:
+        """What the Cloud Workflows engine would run for the workflow's current
+        version (or ``version_id``): the plan (levels of steps and each step's
+        retry and timeout numbers) and the program that interprets it. Read-only."""
+        params = {"version": version_id} if version_id else None
+        return self._request_dict(
+            "GET", f"/workflows/{workflow_id}/graph/plan", params=params, expected="workflow graph plan response"
+        )
+
     def pause_project(self, project_id: str) -> dict[str, Any]:
         """Stop a whole project: no schedule, trigger, endpoint call or run by hand
         goes through until it is resumed. Its workflows and functions keep their own
@@ -5350,6 +5535,8 @@ class Client:
         max_cloud_run_concurrency: int | None = None,
         max_cloud_run_cpu_milli: int | None = None,
         max_cloud_run_memory_mib: int | None = None,
+        cloud_tasks_schedules_enabled: bool | None = None,
+        cloud_workflows_enabled: bool | None = None,
     ) -> dict[str, Any]:
         # No _UNSET sentinel here, unlike update_workspace_notifications: these are
         # NOT NULL integers with no clear-to-null semantics, so plain "None means not
@@ -5369,6 +5556,10 @@ class Client:
             payload["max_cloud_run_cpu_milli"] = max_cloud_run_cpu_milli
         if max_cloud_run_memory_mib is not None:
             payload["max_cloud_run_memory_mib"] = max_cloud_run_memory_mib
+        if cloud_tasks_schedules_enabled is not None:
+            payload["cloud_tasks_schedules_enabled"] = cloud_tasks_schedules_enabled
+        if cloud_workflows_enabled is not None:
+            payload["cloud_workflows_enabled"] = cloud_workflows_enabled
         return self._request_dict(
             "PATCH", "/workspace/compute-policy", json=payload, expected="workspace compute policy response"
         )
@@ -6005,8 +6196,12 @@ class Project:
         default_parameters: dict[str, Any] | None = None,
         enabled: bool = True,
         retries: int = 0,
+        retry_backoff: int | float | None = None,
         timeout_seconds: int | float | None = None,
         cache: bool = False,
+        cpu: float | int | str | None = None,
+        memory: int | float | str | None = None,
+        runtime: str = "job",
         deploy_source: str | None = None,
     ) -> Callable[[Callable[..., Any]], Step]:
         def decorator(fn: Callable[..., Any]) -> Step:
@@ -6021,8 +6216,12 @@ class Project:
                 project_source_mode=self.source_mode,
                 client=self._client,
                 retries=retries,
+                retry_backoff=retry_backoff,
                 timeout_seconds=timeout_seconds,
                 cache=cache,
+                cpu=cpu,
+                memory=memory,
+                runtime=runtime,
             )
             self._steps.append(step)
             self._functions.append(step)
@@ -7270,8 +7469,12 @@ class Step(Function):
         function_id: str | None = None,
         data: dict[str, Any] | None = None,
         retries: int = 0,
+        retry_backoff: int | float | None = None,
         timeout_seconds: int | float | None = None,
         cache: bool = False,
+        cpu: float | int | str | None = None,
+        memory: int | float | str | None = None,
+        runtime: str = "job",
     ) -> None:
         super().__init__(
             fn,
@@ -7296,11 +7499,32 @@ class Step(Function):
         )
         if retries < 0:
             raise ValueError("retries must be greater than or equal to 0")
+        if retry_backoff is not None and retry_backoff < 0:
+            raise ValueError("retry_backoff must be greater than or equal to 0")
         if timeout_seconds is not None and timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than 0")
+        if runtime not in ("job", "service"):
+            raise ValueError("runtime must be 'job' or 'service'")
         self.retries = retries
         self.timeout_seconds = timeout_seconds
         self.cache = cache
+        self.runtime = runtime
+        # How a failed attempt is retried on an engine that retries per step:
+        # the wait before the second attempt doubles each time, up to five minutes.
+        backoff = float(retry_backoff) if retry_backoff is not None else 0.0
+        self.retry_policy: dict[str, Any] = {
+            "retries": retries,
+            "backoff_seconds": backoff,
+            "backoff_multiplier": 2.0 if backoff else 1.0,
+            "max_backoff_seconds": max(backoff, min(backoff * 16, 300.0)) if backoff else 0.0,
+        }
+        # The step's own container size (the Cloud Workflows engine runs each
+        # step in its own); the workflow's `resources` is the inherited layer.
+        self.own_resources: dict[str, Any] = {}
+        if cpu is not None:
+            self.own_resources["cpu"] = str(cpu)
+        if memory is not None:
+            self.own_resources["memory"] = str(memory)
         self.resources: dict[str, Any] = {}
 
     def deploy(self, **_kwargs: Any) -> Step:
@@ -7346,6 +7570,90 @@ class Step(Function):
         if self.fn is None:
             raise RebaseWorkflowError("remote step handles cannot be called locally; use .remote(...)")
         return self.fn(*args, **kwargs)
+
+    def after(self, *promises: Any) -> Callable[..., StepPromise]:
+        """Order this step after other steps whose output it does not read:
+        ``notify.after(write_db())(summary=s)``. Deploy-time only."""
+        keys: list[str] = []
+        for promise in promises:
+            if not isinstance(promise, StepPromise):
+                raise RebaseWorkflowError("step.after takes the results of other step calls")
+            keys.append(promise.node_key)
+
+        def call(*args: Any, **kwargs: Any) -> StepPromise:
+            trace = _current_trace()
+            if trace is None:
+                raise RebaseWorkflowError("step.after is only meaningful inside a workflow body")
+            return trace.record_step(self, args, kwargs, ordering=tuple(keys))
+
+        return call
+
+    def when(self, condition: Any, *, equals: Any = _UNSET) -> Callable[..., StepPromise]:
+        """Run this step only when ``condition`` (a step output or workflow
+        parameter) is truthy, or equal to ``equals``; otherwise it is skipped
+        and its output reads as None. Deploy-time only."""
+        spec = _condition_binding(condition, equals=equals)
+
+        def call(*args: Any, **kwargs: Any) -> StepPromise:
+            trace = _current_trace()
+            if trace is None:
+                raise RebaseWorkflowError("step.when is only meaningful inside a workflow body")
+            return trace.record_step(self, args, kwargs, condition={**spec, "negate": False})
+
+        return call
+
+    def map(  # type: ignore[override]
+        self,
+        items: Any,
+        *,
+        parameter: str | None = None,
+        kwargs: dict[str, Any] | None = None,
+        max_concurrency: int | None = None,
+        ordered: bool = True,
+        return_exceptions: bool = False,
+        timeout: float | None = None,
+        **bound: Any,
+    ) -> Any:
+        """Inside a workflow body: one step node that runs once per item of
+        ``items`` (another step's output, a workflow parameter, or a literal
+        list), side by side up to ``max_concurrency``, with ``bound`` as the
+        other arguments; its output is the list of the items' results. Outside
+        a body it is ``Function.map``, the runtime fan-out."""
+        trace = _current_trace()
+        if trace is None:
+            return Function.map(
+                self,
+                items,
+                parameter=parameter,
+                kwargs={**(kwargs or {}), **bound} or None,
+                max_concurrency=max_concurrency,
+                ordered=ordered,
+                return_exceptions=return_exceptions,
+                timeout=timeout,
+            )
+        mapped = parameter or self._infer_mapped_parameter(set(kwargs or {}) | set(bound))
+        return trace.record_map(
+            self, items, parameter=mapped, kwargs={**(kwargs or {}), **bound}, max_concurrency=max_concurrency
+        )
+
+    def _infer_mapped_parameter(self, given: set[str]) -> str:
+        """The one parameter the mapped item fills: whatever the body did not
+        pass by name. Two candidates need an explicit ``parameter=``."""
+        if self.fn is None:
+            raise RebaseWorkflowError("parameter is required to map a remote step handle")
+        parameters = inspect.signature(self.fn).parameters
+        candidates = [name for name in parameters if name not in given]
+        # A parameter with a default is not what the item fills, unless it is
+        # the only one left.
+        required = [name for name in candidates if parameters[name].default is inspect.Parameter.empty]
+        if len(required) == 1:
+            return required[0]
+        if len(candidates) == 1:
+            return candidates[0]
+        raise RebaseWorkflowError(
+            f"step {self.name!r}.map: say which parameter takes each item (parameter=...); "
+            f"candidates: {', '.join(candidates) or 'none'}"
+        )
 
     def submit(self, *args: Any, **kwargs: Any) -> Run:
         return self.spawn(**self._parameters_from_call(args, kwargs))
@@ -7555,6 +7863,16 @@ class Workflow:
         _trace_stack.append(trace)
         try:
             result = self.fn(**self._trace_arguments())
+        except RebaseWorkflowError as exc:
+            if isinstance(exc, _RuntimeBranchingError):
+                raise RebaseWorkflowError(
+                    "Could not compile a static step graph for this workflow. Rebase step workflows support "
+                    "direct step calls and literal containers at deployment time; put runtime branching inside "
+                    "a step function."
+                ) from exc
+            # Already says what is wrong with the body (a map over the wrong
+            # thing, a condition on a literal): keep the specific message.
+            raise
         except Exception as exc:
             if trace.nodes or self._references_step():
                 raise RebaseWorkflowError(
@@ -7569,8 +7887,7 @@ class Workflow:
         if not trace.nodes:
             return None
         return {
-            "schema_version": 1,
-            "engine": "prefect",
+            "schema_version": 2,
             "nodes": trace.nodes,
             "return_binding": _binding_for(result),
         }
