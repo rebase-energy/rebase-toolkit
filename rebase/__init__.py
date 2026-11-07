@@ -15,6 +15,7 @@ from rebase.client import (
     Client,
     Cron,
     Dataset,
+    DeploymentError,
     EndpointConfig,
     Environment,
     ExecutionMode,
@@ -44,6 +45,7 @@ from rebase.client import (
     Workflow,
     configure,
     problem_score_payload,
+    when,
 )
 from rebase.config import DEFAULT_API_URL, DEFAULT_SERVER_URL
 from rebase.contract import (
@@ -53,6 +55,7 @@ from rebase.contract import (
     Freshness,
     ValidationReport,
 )
+from rebase.deployment import DeploymentReport, DeploymentResult
 from rebase.public import (
     asgi_app,
     deploy,
@@ -87,6 +90,9 @@ __all__ = [
     "Dataset",
     "Problem",
     "problem_score_payload",
+    "DeploymentError",
+    "DeploymentReport",
+    "DeploymentResult",
     "Duration",
     "EndpointConfig",
     "Environment",
@@ -120,6 +126,7 @@ __all__ = [
     "ModelHandle",
     "OnUpdate",
     "OnWorkflow",
+    "when",
     "Optimizer",
     "OptimizerHandle",
     "Predictor",

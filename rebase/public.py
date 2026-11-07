@@ -29,7 +29,10 @@ from rebase.client import (
     Trigger,
     Volume,
     Workflow,
+    _plan_deployment,
+    _resolve_environment,
 )
+from rebase.deployment import _deployment_scope
 
 DEFAULT_PROJECT_NAME = "default"
 
@@ -499,7 +502,10 @@ def deploy(
         deploy_kwargs["deploy_source"] = deploy_source
     if environment is not None:
         deploy_kwargs["environment"] = environment
-    deployed = [target.deploy(**deploy_kwargs) for target in targets]
+    with _deployment_scope() as report:
+        for target in targets:
+            _plan_deployment(report, target, _resolve_environment(target._client, environment))
+        deployed = [target.deploy(**deploy_kwargs) for target in targets]
     return deployed[0] if len(deployed) == 1 else deployed
 
 

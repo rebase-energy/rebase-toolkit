@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import sys
@@ -16,12 +17,16 @@ import textwrap
 import time
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import suppress
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
+from threading import local as thread_local
 from types import FunctionType
-from typing import Any, Self
+from typing import Any, Self, cast
 from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -31,6 +36,19 @@ from rebase._framework import framework_models, framework_module, installs_frame
 from rebase.auth import AuthError, load_access_token
 from rebase.client_identity import identity_headers
 from rebase.config import DEFAULT_SERVER_URL, active_environment, load_profile, local_workspace_id
+from rebase.deployment import (
+    DeploymentReport,
+    DeploymentResult,
+    _cache_context,
+    _DefinitionPrepared,
+    _deployment_scope,
+    _DeploymentCache,
+    _mark_uncertain,
+    _prepare_context,
+    _PreparedDefinition,
+    _report_context,
+    _target_context,
+)
 from rebase.image import DEFAULT_PYTHON_VERSION, Image
 from rebase.runtime import current_run
 from rebase.source_bundle import SourceBundle, build_source_bundle
@@ -86,11 +104,68 @@ def _environment_scoped_deploy(method: Callable[..., Any]) -> Callable[..., Any]
         kwargs["environment"] = environment
         token = _environment_context.set(environment)
         try:
-            return method(self, *args, **kwargs)
+            with _deployment_scope() as report:
+                self.deployment_report = report
+                result = _plan_deployment(report, self, environment, only=kwargs.get("only"))
+                target_token = _target_context.set(result)
+                if result is not None:
+                    # Shared steps may be written more than once in a deploy.
+                    result.status = "unattempted"
+                    result.error = None
+                try:
+                    deployed = method(self, *args, **kwargs)
+                except BaseException as exc:
+                    message = str(exc) or type(exc).__name__
+                    report.error = message
+                    if result is not None:
+                        if result.status != "uncertain":
+                            result.status = "failed"
+                        result.error = result.error or message
+                    if isinstance(exc, RebaseWorkflowError) and not isinstance(exc, DeploymentError):
+                        raise DeploymentError(message, report=report, status_code=exc.status_code) from exc
+                    raise
+                else:
+                    if result is not None:
+                        if isinstance(deployed, _PreparedDefinition):
+                            return deployed
+                        if result.status != "unchanged":
+                            result.status = "succeeded"
+                        result.id = getattr(self, "id", None)
+                        result.error = None
+                    return deployed
+                finally:
+                    _target_context.reset(target_token)
         finally:
             _environment_context.reset(token)
 
     return scoped
+
+
+def _plan_deployment(
+    report: DeploymentReport, target: Any, environment: str, *, only: Sequence[str] | None = None
+) -> DeploymentResult | None:
+    """Plan selected targets up front so an aborted suffix remains visible."""
+    if isinstance(target, Project):
+        children = (
+            target._selected_workflows(only)
+            if only is not None
+            else (*target._functions, *target._workflows, *target._asgi_apps)
+        )
+        for child in children:
+            if not isinstance(child, Step):
+                _plan_deployment(report, child, environment)
+        return None
+    if isinstance(target, Workflow):
+        for step in target._collect_steps():
+            _plan_deployment(report, step, environment)
+    target_type = "asgi_app" if isinstance(target, ASGIApp) else type(target).__name__.lower()
+    return report._plan(
+        target,
+        target_type=target_type,
+        name=str(target.name),
+        project=getattr(target, "project", None),
+        environment=environment,
+    )
 
 
 _trace_stack: list[_WorkflowTrace] = []
@@ -107,6 +182,13 @@ DEFAULT_API_KEY_PERMISSIONS = [
     "runs:read",
 ]
 DEPLOY_REQUEST_TIMEOUT_SECONDS = 300
+DEPLOY_REQUEST_ATTEMPTS = 3
+# A 429 is the platform refusing a request before doing any of it -- the bucket
+# data routes are budgeted per workspace, and over budget they answer 429 with a
+# Retry-After -- so any request can be sent again after the wait, writes included.
+# Up to this many waits, each no longer than this; past that the 429 is the error.
+RATE_LIMIT_ATTEMPTS = 4
+RATE_LIMIT_MAX_WAIT_SECONDS = 60.0
 # (connect, read) for POST /runs/ephemeral: the server executes quick runs inside
 # the request and enforces a 300 s run cap, so the read timeout is that plus
 # headroom. The old default of 30 s failed any run longer than half a minute.
@@ -122,6 +204,40 @@ class RebaseWorkflowError(RuntimeError):
 
 
 RebaseError = RebaseWorkflowError
+
+
+class DeploymentError(RebaseWorkflowError):
+    """An incomplete deployment, with outcomes collected before it stopped."""
+
+    def __init__(self, message: str, *, report: DeploymentReport, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.report = report
+        self.status_code = status_code
+
+
+class _DeploymentRequestError(RebaseWorkflowError):
+    def __init__(self, message: str, *, uncertain: bool, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.uncertain = uncertain
+        self.status_code = status_code
+
+
+def _retry_after_seconds(response: requests.Response) -> float | None:
+    """How long a 429 asks us to wait, or None when it is too long to wait out."""
+    try:
+        wait = float(response.headers.get("Retry-After", "1"))
+    except (AttributeError, ValueError):
+        wait = 1.0
+    wait = max(wait, 0.0)
+    return wait if wait <= RATE_LIMIT_MAX_WAIT_SECONDS else None
+
+
+def _deploy_retry_delay(attempt: int, response: requests.Response | None = None) -> float:
+    delay = 2**attempt + random.uniform(0, 0.25)
+    if response is not None:
+        with suppress(AttributeError, ValueError):
+            delay = max(delay, float(response.headers.get("Retry-After", "0")))
+    return min(delay, 10.0)
 
 
 class EndpointConfig:
@@ -2494,9 +2610,14 @@ def _assert_json_literal(value: Any) -> None:
         ) from exc
 
 
+class _RuntimeBranchingError(RebaseWorkflowError):
+    """The body used a traced value as if it were real; wrapped by the compiler
+    into the one message about static graphs."""
+
+
 class _TraceValue:
     def _unsupported(self, operation: str) -> RebaseWorkflowError:
-        return RebaseWorkflowError(
+        return _RuntimeBranchingError(
             f"Step workflows must be static. Runtime values cannot be used with {operation} during deployment."
         )
 
@@ -2526,11 +2647,23 @@ class StepPromise(_TraceValue):
         self.node_key = node_key
 
 
+class _MapItem(_TraceValue):
+    """One item of the list a ``step.map`` runs over, inside that step's inputs."""
+
+
+class _MapIndex(_TraceValue):
+    """The item's position, inside a ``step.map`` step's inputs."""
+
+
 def _binding_for(value: Any) -> dict[str, Any]:
     if isinstance(value, StepPromise):
         return {"type": "node_output", "node_key": value.node_key}
     if isinstance(value, _WorkflowParameter):
         return {"type": "parameter", "name": value.name}
+    if isinstance(value, _MapItem):
+        return {"type": "map_item"}
+    if isinstance(value, _MapIndex):
+        return {"type": "map_index"}
     if isinstance(value, dict):
         items: dict[str, dict[str, Any]] = {}
         for key, item in value.items():
@@ -2564,23 +2697,23 @@ def _binding_node_keys(binding: dict[str, Any]) -> set[str]:
 
 
 class _WorkflowTrace:
-    """Compiles a workflow body into a chain of step nodes.
+    """Compiles a workflow body into a graph of step nodes.
 
-    Steps are sequential by contract: each one runs after the one before it, whether or
-    not it consumes its output. The graph could express parallel roots — dependencies are
-    derived from data bindings, so two steps that ignore each other would have none — but
-    a chain is what makes a workflow legible: a straight line to draw, and one unambiguous
-    answer to "which step failed, and what never ran because of it". Independent work that
-    wants to run side by side belongs to tasks inside a step, not to steps.
+    Every node's dependencies are the steps whose outputs it reads (its data
+    bindings), plus any ordering edge the body asked for with ``step.after``.
+    Two steps that read nothing of each other have no edge, so an engine that
+    can run them side by side does (the Cloud Workflows engine); the in-process
+    runner still runs the nodes in the order the body called them. A
+    ``step.map`` is one node that fans out over a list; ``rb.when`` is a switch
+    between two conditioned steps.
     """
 
     def __init__(self, *, ephemeral: bool = False) -> None:
         self.ephemeral = ephemeral
         self.nodes: list[dict[str, Any]] = []
         self._node_keys: set[str] = set()
-        self._previous_node_key: str | None = None
 
-    def record_step(self, step: Step, args: tuple[Any, ...], kwargs: dict[str, Any]) -> StepPromise:
+    def _check_step(self, step: Step) -> str | None:
         step_name = str(step.name)
         if step.fn is None:
             raise RebaseWorkflowError(f"Step {step_name!r} cannot be used in a workflow without local source.")
@@ -2592,35 +2725,45 @@ class _WorkflowTrace:
         function_version_id = step.data.get("current_version_id")
         if not self.ephemeral and function_version_id is None:
             raise RebaseWorkflowError(f"Step {step_name!r} has no current function version after deployment.")
+        return function_version_id
 
-        signature = inspect.signature(step.fn)
-        bound = signature.bind(*args, **kwargs)
-        bound.apply_defaults()
-        input_bindings = {name: _binding_for(value) for name, value in bound.arguments.items()}
-        upstream_node_keys: set[str] = set()
+    def _node_for(
+        self,
+        step: Step,
+        input_bindings: dict[str, dict[str, Any]],
+        *,
+        function_version_id: str | None,
+        ordering: tuple[str, ...] = (),
+        condition: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        upstream_node_keys: set[str] = set(ordering)
         for binding in input_bindings.values():
             upstream_node_keys.update(_binding_node_keys(binding))
-        # The ordering edge, on top of whatever the data bindings imply. Kept separate from
-        # `input_bindings`, so the graph still shows which dependency carries a value and
-        # which is only sequence.
-        if self._previous_node_key is not None:
-            upstream_node_keys.add(self._previous_node_key)
-
-        node_key = _node_key_for(step_name, self._node_keys)
+        if condition is not None:
+            upstream_node_keys.update(_binding_node_keys(condition["binding"]))
+        node_key = _node_key_for(str(step.name), self._node_keys)
         self._node_keys.add(node_key)
-        node = {
+        node: dict[str, Any] = {
             "node_key": node_key,
-            "name": step_name,
+            "name": str(step.name),
             "function_id": step.id,
             "function_version_id": function_version_id,
             "entrypoint": step.entrypoint,
             "input_bindings": input_bindings,
             "upstream_node_keys": sorted(upstream_node_keys),
-            "retry_policy": {"retries": step.retries},
+            # Kept separate from the data edges, so the graph still shows which
+            # dependency carries a value and which is only sequence.
+            "ordering_node_keys": sorted(ordering),
+            "retry_policy": dict(step.retry_policy),
             "timeout_seconds": step.timeout_seconds,
             "cache_policy": {"enabled": step.cache},
-            "resource_policy": step.resources,
+            # The workflow's resources are the inherited layer; the step's own
+            # cpu/memory override them.
+            "resource_policy": {**(step.resources or {}), **step.own_resources},
+            "runtime": step.runtime,
         }
+        if condition is not None:
+            node["condition"] = condition
         if self.ephemeral:
             node.update(
                 {
@@ -2631,9 +2774,133 @@ class _WorkflowTrace:
                     "image_spec": step.image_spec,
                 }
             )
+        return node
+
+    def record_step(
+        self,
+        step: Step,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        ordering: tuple[str, ...] = (),
+        condition: dict[str, Any] | None = None,
+    ) -> StepPromise:
+        function_version_id = self._check_step(step)
+        signature = inspect.signature(step.fn)  # type: ignore[arg-type]
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        input_bindings = {name: _binding_for(value) for name, value in bound.arguments.items()}
+        node = self._node_for(
+            step, input_bindings, function_version_id=function_version_id, ordering=ordering, condition=condition
+        )
         self.nodes.append(node)
-        self._previous_node_key = node_key
+        return StepPromise(node["node_key"])
+
+    def record_map(
+        self,
+        step: Step,
+        items: Any,
+        *,
+        parameter: str,
+        kwargs: dict[str, Any],
+        max_concurrency: int | None,
+    ) -> StepPromise:
+        function_version_id = self._check_step(step)
+        if not isinstance(items, (StepPromise, _WorkflowParameter, list, tuple)):
+            raise RebaseWorkflowError(
+                f"step {step.name!r}.map needs a list to map over: another step's output, a workflow "
+                f"parameter, or a literal list; got {type(items).__name__}"
+            )
+        if isinstance(items, (list, tuple)) and any(isinstance(item, _TraceValue) for item in items):
+            raise RebaseWorkflowError(
+                f"step {step.name!r}.map: a literal list of items cannot mix in step outputs; map over the "
+                "step's output directly"
+            )
+        signature = inspect.signature(step.fn)  # type: ignore[arg-type]
+        if parameter not in signature.parameters:
+            raise RebaseWorkflowError(f"step {step.name!r} has no parameter {parameter!r} to map over")
+        if parameter in kwargs:
+            raise RebaseWorkflowError(f"step {step.name!r}.map: {parameter!r} is the mapped parameter")
+        bound = signature.bind(**{parameter: _MapItem()}, **kwargs)
+        bound.apply_defaults()
+        input_bindings = {name: _binding_for(value) for name, value in bound.arguments.items()}
+        node = self._node_for(step, input_bindings, function_version_id=function_version_id)
+        node["kind"] = "map"
+        node["items_binding"] = _binding_for(items)
+        node["upstream_node_keys"] = sorted(set(node["upstream_node_keys"]) | _binding_node_keys(node["items_binding"]))
+        if max_concurrency is not None:
+            if max_concurrency < 1:
+                raise RebaseWorkflowError("max_concurrency must be at least 1")
+            node["max_concurrency"] = int(max_concurrency)
+        self.nodes.append(node)
+        return StepPromise(node["node_key"])
+
+    def record_switch(self, condition: dict[str, Any], then: StepPromise, otherwise: StepPromise) -> StepPromise:
+        branches: dict[str, dict[str, Any]] = {}
+        for promise, negate in ((then, False), (otherwise, True)):
+            if not isinstance(promise, StepPromise):
+                raise RebaseWorkflowError("rb.when needs two step calls, then=step(...) and otherwise=step(...)")
+            node = next((n for n in self.nodes if n["node_key"] == promise.node_key), None)
+            if node is None or node.get("kind", "step") != "step":
+                raise RebaseWorkflowError("rb.when branches must be plain steps called in this workflow")
+            if "condition" in node:
+                raise RebaseWorkflowError(f"step {node['name']!r} already runs under a condition")
+            node["condition"] = {**condition, "negate": negate}
+            node["upstream_node_keys"] = sorted(
+                set(node["upstream_node_keys"]) | _binding_node_keys(condition["binding"])
+            )
+            branches[promise.node_key] = node
+        node_key = _node_key_for("when", self._node_keys)
+        self._node_keys.add(node_key)
+        self.nodes.append(
+            {
+                "kind": "switch",
+                "node_key": node_key,
+                "name": node_key,
+                "function_id": None,
+                "function_version_id": None,
+                "entrypoint": None,
+                "input_bindings": {},
+                "upstream_node_keys": sorted(
+                    {then.node_key, otherwise.node_key} | _binding_node_keys(condition["binding"])
+                ),
+                "ordering_node_keys": [],
+                "retry_policy": {"retries": 0},
+                "timeout_seconds": None,
+                "cache_policy": {"enabled": False},
+                "resource_policy": {},
+                "runtime": "job",
+                "condition": condition,
+                "then_node_key": then.node_key,
+                "otherwise_node_key": otherwise.node_key,
+            }
+        )
         return StepPromise(node_key)
+
+
+def _condition_binding(condition: Any, *, equals: Any) -> dict[str, Any]:
+    if not isinstance(condition, (StepPromise, _WorkflowParameter)):
+        raise RebaseWorkflowError(
+            "a condition must be a step's output or a workflow parameter; comparisons on them are not "
+            "evaluated at deploy time -- use equals=... to compare"
+        )
+    spec: dict[str, Any] = {"binding": _binding_for(condition), "op": "truthy"}
+    if equals is not _UNSET:
+        _assert_json_literal(equals)
+        spec = {"binding": _binding_for(condition), "op": "eq", "value": equals}
+    return spec
+
+
+def when(condition: Any, *, then: Any, otherwise: Any, equals: Any = _UNSET) -> StepPromise:
+    """Choose between two step calls at run time: ``then`` when ``condition``
+    (a step output or workflow parameter) is truthy -- or equal to ``equals``
+    -- else ``otherwise``. Both calls are made in the body; only the taken one
+    runs, and the result is the taken one's output. Deploy-time only, like
+    every step call in a workflow body."""
+    trace = _current_trace()
+    if trace is None:
+        raise RebaseWorkflowError("rb.when is only meaningful inside a workflow body")
+    return trace.record_switch(_condition_binding(condition, equals=equals), then, otherwise)
 
 
 def _current_trace() -> _WorkflowTrace | None:
@@ -3022,27 +3289,131 @@ class Client:
             resolved_headers["X-Rebase-GitOps-Release"] = release_id
         return resolved_headers
 
+    def _deployment_cache(self, environment: str | None = None) -> _DeploymentCache | None:
+        caches = _cache_context.get()
+        if caches is None:
+            return None
+        # Client identity prevents sharing between credentials/HTTP sessions.
+        key = (
+            self,
+            self.api_url,
+            self.workspace_id,
+            _resolve_environment(self, environment),
+            self.api_key,
+            self.access_token,
+        )
+        return caches.setdefault(key, _DeploymentCache())
+
+    def _deployment_lookup(self, path: str, read: Callable[[], Any], *, environment: str | None = None) -> Any:
+        cache = self._deployment_cache(environment)
+        if cache is None:
+            return read()
+        if path not in cache.lookups:
+            cache.lookups[path] = deepcopy(read())
+        return deepcopy(cache.lookups[path])
+
+    def _invalidate_deployment_lookup(self, method: str, path: str, environment: str) -> None:
+        cache = self._deployment_cache(environment)
+        if cache is None or method.upper() in {"GET", "HEAD"}:
+            return
+        parts = path.strip("/").split("/")
+        if parts[0] == "projects":
+            if len(parts) <= 2:
+                cache.lookups.pop("/projects", None)
+                if method.upper() == "DELETE" or path == "/projects/batch-delete":
+                    cache.lookups.clear()
+                    cache.steps.clear()
+            else:
+                cache.lookups.pop(path, None)
+        elif parts[0] in {"functions", "workflows"}:
+            for key in list(cache.lookups):
+                if key.endswith("/" + parts[0]):
+                    cache.lookups.pop(key)
+            if parts[0] == "functions":
+                cache.steps.pop("/" + "/".join(parts[:2]), None)
+        elif parts[0] == "secrets":
+            for key in list(cache.lookups):
+                if key.startswith("/secrets/"):
+                    cache.lookups.pop(key)
+
     def request(
         self, method: str, path: str, *, auth: bool = True, **kwargs: Any
     ) -> dict[str, Any] | list[dict[str, Any]]:
         return self._request_response(method, path, auth=auth, **kwargs).json()
 
     def _request_response(self, method: str, path: str, *, auth: bool = True, **kwargs: Any) -> requests.Response:
-        """Send one authenticated request, including the disk-token retry and error mapping."""
+        """Retry deployment reads and writes known not to have connected.
+
+        Other writes may already have committed. Never replay them here: callers
+        with a read-back contract can reconcile an uncertain response instead.
+        Run submission and other non-deployment requests retain their behavior.
+        """
+        deploying = kwargs.pop("_deployment_request", False) or _report_context.get() is not None
         caller_headers = kwargs.pop("headers", {})
         headers = self._request_headers(auth=auth, headers=caller_headers)
         timeout = kwargs.pop("timeout", 30)
-        response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
-        if getattr(response, "status_code", None) == 401 and auth and self._invalidate_cached_token():
-            headers = self._request_headers(auth=auth, headers=caller_headers)
-            response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            error = RebaseWorkflowError(_response_error_message(response))
-            error.status_code = response.status_code
-            raise error from exc
-        return response
+        self._invalidate_deployment_lookup(method, path, headers["X-Rebase-Environment"])
+        read_only = method.upper() in {"GET", "HEAD"}
+        attempts = DEPLOY_REQUEST_ATTEMPTS if deploying else 1
+        refreshed_token = False
+        for attempt in range(attempts):
+            try:
+                response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
+                if (
+                    getattr(response, "status_code", None) == 401
+                    and auth
+                    and not refreshed_token
+                    and self._invalidate_cached_token()
+                ):
+                    refreshed_token = True
+                    headers = self._request_headers(auth=auth, headers=caller_headers)
+                    response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
+                throttled = 0
+                while getattr(response, "status_code", None) == 429 and throttled < RATE_LIMIT_ATTEMPTS:
+                    wait = _retry_after_seconds(response)
+                    if wait is None:
+                        break
+                    throttled += 1
+                    time.sleep(wait)
+                    response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                if not deploying:
+                    raise
+                safe_to_retry = read_only or isinstance(exc, requests.ConnectTimeout)
+                if safe_to_retry and attempt + 1 < attempts:
+                    time.sleep(_deploy_retry_delay(attempt))
+                    continue
+                uncertain = not safe_to_retry
+                message = f"{method} {path}: {type(exc).__name__}: {exc}"
+                if uncertain:
+                    message += " (write outcome uncertain)"
+                    _mark_uncertain(message)
+                raise _DeploymentRequestError(message, uncertain=uncertain) from exc
+            except KeyboardInterrupt:
+                if deploying and not read_only:
+                    _mark_uncertain(f"{method} {path}: interrupted while awaiting a write response")
+                raise
+            if (
+                deploying
+                and read_only
+                and getattr(response, "status_code", None) in {429, 500, 502, 503, 504}
+                and attempt + 1 < attempts
+            ):
+                time.sleep(_deploy_retry_delay(attempt, response))
+                continue
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                message = _response_error_message(response)
+                if deploying and not read_only and (response.status_code >= 500 or response.status_code == 408):
+                    message = f"{method} {path}: {message} (write outcome uncertain)"
+                    _mark_uncertain(message)
+                    raise _DeploymentRequestError(message, uncertain=True, status_code=response.status_code) from exc
+                error = RebaseWorkflowError(message)
+                error.status_code = response.status_code
+                raise error from exc
+            return response
+        raise AssertionError("request attempts exhausted without a result")
 
     def _request_dict(self, method: str, path: str, *, expected: str, **kwargs: Any) -> dict[str, Any]:
         response = self.request(method, path, **kwargs)
@@ -3226,7 +3597,10 @@ class Client:
         return self._request_dict("PUT", "/secrets", json={"name": name, "values": values}, expected="secret response")
 
     def get_secret(self, name: str) -> dict[str, Any]:
-        return self._request_dict("GET", f"/secrets/{name}", expected="secret response")
+        return self._deployment_lookup(
+            f"/secrets/{name}",
+            lambda: self._request_dict("GET", f"/secrets/{name}", expected="secret response"),
+        )
 
     def delete_secret(self, name: str) -> dict[str, Any]:
         return self._request_dict("DELETE", f"/secrets/{name}", expected="secret response")
@@ -4006,7 +4380,11 @@ class Client:
         self.request_no_content("DELETE", f"/workflows/{workflow_id}", params={"force": str(force).lower()})
 
     def find_project(self, name: str, *, environment_name: str | None = None) -> dict[str, Any] | None:
-        projects = self.list_projects(environment_name=environment_name) if environment_name else self.list_projects()
+        projects = self._deployment_lookup(
+            "/projects",
+            lambda: self.list_projects(environment_name=environment_name) if environment_name else self.list_projects(),
+            environment=environment_name,
+        )
         return _find_named(projects, name)
 
     def _resolve_project_id(self, project: str | None, project_id: str | None) -> str | None:
@@ -4065,9 +4443,8 @@ class Client:
             return []
         if resolved_project_id is None:
             return self._list_workspace_functions()
-        return self._request_list(
-            "GET", f"/projects/{resolved_project_id}/functions", expected="function list response"
-        )
+        path = f"/projects/{resolved_project_id}/functions"
+        return self._deployment_lookup(path, lambda: self._request_list("GET", path, expected="function list response"))
 
     def _list_workspace_functions(self) -> list[dict[str, Any]]:
         """Every function in the workspace, in one request where the API allows it.
@@ -4101,6 +4478,39 @@ class Client:
             resolved_project_id = self.ensure_project(project or DEFAULT_PROJECT_NAME)["id"]
         return self._request_list(
             "GET", f"/projects/{resolved_project_id}/asgi-apps", expected="ASGI app list response"
+        )
+
+    def get_asgi_app(self, asgi_app_id: str) -> dict[str, Any]:
+        return self._request_dict("GET", f"/asgi-apps/{asgi_app_id}", expected="ASGI app response")
+
+    def get_asgi_app_instances(
+        self,
+        asgi_app_id: str,
+        *,
+        since: str | datetime | None = None,
+        window_seconds: int | None = None,
+        limit: int | None = None,
+        include_requests: bool | None = None,
+    ) -> dict[str, Any]:
+        """Running instances and recent container events of a deployed ASGI app.
+
+        The platform's own view of the app's service: billed instance counts,
+        the instances seen in the last ``window_seconds`` with their lifecycle
+        (started, ready, requests served), and the container events behind
+        them. Pass the returned ``next_since`` back as ``since`` to receive
+        only newer events on the next call.
+        """
+        params: dict[str, Any] = {}
+        if since is not None:
+            params["since"] = since.isoformat() if isinstance(since, datetime) else since
+        if window_seconds is not None:
+            params["window_seconds"] = window_seconds
+        if limit is not None:
+            params["limit"] = limit
+        if include_requests is not None:
+            params["include_requests"] = "true" if include_requests else "false"
+        return self._request_dict(
+            "GET", f"/asgi-apps/{asgi_app_id}/instances", params=params or None, expected="ASGI app instances response"
         )
 
     def find_asgi_app(self, name: str, *, project: str) -> dict[str, Any] | None:
@@ -4338,6 +4748,8 @@ class Client:
             payload["buckets"] = buckets
         if build:
             payload["build"] = build
+        if _report_context.get() is not None:
+            return self._write_definition("POST", f"/projects/{project_id}/functions", payload, target_type="function")
         return self._request_dict(
             "POST", f"/projects/{project_id}/functions", json=payload, expected="function response"
         )
@@ -4417,6 +4829,8 @@ class Client:
         payload.update(execution_payload)
         if build:
             payload["build"] = build
+        if _report_context.get() is not None:
+            return self._write_definition("PATCH", f"/functions/{function_id}", payload, target_type="function")
         return self._request_dict("PATCH", f"/functions/{function_id}", json=payload, expected="function response")
 
     def run_function(self, function_id: str, parameters: dict[str, Any] | None = None) -> Run:
@@ -4779,7 +5193,7 @@ class Client:
         if project is not None and resolved_project_id is None:
             return []
         path = f"/projects/{resolved_project_id}/workflows" if resolved_project_id is not None else "/workflows"
-        return self._request_list("GET", path, expected="workflow list response")
+        return self._deployment_lookup(path, lambda: self._request_list("GET", path, expected="workflow list response"))
 
     def get_workflow(self, workflow_id: str) -> dict[str, Any]:
         return self._request_dict("GET", f"/workflows/{workflow_id}", expected="workflow response")
@@ -4787,6 +5201,204 @@ class Client:
     def find_workflow(self, name: str, *, project: str | None = None) -> dict[str, Any] | None:
         workflows = self.list_workflows(project=project) if project is not None else self.list_workflows()
         return _find_named(workflows, name)
+
+    def _confirmed_definition(
+        self, resource: dict[str, Any], payload: dict[str, Any], *, target_type: str
+    ) -> dict[str, Any] | None:
+        """Confirm persisted fields using the resource and its pinned version."""
+        if "build" in payload or not resource.get("id"):
+            return None
+        # Environment is a request selector, not a persisted resource field.
+        if "environment" in payload and payload["environment"] != _resolve_environment(self, None):
+            return None
+        expected = {key: value for key, value in payload.items() if key != "environment"}
+        missing = expected.keys() - resource.keys()
+        version: dict[str, Any] = {}
+        if missing:
+            version_id = resource.get("current_version_id")
+            if not version_id:
+                return None
+            version = self._request_dict(
+                "GET",
+                f"/{target_type}s/{resource['id']}/versions/{version_id}",
+                expected=f"{target_type} version response",
+                _deployment_request=True,
+            )
+            if version.get("id") != version_id or version.get(f"{target_type}_id") != resource["id"]:
+                return None
+            # A concurrent deploy must not let us combine fields from two versions.
+            current = self._request_dict(
+                "GET", f"/{target_type}s/{resource['id']}", expected="resource response", _deployment_request=True
+            )
+            if current.get("id") != resource["id"] or current.get("current_version_id") != version_id:
+                return None
+            resource = current
+        observed = {**version, **resource}
+        if (
+            expected.get("mode") == observed.get("mode") == "job"
+            and expected.get("isolation") == "shared"
+            and "isolation" in observed
+            and observed["isolation"] is None
+            and observed.get("run_type") == "long"
+        ):
+            # Job responses expose no warm-runner isolation; the SDK sends the
+            # default shared value for its legacy long/job execution policy.
+            expected["isolation"] = None
+        requested_image = expected.get("image_spec")
+        stored_image = observed.get("image_spec")
+        if (
+            isinstance(requested_image, dict)
+            and requested_image.get("kind") == "python"
+            and "runtime" not in requested_image
+            and isinstance(stored_image, dict)
+            and stored_image.get("runtime") == "python"
+        ):
+            # The API adds this default to legacy Python image specifications.
+            observed["image_spec"] = {key: value for key, value in stored_image.items() if key != "runtime"}
+        if all(key in observed and observed[key] == value for key, value in expected.items()):
+            return resource
+        return None
+
+    def _write_definition(self, method: str, path: str, payload: dict[str, Any], *, target_type: str) -> dict[str, Any]:
+        if _prepare_context.get() and target_type == "workflow":
+            raise _DefinitionPrepared(_PreparedDefinition(method, path, deepcopy(payload), target_type))
+        cache = self._deployment_cache()
+        target = _target_context.get()
+        reuse_step = (
+            cache is not None and target is not None and target.target_type == "step" and "build" not in payload
+        )
+        # POST includes the name and optional nulls; PATCH omits them. Compare
+        # the resolved wire definition, including image, source and resources.
+        definition = {key: value for key, value in payload.items() if key != "name" and value is not None}
+        if cache is not None and reuse_step and method == "PATCH" and "name" not in payload:
+            previous = cache.steps.get(path)
+            if previous is not None and previous[0] == definition:
+                if previous[2] and target is not None:
+                    target.status = "unchanged"
+                return deepcopy(previous[1])
+        inventories = (
+            {key: deepcopy(value) for key, value in cache.lookups.items() if key.endswith(f"/{target_type}s")}
+            if cache is not None
+            else {}
+        )
+        match = None
+        if method == "PATCH" and (reuse_step or target_type == "workflow"):
+            match = self._compare_definitions([_PreparedDefinition(method, path, payload, target_type)]).get(path)
+        if match is not None:
+            if target is not None:
+                target.status = "unchanged"
+            result = match
+        else:
+            result = self._write_definition_uncached(method, path, payload, target_type=target_type)
+        if cache is not None and result.get("id"):
+            for key, inventory in inventories.items():
+                matches = [item for item in inventory if item.get("id") == result["id"]]
+                if matches:
+                    inventory = [
+                        {**item, **deepcopy(result)} if item.get("id") == result["id"] else item for item in inventory
+                    ]
+                elif method == "POST" and key in {path, f"/{target_type}s"}:
+                    inventory.append({**deepcopy(payload), **deepcopy(result)})
+                cache.lookups[key] = inventory
+            if reuse_step:
+                cache.steps[f"/functions/{result['id']}"] = (deepcopy(definition), deepcopy(result), match is not None)
+        return result
+
+    def _compare_definitions(self, definitions: list[_PreparedDefinition]) -> dict[str, dict[str, Any]]:
+        matches: dict[str, dict[str, Any]] = {}
+        for kind in ("function", "workflow"):
+            pending = [item for item in definitions if item.target_type == kind and item.method == "PATCH"]
+            route = f"/{kind}s/compare-deployments"
+            cache = self._deployment_cache()
+            if cache is not None and cache.lookups.get(route) is False:
+                continue
+            for offset in range(0, len(pending), 100):
+                batch = pending[offset : offset + 100]
+                try:
+                    response = self._request_dict(
+                        "POST",
+                        route,
+                        json={
+                            "items": [{"id": item.path.rsplit("/", 1)[1], "definition": item.payload} for item in batch]
+                        },
+                        timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
+                        expected="deployment comparison response",
+                    )
+                except RebaseWorkflowError as exc:
+                    if exc.status_code not in {404, 405}:
+                        raise
+                    if cache is not None:
+                        cache.lookups[route] = False
+                    break
+                rows = response.get("items")
+                if not isinstance(rows, list) or len(rows) != len(batch):
+                    raise RebaseWorkflowError("Incomplete deployment comparison response")
+                for item, row in zip(batch, rows, strict=True):
+                    expected_id = item.path.rsplit("/", 1)[1]
+                    if not isinstance(row, dict) or row.get("id") != expected_id:
+                        raise RebaseWorkflowError("Mismatched deployment comparison response")
+                    if row.get("unchanged") is True:
+                        resource = row.get("resource")
+                        if (
+                            not isinstance(resource, dict)
+                            or resource.get("id") != expected_id
+                            or not resource.get("current_version_id")
+                        ):
+                            raise RebaseWorkflowError("Unconfirmed deployment comparison response")
+                        matches[item.path] = cast(dict[str, Any], resource)
+        return matches
+
+    def _write_definition_uncached(
+        self, method: str, path: str, payload: dict[str, Any], *, target_type: str
+    ) -> dict[str, Any]:
+        try:
+            return self._request_dict(
+                method,
+                path,
+                json=payload,
+                timeout=DEPLOY_REQUEST_TIMEOUT_SECONDS,
+                _deployment_request=True,
+                expected="resource response",
+            )
+        except _DeploymentRequestError as exc:
+            if not exc.uncertain:
+                raise
+            # A timeout/5xx may follow a successful commit. Probe the persisted
+            # definition, but never assume absence means it is safe to POST again.
+            for attempt in range(DEPLOY_REQUEST_ATTEMPTS):
+                if attempt:
+                    time.sleep(_deploy_retry_delay(attempt - 1))
+                try:
+                    if method == "PATCH":
+                        resource = self._request_dict(
+                            "GET", path, expected="resource response", _deployment_request=True
+                        )
+                    else:
+                        candidates = self._request_list(
+                            "GET", path, expected="resource list response", _deployment_request=True
+                        )
+                        matches = [item for item in candidates if item.get("name") == payload["name"]]
+                        if len(matches) != 1 or not matches[0].get("id"):
+                            continue
+                        resource = self._request_dict(
+                            "GET",
+                            f"/{target_type}s/{matches[0]['id']}",
+                            expected="resource response",
+                            _deployment_request=True,
+                        )
+                    # The resource omits versioned fields such as step_graph.
+                    # Check its pinned version too; missing fields remain uncertain.
+                    confirmed = self._confirmed_definition(resource, payload, target_type=target_type)
+                    if confirmed is not None:
+                        target = _target_context.get()
+                        if target is not None:
+                            target.status = "unattempted"
+                            target.error = None
+                        return confirmed
+                except (RebaseWorkflowError, requests.RequestException, ValueError):
+                    # Preserve the original write failure if read-back is unavailable.
+                    continue
+            raise
 
     def register_workflow(
         self,
@@ -4870,7 +5482,7 @@ class Client:
         }
         if build:
             payload["build"] = build
-        return self._request_dict("POST", path, json=payload, expected="workflow response")
+        return self._write_definition("POST", path, payload, target_type="workflow")
 
     def update_workflow(
         self,
@@ -4966,7 +5578,7 @@ class Client:
             payload["timeout_seconds"] = timeout_seconds
         if build:
             payload["build"] = build
-        return self._request_dict("PATCH", f"/workflows/{workflow_id}", json=payload, expected="workflow response")
+        return self._write_definition("PATCH", f"/workflows/{workflow_id}", payload, target_type="workflow")
 
     def run_workflow(self, workflow_id: str, parameters: dict[str, Any] | None = None) -> Run:
         response = self._request_dict(
@@ -5096,6 +5708,40 @@ class Client:
         """Lift a workflow's pause so scheduled runs fire again."""
         return self._request_dict("POST", f"/workflows/{workflow_id}/resume", expected="workflow response")
 
+    def set_workflow_schedule_backend(self, workflow_id: str, backend: str) -> dict[str, Any]:
+        """Choose which path fires the workflow's cron: ``prefect`` (the default) or
+        ``cloud_tasks``, the push-based path being evaluated next to it. Operational,
+        like pause: no new version. The platform refuses ``cloud_tasks`` unless the
+        workspace allows it (`update_workspace_compute_policy(cloud_tasks_schedules_enabled=True)`),
+        the workflow is job-mode, and its cron reads the same on both engines."""
+        return self._request_dict(
+            "POST",
+            f"/workflows/{workflow_id}/schedule/backend",
+            json={"backend": backend},
+            expected="workflow response",
+        )
+
+    def set_workflow_execution_engine(self, workflow_id: str, engine: str) -> dict[str, Any]:
+        """Choose which engine executes the workflow's step graph: ``runner`` (the
+        default: one container walks it) or ``cloud_workflows`` (one Cloud
+        Workflows execution per run, one Cloud Run Job execution per step).
+        Operational, like pause: no new version, and runs in flight finish on the
+        engine they started on. The platform refuses ``cloud_workflows`` unless
+        the workspace allows it (`update_workspace_compute_policy(cloud_workflows_enabled=True)`)
+        and the workflow is a job-mode step workflow."""
+        return self._request_dict(
+            "POST", f"/workflows/{workflow_id}/engine", json={"engine": engine}, expected="workflow response"
+        )
+
+    def get_workflow_graph_plan(self, workflow_id: str, *, version_id: str | None = None) -> dict[str, Any]:
+        """What the Cloud Workflows engine would run for the workflow's current
+        version (or ``version_id``): the plan (levels of steps and each step's
+        retry and timeout numbers) and the program that interprets it. Read-only."""
+        params = {"version": version_id} if version_id else None
+        return self._request_dict(
+            "GET", f"/workflows/{workflow_id}/graph/plan", params=params, expected="workflow graph plan response"
+        )
+
     def pause_project(self, project_id: str) -> dict[str, Any]:
         """Stop a whole project: no schedule, trigger, endpoint call or run by hand
         goes through until it is resumed. Its workflows and functions keep their own
@@ -5214,6 +5860,8 @@ class Client:
         max_cloud_run_concurrency: int | None = None,
         max_cloud_run_cpu_milli: int | None = None,
         max_cloud_run_memory_mib: int | None = None,
+        cloud_tasks_schedules_enabled: bool | None = None,
+        cloud_workflows_enabled: bool | None = None,
     ) -> dict[str, Any]:
         # No _UNSET sentinel here, unlike update_workspace_notifications: these are
         # NOT NULL integers with no clear-to-null semantics, so plain "None means not
@@ -5233,6 +5881,10 @@ class Client:
             payload["max_cloud_run_cpu_milli"] = max_cloud_run_cpu_milli
         if max_cloud_run_memory_mib is not None:
             payload["max_cloud_run_memory_mib"] = max_cloud_run_memory_mib
+        if cloud_tasks_schedules_enabled is not None:
+            payload["cloud_tasks_schedules_enabled"] = cloud_tasks_schedules_enabled
+        if cloud_workflows_enabled is not None:
+            payload["cloud_workflows_enabled"] = cloud_workflows_enabled
         return self._request_dict(
             "PATCH", "/workspace/compute-policy", json=payload, expected="workspace compute policy response"
         )
@@ -5583,6 +6235,8 @@ class Client:
 
 
 class Project:
+    deployment_report: DeploymentReport | None = None
+
     def __init__(
         self,
         name: str,
@@ -5614,12 +6268,100 @@ class Project:
     def _client(self) -> Client:
         return self.client or default_client()
 
+    def _submit_workflows(self, workflows, prepared, matches, *, environment, jobs):
+        thread_state = thread_local()
+        clients = []
+
+        def submit_one(workflow, definition):
+            original = workflow._client
+            if not hasattr(thread_state, "clients"):
+                thread_state.clients = {}
+            if original not in thread_state.clients:
+                client = copy(original)
+                client._session = None
+                client._session_pid = None
+                client._absent_routes = set(original._absent_routes)
+                client._etags = {}
+                thread_state.clients[original] = client
+                clients.append(client)
+            client = thread_state.clients[original]
+            token = _cache_context.set(None)
+            try:
+                return workflow.deploy(
+                    environment=environment,
+                    _prepared=definition,
+                    _matched=matches.get(definition.path),
+                    _write_client=client,
+                )
+            finally:
+                _cache_context.reset(token)
+
+        if jobs == 1:
+            for workflow, definition in zip(workflows, prepared, strict=True):
+                workflow.deploy(environment=environment, _prepared=definition, _matched=matches.get(definition.path))
+            return
+        remaining = iter(zip(workflows, prepared, strict=True))
+        executor = ThreadPoolExecutor(max_workers=jobs, thread_name_prefix="rebase-deploy")
+        pending = set()
+        failure = None
+        try:
+            while True:
+                while failure is None and len(pending) < jobs:
+                    pair = next(remaining, None)
+                    if pair is None:
+                        break
+                    context = contextvars.copy_context()
+                    pending.add(executor.submit(context.run, partial(submit_one, pair[0], pair[1])))
+                if not pending:
+                    break
+                completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    try:
+                        future.result()
+                    except BaseException as exc:
+                        if failure is None:
+                            failure = exc
+            if failure is not None:
+                raise failure
+        finally:
+            # Cancellation stops new submissions. Already-issued writes finish
+            # and reconcile their outcomes before the final report is printed.
+            executor.shutdown(wait=True, cancel_futures=True)
+            for client in clients:
+                if client._session is not None:
+                    client._session.close()
+
+    def _selected_workflows(self, only: Sequence[str] | None) -> list[Workflow]:
+        if only is None:
+            all_names = [workflow.name for workflow in self._workflows]
+            if len(set(all_names)) != len(all_names):
+                raise RebaseWorkflowError(f"Workflow names must be unique in project {self.name!r}")
+            return list(self._workflows)
+        names = {only} if isinstance(only, str) else set(only)
+        if not names:
+            raise RebaseWorkflowError("only must select at least one workflow")
+        for name in sorted(names):
+            matches = [workflow for workflow in self._workflows if workflow.name == name]
+            if len(matches) != 1:
+                reason = "Unknown" if not matches else "Ambiguous"
+                raise RebaseWorkflowError(f"{reason} workflow {name!r} in project {self.name!r}")
+        return [workflow for workflow in self._workflows if workflow.name in names]
+
     @_environment_scoped_deploy
     def deploy(
-        self, *, replace: bool = False, deploy_source: str | None = None, environment: str | None = None
+        self,
+        *,
+        replace: bool = False,
+        deploy_source: str | None = None,
+        environment: str | None = None,
+        only: Sequence[str] | None = None,
+        jobs: int = 1,
     ) -> Self:
+        if not isinstance(jobs, int) or isinstance(jobs, bool) or not 1 <= jobs <= 16:
+            raise RebaseWorkflowError("jobs must be an integer between 1 and 16")
         environment = _resolve_environment(self._client, environment)
-        for workflow in self._workflows:
+        workflows = self._selected_workflows(only)
+        for workflow in workflows:
             workflow._validate_schedule_defaults()
         resolved_deploy_source = _validate_deploy_source(deploy_source)
         preflight_datasets(self._client)
@@ -5633,20 +6375,35 @@ class Project:
             environment_name=environment,
         )
         self.id = project["id"]
-        for problem in self._problems:
+        for problem in self._problems if only is None else []:
             problem.register(self._client, project_id=self.id, project_name=self.name)
-        for function in self._functions:
+        for function in self._functions if only is None else []:
             if isinstance(function, Step):
                 continue  # Steps are deployed automatically via their workflow
             function.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
-        for workflow in self._workflows:
-            workflow.deploy(
+        prepared = [
+            workflow._prepare_deployment(
                 replace=replace,
                 deploy_source=resolved_deploy_source,
                 environment=environment,
                 _skip_dataset_preflight=True,
             )
-        for asgi_app in self._asgi_apps:
+            for workflow in workflows
+        ]
+        grouped: dict[Client, list[_PreparedDefinition]] = {}
+        for workflow, definition in zip(workflows, prepared, strict=True):
+            grouped.setdefault(workflow._client, []).append(definition)
+        matches = {client: client._compare_definitions(definitions) for client, definitions in grouped.items()}
+        changed_workflows, changed_definitions = [], []
+        for workflow, definition in zip(workflows, prepared, strict=True):
+            match = matches[workflow._client].get(definition.path)
+            if match is not None:
+                workflow.deploy(environment=environment, _prepared=definition, _matched=match)
+            else:
+                changed_workflows.append(workflow)
+                changed_definitions.append(definition)
+        self._submit_workflows(changed_workflows, changed_definitions, {}, environment=environment, jobs=jobs)
+        for asgi_app in self._asgi_apps if only is None else []:
             asgi_app.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
         return self
 
@@ -5785,8 +6542,12 @@ class Project:
         default_parameters: dict[str, Any] | None = None,
         enabled: bool = True,
         retries: int = 0,
+        retry_backoff: int | float | None = None,
         timeout_seconds: int | float | None = None,
         cache: bool = False,
+        cpu: float | int | str | None = None,
+        memory: int | float | str | None = None,
+        runtime: str = "job",
         deploy_source: str | None = None,
     ) -> Callable[[Callable[..., Any]], Step]:
         def decorator(fn: Callable[..., Any]) -> Step:
@@ -5801,8 +6562,12 @@ class Project:
                 project_source_mode=self.source_mode,
                 client=self._client,
                 retries=retries,
+                retry_backoff=retry_backoff,
                 timeout_seconds=timeout_seconds,
                 cache=cache,
+                cpu=cpu,
+                memory=memory,
+                runtime=runtime,
             )
             self._steps.append(step)
             self._functions.append(step)
@@ -5875,6 +6640,8 @@ class Project:
 
 
 class ASGIApp:
+    deployment_report: DeploymentReport | None = None
+
     def __init__(
         self,
         fn: Callable[..., Any] | None = None,
@@ -6054,6 +6821,8 @@ class ASGIApp:
 
 
 class Function:
+    deployment_report: DeploymentReport | None = None
+
     def __init__(
         self,
         fn: Callable[..., Any] | None = None,
@@ -6590,6 +7359,7 @@ def _write_huggingface_provenance_files(
 
 
 class Model(_FrameworkModel):
+    deployment_report: DeploymentReport | None = None
     _operation_name: str | None = None
     _framework_init_mode = "name"
     _not_deployable_message = MODEL_NOT_DIRECTLY_DEPLOYABLE_ERROR
@@ -7045,8 +7815,12 @@ class Step(Function):
         function_id: str | None = None,
         data: dict[str, Any] | None = None,
         retries: int = 0,
+        retry_backoff: int | float | None = None,
         timeout_seconds: int | float | None = None,
         cache: bool = False,
+        cpu: float | int | str | None = None,
+        memory: int | float | str | None = None,
+        runtime: str = "job",
     ) -> None:
         super().__init__(
             fn,
@@ -7071,11 +7845,32 @@ class Step(Function):
         )
         if retries < 0:
             raise ValueError("retries must be greater than or equal to 0")
+        if retry_backoff is not None and retry_backoff < 0:
+            raise ValueError("retry_backoff must be greater than or equal to 0")
         if timeout_seconds is not None and timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than 0")
+        if runtime not in ("job", "service"):
+            raise ValueError("runtime must be 'job' or 'service'")
         self.retries = retries
         self.timeout_seconds = timeout_seconds
         self.cache = cache
+        self.runtime = runtime
+        # How a failed attempt is retried on an engine that retries per step:
+        # the wait before the second attempt doubles each time, up to five minutes.
+        backoff = float(retry_backoff) if retry_backoff is not None else 0.0
+        self.retry_policy: dict[str, Any] = {
+            "retries": retries,
+            "backoff_seconds": backoff,
+            "backoff_multiplier": 2.0 if backoff else 1.0,
+            "max_backoff_seconds": max(backoff, min(backoff * 16, 300.0)) if backoff else 0.0,
+        }
+        # The step's own container size (the Cloud Workflows engine runs each
+        # step in its own); the workflow's `resources` is the inherited layer.
+        self.own_resources: dict[str, Any] = {}
+        if cpu is not None:
+            self.own_resources["cpu"] = str(cpu)
+        if memory is not None:
+            self.own_resources["memory"] = str(memory)
         self.resources: dict[str, Any] = {}
 
     def deploy(self, **_kwargs: Any) -> Step:
@@ -7122,11 +7917,97 @@ class Step(Function):
             raise RebaseWorkflowError("remote step handles cannot be called locally; use .remote(...)")
         return self.fn(*args, **kwargs)
 
+    def after(self, *promises: Any) -> Callable[..., StepPromise]:
+        """Order this step after other steps whose output it does not read:
+        ``notify.after(write_db())(summary=s)``. Deploy-time only."""
+        keys: list[str] = []
+        for promise in promises:
+            if not isinstance(promise, StepPromise):
+                raise RebaseWorkflowError("step.after takes the results of other step calls")
+            keys.append(promise.node_key)
+
+        def call(*args: Any, **kwargs: Any) -> StepPromise:
+            trace = _current_trace()
+            if trace is None:
+                raise RebaseWorkflowError("step.after is only meaningful inside a workflow body")
+            return trace.record_step(self, args, kwargs, ordering=tuple(keys))
+
+        return call
+
+    def when(self, condition: Any, *, equals: Any = _UNSET) -> Callable[..., StepPromise]:
+        """Run this step only when ``condition`` (a step output or workflow
+        parameter) is truthy, or equal to ``equals``; otherwise it is skipped
+        and its output reads as None. Deploy-time only."""
+        spec = _condition_binding(condition, equals=equals)
+
+        def call(*args: Any, **kwargs: Any) -> StepPromise:
+            trace = _current_trace()
+            if trace is None:
+                raise RebaseWorkflowError("step.when is only meaningful inside a workflow body")
+            return trace.record_step(self, args, kwargs, condition={**spec, "negate": False})
+
+        return call
+
+    def map(  # type: ignore[override]
+        self,
+        items: Any,
+        *,
+        parameter: str | None = None,
+        kwargs: dict[str, Any] | None = None,
+        max_concurrency: int | None = None,
+        ordered: bool = True,
+        return_exceptions: bool = False,
+        timeout: float | None = None,
+        **bound: Any,
+    ) -> Any:
+        """Inside a workflow body: one step node that runs once per item of
+        ``items`` (another step's output, a workflow parameter, or a literal
+        list), side by side up to ``max_concurrency``, with ``bound`` as the
+        other arguments; its output is the list of the items' results. Outside
+        a body it is ``Function.map``, the runtime fan-out."""
+        trace = _current_trace()
+        if trace is None:
+            return Function.map(
+                self,
+                items,
+                parameter=parameter,
+                kwargs={**(kwargs or {}), **bound} or None,
+                max_concurrency=max_concurrency,
+                ordered=ordered,
+                return_exceptions=return_exceptions,
+                timeout=timeout,
+            )
+        mapped = parameter or self._infer_mapped_parameter(set(kwargs or {}) | set(bound))
+        return trace.record_map(
+            self, items, parameter=mapped, kwargs={**(kwargs or {}), **bound}, max_concurrency=max_concurrency
+        )
+
+    def _infer_mapped_parameter(self, given: set[str]) -> str:
+        """The one parameter the mapped item fills: whatever the body did not
+        pass by name. Two candidates need an explicit ``parameter=``."""
+        if self.fn is None:
+            raise RebaseWorkflowError("parameter is required to map a remote step handle")
+        parameters = inspect.signature(self.fn).parameters
+        candidates = [name for name in parameters if name not in given]
+        # A parameter with a default is not what the item fills, unless it is
+        # the only one left.
+        required = [name for name in candidates if parameters[name].default is inspect.Parameter.empty]
+        if len(required) == 1:
+            return required[0]
+        if len(candidates) == 1:
+            return candidates[0]
+        raise RebaseWorkflowError(
+            f"step {self.name!r}.map: say which parameter takes each item (parameter=...); "
+            f"candidates: {', '.join(candidates) or 'none'}"
+        )
+
     def submit(self, *args: Any, **kwargs: Any) -> Run:
         return self.spawn(**self._parameters_from_call(args, kwargs))
 
 
 class Workflow:
+    deployment_report: DeploymentReport | None = None
+
     def __init__(
         self,
         fn: Callable[..., Any] | None = None,
@@ -7328,6 +8209,16 @@ class Workflow:
         _trace_stack.append(trace)
         try:
             result = self.fn(**self._trace_arguments())
+        except RebaseWorkflowError as exc:
+            if isinstance(exc, _RuntimeBranchingError):
+                raise RebaseWorkflowError(
+                    "Could not compile a static step graph for this workflow. Rebase step workflows support "
+                    "direct step calls and literal containers at deployment time; put runtime branching inside "
+                    "a step function."
+                ) from exc
+            # Already says what is wrong with the body (a map over the wrong
+            # thing, a condition on a literal): keep the specific message.
+            raise
         except Exception as exc:
             if trace.nodes or self._references_step():
                 raise RebaseWorkflowError(
@@ -7342,8 +8233,7 @@ class Workflow:
         if not trace.nodes:
             return None
         return {
-            "schema_version": 1,
-            "engine": "prefect",
+            "schema_version": 2,
             "nodes": trace.nodes,
             "return_binding": _binding_for(result),
         }
@@ -7361,7 +8251,58 @@ class Workflow:
             )
 
     @_environment_scoped_deploy
+    def _prepare_deployment(
+        self, *, replace=False, deploy_source=None, environment=None, _skip_dataset_preflight=False
+    ):
+        token = _prepare_context.set(True)
+        try:
+            try:
+                self._deploy_definition(
+                    replace=replace,
+                    deploy_source=deploy_source,
+                    environment=environment,
+                    _skip_dataset_preflight=_skip_dataset_preflight,
+                )
+            except _DefinitionPrepared as captured:
+                return captured.definition
+            raise RebaseWorkflowError("Workflow preparation did not produce a definition")
+        finally:
+            _prepare_context.reset(token)
+
+    @_environment_scoped_deploy
     def deploy(
+        self,
+        *,
+        replace: bool = False,
+        deploy_source: str | None = None,
+        environment: str | None = None,
+        _skip_dataset_preflight: bool = False,
+        _prepared: _PreparedDefinition | None = None,
+        _matched: dict[str, Any] | None = None,
+        _write_client: Client | None = None,
+    ) -> Workflow:
+        if _prepared is None:
+            return self._deploy_definition(
+                replace=replace,
+                deploy_source=deploy_source,
+                environment=environment,
+                _skip_dataset_preflight=_skip_dataset_preflight,
+            )
+        prepared = _prepared
+        match = _matched
+        if match is not None:
+            result = _target_context.get()
+            if result is not None:
+                result.status = "unchanged"
+            deployed = match
+        else:
+            deployed = (_write_client or self._client)._write_definition_uncached(
+                prepared.method, prepared.path, prepared.payload, target_type="workflow"
+            )
+        self._adopt_deployed(deployed, prepared.payload.get("step_graph"))
+        return self
+
+    def _deploy_definition(
         self,
         *,
         replace: bool = False,
