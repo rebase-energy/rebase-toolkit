@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Changed
+
+- **`rebase setup` reuses the profile that is already signed in instead of
+  minting one per workspace.** The sign-in session is one file per machine, so
+  every session profile on the same API URL was the same identity under a
+  different name -- `rebase setup --profile uk-signal` for one workspace and
+  `--profile prod` for another left three identical rows in `rebase profile
+  list`. Without `--profile`, setup and `rebase workspace create` now find the
+  profile already signed in on that API (the active one when it qualifies) and
+  only move its workspace selection; `--profile <name>` still creates a separate
+  profile on purpose, with a hint when one on the same API already exists.
+  `rebase profile list` gained an API column so duplicates read as duplicates,
+  and `rebase profile delete <name>` removes a profile you no longer want.
+- **`rebase profile list` no longer shows a workspace per profile.** A profile is an
+  identity on a backend (credential + API URL); the workspace it targets is a
+  selection that credential moves across every workspace it can reach, so the
+  Workspace and Workspace ID columns read as a binding that does not exist. The
+  table now shows the identity the credential signs in as (the session's email;
+  an API key's owner is not stored locally) and points at `rebase workspace` for
+  memberships and the current selection. The API URL column is gone too:
+  `rebase profile show` has it. `--json` keeps `workspace`, `workspace_id` and
+  `api_url` and gains `identity`.
+
 ### Added
 
 - **Scores: a problem version keeps its leaderboard.** `rb.Problem.from_name("icing:se1").record(result)`

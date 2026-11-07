@@ -77,6 +77,7 @@ from rebase.config import (
     active_platform,
     add_search_path,
     config_path,
+    delete_profile,
     editor_settings,
     find_local_config,
     list_profiles,
@@ -1434,12 +1435,21 @@ def _profile_credential_label(profile_data: dict[str, Any], *, has_auth_session:
     return "none"
 
 
+def _profile_identity(profile_data: dict[str, Any], *, has_auth_session: bool, auth_email: str | None) -> str | None:
+    """Who the credential signs in as, when that is known locally: the
+    session's email. An API key's owner is not stored with it."""
+    if profile_data.get("api_key"):
+        return None
+    return auth_email if has_auth_session else None
+
+
 def _profile_summary(
     name: str,
     profile_data: dict[str, Any],
     *,
     active_profile: str,
     has_auth_session: bool,
+    auth_email: str | None = None,
 ) -> dict[str, Any]:
     return {
         "active": name == active_profile,
@@ -1449,6 +1459,7 @@ def _profile_summary(
         "api_url": _profile_api_url(profile_data),
         "has_api_key": bool(profile_data.get("api_key")),
         "credential": _profile_credential_label(profile_data, has_auth_session=has_auth_session),
+        "identity": _profile_identity(profile_data, has_auth_session=has_auth_session, auth_email=auth_email),
     }
 
 
@@ -1457,7 +1468,15 @@ def _profiles_table(
     *,
     active_profile: str,
     has_auth_session: bool,
+    auth_email: str | None = None,
 ) -> Table:
+    """One row per profile: an identity on a backend, so the columns are exactly
+    what can differ between identities -- the credential, who it signs in as and
+    the API it talks to. Two rows that read the same are the same identity twice.
+    The workspace a profile currently selects is deliberately not a column: it is
+    a cursor the credential moves across every workspace it can reach (`rebase
+    workspace` lists those), and printing it beside the credential read as a
+    binding."""
     table = Table(
         title="Profiles",
         box=box.ASCII,
@@ -1468,28 +1487,32 @@ def _profiles_table(
     )
     table.add_column("Active", justify="center", no_wrap=True, style="rebase.active")
     table.add_column("Profile")
-    table.add_column("Workspace", overflow="fold")
-    table.add_column("Workspace ID", style="rebase.muted", overflow="fold")
-    table.add_column("API URL", overflow="fold")
     table.add_column("Credential", no_wrap=True)
+    table.add_column("Identity", overflow="fold")
+    table.add_column("API", overflow="fold")
     for profile_name, profile_data in sorted(profiles.items()):
         summary = _profile_summary(
             profile_name,
             profile_data,
             active_profile=active_profile,
             has_auth_session=has_auth_session,
+            auth_email=auth_email,
         )
         style = "rebase.active" if summary["active"] else None
         table.add_row(
             "*" if summary["active"] else "",
             profile_name,
-            summary["workspace"],
-            summary["workspace_id"],
-            summary["api_url"],
             summary["credential"],
+            summary["identity"] or "-",
+            _api_label(summary["api_url"]),
             style=style,
         )
     return table
+
+
+def _api_label(api_url: str) -> str:
+    """The hosted platform by name; anything else by its URL, since that is the difference."""
+    return "hosted" if api_url.rstrip("/") == DEFAULT_SERVER_URL else api_url
 
 
 def _profile_show_data(profile: str | None = None) -> dict[str, Any]:
@@ -2143,7 +2166,14 @@ def _list_project_targets(
 
 @app.command("setup")
 def setup_command(
-    profile: Annotated[str, typer.Option("--profile", "-p", help="Credential profile name.")] = DEFAULT_PROFILE,
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            "-p",
+            help="Credential profile name. Defaults to the profile already signed in on this API, else 'default'.",
+        ),
+    ] = None,
     api_key: Annotated[str | None, typer.Option("--api-key", hidden=True)] = None,
     api_url: Annotated[
         str | None,
@@ -2225,6 +2255,7 @@ def setup_command(
         except Exception as exc:
             raise RebaseWorkflowError(f"could not verify API key against {verify_url}: {exc}") from exc
 
+    profile = profile or DEFAULT_PROFILE
     path = write_profile(api_key=api_key, profile=profile, api_url=api_url, workspace=workspace)
     console.print(f"Saved Rebase credentials for profile '[rebase.value]{profile}[/rebase.value]'")
     console.print(f"[rebase.muted]{path}[/rebase.muted]")
@@ -2454,6 +2485,7 @@ def _profile_list_data() -> dict[str, Any]:
                 profile_data,
                 active_profile=active_profile,
                 has_auth_session=auth["exists"],
+                auth_email=auth.get("email"),
             )
             for profile_name, profile_data in sorted(profiles.items())
         ],
@@ -2500,12 +2532,18 @@ def profile_list_command(
         _print_json(data)
         return
     profiles = list_profiles()
+    auth = data.get("auth", {})
     console.print(
         _profiles_table(
             profiles,
             active_profile=data["active_profile"],
-            has_auth_session=bool(data.get("auth", {}).get("exists")),
+            has_auth_session=bool(auth.get("exists")),
+            auth_email=auth.get("email"),
         )
+    )
+    console.print(
+        "[rebase.muted]A profile is an identity; the workspace it targets is a selection. "
+        "`rebase workspace` lists the workspaces the active profile can reach and which one is selected.[/rebase.muted]"
     )
 
 
@@ -2522,6 +2560,26 @@ def profile_show_command(
 def profile_switch_command(profile: Annotated[str, typer.Argument(help="Profile name.")]) -> None:
     """Switch the active local Rebase CLI profile."""
     _switch_profile(profile)
+
+
+@profile_app.command("delete")
+def profile_delete_command(
+    profile: Annotated[str, typer.Argument(help="Profile name.")],
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Delete a local profile. The stored sign-in session and the workspace are untouched."""
+    if profile not in list_profiles():
+        raise RebaseWorkflowError(f"unknown profile: {profile}")
+    if not yes and not typer.confirm(f"Delete local profile '{profile}'?"):
+        raise typer.Abort()
+    try:
+        path = delete_profile(profile)
+    except ValueError as exc:
+        raise RebaseWorkflowError(
+            f"'{profile}' is the active profile. `rebase profile switch <other>` first, then delete it."
+        ) from exc
+    console.print(f"Deleted profile '[rebase.value]{profile}[/rebase.value]'")
+    console.print(f"[rebase.muted]{path}[/rebase.muted]")
 
 
 @profile_app.command("link")
@@ -2609,7 +2667,14 @@ def workspace_create_command(
         str | None,
         typer.Argument(help="Workspace handle to create."),
     ] = None,
-    profile: Annotated[str, typer.Option("--profile", "-p", help="Credential profile name.")] = DEFAULT_PROFILE,
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            "-p",
+            help="Credential profile name. Defaults to the profile already signed in on this API, else 'default'.",
+        ),
+    ] = None,
     api_url: Annotated[
         str | None,
         typer.Option(
