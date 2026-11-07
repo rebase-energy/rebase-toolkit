@@ -585,7 +585,7 @@ model = PriceForecastPredictor()
     assert observed["entrypoint"] == "predict"
     assert observed["parameters"] == {"zone": "SE4"}
     assert observed["default_parameters"] == {"zone": "SE3"}
-    assert any("emflow" in package for package in observed["image_spec"]["uv_pip_packages"])
+    assert any("sdflow" in package for package in observed["image_spec"]["uv_pip_packages"])
     assert "class PriceForecastPredictor(rb.Predictor):" in observed["source_code"]
     assert '"zone": "SE4"' in capsys.readouterr().out
 

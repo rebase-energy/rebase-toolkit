@@ -4604,7 +4604,7 @@ dataset_app.add_typer(contract_app, name="contract")
 problem_app = typer.Typer(
     add_completion=False,
     cls=AlphabeticalTyperGroup,
-    help="Problems: verifiable targets registered from emflow problem factories by `rebase deploy`.",
+    help="Problems: verifiable targets registered from sdflow problem factories by `rebase deploy`.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -4701,7 +4701,7 @@ def problem_get_command(
         }
         details.update(_problem_spec_summary(latest.get("spec")))
         source = latest.get("source") or {}
-        for key in ("project", "module", "git_commit_sha", "emflow_version"):
+        for key in ("project", "module", "git_commit_sha", "framework", "framework_version", "emflow_version"):
             if source.get(key):
                 details[key] = source[key]
         console.print(_detail_table("Latest Version", details))

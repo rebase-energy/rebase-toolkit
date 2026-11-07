@@ -370,3 +370,58 @@ class TestScoresCli:
         assert cli.main(["problem", "scores", "icing:se1", "--all", "--split", "validation", "--json"]) == 0
         assert client.listed["best"] is False and client.listed["split"] == "validation"
         assert '"climatology"' in capsys.readouterr().out
+
+
+class TestFramework:
+    def test_load_prefers_sdflow_and_records_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import types
+
+        from rebase import client as client_module
+
+        fake = types.ModuleType("sdflow")
+        fake.__version__ = "0.1.0"
+        fake.load_problem = lambda name: _emflow_like_problem(name)  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "sdflow", fake)
+        monkeypatch.delitem(sys.modules, "emflow", raising=False)
+
+        problem = Problem.from_name("icing:se1", client=FakeClient())
+        assert problem.load().name == "icing:se1"
+        source = problem._source("icing")
+        assert source["framework"] == "sdflow" and source["framework_version"] == "0.1.0"
+        assert client_module.decision_framework() is fake
+
+    def test_load_falls_back_to_emflow(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import types
+
+        from rebase import _framework
+        from rebase import client as client_module
+
+        monkeypatch.delitem(sys.modules, "sdflow", raising=False)
+        fake = types.ModuleType("emflow")
+        fake.__version__ = "0.3.1"
+        fake.load_problem = lambda name: _emflow_like_problem(name)  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "emflow", fake)
+        monkeypatch.setattr(
+            _framework.importlib,
+            "import_module",
+            lambda n: (_ for _ in ()).throw(ImportError()) if n == "sdflow" else fake,
+        )
+        assert client_module.decision_framework() is fake
+
+
+class TestInstallsFramework:
+    def test_either_framework_counts(self) -> None:
+        from rebase._framework import installs_framework
+
+        assert installs_framework("sdflow>=0.1")
+        assert installs_framework("sdflow[energy]==0.1.0")
+        assert installs_framework("emflow @ git+https://github.com/rebase-energy/emflow.git@abc")
+        assert not installs_framework("pandas>=2")
+        assert not installs_framework("sdflowers")
+
+    def test_models_default_to_sdflow_from_pypi(self) -> None:
+        from rebase.client import DEFAULT_MODEL_DEPENDENCY, _model_dependencies
+
+        assert DEFAULT_MODEL_DEPENDENCY.startswith("sdflow")
+        assert _model_dependencies(["pandas>=2"]) == ["pandas>=2", DEFAULT_MODEL_DEPENDENCY]
+        assert _model_dependencies(["emflow>=0.3"]) == ["emflow>=0.3"], "a named framework is left alone"

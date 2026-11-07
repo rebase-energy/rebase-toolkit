@@ -27,6 +27,17 @@
 
 ### Added
 
+- **The SDK builds on sdflow.** `rebase.Predictor`, `Optimizer`, `Agent` and `Simulator`
+  subclass sdflow's model classes, `rebase.modeling` re-exports sdflow, the `modeling`
+  extra installs `sdflow>=0.1,<0.2` from PyPI, and a model image whose dependencies name
+  no framework now gets sdflow instead of a pinned emflow git commit. emflow is still
+  accepted everywhere for one release: an emflow install is used when sdflow is absent,
+  and a dependency naming emflow is left alone. The hosted hillclimb engine keeps the
+  `emflow://` target scheme until it moves.
+- **Problems load through sdflow when it is installed.** `rb.Problem.load()` and the
+  provenance recorded with a registration or a score use sdflow, emflow's domain-neutral
+  successor, and fall back to emflow; the source now says `framework` and
+  `framework_version` instead of `emflow_version`.
 - **Scores: a problem version keeps its leaderboard.** `rb.Problem.from_name("icing:se1").record(result)`
   appends an `emflow.evaluate` result -- model, split, metric, score, origins,
   analyzer stats, git metadata -- to the problem version whose fingerprint matches

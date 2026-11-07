@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
-from rebase._optional import optional_module
+from rebase._framework import framework_models, framework_module, installs_framework
 from rebase.auth import AuthError, load_access_token
 from rebase.client_identity import identity_headers
 from rebase.config import DEFAULT_SERVER_URL, active_environment, load_profile, local_workspace_id
@@ -35,36 +35,37 @@ from rebase.image import DEFAULT_PYTHON_VERSION, Image
 from rebase.runtime import current_run
 from rebase.source_bundle import SourceBundle, build_source_bundle
 
-try:
-    from emflow.models import Agent as _ImportedEmflowAgent
-    from emflow.models import Model as _ImportedEmflowModel
-    from emflow.models import Optimizer as _ImportedEmflowOptimizer
-    from emflow.models import Predictor as _ImportedEmflowPredictor
-    from emflow.models import Simulator as _ImportedEmflowSimulator
-except ImportError:
+_framework_models = framework_models()
+if _framework_models is not None:
+    _ImportedFrameworkAgent = _framework_models.Agent
+    _ImportedFrameworkModel = _framework_models.Model
+    _ImportedFrameworkOptimizer = _framework_models.Optimizer
+    _ImportedFrameworkPredictor = _framework_models.Predictor
+    _ImportedFrameworkSimulator = _framework_models.Simulator
+else:
 
-    class _ImportedEmflowModel:
+    class _ImportedFrameworkModel:
         def __init__(self, name: str | None = None) -> None:
             self.name = name
 
-    class _ImportedEmflowPredictor(_ImportedEmflowModel):
+    class _ImportedFrameworkPredictor(_ImportedFrameworkModel):
         pass
 
-    class _ImportedEmflowOptimizer(_ImportedEmflowModel):
+    class _ImportedFrameworkOptimizer(_ImportedFrameworkModel):
         pass
 
-    class _ImportedEmflowAgent(_ImportedEmflowModel):
+    class _ImportedFrameworkAgent(_ImportedFrameworkModel):
         pass
 
-    class _ImportedEmflowSimulator(_ImportedEmflowModel):
+    class _ImportedFrameworkSimulator(_ImportedFrameworkModel):
         pass
 
 
-_EmflowModel: Any = _ImportedEmflowModel
-_EmflowPredictor: Any = _ImportedEmflowPredictor
-_EmflowOptimizer: Any = _ImportedEmflowOptimizer
-_EmflowAgent: Any = _ImportedEmflowAgent
-_EmflowSimulator: Any = _ImportedEmflowSimulator
+_FrameworkModel: Any = _ImportedFrameworkModel
+_FrameworkPredictor: Any = _ImportedFrameworkPredictor
+_FrameworkOptimizer: Any = _ImportedFrameworkOptimizer
+_FrameworkAgent: Any = _ImportedFrameworkAgent
+_FrameworkSimulator: Any = _ImportedFrameworkSimulator
 
 
 _default_client: Client | None = None
@@ -654,9 +655,9 @@ DEFAULT_RUN_TYPE: RunType = "quick_shared"
 WORKFLOW_RUN_TYPES = ("quick", "long")
 DeploySource = str
 DEFAULT_DEPLOY_SOURCE: DeploySource = "rebase"
-DEFAULT_MODEL_DEPENDENCY = (
-    "emflow @ git+https://github.com/rebase-energy/emflow.git@2d0205e1b479d439df72e50c6865735d0b26de8d"
-)
+# What a model image installs when its dependencies name no framework: sdflow from
+# PyPI. A dependency that names sdflow or emflow (by name or git URL) is left alone.
+DEFAULT_MODEL_DEPENDENCY = "sdflow>=0.1,<0.2"
 LEGACY_BACKEND_REMOVED_ERROR = (
     "the 'backend' parameter was removed; use mode='interactive' | 'job' and isolation='shared' | 'dedicated'"
 )
@@ -1768,7 +1769,7 @@ def _config_diff_lines(key: str, stored: Any, local: Any) -> list[str]:
 
 # --- Problems ---------------------------------------------------------------------
 # A problem is a workspace resource like a dataset: a verifiable target that every
-# project's models are scored against. It is declared from an emflow Problem
+# project's models are scored against. It is declared from an sdflow Problem
 # factory and registered by `rebase deploy`; the server versions it by the
 # fingerprint of its spec (toolkit app/problems.py -- keep the two in step).
 
@@ -1814,10 +1815,10 @@ def _metric_params(metric: Any) -> dict[str, Any]:
 
 
 def problem_spec(problem: Any) -> dict[str, Any]:
-    """Serialise an emflow ``Problem`` into the spec the platform registers.
+    """Serialise an sdflow (or emflow) ``Problem`` into the spec the platform registers.
 
     Carries what *defines* the problem -- objective, schedule, splits, reference
-    scores -- plus its description. Duck-typed, so the SDK never imports emflow.
+    scores -- plus its description. Duck-typed, so the SDK never imports the framework here.
     """
     objective = getattr(problem, "objective", None)
     metric = getattr(objective, "metric", None)
@@ -1864,8 +1865,13 @@ def _json_number(value: Any) -> Any:
     return int(value) if isinstance(value, int) else number
 
 
+def decision_framework() -> Any:
+    """The framework to load problems with: sdflow when installed, else emflow."""
+    return framework_module()
+
+
 def problem_score_payload(result: Any, *, model: str | None = None) -> dict[str, Any]:
-    """What a score record carries, read off an emflow ``Result`` (duck-typed)."""
+    """What a score record carries, read off an sdflow ``Result`` (duck-typed)."""
     stats_source = getattr(result, "stats", None)
     stats = stats_source() if callable(stats_source) else (stats_source or {})
     return {
@@ -1881,13 +1887,13 @@ def problem_score_payload(result: Any, *, model: str | None = None) -> dict[str,
 
 
 class Problem:
-    """A workspace problem: a verifiable target registered from an emflow ``Problem``.
+    """A workspace problem: a verifiable target registered from an sdflow ``Problem``.
 
     Declare one on a project from a factory; ``rebase deploy`` registers it and the
     platform versions it by the fingerprint of its spec::
 
         @project.problem(name="icing:se1")
-        def icing_se1() -> emflow.Problem:
+        def icing_se1() -> sdflow.Problem:
             return get_problem_se1()
 
     Reference a registered one by name::
@@ -1895,7 +1901,7 @@ class Problem:
         problem = rb.Problem.from_name("icing:se1")
         problem.get()        # the record with its latest version
         problem.versions()   # every version, oldest first
-        problem.load()       # the emflow Problem (the defining package must be installed)
+        problem.load()       # the sdflow Problem (the defining package must be installed)
     """
 
     def __init__(
@@ -1935,15 +1941,14 @@ class Problem:
         return self._client
 
     def load(self) -> Any:
-        """The emflow ``Problem``: from the factory when declared here, else
-        ``emflow.load_problem(name)`` (needs ``rebase-toolkit[modeling]`` and the
-        package that registers the problem)."""
+        """The framework ``Problem``: from the factory when declared here, else
+        ``load_problem(name)`` from sdflow, or emflow when only that is installed
+        (``rebase-toolkit[modeling]``), plus the package that registers the problem."""
         if self._loaded is None:
             if self.factory is not None:
                 self._loaded = self.factory()
             else:
-                emflow = optional_module("emflow", "modeling")
-                self._loaded = emflow.load_problem(self.name)
+                self._loaded = decision_framework().load_problem(self.name)
         return self._loaded
 
     def spec(self) -> dict[str, Any]:
@@ -1963,9 +1968,10 @@ class Problem:
             # of the script that runs, else of the working directory.
             main_file = getattr(sys.modules.get("__main__"), "__file__", None)
             source.update(_git_metadata_for_path(Path(main_file).resolve() if main_file else Path.cwd()))
-        emflow = sys.modules.get("emflow")
-        if emflow is not None:
-            source["emflow_version"] = getattr(emflow, "__version__", None)
+        framework = sys.modules.get("sdflow") or sys.modules.get("emflow")
+        if framework is not None:
+            source["framework"] = framework.__name__
+            source["framework_version"] = getattr(framework, "__version__", None)
         if project_name:
             source["project"] = project_name
         return {key: value for key, value in source.items() if value is not None}
@@ -2011,7 +2017,7 @@ class Problem:
         project_id: str | None = None,
         client: Client | None = None,
     ) -> dict[str, Any]:
-        """Record an ``emflow.evaluate`` result against this problem's registered version.
+        """Record an ``sdflow.evaluate`` result against this problem's registered version.
 
         The score is pinned to the version whose fingerprint matches the spec this
         process loaded, so a run against an unregistered spec is refused (deploy
@@ -2183,21 +2189,9 @@ def _image_spec_for(
     return Image.python().to_dict()
 
 
-def _installs_emflow(package: str) -> bool:
-    normalized = package.strip().lower()
-    return (
-        normalized == "emflow"
-        or normalized.startswith("emflow ")
-        or normalized.startswith("emflow=")
-        or normalized.startswith("emflow>")
-        or normalized.startswith("emflow<")
-        or "github.com/rebase-energy/emflow" in normalized
-    )
-
-
 def _model_dependencies(dependencies: list[str] | tuple[str, ...] | None = None) -> list[str]:
     packages = [package for package in dependencies or [] if package.strip()]
-    if not any(_installs_emflow(package) for package in packages):
+    if not any(installs_framework(package) for package in packages):
         packages.append(DEFAULT_MODEL_DEPENDENCY)
     return packages
 
@@ -5662,10 +5656,10 @@ class Project:
         name: str | None = None,
         description: str | None = None,
     ) -> Callable[[Callable[[], Any]], Problem]:
-        """Declare a workspace problem from an emflow ``Problem`` factory.
+        """Declare a workspace problem from an sdflow ``Problem`` factory.
 
         ``deploy()`` registers it with this project as provenance. ``name`` defaults
-        to the emflow problem's own name."""
+        to the sdflow problem's own name."""
 
         def decorator(factory: Callable[[], Any]) -> Problem:
             problem = Problem(name, description=description, factory=factory, client=self.client)
@@ -6595,9 +6589,9 @@ def _write_huggingface_provenance_files(
         (folder / "README.md").write_text(readme, encoding="utf-8")
 
 
-class Model(_EmflowModel):
+class Model(_FrameworkModel):
     _operation_name: str | None = None
-    _emflow_init_mode = "name"
+    _framework_init_mode = "name"
     _not_deployable_message = MODEL_NOT_DIRECTLY_DEPLOYABLE_ERROR
 
     project: str | None = "default"
@@ -6645,7 +6639,7 @@ class Model(_EmflowModel):
         _reject_legacy_backend(backend)
         cls = type(self)
         resolved_name = name or getattr(cls, "name", None) or _model_target_name(cls)
-        self._init_emflow_base(resolved_name)
+        self._init_framework_base(resolved_name)
         self.name = resolved_name
         self.project = project if project is not None else getattr(cls, "project", "default")
         self.description = description if description is not None else getattr(cls, "description", None)
@@ -6710,8 +6704,8 @@ class Model(_EmflowModel):
     def _client(self) -> Client:
         return self.client or default_client()
 
-    def _init_emflow_base(self, resolved_name: str) -> None:
-        mode = getattr(type(self), "_emflow_init_mode", "name")
+    def _init_framework_base(self, resolved_name: str) -> None:
+        mode = getattr(type(self), "_framework_init_mode", "name")
         if mode == "skip":
             return
         try:
@@ -6991,9 +6985,9 @@ class Model(_EmflowModel):
         )
 
 
-class Predictor(Model, _EmflowPredictor):
+class Predictor(Model, _FrameworkPredictor):
     _operation_name = "predict"
-    _emflow_init_mode = "empty"
+    _framework_init_mode = "empty"
 
     @classmethod
     def from_name(cls, project: str, name: str, *, client: Client | None = None) -> PredictorHandle:
@@ -7004,9 +6998,9 @@ class Predictor(Model, _EmflowPredictor):
         return PredictorHandle(data, client=resolved_client, project=project)
 
 
-class Optimizer(Model, _EmflowOptimizer):
+class Optimizer(Model, _FrameworkOptimizer):
     _operation_name = "optimize"
-    _emflow_init_mode = "empty"
+    _framework_init_mode = "empty"
 
     @classmethod
     def from_name(cls, project: str, name: str, *, client: Client | None = None) -> OptimizerHandle:
@@ -7017,9 +7011,9 @@ class Optimizer(Model, _EmflowOptimizer):
         return OptimizerHandle(data, client=resolved_client, project=project)
 
 
-class Agent(Model, _EmflowAgent):
+class Agent(Model, _FrameworkAgent):
     _operation_name = "act"
-    _emflow_init_mode = "empty"
+    _framework_init_mode = "empty"
 
     @classmethod
     def from_name(cls, project: str, name: str, *, client: Client | None = None) -> AgentHandle:
@@ -7030,8 +7024,8 @@ class Agent(Model, _EmflowAgent):
         return AgentHandle(data, client=resolved_client, project=project)
 
 
-class Simulator(Model, _EmflowSimulator):
-    _emflow_init_mode = "skip"
+class Simulator(Model, _FrameworkSimulator):
+    _framework_init_mode = "skip"
     _not_deployable_message = SIMULATOR_NOT_DEPLOYABLE_ERROR
 
 
