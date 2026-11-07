@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Scores: a problem version keeps its leaderboard.** `rb.Problem.from_name("icing:se1").record(result)`
+  appends an `emflow.evaluate` result -- model, split, metric, score, origins,
+  analyzer stats, git metadata -- to the problem version whose fingerprint matches
+  the spec the process loaded; a run against an unregistered spec is refused
+  rather than attached to the latest version. `problem.scores(...)` and
+  `rebase problem scores icing:se1` read them back, best per model and split by
+  default, `--all` for every run, `--version N` for another version.
+- **`rb.Problem` and `@project.problem(...)`: problems are workspace resources
+  registered by `rebase deploy`.** A problem is the verifiable target a model is
+  scored against -- an emflow `Problem` with its schedule, splits and objective.
+  Declare one on a project from a factory and deploying registers its spec; the
+  platform versions it by fingerprint (objective, schedule, splits, reference
+  scores -- not the description), so an unchanged spec re-registers as the same
+  version and a moved holdout mints the next. The registering project is kept as
+  provenance, not ownership: every project in the workspace scores against the
+  same `icing:se1 v2`. `rebase problem list|get|versions|delete` read and manage
+  what is registered; `rb.Problem.from_name("icing:se1").load()` returns the
+  emflow object through emflow's `emflow.problems` entry-point group. New
+  permissions `problems:read` (Viewers and up) and `problems:write` (Developers
+  and up).
+
 ## 0.10.0 — 2026-09-22
 
 ### Added

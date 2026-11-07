@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -26,6 +27,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
+from rebase._optional import optional_module
 from rebase.auth import AuthError, load_access_token
 from rebase.client_identity import identity_headers
 from rebase.config import DEFAULT_SERVER_URL, active_environment, load_profile, local_workspace_id
@@ -1764,6 +1766,286 @@ def _config_diff_lines(key: str, stored: Any, local: Any) -> list[str]:
     return lines or [f"{key}: changed"]
 
 
+# --- Problems ---------------------------------------------------------------------
+# A problem is a workspace resource like a dataset: a verifiable target that every
+# project's models are scored against. It is declared from an emflow Problem
+# factory and registered by `rebase deploy`; the server versions it by the
+# fingerprint of its spec (toolkit app/problems.py -- keep the two in step).
+
+PROBLEM_SPEC_VERSION = 1
+_PROBLEM_NON_IDENTIFYING_KEYS = frozenset({"description"})
+
+
+def problem_fingerprint(spec: dict[str, Any]) -> str:
+    """Stable hash of the identifying parts of a problem spec (mirrors the server)."""
+    identifying = {key: value for key, value in spec.items() if key not in _PROBLEM_NON_IDENTIFYING_KEYS}
+    canonical = json.dumps(identifying, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _iso(value: Any) -> Any:
+    if value is None:
+        return None
+    iso = getattr(value, "isoformat", None)
+    return iso() if callable(iso) else str(value)
+
+
+def _schedule_spec(schedule: Any) -> dict[str, Any] | None:
+    if schedule is None:
+        return None
+    origins = getattr(schedule, "_origins", None)
+    if origins is not None:
+        return {
+            "kind": "explicit",
+            "n_origins": len(origins),
+            "first_asof": _iso(origins[0].asof) if origins else None,
+            "last_asof": _iso(origins[-1].asof) if origins else None,
+        }
+    spec: dict[str, Any] = {"kind": "regular"}
+    for key in ("origin_freq", "cover_start", "cover_end", "target_freq", "origin_time"):
+        value = getattr(schedule, key, None)
+        spec[key] = None if value is None else str(value)
+    return spec
+
+
+def _metric_params(metric: Any) -> dict[str, Any]:
+    params = getattr(metric, "__dict__", None) or {}
+    return {key: value for key, value in params.items() if not key.startswith("_")}
+
+
+def problem_spec(problem: Any) -> dict[str, Any]:
+    """Serialise an emflow ``Problem`` into the spec the platform registers.
+
+    Carries what *defines* the problem -- objective, schedule, splits, reference
+    scores -- plus its description. Duck-typed, so the SDK never imports emflow.
+    """
+    objective = getattr(problem, "objective", None)
+    metric = getattr(objective, "metric", None)
+    splits = getattr(problem, "splits", None)
+    dataset = getattr(problem, "dataset", None)
+    return {
+        "spec_version": PROBLEM_SPEC_VERSION,
+        "name": problem.name,
+        "description": getattr(problem, "description", None),
+        "objective": None
+        if objective is None
+        else {
+            "metric": getattr(metric, "name", None) or getattr(objective, "name", None),
+            "params": _metric_params(metric),
+            "aggregate": getattr(metric, "aggregate", None),
+            "lower_is_better": bool(getattr(objective, "lower_is_better", True)),
+        },
+        "schedule": _schedule_spec(getattr(problem, "schedule", None)),
+        "splits": None
+        if splits is None
+        else {
+            "train_end": _iso(splits.train_end),
+            "validation": [_iso(value) for value in splits.validation],
+            "holdout": [_iso(value) for value in splits.holdout],
+        },
+        "reference_scores": [
+            {"rank": score.rank, "team": score.team, "score": score.score}
+            for score in (getattr(problem, "reference_scores", None) or [])
+        ],
+        "dataset": None if dataset is None or callable(dataset) else getattr(dataset, "name", None),
+    }
+
+
+def _json_number(value: Any) -> Any:
+    """JSON has no NaN or inf; analyzers produce both. Numpy scalars become plain numbers."""
+    if isinstance(value, bool):
+        return value
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return value
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return int(value) if isinstance(value, int) else number
+
+
+def problem_score_payload(result: Any, *, model: str | None = None) -> dict[str, Any]:
+    """What a score record carries, read off an emflow ``Result`` (duck-typed)."""
+    stats_source = getattr(result, "stats", None)
+    stats = stats_source() if callable(stats_source) else (stats_source or {})
+    return {
+        "model": model or str(getattr(result, "model", None) or "unnamed"),
+        "split": str(getattr(result, "split", None) or "validation"),
+        "metric": str(getattr(result, "objective", None) or "score"),
+        "score": float(result.score),
+        "lower_is_better": bool(getattr(result, "lower_is_better", True)),
+        "n_origins": int(result.n_origins) if getattr(result, "n_origins", None) is not None else None,
+        "n_scored": int(result.n_scored) if getattr(result, "n_scored", None) is not None else None,
+        "stats": {str(key): _json_number(value) for key, value in dict(stats).items()} or None,
+    }
+
+
+class Problem:
+    """A workspace problem: a verifiable target registered from an emflow ``Problem``.
+
+    Declare one on a project from a factory; ``rebase deploy`` registers it and the
+    platform versions it by the fingerprint of its spec::
+
+        @project.problem(name="icing:se1")
+        def icing_se1() -> emflow.Problem:
+            return get_problem_se1()
+
+    Reference a registered one by name::
+
+        problem = rb.Problem.from_name("icing:se1")
+        problem.get()        # the record with its latest version
+        problem.versions()   # every version, oldest first
+        problem.load()       # the emflow Problem (the defining package must be installed)
+    """
+
+    def __init__(
+        self,
+        name: str | None = None,
+        *,
+        description: str | None = None,
+        factory: Callable[[], Any] | None = None,
+        client: Client | None = None,
+    ) -> None:
+        if (name is None or not name.strip()) and factory is None:
+            raise ValueError("Problem requires a name or a factory")
+        self._name = name.strip() if name else None
+        self.description = description
+        self.factory = factory
+        self._client = client
+        self._loaded: Any = None
+        self.id: str | None = None
+        self.version_id: str | None = None
+        self.version_number: int | None = None
+        self.created: bool | None = None
+
+    @classmethod
+    def from_name(cls, name: str, *, client: Client | None = None) -> Problem:
+        """Reference a registered workspace problem by name."""
+        return cls(name, client=client)
+
+    @property
+    def name(self) -> str:
+        if self._name is None:
+            self._name = str(self.load().name)
+        return self._name
+
+    def _resolved_client(self) -> Client:
+        if self._client is None:
+            self._client = default_client()
+        return self._client
+
+    def load(self) -> Any:
+        """The emflow ``Problem``: from the factory when declared here, else
+        ``emflow.load_problem(name)`` (needs ``rebase-toolkit[modeling]`` and the
+        package that registers the problem)."""
+        if self._loaded is None:
+            if self.factory is not None:
+                self._loaded = self.factory()
+            else:
+                emflow = optional_module("emflow", "modeling")
+                self._loaded = emflow.load_problem(self.name)
+        return self._loaded
+
+    def spec(self) -> dict[str, Any]:
+        return problem_spec(self.load())
+
+    def fingerprint(self) -> str:
+        return problem_fingerprint(self.spec())
+
+    def _source(self, project_name: str | None) -> dict[str, Any]:
+        source: dict[str, Any] = {}
+        if self.factory is not None:
+            source.update(_git_metadata_for(self.factory))
+            source["module"] = getattr(self.factory, "__module__", None)
+            source["factory"] = getattr(self.factory, "__qualname__", None)
+        else:
+            # Referenced by name (a backtest script recording a score): the commit
+            # of the script that runs, else of the working directory.
+            main_file = getattr(sys.modules.get("__main__"), "__file__", None)
+            source.update(_git_metadata_for_path(Path(main_file).resolve() if main_file else Path.cwd()))
+        emflow = sys.modules.get("emflow")
+        if emflow is not None:
+            source["emflow_version"] = getattr(emflow, "__version__", None)
+        if project_name:
+            source["project"] = project_name
+        return {key: value for key, value in source.items() if value is not None}
+
+    def register(
+        self,
+        client: Client | None = None,
+        *,
+        project_id: str | None = None,
+        project_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Register this problem's spec with the active workspace. Idempotent: an
+        unchanged spec returns the existing version, a changed one mints the next."""
+        resolved = client or self._resolved_client()
+        spec = self.spec()
+        result = resolved.register_problem(
+            self.name,
+            spec=spec,
+            description=self.description if self.description is not None else spec.get("description"),
+            source=self._source(project_name),
+            project_id=project_id,
+        )
+        problem = result.get("problem") or {}
+        version = result.get("version") or {}
+        self.id = problem.get("id")
+        self.version_id = version.get("id")
+        self.version_number = version.get("version_number")
+        self.created = bool(result.get("created"))
+        return result
+
+    def get(self) -> dict[str, Any]:
+        return self._resolved_client().get_problem(self.name)
+
+    def versions(self) -> list[dict[str, Any]]:
+        return self._resolved_client().list_problem_versions(self.name)
+
+    def record(
+        self,
+        result: Any,
+        *,
+        model: str | None = None,
+        source: dict[str, Any] | None = None,
+        project_id: str | None = None,
+        client: Client | None = None,
+    ) -> dict[str, Any]:
+        """Record an ``emflow.evaluate`` result against this problem's registered version.
+
+        The score is pinned to the version whose fingerprint matches the spec this
+        process loaded, so a run against an unregistered spec is refused (deploy
+        first) rather than attached to whatever version happens to be latest.
+        ``model`` defaults to the result's model name; ``source`` is merged over the
+        git metadata of the problem factory, when one was declared here.
+        """
+        payload = problem_score_payload(result, model=model)
+        payload["fingerprint"] = self.fingerprint()
+        payload["project_id"] = project_id
+        payload["source"] = {**self._source(None), **(source or {})} or None
+        return (client or self._resolved_client()).record_problem_score(self.name, **payload)
+
+    def scores(
+        self,
+        *,
+        version: int | None = None,
+        split: str | None = None,
+        model: str | None = None,
+        best: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Recorded scores, newest first; the latest version unless ``version`` is given."""
+        return self._resolved_client().list_problem_scores(
+            self.name, version=version, split=split, model=model, best=best
+        )
+
+    def delete(self) -> dict[str, Any]:
+        return self._resolved_client().delete_problem(self.name)
+
+    def __repr__(self) -> str:
+        suffix = f" v{self.version_number}" if self.version_number is not None else ""
+        return f"Problem({self._name or '<from factory>'}{suffix})"
+
+
 def preflight_datasets(client: Client | None = None, *, datasets: list[Dataset] | None = None) -> None:
     """Reconcile declared dataset configs with the platform before a deploy.
 
@@ -2443,8 +2725,11 @@ def _git_metadata_for(fn: Callable[..., Any]) -> dict[str, Any]:
     source_file = inspect.getsourcefile(fn)
     if source_file is None:
         return {}
+    return _git_metadata_for_path(Path(source_file).resolve())
 
-    source_path = Path(source_file).resolve()
+
+def _git_metadata_for_path(source_path: Path) -> dict[str, Any]:
+    """Git metadata of the repository that holds ``source_path`` (a file or a directory)."""
     reconciler_root = os.getenv("REBASE_GITOPS_REPO_ROOT")
     reconciler_sha = os.getenv("REBASE_GITOPS_COMMIT_SHA")
     if reconciler_root and reconciler_sha:
@@ -3049,6 +3334,52 @@ class Client:
         return self._request_dict(
             "POST", f"/buckets/{name}/signed-urls", json=payload, expected="bucket signed URL response"
         )
+
+    def register_problem(
+        self,
+        name: str,
+        *,
+        spec: dict[str, Any],
+        description: str | None = None,
+        source: dict[str, Any] | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        payload = {"name": name, "spec": spec, "description": description, "source": source, "project_id": project_id}
+        return self._request_dict("POST", "/problems", json=payload, expected="problem register response")
+
+    def list_problems(self) -> list[dict[str, Any]]:
+        return self._request_list("GET", "/problems", expected="problem list response")
+
+    def get_problem(self, name: str) -> dict[str, Any]:
+        return self._request_dict("GET", f"/problems/{name}", expected="problem response")
+
+    def list_problem_versions(self, name: str) -> list[dict[str, Any]]:
+        return self._request_list("GET", f"/problems/{name}/versions", expected="problem version list response")
+
+    def delete_problem(self, name: str) -> dict[str, Any]:
+        return self._request_dict("DELETE", f"/problems/{name}", expected="problem response")
+
+    def record_problem_score(self, name: str, **payload: Any) -> dict[str, Any]:
+        """Append one backtest result to the version of ``name`` it was scored against."""
+        return self._request_dict("POST", f"/problems/{name}/scores", json=payload, expected="problem score response")
+
+    def list_problem_scores(
+        self,
+        name: str,
+        *,
+        version: int | None = None,
+        split: str | None = None,
+        model: str | None = None,
+        best: bool = False,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"best": "true" if best else "false"}
+        if version is not None:
+            params["version"] = version
+        if split is not None:
+            params["split"] = split
+        if model is not None:
+            params["model"] = model
+        return self._request_list("GET", f"/problems/{name}/scores", params=params, expected="problem score list")
 
     def create_dataset(self, name: str, description: str | None = None) -> dict[str, Any]:
         return self._request_dict(
@@ -5283,6 +5614,7 @@ class Project:
         self._steps: list[Step] = []
         self._workflows: list[Workflow] = []
         self._asgi_apps: list[ASGIApp] = []
+        self._problems: list[Problem] = []
 
     @property
     def _client(self) -> Client:
@@ -5307,6 +5639,8 @@ class Project:
             environment_name=environment,
         )
         self.id = project["id"]
+        for problem in self._problems:
+            problem.register(self._client, project_id=self.id, project_name=self.name)
         for function in self._functions:
             if isinstance(function, Step):
                 continue  # Steps are deployed automatically via their workflow
@@ -5321,6 +5655,24 @@ class Project:
         for asgi_app in self._asgi_apps:
             asgi_app.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
         return self
+
+    def problem(
+        self,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> Callable[[Callable[[], Any]], Problem]:
+        """Declare a workspace problem from an emflow ``Problem`` factory.
+
+        ``deploy()`` registers it with this project as provenance. ``name`` defaults
+        to the emflow problem's own name."""
+
+        def decorator(factory: Callable[[], Any]) -> Problem:
+            problem = Problem(name, description=description, factory=factory, client=self.client)
+            self._problems.append(problem)
+            return problem
+
+        return decorator
 
     def function(
         self,

@@ -52,6 +52,7 @@ from rebase.client import (
     OnWorkflow,
     Optimizer,
     Predictor,
+    Problem,
     Project,
     RebaseWorkflowError,
     Run,
@@ -384,6 +385,8 @@ KNOWN_PERMISSIONS = frozenset(
         "datasets:read",
         "datasets:write",
         "datasets:signal",
+        "problems:read",
+        "problems:write",
         "shell:execute",
         "asgi:source_token",
     }
@@ -1033,11 +1036,11 @@ def deploy_file(
         attached = {
             id(item)
             for _, candidate in projects
-            for item in (*candidate._functions, *candidate._workflows, *candidate._asgi_apps)
+            for item in (*candidate._functions, *candidate._workflows, *candidate._asgi_apps, *candidate._problems)
         }
         orphans = sorted(
             item_name
-            for item_name, item in _unique_named_objects(module, (Workflow, Function, ASGIApp, Model))
+            for item_name, item in _unique_named_objects(module, (Workflow, Function, ASGIApp, Model, Problem))
             if not isinstance(item, Step) and id(item) not in attached
         )
         if orphans:
@@ -1064,6 +1067,9 @@ def deploy_file(
                 endpoint_url = _deployed_endpoint_url(asgi_app)
                 if endpoint_url is not None:
                     deployed.append(("asgi_app", asgi_app.name or "-", asgi_app.id, endpoint_url))
+            for problem in project._problems:
+                label = f"{problem.name} v{problem.version_number}" if problem.version_number else problem.name
+                deployed.append(("problem", label, problem.version_id))
         return deployed
     if all_projects and selected_names:
         raise RebaseWorkflowError(f"No matching Rebase project found for: {', '.join(sorted(selected_names))}")
@@ -4530,10 +4536,217 @@ dataset_app.add_typer(freshness_app, name="freshness")
 dataset_app.add_typer(contract_app, name="contract")
 
 
+problem_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Problems: verifiable targets registered from emflow problem factories by `rebase deploy`.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+PROBLEM_DETAIL_KEYS = ["name", "id", "description", "version_count", "workspace_id", "created_at", "updated_at"]
+
+
+def _problem_spec_summary(spec: dict[str, Any] | None) -> dict[str, str]:
+    """The few spec fields worth a table column: objective, horizon, splits."""
+    spec = spec or {}
+    objective = spec.get("objective") or {}
+    schedule = spec.get("schedule") or {}
+    splits = spec.get("splits") or {}
+
+    def _day(value: Any) -> str:
+        return str(value)[:10] if value else "-"
+
+    def _period(period: Any) -> str:
+        if not isinstance(period, list) or len(period) != 2:
+            return "-"
+        return f"{_day(period[0])} .. {_day(period[1])}"
+
+    horizon = "-"
+    if schedule.get("kind") == "regular":
+        horizon = f"{schedule.get('origin_freq') or '?'} -> {schedule.get('cover_end') or '?'}"
+    elif schedule.get("kind") == "explicit":
+        horizon = f"{schedule.get('n_origins')} origins"
+    return {
+        "objective": str(objective.get("metric") or "-"),
+        "horizon": horizon,
+        "train_end": _day(splits.get("train_end")),
+        "validation": _period(splits.get("validation")),
+        "holdout": _period(splits.get("holdout")),
+    }
+
+
+def _problem_table(title: str) -> Table:
+    return Table(
+        title=title,
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+
+
+@problem_app.command("list")
+def problem_list_command(
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List problems in the active workspace with their latest version."""
+    problems = Client().list_problems()
+    if json_output:
+        _print_json(problems)
+        return
+    table = _problem_table("Problems")
+    table.add_column("Name", style="rebase.value", no_wrap=True)
+    table.add_column("Version", style="rebase.muted")
+    table.add_column("Objective")
+    table.add_column("Horizon")
+    table.add_column("Holdout")
+    table.add_column("Updated", style="rebase.muted")
+    for problem in problems:
+        latest = problem.get("latest_version") or {}
+        summary = _problem_spec_summary(latest.get("spec"))
+        table.add_row(
+            str(problem.get("name", "-")),
+            f"v{latest['version_number']}" if latest.get("version_number") else "-",
+            summary["objective"],
+            summary["horizon"],
+            summary["holdout"],
+            _format_value(problem.get("updated_at")),
+        )
+    console.print(table)
+
+
+@problem_app.command("get")
+def problem_get_command(
+    name: Annotated[str, typer.Argument(help="Problem name, e.g. 'icing:se1'.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show a problem and the spec of its latest version."""
+    problem = Client().get_problem(name)
+    if json_output:
+        _print_json(problem)
+        return
+    console.print(_detail_table("Problem", problem, preferred_keys=PROBLEM_DETAIL_KEYS))
+    latest = problem.get("latest_version")
+    if latest:
+        details: dict[str, Any] = {
+            "version": f"v{latest.get('version_number')}",
+            "fingerprint": latest.get("fingerprint"),
+        }
+        details.update(_problem_spec_summary(latest.get("spec")))
+        source = latest.get("source") or {}
+        for key in ("project", "module", "git_commit_sha", "emflow_version"):
+            if source.get(key):
+                details[key] = source[key]
+        console.print(_detail_table("Latest Version", details))
+
+
+@problem_app.command("versions")
+def problem_versions_command(
+    name: Annotated[str, typer.Argument(help="Problem name, e.g. 'icing:se1'.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List every version of a problem, oldest first."""
+    versions = Client().list_problem_versions(name)
+    if json_output:
+        _print_json(versions)
+        return
+    table = _problem_table(f"Versions of {name}")
+    table.add_column("Version", style="rebase.value", no_wrap=True)
+    table.add_column("Fingerprint", style="rebase.muted")
+    table.add_column("Objective")
+    table.add_column("Train End")
+    table.add_column("Validation")
+    table.add_column("Holdout")
+    table.add_column("Project", style="rebase.muted")
+    table.add_column("Created", style="rebase.muted")
+    for version in versions:
+        summary = _problem_spec_summary(version.get("spec"))
+        source = version.get("source") or {}
+        table.add_row(
+            f"v{version.get('version_number')}",
+            str(version.get("fingerprint") or "")[:12],
+            summary["objective"],
+            summary["train_end"],
+            summary["validation"],
+            summary["holdout"],
+            str(source.get("project") or "-"),
+            _format_value(version.get("created_at")),
+        )
+    console.print(table)
+
+
+@problem_app.command("scores")
+def problem_scores_command(
+    name: Annotated[str, typer.Argument(help="Problem name, e.g. 'icing:se1'.")],
+    all_runs: Annotated[
+        bool, typer.Option("--all", "-a", help="Every recorded run, not only the best per model and split.")
+    ] = False,
+    version: Annotated[
+        int | None, typer.Option("--version", "-v", help="Problem version; defaults to the latest.")
+    ] = None,
+    split: Annotated[
+        str | None, typer.Option("--split", "-s", help="Only this split, e.g. validation or holdout.")
+    ] = None,
+    model: Annotated[str | None, typer.Option("--model", "-m", help="Only this model name.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """The leaderboard of a problem version: recorded backtest scores, best per model and split."""
+    scores = Client().list_problem_scores(name, version=version, split=split, model=model, best=not all_runs)
+    if json_output:
+        _print_json(scores)
+        return
+    if not scores:
+        console.print(f"No scores recorded on {name}. Record one with `rb.Problem.from_name({name!r}).record(result)`.")
+        return
+    version_number = scores[0].get("version_number")
+    table = _problem_table(f"Scores on {name} v{version_number}" + ("" if all_runs else " (best per model and split)"))
+    table.add_column("Split", no_wrap=True)
+    table.add_column("Model", style="rebase.value")
+    table.add_column("Score", justify="right", no_wrap=True)
+    table.add_column("Metric", style="rebase.muted")
+    table.add_column("Origins", justify="right")
+    table.add_column("Skill", justify="right", style="rebase.muted")
+    table.add_column("Commit", style="rebase.muted", no_wrap=True)
+    table.add_column("Recorded", style="rebase.muted")
+    for score in scores:
+        stats = score.get("stats") or {}
+        skill = stats.get("PersistenceSkill.skill")
+        source = score.get("source") or {}
+        sha = str(source.get("git_commit_sha") or "")[:7]
+        table.add_row(
+            str(score.get("split") or "-"),
+            str(score.get("model") or "-"),
+            f"{float(score['score']):.4g}" if score.get("score") is not None else "-",
+            str(score.get("metric") or "-"),
+            str(score.get("n_origins") if score.get("n_origins") is not None else "-"),
+            f"{float(skill):.2f}" if isinstance(skill, (int, float)) else "-",
+            (sha + ("*" if source.get("git_dirty") else "")) or "-",
+            _format_value(score.get("created_at")),
+        )
+    console.print(table)
+    if not all_runs:
+        console.print("[rebase.muted]`--all` lists every run; `--version N` another problem version.[/rebase.muted]")
+
+
+@problem_app.command("delete")
+def problem_delete_command(
+    name: Annotated[str, typer.Argument(help="Problem name, e.g. 'icing:se1'.")],
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Delete a problem and all of its versions."""
+    if not yes and not typer.confirm(f"Delete problem {name} and all its versions?"):
+        raise typer.Abort()
+    result = Client().delete_problem(name)
+    console.print(f"Deleted problem [rebase.value]{result.get('deleted', name)}[/]")
+
+
 app.add_typer(secret_app, name="secret")
 app.add_typer(volume_app, name="volume")
 app.add_typer(bucket_app, name="bucket")
 app.add_typer(dataset_app, name="dataset")
+app.add_typer(problem_app, name="problem")
 
 
 @api_key_app.command("list")
