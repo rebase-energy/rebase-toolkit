@@ -35,7 +35,15 @@ from rebase.auth import (
 )
 from rebase.brand import BRAND_BRIGHT_GREEN, BRAND_MEDIUM_GRAY
 from rebase.client import Client, RebaseWorkflowError, _git, _parse_github_remote
-from rebase.config import selected_profile_name, write_local_config, write_profile
+from rebase.config import (
+    DEFAULT_PROFILE,
+    selected_profile_name,
+    session_profile_for,
+    set_default_profile,
+    set_profile_workspace,
+    write_local_config,
+    write_profile,
+)
 
 JOIN_WORKSPACE = "Join an existing workspace"
 CREATE_WORKSPACE = "Create a new workspace"
@@ -1617,6 +1625,34 @@ def run_connect_huggingface(args: Any) -> int:
     return 0
 
 
+def _save_signed_in_profile(args: Any, *, api_url: str, workspace: dict[str, Any]) -> None:
+    """Record the workspace on the profile this sign-in belongs to.
+
+    Without `--profile`, that is the profile already signed in on this API URL when
+    one exists: the session is machine-wide, so a second profile on the same API
+    would be the same identity twice, and the one that exists only gets its workspace
+    selection moved. A profile is only written fresh when none qualifies, or when
+    `--profile` names one explicitly -- the escape hatch for a second identity, which
+    a session profile on an API that already has one cannot be, hence the hint.
+    """
+    requested = getattr(args, "profile", None)
+    existing = session_profile_for(api_url)
+    if requested is None:
+        if existing is not None:
+            set_profile_workspace(str(workspace["id"]), workspace.get("name"), profile=existing)
+            path = set_default_profile(existing)
+            _hint(f"Using existing Rebase profile '{existing}' in {path}")
+            return
+        requested = DEFAULT_PROFILE
+    elif existing is not None and existing != requested:
+        _hint(
+            f"Profile '{existing}' already signs in on this API; profiles are for a separate identity "
+            "or API URL, and `rebase workspace switch` changes the workspace."
+        )
+    path = write_profile(profile=requested, api_url=api_url, workspace=workspace)
+    _hint(f"Saved Rebase profile '{requested}' to {path}")
+
+
 def run_setup(args: Any) -> int:
     _restore_terminal_for_prompts()
     _intro()
@@ -1638,9 +1674,8 @@ def run_setup(args: Any) -> int:
             _section("Authenticate", step=1, total=total_steps)
             token = _switch_account(args, config)
     workspace_id = str(workspace["id"])
-    path = write_profile(profile=args.profile, api_url=authed_client.api_url, workspace=workspace)
     _success(f"Using workspace {workspace_id}")
-    _hint(f"Saved Rebase profile '{args.profile}' to {path}")
+    _save_signed_in_profile(args, api_url=authed_client.api_url, workspace=workspace)
     _mark_local_workspace(workspace)
     _hint("Run `rebase connect github` when you are ready to add source backing.")
     _success("Setup complete")
@@ -1659,9 +1694,8 @@ def run_workspace_create(args: Any) -> int:
 
     workspace = _create_workspace(args, authed_client, session=session)
     workspace_id = str(workspace["id"])
-    path = write_profile(profile=args.profile, api_url=authed_client.api_url, workspace=workspace)
     _success(f"Created workspace {workspace_id}")
-    _hint(f"Saved Rebase profile '{args.profile}' to {path}")
+    _save_signed_in_profile(args, api_url=authed_client.api_url, workspace=workspace)
     _mark_local_workspace(workspace)
     _hint("Run `rebase connect github` when you are ready to add source backing.")
     _success("Workspace create complete")

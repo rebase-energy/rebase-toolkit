@@ -52,6 +52,7 @@ from rebase.client import (
     OnWorkflow,
     Optimizer,
     Predictor,
+    Problem,
     Project,
     RebaseWorkflowError,
     Run,
@@ -77,6 +78,7 @@ from rebase.config import (
     active_platform,
     add_search_path,
     config_path,
+    delete_profile,
     editor_settings,
     find_local_config,
     list_profiles,
@@ -393,6 +395,8 @@ KNOWN_PERMISSIONS = frozenset(
         "datasets:read",
         "datasets:write",
         "datasets:signal",
+        "problems:read",
+        "problems:write",
         "shell:execute",
         "asgi:source_token",
     }
@@ -1095,11 +1099,11 @@ def _deploy_file(
         attached = {
             id(item)
             for _, candidate in projects
-            for item in (*candidate._functions, *candidate._workflows, *candidate._asgi_apps)
+            for item in (*candidate._functions, *candidate._workflows, *candidate._asgi_apps, *candidate._problems)
         }
         orphans = sorted(
             item_name
-            for item_name, item in _unique_named_objects(module, (Workflow, Function, ASGIApp, Model))
+            for item_name, item in _unique_named_objects(module, (Workflow, Function, ASGIApp, Model, Problem))
             if not isinstance(item, Step) and id(item) not in attached
         )
         if orphans:
@@ -1129,6 +1133,9 @@ def _deploy_file(
                 endpoint_url = _deployed_endpoint_url(asgi_app)
                 if endpoint_url is not None:
                     deployed.append(("asgi_app", asgi_app.name or "-", asgi_app.id, endpoint_url))
+            for problem in project._problems:
+                label = f"{problem.name} v{problem.version_number}" if problem.version_number else problem.name
+                deployed.append(("problem", label, problem.version_id))
         return deployed
     if all_projects and selected_names:
         raise RebaseWorkflowError(f"No matching Rebase project found for: {', '.join(sorted(selected_names))}")
@@ -1496,12 +1503,21 @@ def _profile_credential_label(profile_data: dict[str, Any], *, has_auth_session:
     return "none"
 
 
+def _profile_identity(profile_data: dict[str, Any], *, has_auth_session: bool, auth_email: str | None) -> str | None:
+    """Who the credential signs in as, when that is known locally: the
+    session's email. An API key's owner is not stored with it."""
+    if profile_data.get("api_key"):
+        return None
+    return auth_email if has_auth_session else None
+
+
 def _profile_summary(
     name: str,
     profile_data: dict[str, Any],
     *,
     active_profile: str,
     has_auth_session: bool,
+    auth_email: str | None = None,
 ) -> dict[str, Any]:
     return {
         "active": name == active_profile,
@@ -1511,6 +1527,7 @@ def _profile_summary(
         "api_url": _profile_api_url(profile_data),
         "has_api_key": bool(profile_data.get("api_key")),
         "credential": _profile_credential_label(profile_data, has_auth_session=has_auth_session),
+        "identity": _profile_identity(profile_data, has_auth_session=has_auth_session, auth_email=auth_email),
     }
 
 
@@ -1519,7 +1536,15 @@ def _profiles_table(
     *,
     active_profile: str,
     has_auth_session: bool,
+    auth_email: str | None = None,
 ) -> Table:
+    """One row per profile: an identity on a backend, so the columns are exactly
+    what can differ between identities -- the credential, who it signs in as and
+    the API it talks to. Two rows that read the same are the same identity twice.
+    The workspace a profile currently selects is deliberately not a column: it is
+    a cursor the credential moves across every workspace it can reach (`rebase
+    workspace` lists those), and printing it beside the credential read as a
+    binding."""
     table = Table(
         title="Profiles",
         box=box.ASCII,
@@ -1530,28 +1555,32 @@ def _profiles_table(
     )
     table.add_column("Active", justify="center", no_wrap=True, style="rebase.active")
     table.add_column("Profile")
-    table.add_column("Workspace", overflow="fold")
-    table.add_column("Workspace ID", style="rebase.muted", overflow="fold")
-    table.add_column("API URL", overflow="fold")
     table.add_column("Credential", no_wrap=True)
+    table.add_column("Identity", overflow="fold")
+    table.add_column("API", overflow="fold")
     for profile_name, profile_data in sorted(profiles.items()):
         summary = _profile_summary(
             profile_name,
             profile_data,
             active_profile=active_profile,
             has_auth_session=has_auth_session,
+            auth_email=auth_email,
         )
         style = "rebase.active" if summary["active"] else None
         table.add_row(
             "*" if summary["active"] else "",
             profile_name,
-            summary["workspace"],
-            summary["workspace_id"],
-            summary["api_url"],
             summary["credential"],
+            summary["identity"] or "-",
+            _api_label(summary["api_url"]),
             style=style,
         )
     return table
+
+
+def _api_label(api_url: str) -> str:
+    """The hosted platform by name; anything else by its URL, since that is the difference."""
+    return "hosted" if api_url.rstrip("/") == DEFAULT_SERVER_URL else api_url
 
 
 def _profile_show_data(profile: str | None = None) -> dict[str, Any]:
@@ -2223,7 +2252,14 @@ def _list_project_targets(
 
 @app.command("setup")
 def setup_command(
-    profile: Annotated[str, typer.Option("--profile", "-p", help="Credential profile name.")] = DEFAULT_PROFILE,
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            "-p",
+            help="Credential profile name. Defaults to the profile already signed in on this API, else 'default'.",
+        ),
+    ] = None,
     api_key: Annotated[str | None, typer.Option("--api-key", hidden=True)] = None,
     api_url: Annotated[
         str | None,
@@ -2305,6 +2341,7 @@ def setup_command(
         except Exception as exc:
             raise RebaseWorkflowError(f"could not verify API key against {verify_url}: {exc}") from exc
 
+    profile = profile or DEFAULT_PROFILE
     path = write_profile(api_key=api_key, profile=profile, api_url=api_url, workspace=workspace)
     console.print(f"Saved Rebase credentials for profile '[rebase.value]{profile}[/rebase.value]'")
     console.print(f"[rebase.muted]{path}[/rebase.muted]")
@@ -2534,6 +2571,7 @@ def _profile_list_data() -> dict[str, Any]:
                 profile_data,
                 active_profile=active_profile,
                 has_auth_session=auth["exists"],
+                auth_email=auth.get("email"),
             )
             for profile_name, profile_data in sorted(profiles.items())
         ],
@@ -2580,12 +2618,18 @@ def profile_list_command(
         _print_json(data)
         return
     profiles = list_profiles()
+    auth = data.get("auth", {})
     console.print(
         _profiles_table(
             profiles,
             active_profile=data["active_profile"],
-            has_auth_session=bool(data.get("auth", {}).get("exists")),
+            has_auth_session=bool(auth.get("exists")),
+            auth_email=auth.get("email"),
         )
+    )
+    console.print(
+        "[rebase.muted]A profile is an identity; the workspace it targets is a selection. "
+        "`rebase workspace` lists the workspaces the active profile can reach and which one is selected.[/rebase.muted]"
     )
 
 
@@ -2602,6 +2646,26 @@ def profile_show_command(
 def profile_switch_command(profile: Annotated[str, typer.Argument(help="Profile name.")]) -> None:
     """Switch the active local Rebase CLI profile."""
     _switch_profile(profile)
+
+
+@profile_app.command("delete")
+def profile_delete_command(
+    profile: Annotated[str, typer.Argument(help="Profile name.")],
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Delete a local profile. The stored sign-in session and the workspace are untouched."""
+    if profile not in list_profiles():
+        raise RebaseWorkflowError(f"unknown profile: {profile}")
+    if not yes and not typer.confirm(f"Delete local profile '{profile}'?"):
+        raise typer.Abort()
+    try:
+        path = delete_profile(profile)
+    except ValueError as exc:
+        raise RebaseWorkflowError(
+            f"'{profile}' is the active profile. `rebase profile switch <other>` first, then delete it."
+        ) from exc
+    console.print(f"Deleted profile '[rebase.value]{profile}[/rebase.value]'")
+    console.print(f"[rebase.muted]{path}[/rebase.muted]")
 
 
 @profile_app.command("link")
@@ -2689,7 +2753,14 @@ def workspace_create_command(
         str | None,
         typer.Argument(help="Workspace handle to create."),
     ] = None,
-    profile: Annotated[str, typer.Option("--profile", "-p", help="Credential profile name.")] = DEFAULT_PROFILE,
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            "-p",
+            help="Credential profile name. Defaults to the profile already signed in on this API, else 'default'.",
+        ),
+    ] = None,
     api_url: Annotated[
         str | None,
         typer.Option(
@@ -4644,10 +4715,217 @@ dataset_app.add_typer(freshness_app, name="freshness")
 dataset_app.add_typer(contract_app, name="contract")
 
 
+problem_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Problems: verifiable targets registered from sdflow problem factories by `rebase deploy`.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+PROBLEM_DETAIL_KEYS = ["name", "id", "description", "version_count", "workspace_id", "created_at", "updated_at"]
+
+
+def _problem_spec_summary(spec: dict[str, Any] | None) -> dict[str, str]:
+    """The few spec fields worth a table column: objective, horizon, splits."""
+    spec = spec or {}
+    objective = spec.get("objective") or {}
+    schedule = spec.get("schedule") or {}
+    splits = spec.get("splits") or {}
+
+    def _day(value: Any) -> str:
+        return str(value)[:10] if value else "-"
+
+    def _period(period: Any) -> str:
+        if not isinstance(period, list) or len(period) != 2:
+            return "-"
+        return f"{_day(period[0])} .. {_day(period[1])}"
+
+    horizon = "-"
+    if schedule.get("kind") == "regular":
+        horizon = f"{schedule.get('origin_freq') or '?'} -> {schedule.get('cover_end') or '?'}"
+    elif schedule.get("kind") == "explicit":
+        horizon = f"{schedule.get('n_origins')} origins"
+    return {
+        "objective": str(objective.get("metric") or "-"),
+        "horizon": horizon,
+        "train_end": _day(splits.get("train_end")),
+        "validation": _period(splits.get("validation")),
+        "holdout": _period(splits.get("holdout")),
+    }
+
+
+def _problem_table(title: str) -> Table:
+    return Table(
+        title=title,
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+
+
+@problem_app.command("list")
+def problem_list_command(
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List problems in the active workspace with their latest version."""
+    problems = Client().list_problems()
+    if json_output:
+        _print_json(problems)
+        return
+    table = _problem_table("Problems")
+    table.add_column("Name", style="rebase.value", no_wrap=True)
+    table.add_column("Version", style="rebase.muted")
+    table.add_column("Objective")
+    table.add_column("Horizon")
+    table.add_column("Holdout")
+    table.add_column("Updated", style="rebase.muted")
+    for problem in problems:
+        latest = problem.get("latest_version") or {}
+        summary = _problem_spec_summary(latest.get("spec"))
+        table.add_row(
+            str(problem.get("name", "-")),
+            f"v{latest['version_number']}" if latest.get("version_number") else "-",
+            summary["objective"],
+            summary["horizon"],
+            summary["holdout"],
+            _format_value(problem.get("updated_at")),
+        )
+    console.print(table)
+
+
+@problem_app.command("get")
+def problem_get_command(
+    name: Annotated[str, typer.Argument(help="Problem name, e.g. 'icing:se1'.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show a problem and the spec of its latest version."""
+    problem = Client().get_problem(name)
+    if json_output:
+        _print_json(problem)
+        return
+    console.print(_detail_table("Problem", problem, preferred_keys=PROBLEM_DETAIL_KEYS))
+    latest = problem.get("latest_version")
+    if latest:
+        details: dict[str, Any] = {
+            "version": f"v{latest.get('version_number')}",
+            "fingerprint": latest.get("fingerprint"),
+        }
+        details.update(_problem_spec_summary(latest.get("spec")))
+        source = latest.get("source") or {}
+        for key in ("project", "module", "git_commit_sha", "framework", "framework_version", "emflow_version"):
+            if source.get(key):
+                details[key] = source[key]
+        console.print(_detail_table("Latest Version", details))
+
+
+@problem_app.command("versions")
+def problem_versions_command(
+    name: Annotated[str, typer.Argument(help="Problem name, e.g. 'icing:se1'.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List every version of a problem, oldest first."""
+    versions = Client().list_problem_versions(name)
+    if json_output:
+        _print_json(versions)
+        return
+    table = _problem_table(f"Versions of {name}")
+    table.add_column("Version", style="rebase.value", no_wrap=True)
+    table.add_column("Fingerprint", style="rebase.muted")
+    table.add_column("Objective")
+    table.add_column("Train End")
+    table.add_column("Validation")
+    table.add_column("Holdout")
+    table.add_column("Project", style="rebase.muted")
+    table.add_column("Created", style="rebase.muted")
+    for version in versions:
+        summary = _problem_spec_summary(version.get("spec"))
+        source = version.get("source") or {}
+        table.add_row(
+            f"v{version.get('version_number')}",
+            str(version.get("fingerprint") or "")[:12],
+            summary["objective"],
+            summary["train_end"],
+            summary["validation"],
+            summary["holdout"],
+            str(source.get("project") or "-"),
+            _format_value(version.get("created_at")),
+        )
+    console.print(table)
+
+
+@problem_app.command("scores")
+def problem_scores_command(
+    name: Annotated[str, typer.Argument(help="Problem name, e.g. 'icing:se1'.")],
+    all_runs: Annotated[
+        bool, typer.Option("--all", "-a", help="Every recorded run, not only the best per model and split.")
+    ] = False,
+    version: Annotated[
+        int | None, typer.Option("--version", "-v", help="Problem version; defaults to the latest.")
+    ] = None,
+    split: Annotated[
+        str | None, typer.Option("--split", "-s", help="Only this split, e.g. validation or holdout.")
+    ] = None,
+    model: Annotated[str | None, typer.Option("--model", "-m", help="Only this model name.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """The leaderboard of a problem version: recorded backtest scores, best per model and split."""
+    scores = Client().list_problem_scores(name, version=version, split=split, model=model, best=not all_runs)
+    if json_output:
+        _print_json(scores)
+        return
+    if not scores:
+        console.print(f"No scores recorded on {name}. Record one with `rb.Problem.from_name({name!r}).record(result)`.")
+        return
+    version_number = scores[0].get("version_number")
+    table = _problem_table(f"Scores on {name} v{version_number}" + ("" if all_runs else " (best per model and split)"))
+    table.add_column("Split", no_wrap=True)
+    table.add_column("Model", style="rebase.value")
+    table.add_column("Score", justify="right", no_wrap=True)
+    table.add_column("Metric", style="rebase.muted")
+    table.add_column("Origins", justify="right")
+    table.add_column("Skill", justify="right", style="rebase.muted")
+    table.add_column("Commit", style="rebase.muted", no_wrap=True)
+    table.add_column("Recorded", style="rebase.muted")
+    for score in scores:
+        stats = score.get("stats") or {}
+        skill = stats.get("PersistenceSkill.skill")
+        source = score.get("source") or {}
+        sha = str(source.get("git_commit_sha") or "")[:7]
+        table.add_row(
+            str(score.get("split") or "-"),
+            str(score.get("model") or "-"),
+            f"{float(score['score']):.4g}" if score.get("score") is not None else "-",
+            str(score.get("metric") or "-"),
+            str(score.get("n_origins") if score.get("n_origins") is not None else "-"),
+            f"{float(skill):.2f}" if isinstance(skill, (int, float)) else "-",
+            (sha + ("*" if source.get("git_dirty") else "")) or "-",
+            _format_value(score.get("created_at")),
+        )
+    console.print(table)
+    if not all_runs:
+        console.print("[rebase.muted]`--all` lists every run; `--version N` another problem version.[/rebase.muted]")
+
+
+@problem_app.command("delete")
+def problem_delete_command(
+    name: Annotated[str, typer.Argument(help="Problem name, e.g. 'icing:se1'.")],
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Delete a problem and all of its versions."""
+    if not yes and not typer.confirm(f"Delete problem {name} and all its versions?"):
+        raise typer.Abort()
+    result = Client().delete_problem(name)
+    console.print(f"Deleted problem [rebase.value]{result.get('deleted', name)}[/]")
+
+
 app.add_typer(secret_app, name="secret")
 app.add_typer(volume_app, name="volume")
 app.add_typer(bucket_app, name="bucket")
 app.add_typer(dataset_app, name="dataset")
+app.add_typer(problem_app, name="problem")
 
 
 @api_key_app.command("list")

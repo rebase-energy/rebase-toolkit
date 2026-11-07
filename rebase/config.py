@@ -287,6 +287,52 @@ def set_default_profile(profile: str, *, path: Path | None = None) -> Path:
     return _write_config(data, resolved_path)
 
 
+def normalized_api_url(api_url: str | None) -> str:
+    return (api_url or DEFAULT_SERVER_URL).rstrip("/")
+
+
+def _optional_str(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def session_profile_for(api_url: str | None, *, path: Path | None = None) -> str | None:
+    """The profile that already signs in with the stored session on this API URL, if any.
+
+    The Supabase session is one file per machine, so every session profile on the
+    same API URL is the same identity: a second one is a duplicate, not a second
+    login. `rebase setup` therefore reuses the one that exists -- the active profile
+    when it qualifies, else the first by name -- and only moves its workspace
+    selection. API-key profiles are a different identity and never match.
+    """
+    wanted = normalized_api_url(api_url)
+    candidates = [
+        name
+        for name, profile in sorted(list_profiles(path=path).items())
+        if not profile.get("api_key") and normalized_api_url(_optional_str(profile.get("api_url"))) == wanted
+    ]
+    data = read_config(path)
+    if not candidates:
+        return None
+    active = data.get("default_profile")
+    if isinstance(active, str) and active in candidates:
+        return active
+    return candidates[0]
+
+
+def delete_profile(profile: str, *, path: Path | None = None) -> Path:
+    """Remove a local profile. The active one cannot go: switch first."""
+    resolved_path = path or config_path()
+    data = read_config(resolved_path)
+    profiles = data.get("profiles")
+    if not isinstance(profiles, dict) or profile not in profiles:
+        raise KeyError(profile)
+    if data.get("default_profile") == profile:
+        raise ValueError(profile)
+    del profiles[profile]
+    data["profiles"] = profiles
+    return _write_config(data, resolved_path)
+
+
 def write_profile(
     *,
     api_key: str | None = None,

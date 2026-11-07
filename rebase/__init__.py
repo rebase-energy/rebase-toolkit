@@ -31,6 +31,7 @@ from rebase.client import (
     OptimizerHandle,
     Predictor,
     PredictorHandle,
+    Problem,
     Project,
     RebaseError,
     RebaseWorkflowError,
@@ -43,6 +44,7 @@ from rebase.client import (
     Volume,
     Workflow,
     configure,
+    problem_score_payload,
     when,
 )
 from rebase.config import DEFAULT_API_URL, DEFAULT_SERVER_URL
@@ -86,6 +88,8 @@ __all__ = [
     "ContractViolation",
     "Cron",
     "Dataset",
+    "Problem",
+    "problem_score_payload",
     "DeploymentError",
     "DeploymentReport",
     "DeploymentResult",

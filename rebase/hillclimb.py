@@ -133,8 +133,10 @@ def discover_emflow_problems(family: str | None = None) -> list[dict[str, str]]:
     """Return installed emflow registry targets without loading their datasets."""
     _require_hillclimb()
     try:
-        import emflow as ef
-    except ModuleNotFoundError as exc:
+        from rebase._framework import framework_module
+
+        ef = framework_module()  # sdflow or emflow; the engine addresses both as emflow://
+    except ImportError as exc:
         raise RuntimeError(
             "problem discovery needs the hillclimb extra: pip install 'rebase-toolkit[hillclimb]'"
         ) from exc

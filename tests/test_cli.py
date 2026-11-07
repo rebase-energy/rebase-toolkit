@@ -585,7 +585,7 @@ model = PriceForecastPredictor()
     assert observed["entrypoint"] == "predict"
     assert observed["parameters"] == {"zone": "SE4"}
     assert observed["default_parameters"] == {"zone": "SE3"}
-    assert any("emflow" in package for package in observed["image_spec"]["uv_pip_packages"])
+    assert any("sdflow" in package for package in observed["image_spec"]["uv_pip_packages"])
     assert "class PriceForecastPredictor(rb.Predictor):" in observed["source_code"]
     assert '"zone": "SE4"' in capsys.readouterr().out
 
@@ -3030,10 +3030,14 @@ def test_profile_list_renders_local_profiles(monkeypatch, tmp_path: Path, capsys
 
     output = capsys.readouterr().out
     assert "Profiles" in output
-    assert "dev-workspace" in output
     assert "prod" in output
     assert "api key" in output
     assert "rbw_prod" not in output
+    # a profile is an identity, not a workspace binding: the selection is not a column
+    assert "dev-workspace" not in output and "Workspace" not in output
+    # the API is part of the identity, so two rows that read the same are one identity twice
+    assert "prod.test" in output and "dev.test" in output
+    assert "rebase workspace" in output
 
 
 def test_profile_list_json_does_not_leak_api_keys(monkeypatch, tmp_path: Path, capsys) -> None:
@@ -3069,6 +3073,7 @@ def test_profile_list_json_does_not_leak_api_keys(monkeypatch, tmp_path: Path, c
             "api_url": "https://api.example.test",
             "has_api_key": True,
             "credential": "api key",
+            "identity": None,
         }
     ]
     assert "rbw_secret" not in output

@@ -2380,7 +2380,7 @@ def test_predictor_as_function_generates_predict_wrapper() -> None:
     assert function.run_type == "quick_shared"
     assert function.image_spec is not None
     assert "boltons==25.0.0" in function.image_spec["uv_pip_packages"]
-    assert any("emflow" in package for package in function.image_spec["uv_pip_packages"])
+    assert any("sdflow" in package for package in function.image_spec["uv_pip_packages"])
     assert "class PriceForecastPredictor(rb.Predictor):" in str(function.source_code)
     assert "def predict(zone: str = 'SE3', horizon_hours: int = 24) -> dict:" in str(function.source_code)
     assert "model = PriceForecastPredictor()" in str(function.source_code)
@@ -2415,7 +2415,7 @@ def test_predictor_deploy_registers_model(monkeypatch) -> None:
     assert observed["default_parameters"] == {"zone": "SE3"}
     assert observed["mode"] == "interactive"
     assert observed["isolation"] == "shared"
-    assert any("emflow" in package for package in observed["image_spec"]["uv_pip_packages"])
+    assert any("sdflow" in package for package in observed["image_spec"]["uv_pip_packages"])
 
 
 def test_client_records_model_publication(monkeypatch) -> None:
