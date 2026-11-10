@@ -11,6 +11,7 @@ import os
 import random
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -31,6 +32,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
+from rebase._framework import framework_models, framework_module, installs_framework
 from rebase.auth import AuthError, load_access_token
 from rebase.client_identity import identity_headers
 from rebase.config import DEFAULT_SERVER_URL, active_environment, load_profile, local_workspace_id
@@ -51,36 +53,37 @@ from rebase.image import DEFAULT_PYTHON_VERSION, Image
 from rebase.runtime import current_run
 from rebase.source_bundle import SourceBundle, build_source_bundle
 
-try:
-    from emflow.models import Agent as _ImportedEmflowAgent
-    from emflow.models import Model as _ImportedEmflowModel
-    from emflow.models import Optimizer as _ImportedEmflowOptimizer
-    from emflow.models import Predictor as _ImportedEmflowPredictor
-    from emflow.models import Simulator as _ImportedEmflowSimulator
-except ImportError:
+_framework_models = framework_models()
+if _framework_models is not None:
+    _ImportedFrameworkAgent = _framework_models.Agent
+    _ImportedFrameworkModel = _framework_models.Model
+    _ImportedFrameworkOptimizer = _framework_models.Optimizer
+    _ImportedFrameworkPredictor = _framework_models.Predictor
+    _ImportedFrameworkSimulator = _framework_models.Simulator
+else:
 
-    class _ImportedEmflowModel:
+    class _ImportedFrameworkModel:
         def __init__(self, name: str | None = None) -> None:
             self.name = name
 
-    class _ImportedEmflowPredictor(_ImportedEmflowModel):
+    class _ImportedFrameworkPredictor(_ImportedFrameworkModel):
         pass
 
-    class _ImportedEmflowOptimizer(_ImportedEmflowModel):
+    class _ImportedFrameworkOptimizer(_ImportedFrameworkModel):
         pass
 
-    class _ImportedEmflowAgent(_ImportedEmflowModel):
+    class _ImportedFrameworkAgent(_ImportedFrameworkModel):
         pass
 
-    class _ImportedEmflowSimulator(_ImportedEmflowModel):
+    class _ImportedFrameworkSimulator(_ImportedFrameworkModel):
         pass
 
 
-_EmflowModel: Any = _ImportedEmflowModel
-_EmflowPredictor: Any = _ImportedEmflowPredictor
-_EmflowOptimizer: Any = _ImportedEmflowOptimizer
-_EmflowAgent: Any = _ImportedEmflowAgent
-_EmflowSimulator: Any = _ImportedEmflowSimulator
+_FrameworkModel: Any = _ImportedFrameworkModel
+_FrameworkPredictor: Any = _ImportedFrameworkPredictor
+_FrameworkOptimizer: Any = _ImportedFrameworkOptimizer
+_FrameworkAgent: Any = _ImportedFrameworkAgent
+_FrameworkSimulator: Any = _ImportedFrameworkSimulator
 
 
 _default_client: Client | None = None
@@ -180,6 +183,12 @@ DEFAULT_API_KEY_PERMISSIONS = [
 ]
 DEPLOY_REQUEST_TIMEOUT_SECONDS = 300
 DEPLOY_REQUEST_ATTEMPTS = 3
+# A 429 is the platform refusing a request before doing any of it -- the bucket
+# data routes are budgeted per workspace, and over budget they answer 429 with a
+# Retry-After -- so any request can be sent again after the wait, writes included.
+# Up to this many waits, each no longer than this; past that the 429 is the error.
+RATE_LIMIT_ATTEMPTS = 4
+RATE_LIMIT_MAX_WAIT_SECONDS = 60.0
 # (connect, read) for POST /runs/ephemeral: the server executes quick runs inside
 # the request and enforces a 300 s run cap, so the read timeout is that plus
 # headroom. The old default of 30 s failed any run longer than half a minute.
@@ -211,6 +220,16 @@ class _DeploymentRequestError(RebaseWorkflowError):
         super().__init__(message)
         self.uncertain = uncertain
         self.status_code = status_code
+
+
+def _retry_after_seconds(response: requests.Response) -> float | None:
+    """How long a 429 asks us to wait, or None when it is too long to wait out."""
+    try:
+        wait = float(response.headers.get("Retry-After", "1"))
+    except (AttributeError, ValueError):
+        wait = 1.0
+    wait = max(wait, 0.0)
+    return wait if wait <= RATE_LIMIT_MAX_WAIT_SECONDS else None
 
 
 def _deploy_retry_delay(attempt: int, response: requests.Response | None = None) -> float:
@@ -752,9 +771,9 @@ DEFAULT_RUN_TYPE: RunType = "quick_shared"
 WORKFLOW_RUN_TYPES = ("quick", "long")
 DeploySource = str
 DEFAULT_DEPLOY_SOURCE: DeploySource = "rebase"
-DEFAULT_MODEL_DEPENDENCY = (
-    "emflow @ git+https://github.com/rebase-energy/emflow.git@2d0205e1b479d439df72e50c6865735d0b26de8d"
-)
+# What a model image installs when its dependencies name no framework: sdflow from
+# PyPI. A dependency that names sdflow or emflow (by name or git URL) is left alone.
+DEFAULT_MODEL_DEPENDENCY = "sdflow>=0.1,<0.2"
 LEGACY_BACKEND_REMOVED_ERROR = (
     "the 'backend' parameter was removed; use mode='interactive' | 'job' and isolation='shared' | 'dedicated'"
 )
@@ -1864,6 +1883,291 @@ def _config_diff_lines(key: str, stored: Any, local: Any) -> list[str]:
     return lines or [f"{key}: changed"]
 
 
+# --- Problems ---------------------------------------------------------------------
+# A problem is a workspace resource like a dataset: a verifiable target that every
+# project's models are scored against. It is declared from an sdflow Problem
+# factory and registered by `rebase deploy`; the server versions it by the
+# fingerprint of its spec (toolkit app/problems.py -- keep the two in step).
+
+PROBLEM_SPEC_VERSION = 1
+_PROBLEM_NON_IDENTIFYING_KEYS = frozenset({"description"})
+
+
+def problem_fingerprint(spec: dict[str, Any]) -> str:
+    """Stable hash of the identifying parts of a problem spec (mirrors the server)."""
+    identifying = {key: value for key, value in spec.items() if key not in _PROBLEM_NON_IDENTIFYING_KEYS}
+    canonical = json.dumps(identifying, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _iso(value: Any) -> Any:
+    if value is None:
+        return None
+    iso = getattr(value, "isoformat", None)
+    return iso() if callable(iso) else str(value)
+
+
+def _schedule_spec(schedule: Any) -> dict[str, Any] | None:
+    if schedule is None:
+        return None
+    origins = getattr(schedule, "_origins", None)
+    if origins is not None:
+        return {
+            "kind": "explicit",
+            "n_origins": len(origins),
+            "first_asof": _iso(origins[0].asof) if origins else None,
+            "last_asof": _iso(origins[-1].asof) if origins else None,
+        }
+    spec: dict[str, Any] = {"kind": "regular"}
+    for key in ("origin_freq", "cover_start", "cover_end", "target_freq", "origin_time"):
+        value = getattr(schedule, key, None)
+        spec[key] = None if value is None else str(value)
+    return spec
+
+
+def _metric_params(metric: Any) -> dict[str, Any]:
+    params = getattr(metric, "__dict__", None) or {}
+    return {key: value for key, value in params.items() if not key.startswith("_")}
+
+
+def problem_spec(problem: Any) -> dict[str, Any]:
+    """Serialise an sdflow (or emflow) ``Problem`` into the spec the platform registers.
+
+    Carries what *defines* the problem -- objective, schedule, splits, reference
+    scores -- plus its description. Duck-typed, so the SDK never imports the framework here.
+    """
+    objective = getattr(problem, "objective", None)
+    metric = getattr(objective, "metric", None)
+    splits = getattr(problem, "splits", None)
+    dataset = getattr(problem, "dataset", None)
+    return {
+        "spec_version": PROBLEM_SPEC_VERSION,
+        "name": problem.name,
+        "description": getattr(problem, "description", None),
+        "objective": None
+        if objective is None
+        else {
+            "metric": getattr(metric, "name", None) or getattr(objective, "name", None),
+            "params": _metric_params(metric),
+            "aggregate": getattr(metric, "aggregate", None),
+            "lower_is_better": bool(getattr(objective, "lower_is_better", True)),
+        },
+        "schedule": _schedule_spec(getattr(problem, "schedule", None)),
+        "splits": None
+        if splits is None
+        else {
+            "train_end": _iso(splits.train_end),
+            "validation": [_iso(value) for value in splits.validation],
+            "holdout": [_iso(value) for value in splits.holdout],
+        },
+        "reference_scores": [
+            {"rank": score.rank, "team": score.team, "score": score.score}
+            for score in (getattr(problem, "reference_scores", None) or [])
+        ],
+        "dataset": None if dataset is None or callable(dataset) else getattr(dataset, "name", None),
+    }
+
+
+def _json_number(value: Any) -> Any:
+    """JSON has no NaN or inf; analyzers produce both. Numpy scalars become plain numbers."""
+    if isinstance(value, bool):
+        return value
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return value
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return int(value) if isinstance(value, int) else number
+
+
+def decision_framework() -> Any:
+    """The framework to load problems with: sdflow when installed, else emflow."""
+    return framework_module()
+
+
+def problem_score_payload(result: Any, *, model: str | None = None) -> dict[str, Any]:
+    """What a score record carries, read off an sdflow ``Result`` (duck-typed)."""
+    stats_source = getattr(result, "stats", None)
+    stats = stats_source() if callable(stats_source) else (stats_source or {})
+    return {
+        "model": model or str(getattr(result, "model", None) or "unnamed"),
+        "split": str(getattr(result, "split", None) or "validation"),
+        "metric": str(getattr(result, "objective", None) or "score"),
+        "score": float(result.score),
+        "lower_is_better": bool(getattr(result, "lower_is_better", True)),
+        "n_origins": int(result.n_origins) if getattr(result, "n_origins", None) is not None else None,
+        "n_scored": int(result.n_scored) if getattr(result, "n_scored", None) is not None else None,
+        "stats": {str(key): _json_number(value) for key, value in dict(stats).items()} or None,
+    }
+
+
+class Problem:
+    """A workspace problem: a verifiable target registered from an sdflow ``Problem``.
+
+    Declare one on a project from a factory; ``rebase deploy`` registers it and the
+    platform versions it by the fingerprint of its spec::
+
+        @project.problem(name="icing:se1")
+        def icing_se1() -> sdflow.Problem:
+            return get_problem_se1()
+
+    Reference a registered one by name::
+
+        problem = rb.Problem.from_name("icing:se1")
+        problem.get()        # the record with its latest version
+        problem.versions()   # every version, oldest first
+        problem.load()       # the sdflow Problem (the defining package must be installed)
+    """
+
+    def __init__(
+        self,
+        name: str | None = None,
+        *,
+        description: str | None = None,
+        factory: Callable[[], Any] | None = None,
+        client: Client | None = None,
+    ) -> None:
+        if (name is None or not name.strip()) and factory is None:
+            raise ValueError("Problem requires a name or a factory")
+        self._name = name.strip() if name else None
+        self.description = description
+        self.factory = factory
+        self._client = client
+        self._loaded: Any = None
+        self.id: str | None = None
+        self.version_id: str | None = None
+        self.version_number: int | None = None
+        self.created: bool | None = None
+
+    @classmethod
+    def from_name(cls, name: str, *, client: Client | None = None) -> Problem:
+        """Reference a registered workspace problem by name."""
+        return cls(name, client=client)
+
+    @property
+    def name(self) -> str:
+        if self._name is None:
+            self._name = str(self.load().name)
+        return self._name
+
+    def _resolved_client(self) -> Client:
+        if self._client is None:
+            self._client = default_client()
+        return self._client
+
+    def load(self) -> Any:
+        """The framework ``Problem``: from the factory when declared here, else
+        ``load_problem(name)`` from sdflow, or emflow when only that is installed
+        (``rebase-toolkit[modeling]``), plus the package that registers the problem."""
+        if self._loaded is None:
+            if self.factory is not None:
+                self._loaded = self.factory()
+            else:
+                self._loaded = decision_framework().load_problem(self.name)
+        return self._loaded
+
+    def spec(self) -> dict[str, Any]:
+        return problem_spec(self.load())
+
+    def fingerprint(self) -> str:
+        return problem_fingerprint(self.spec())
+
+    def _source(self, project_name: str | None) -> dict[str, Any]:
+        source: dict[str, Any] = {}
+        if self.factory is not None:
+            source.update(_git_metadata_for(self.factory))
+            source["module"] = getattr(self.factory, "__module__", None)
+            source["factory"] = getattr(self.factory, "__qualname__", None)
+        else:
+            # Referenced by name (a backtest script recording a score): the commit
+            # of the script that runs, else of the working directory.
+            main_file = getattr(sys.modules.get("__main__"), "__file__", None)
+            source.update(_git_metadata_for_path(Path(main_file).resolve() if main_file else Path.cwd()))
+        framework = sys.modules.get("sdflow") or sys.modules.get("emflow")
+        if framework is not None:
+            source["framework"] = framework.__name__
+            source["framework_version"] = getattr(framework, "__version__", None)
+        if project_name:
+            source["project"] = project_name
+        return {key: value for key, value in source.items() if value is not None}
+
+    def register(
+        self,
+        client: Client | None = None,
+        *,
+        project_id: str | None = None,
+        project_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Register this problem's spec with the active workspace. Idempotent: an
+        unchanged spec returns the existing version, a changed one mints the next."""
+        resolved = client or self._resolved_client()
+        spec = self.spec()
+        result = resolved.register_problem(
+            self.name,
+            spec=spec,
+            description=self.description if self.description is not None else spec.get("description"),
+            source=self._source(project_name),
+            project_id=project_id,
+        )
+        problem = result.get("problem") or {}
+        version = result.get("version") or {}
+        self.id = problem.get("id")
+        self.version_id = version.get("id")
+        self.version_number = version.get("version_number")
+        self.created = bool(result.get("created"))
+        return result
+
+    def get(self) -> dict[str, Any]:
+        return self._resolved_client().get_problem(self.name)
+
+    def versions(self) -> list[dict[str, Any]]:
+        return self._resolved_client().list_problem_versions(self.name)
+
+    def record(
+        self,
+        result: Any,
+        *,
+        model: str | None = None,
+        source: dict[str, Any] | None = None,
+        project_id: str | None = None,
+        client: Client | None = None,
+    ) -> dict[str, Any]:
+        """Record an ``sdflow.evaluate`` result against this problem's registered version.
+
+        The score is pinned to the version whose fingerprint matches the spec this
+        process loaded, so a run against an unregistered spec is refused (deploy
+        first) rather than attached to whatever version happens to be latest.
+        ``model`` defaults to the result's model name; ``source`` is merged over the
+        git metadata of the problem factory, when one was declared here.
+        """
+        payload = problem_score_payload(result, model=model)
+        payload["fingerprint"] = self.fingerprint()
+        payload["project_id"] = project_id
+        payload["source"] = {**self._source(None), **(source or {})} or None
+        return (client or self._resolved_client()).record_problem_score(self.name, **payload)
+
+    def scores(
+        self,
+        *,
+        version: int | None = None,
+        split: str | None = None,
+        model: str | None = None,
+        best: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Recorded scores, newest first; the latest version unless ``version`` is given."""
+        return self._resolved_client().list_problem_scores(
+            self.name, version=version, split=split, model=model, best=best
+        )
+
+    def delete(self) -> dict[str, Any]:
+        return self._resolved_client().delete_problem(self.name)
+
+    def __repr__(self) -> str:
+        suffix = f" v{self.version_number}" if self.version_number is not None else ""
+        return f"Problem({self._name or '<from factory>'}{suffix})"
+
+
 def preflight_datasets(client: Client | None = None, *, datasets: list[Dataset] | None = None) -> None:
     """Reconcile declared dataset configs with the platform before a deploy.
 
@@ -2001,21 +2305,9 @@ def _image_spec_for(
     return Image.python().to_dict()
 
 
-def _installs_emflow(package: str) -> bool:
-    normalized = package.strip().lower()
-    return (
-        normalized == "emflow"
-        or normalized.startswith("emflow ")
-        or normalized.startswith("emflow=")
-        or normalized.startswith("emflow>")
-        or normalized.startswith("emflow<")
-        or "github.com/rebase-energy/emflow" in normalized
-    )
-
-
 def _model_dependencies(dependencies: list[str] | tuple[str, ...] | None = None) -> list[str]:
     packages = [package for package in dependencies or [] if package.strip()]
-    if not any(_installs_emflow(package) for package in packages):
+    if not any(installs_framework(package) for package in packages):
         packages.append(DEFAULT_MODEL_DEPENDENCY)
     return packages
 
@@ -2318,9 +2610,14 @@ def _assert_json_literal(value: Any) -> None:
         ) from exc
 
 
+class _RuntimeBranchingError(RebaseWorkflowError):
+    """The body used a traced value as if it were real; wrapped by the compiler
+    into the one message about static graphs."""
+
+
 class _TraceValue:
     def _unsupported(self, operation: str) -> RebaseWorkflowError:
-        return RebaseWorkflowError(
+        return _RuntimeBranchingError(
             f"Step workflows must be static. Runtime values cannot be used with {operation} during deployment."
         )
 
@@ -2350,11 +2647,23 @@ class StepPromise(_TraceValue):
         self.node_key = node_key
 
 
+class _MapItem(_TraceValue):
+    """One item of the list a ``step.map`` runs over, inside that step's inputs."""
+
+
+class _MapIndex(_TraceValue):
+    """The item's position, inside a ``step.map`` step's inputs."""
+
+
 def _binding_for(value: Any) -> dict[str, Any]:
     if isinstance(value, StepPromise):
         return {"type": "node_output", "node_key": value.node_key}
     if isinstance(value, _WorkflowParameter):
         return {"type": "parameter", "name": value.name}
+    if isinstance(value, _MapItem):
+        return {"type": "map_item"}
+    if isinstance(value, _MapIndex):
+        return {"type": "map_index"}
     if isinstance(value, dict):
         items: dict[str, dict[str, Any]] = {}
         for key, item in value.items():
@@ -2388,23 +2697,23 @@ def _binding_node_keys(binding: dict[str, Any]) -> set[str]:
 
 
 class _WorkflowTrace:
-    """Compiles a workflow body into a chain of step nodes.
+    """Compiles a workflow body into a graph of step nodes.
 
-    Steps are sequential by contract: each one runs after the one before it, whether or
-    not it consumes its output. The graph could express parallel roots — dependencies are
-    derived from data bindings, so two steps that ignore each other would have none — but
-    a chain is what makes a workflow legible: a straight line to draw, and one unambiguous
-    answer to "which step failed, and what never ran because of it". Independent work that
-    wants to run side by side belongs to tasks inside a step, not to steps.
+    Every node's dependencies are the steps whose outputs it reads (its data
+    bindings), plus any ordering edge the body asked for with ``step.after``.
+    Two steps that read nothing of each other have no edge, so an engine that
+    can run them side by side does (the Cloud Workflows engine); the in-process
+    runner still runs the nodes in the order the body called them. A
+    ``step.map`` is one node that fans out over a list; ``rb.when`` is a switch
+    between two conditioned steps.
     """
 
     def __init__(self, *, ephemeral: bool = False) -> None:
         self.ephemeral = ephemeral
         self.nodes: list[dict[str, Any]] = []
         self._node_keys: set[str] = set()
-        self._previous_node_key: str | None = None
 
-    def record_step(self, step: Step, args: tuple[Any, ...], kwargs: dict[str, Any]) -> StepPromise:
+    def _check_step(self, step: Step) -> str | None:
         step_name = str(step.name)
         if step.fn is None:
             raise RebaseWorkflowError(f"Step {step_name!r} cannot be used in a workflow without local source.")
@@ -2416,35 +2725,45 @@ class _WorkflowTrace:
         function_version_id = step.data.get("current_version_id")
         if not self.ephemeral and function_version_id is None:
             raise RebaseWorkflowError(f"Step {step_name!r} has no current function version after deployment.")
+        return function_version_id
 
-        signature = inspect.signature(step.fn)
-        bound = signature.bind(*args, **kwargs)
-        bound.apply_defaults()
-        input_bindings = {name: _binding_for(value) for name, value in bound.arguments.items()}
-        upstream_node_keys: set[str] = set()
+    def _node_for(
+        self,
+        step: Step,
+        input_bindings: dict[str, dict[str, Any]],
+        *,
+        function_version_id: str | None,
+        ordering: tuple[str, ...] = (),
+        condition: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        upstream_node_keys: set[str] = set(ordering)
         for binding in input_bindings.values():
             upstream_node_keys.update(_binding_node_keys(binding))
-        # The ordering edge, on top of whatever the data bindings imply. Kept separate from
-        # `input_bindings`, so the graph still shows which dependency carries a value and
-        # which is only sequence.
-        if self._previous_node_key is not None:
-            upstream_node_keys.add(self._previous_node_key)
-
-        node_key = _node_key_for(step_name, self._node_keys)
+        if condition is not None:
+            upstream_node_keys.update(_binding_node_keys(condition["binding"]))
+        node_key = _node_key_for(str(step.name), self._node_keys)
         self._node_keys.add(node_key)
-        node = {
+        node: dict[str, Any] = {
             "node_key": node_key,
-            "name": step_name,
+            "name": str(step.name),
             "function_id": step.id,
             "function_version_id": function_version_id,
             "entrypoint": step.entrypoint,
             "input_bindings": input_bindings,
             "upstream_node_keys": sorted(upstream_node_keys),
-            "retry_policy": {"retries": step.retries},
+            # Kept separate from the data edges, so the graph still shows which
+            # dependency carries a value and which is only sequence.
+            "ordering_node_keys": sorted(ordering),
+            "retry_policy": dict(step.retry_policy),
             "timeout_seconds": step.timeout_seconds,
             "cache_policy": {"enabled": step.cache},
-            "resource_policy": step.resources,
+            # The workflow's resources are the inherited layer; the step's own
+            # cpu/memory override them.
+            "resource_policy": {**(step.resources or {}), **step.own_resources},
+            "runtime": step.runtime,
         }
+        if condition is not None:
+            node["condition"] = condition
         if self.ephemeral:
             node.update(
                 {
@@ -2455,9 +2774,133 @@ class _WorkflowTrace:
                     "image_spec": step.image_spec,
                 }
             )
+        return node
+
+    def record_step(
+        self,
+        step: Step,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        *,
+        ordering: tuple[str, ...] = (),
+        condition: dict[str, Any] | None = None,
+    ) -> StepPromise:
+        function_version_id = self._check_step(step)
+        signature = inspect.signature(step.fn)  # type: ignore[arg-type]
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        input_bindings = {name: _binding_for(value) for name, value in bound.arguments.items()}
+        node = self._node_for(
+            step, input_bindings, function_version_id=function_version_id, ordering=ordering, condition=condition
+        )
         self.nodes.append(node)
-        self._previous_node_key = node_key
+        return StepPromise(node["node_key"])
+
+    def record_map(
+        self,
+        step: Step,
+        items: Any,
+        *,
+        parameter: str,
+        kwargs: dict[str, Any],
+        max_concurrency: int | None,
+    ) -> StepPromise:
+        function_version_id = self._check_step(step)
+        if not isinstance(items, (StepPromise, _WorkflowParameter, list, tuple)):
+            raise RebaseWorkflowError(
+                f"step {step.name!r}.map needs a list to map over: another step's output, a workflow "
+                f"parameter, or a literal list; got {type(items).__name__}"
+            )
+        if isinstance(items, (list, tuple)) and any(isinstance(item, _TraceValue) for item in items):
+            raise RebaseWorkflowError(
+                f"step {step.name!r}.map: a literal list of items cannot mix in step outputs; map over the "
+                "step's output directly"
+            )
+        signature = inspect.signature(step.fn)  # type: ignore[arg-type]
+        if parameter not in signature.parameters:
+            raise RebaseWorkflowError(f"step {step.name!r} has no parameter {parameter!r} to map over")
+        if parameter in kwargs:
+            raise RebaseWorkflowError(f"step {step.name!r}.map: {parameter!r} is the mapped parameter")
+        bound = signature.bind(**{parameter: _MapItem()}, **kwargs)
+        bound.apply_defaults()
+        input_bindings = {name: _binding_for(value) for name, value in bound.arguments.items()}
+        node = self._node_for(step, input_bindings, function_version_id=function_version_id)
+        node["kind"] = "map"
+        node["items_binding"] = _binding_for(items)
+        node["upstream_node_keys"] = sorted(set(node["upstream_node_keys"]) | _binding_node_keys(node["items_binding"]))
+        if max_concurrency is not None:
+            if max_concurrency < 1:
+                raise RebaseWorkflowError("max_concurrency must be at least 1")
+            node["max_concurrency"] = int(max_concurrency)
+        self.nodes.append(node)
+        return StepPromise(node["node_key"])
+
+    def record_switch(self, condition: dict[str, Any], then: StepPromise, otherwise: StepPromise) -> StepPromise:
+        branches: dict[str, dict[str, Any]] = {}
+        for promise, negate in ((then, False), (otherwise, True)):
+            if not isinstance(promise, StepPromise):
+                raise RebaseWorkflowError("rb.when needs two step calls, then=step(...) and otherwise=step(...)")
+            node = next((n for n in self.nodes if n["node_key"] == promise.node_key), None)
+            if node is None or node.get("kind", "step") != "step":
+                raise RebaseWorkflowError("rb.when branches must be plain steps called in this workflow")
+            if "condition" in node:
+                raise RebaseWorkflowError(f"step {node['name']!r} already runs under a condition")
+            node["condition"] = {**condition, "negate": negate}
+            node["upstream_node_keys"] = sorted(
+                set(node["upstream_node_keys"]) | _binding_node_keys(condition["binding"])
+            )
+            branches[promise.node_key] = node
+        node_key = _node_key_for("when", self._node_keys)
+        self._node_keys.add(node_key)
+        self.nodes.append(
+            {
+                "kind": "switch",
+                "node_key": node_key,
+                "name": node_key,
+                "function_id": None,
+                "function_version_id": None,
+                "entrypoint": None,
+                "input_bindings": {},
+                "upstream_node_keys": sorted(
+                    {then.node_key, otherwise.node_key} | _binding_node_keys(condition["binding"])
+                ),
+                "ordering_node_keys": [],
+                "retry_policy": {"retries": 0},
+                "timeout_seconds": None,
+                "cache_policy": {"enabled": False},
+                "resource_policy": {},
+                "runtime": "job",
+                "condition": condition,
+                "then_node_key": then.node_key,
+                "otherwise_node_key": otherwise.node_key,
+            }
+        )
         return StepPromise(node_key)
+
+
+def _condition_binding(condition: Any, *, equals: Any) -> dict[str, Any]:
+    if not isinstance(condition, (StepPromise, _WorkflowParameter)):
+        raise RebaseWorkflowError(
+            "a condition must be a step's output or a workflow parameter; comparisons on them are not "
+            "evaluated at deploy time -- use equals=... to compare"
+        )
+    spec: dict[str, Any] = {"binding": _binding_for(condition), "op": "truthy"}
+    if equals is not _UNSET:
+        _assert_json_literal(equals)
+        spec = {"binding": _binding_for(condition), "op": "eq", "value": equals}
+    return spec
+
+
+def when(condition: Any, *, then: Any, otherwise: Any, equals: Any = _UNSET) -> StepPromise:
+    """Choose between two step calls at run time: ``then`` when ``condition``
+    (a step output or workflow parameter) is truthy -- or equal to ``equals``
+    -- else ``otherwise``. Both calls are made in the body; only the taken one
+    runs, and the result is the taken one's output. Deploy-time only, like
+    every step call in a workflow body."""
+    trace = _current_trace()
+    if trace is None:
+        raise RebaseWorkflowError("rb.when is only meaningful inside a workflow body")
+    return trace.record_switch(_condition_binding(condition, equals=equals), then, otherwise)
 
 
 def _current_trace() -> _WorkflowTrace | None:
@@ -2543,8 +2986,11 @@ def _git_metadata_for(fn: Callable[..., Any]) -> dict[str, Any]:
     source_file = inspect.getsourcefile(fn)
     if source_file is None:
         return {}
+    return _git_metadata_for_path(Path(source_file).resolve())
 
-    source_path = Path(source_file).resolve()
+
+def _git_metadata_for_path(source_path: Path) -> dict[str, Any]:
+    """Git metadata of the repository that holds ``source_path`` (a file or a directory)."""
     reconciler_root = os.getenv("REBASE_GITOPS_REPO_ROOT")
     reconciler_sha = os.getenv("REBASE_GITOPS_COMMIT_SHA")
     if reconciler_root and reconciler_sha:
@@ -2922,6 +3368,14 @@ class Client:
                     refreshed_token = True
                     headers = self._request_headers(auth=auth, headers=caller_headers)
                     response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
+                throttled = 0
+                while getattr(response, "status_code", None) == 429 and throttled < RATE_LIMIT_ATTEMPTS:
+                    wait = _retry_after_seconds(response)
+                    if wait is None:
+                        break
+                    throttled += 1
+                    time.sleep(wait)
+                    response = self._http_request(method, path, headers=headers, timeout=timeout, **kwargs)
             except (requests.Timeout, requests.ConnectionError) as exc:
                 if not deploying:
                     raise
@@ -3248,6 +3702,52 @@ class Client:
         return self._request_dict(
             "POST", f"/buckets/{name}/signed-urls", json=payload, expected="bucket signed URL response"
         )
+
+    def register_problem(
+        self,
+        name: str,
+        *,
+        spec: dict[str, Any],
+        description: str | None = None,
+        source: dict[str, Any] | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        payload = {"name": name, "spec": spec, "description": description, "source": source, "project_id": project_id}
+        return self._request_dict("POST", "/problems", json=payload, expected="problem register response")
+
+    def list_problems(self) -> list[dict[str, Any]]:
+        return self._request_list("GET", "/problems", expected="problem list response")
+
+    def get_problem(self, name: str) -> dict[str, Any]:
+        return self._request_dict("GET", f"/problems/{name}", expected="problem response")
+
+    def list_problem_versions(self, name: str) -> list[dict[str, Any]]:
+        return self._request_list("GET", f"/problems/{name}/versions", expected="problem version list response")
+
+    def delete_problem(self, name: str) -> dict[str, Any]:
+        return self._request_dict("DELETE", f"/problems/{name}", expected="problem response")
+
+    def record_problem_score(self, name: str, **payload: Any) -> dict[str, Any]:
+        """Append one backtest result to the version of ``name`` it was scored against."""
+        return self._request_dict("POST", f"/problems/{name}/scores", json=payload, expected="problem score response")
+
+    def list_problem_scores(
+        self,
+        name: str,
+        *,
+        version: int | None = None,
+        split: str | None = None,
+        model: str | None = None,
+        best: bool = False,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"best": "true" if best else "false"}
+        if version is not None:
+            params["version"] = version
+        if split is not None:
+            params["split"] = split
+        if model is not None:
+            params["model"] = model
+        return self._request_list("GET", f"/problems/{name}/scores", params=params, expected="problem score list")
 
     def create_dataset(self, name: str, description: str | None = None) -> dict[str, Any]:
         return self._request_dict(
@@ -3978,6 +4478,39 @@ class Client:
             resolved_project_id = self.ensure_project(project or DEFAULT_PROJECT_NAME)["id"]
         return self._request_list(
             "GET", f"/projects/{resolved_project_id}/asgi-apps", expected="ASGI app list response"
+        )
+
+    def get_asgi_app(self, asgi_app_id: str) -> dict[str, Any]:
+        return self._request_dict("GET", f"/asgi-apps/{asgi_app_id}", expected="ASGI app response")
+
+    def get_asgi_app_instances(
+        self,
+        asgi_app_id: str,
+        *,
+        since: str | datetime | None = None,
+        window_seconds: int | None = None,
+        limit: int | None = None,
+        include_requests: bool | None = None,
+    ) -> dict[str, Any]:
+        """Running instances and recent container events of a deployed ASGI app.
+
+        The platform's own view of the app's service: billed instance counts,
+        the instances seen in the last ``window_seconds`` with their lifecycle
+        (started, ready, requests served), and the container events behind
+        them. Pass the returned ``next_since`` back as ``since`` to receive
+        only newer events on the next call.
+        """
+        params: dict[str, Any] = {}
+        if since is not None:
+            params["since"] = since.isoformat() if isinstance(since, datetime) else since
+        if window_seconds is not None:
+            params["window_seconds"] = window_seconds
+        if limit is not None:
+            params["limit"] = limit
+        if include_requests is not None:
+            params["include_requests"] = "true" if include_requests else "false"
+        return self._request_dict(
+            "GET", f"/asgi-apps/{asgi_app_id}/instances", params=params or None, expected="ASGI app instances response"
         )
 
     def find_asgi_app(self, name: str, *, project: str) -> dict[str, Any] | None:
@@ -5175,6 +5708,40 @@ class Client:
         """Lift a workflow's pause so scheduled runs fire again."""
         return self._request_dict("POST", f"/workflows/{workflow_id}/resume", expected="workflow response")
 
+    def set_workflow_schedule_backend(self, workflow_id: str, backend: str) -> dict[str, Any]:
+        """Choose which path fires the workflow's cron: ``prefect`` (the default) or
+        ``cloud_tasks``, the push-based path being evaluated next to it. Operational,
+        like pause: no new version. The platform refuses ``cloud_tasks`` unless the
+        workspace allows it (`update_workspace_compute_policy(cloud_tasks_schedules_enabled=True)`),
+        the workflow is job-mode, and its cron reads the same on both engines."""
+        return self._request_dict(
+            "POST",
+            f"/workflows/{workflow_id}/schedule/backend",
+            json={"backend": backend},
+            expected="workflow response",
+        )
+
+    def set_workflow_execution_engine(self, workflow_id: str, engine: str) -> dict[str, Any]:
+        """Choose which engine executes the workflow's step graph: ``runner`` (the
+        default: one container walks it) or ``cloud_workflows`` (one Cloud
+        Workflows execution per run, one Cloud Run Job execution per step).
+        Operational, like pause: no new version, and runs in flight finish on the
+        engine they started on. The platform refuses ``cloud_workflows`` unless
+        the workspace allows it (`update_workspace_compute_policy(cloud_workflows_enabled=True)`)
+        and the workflow is a job-mode step workflow."""
+        return self._request_dict(
+            "POST", f"/workflows/{workflow_id}/engine", json={"engine": engine}, expected="workflow response"
+        )
+
+    def get_workflow_graph_plan(self, workflow_id: str, *, version_id: str | None = None) -> dict[str, Any]:
+        """What the Cloud Workflows engine would run for the workflow's current
+        version (or ``version_id``): the plan (levels of steps and each step's
+        retry and timeout numbers) and the program that interprets it. Read-only."""
+        params = {"version": version_id} if version_id else None
+        return self._request_dict(
+            "GET", f"/workflows/{workflow_id}/graph/plan", params=params, expected="workflow graph plan response"
+        )
+
     def pause_project(self, project_id: str) -> dict[str, Any]:
         """Stop a whole project: no schedule, trigger, endpoint call or run by hand
         goes through until it is resumed. Its workflows and functions keep their own
@@ -5293,6 +5860,8 @@ class Client:
         max_cloud_run_concurrency: int | None = None,
         max_cloud_run_cpu_milli: int | None = None,
         max_cloud_run_memory_mib: int | None = None,
+        cloud_tasks_schedules_enabled: bool | None = None,
+        cloud_workflows_enabled: bool | None = None,
     ) -> dict[str, Any]:
         # No _UNSET sentinel here, unlike update_workspace_notifications: these are
         # NOT NULL integers with no clear-to-null semantics, so plain "None means not
@@ -5312,6 +5881,10 @@ class Client:
             payload["max_cloud_run_cpu_milli"] = max_cloud_run_cpu_milli
         if max_cloud_run_memory_mib is not None:
             payload["max_cloud_run_memory_mib"] = max_cloud_run_memory_mib
+        if cloud_tasks_schedules_enabled is not None:
+            payload["cloud_tasks_schedules_enabled"] = cloud_tasks_schedules_enabled
+        if cloud_workflows_enabled is not None:
+            payload["cloud_workflows_enabled"] = cloud_workflows_enabled
         return self._request_dict(
             "PATCH", "/workspace/compute-policy", json=payload, expected="workspace compute policy response"
         )
@@ -5689,6 +6262,7 @@ class Project:
         self._steps: list[Step] = []
         self._workflows: list[Workflow] = []
         self._asgi_apps: list[ASGIApp] = []
+        self._problems: list[Problem] = []
 
     @property
     def _client(self) -> Client:
@@ -5801,6 +6375,8 @@ class Project:
             environment_name=environment,
         )
         self.id = project["id"]
+        for problem in self._problems if only is None else []:
+            problem.register(self._client, project_id=self.id, project_name=self.name)
         for function in self._functions if only is None else []:
             if isinstance(function, Step):
                 continue  # Steps are deployed automatically via their workflow
@@ -5830,6 +6406,24 @@ class Project:
         for asgi_app in self._asgi_apps if only is None else []:
             asgi_app.deploy(replace=replace, deploy_source=resolved_deploy_source, environment=environment)
         return self
+
+    def problem(
+        self,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> Callable[[Callable[[], Any]], Problem]:
+        """Declare a workspace problem from an sdflow ``Problem`` factory.
+
+        ``deploy()`` registers it with this project as provenance. ``name`` defaults
+        to the sdflow problem's own name."""
+
+        def decorator(factory: Callable[[], Any]) -> Problem:
+            problem = Problem(name, description=description, factory=factory, client=self.client)
+            self._problems.append(problem)
+            return problem
+
+        return decorator
 
     def function(
         self,
@@ -5948,8 +6542,12 @@ class Project:
         default_parameters: dict[str, Any] | None = None,
         enabled: bool = True,
         retries: int = 0,
+        retry_backoff: int | float | None = None,
         timeout_seconds: int | float | None = None,
         cache: bool = False,
+        cpu: float | int | str | None = None,
+        memory: int | float | str | None = None,
+        runtime: str = "job",
         deploy_source: str | None = None,
     ) -> Callable[[Callable[..., Any]], Step]:
         def decorator(fn: Callable[..., Any]) -> Step:
@@ -5964,8 +6562,12 @@ class Project:
                 project_source_mode=self.source_mode,
                 client=self._client,
                 retries=retries,
+                retry_backoff=retry_backoff,
                 timeout_seconds=timeout_seconds,
                 cache=cache,
+                cpu=cpu,
+                memory=memory,
+                runtime=runtime,
             )
             self._steps.append(step)
             self._functions.append(step)
@@ -6756,10 +7358,10 @@ def _write_huggingface_provenance_files(
         (folder / "README.md").write_text(readme, encoding="utf-8")
 
 
-class Model(_EmflowModel):
+class Model(_FrameworkModel):
     deployment_report: DeploymentReport | None = None
     _operation_name: str | None = None
-    _emflow_init_mode = "name"
+    _framework_init_mode = "name"
     _not_deployable_message = MODEL_NOT_DIRECTLY_DEPLOYABLE_ERROR
 
     project: str | None = "default"
@@ -6807,7 +7409,7 @@ class Model(_EmflowModel):
         _reject_legacy_backend(backend)
         cls = type(self)
         resolved_name = name or getattr(cls, "name", None) or _model_target_name(cls)
-        self._init_emflow_base(resolved_name)
+        self._init_framework_base(resolved_name)
         self.name = resolved_name
         self.project = project if project is not None else getattr(cls, "project", "default")
         self.description = description if description is not None else getattr(cls, "description", None)
@@ -6872,8 +7474,8 @@ class Model(_EmflowModel):
     def _client(self) -> Client:
         return self.client or default_client()
 
-    def _init_emflow_base(self, resolved_name: str) -> None:
-        mode = getattr(type(self), "_emflow_init_mode", "name")
+    def _init_framework_base(self, resolved_name: str) -> None:
+        mode = getattr(type(self), "_framework_init_mode", "name")
         if mode == "skip":
             return
         try:
@@ -7153,9 +7755,9 @@ class Model(_EmflowModel):
         )
 
 
-class Predictor(Model, _EmflowPredictor):
+class Predictor(Model, _FrameworkPredictor):
     _operation_name = "predict"
-    _emflow_init_mode = "empty"
+    _framework_init_mode = "empty"
 
     @classmethod
     def from_name(cls, project: str, name: str, *, client: Client | None = None) -> PredictorHandle:
@@ -7166,9 +7768,9 @@ class Predictor(Model, _EmflowPredictor):
         return PredictorHandle(data, client=resolved_client, project=project)
 
 
-class Optimizer(Model, _EmflowOptimizer):
+class Optimizer(Model, _FrameworkOptimizer):
     _operation_name = "optimize"
-    _emflow_init_mode = "empty"
+    _framework_init_mode = "empty"
 
     @classmethod
     def from_name(cls, project: str, name: str, *, client: Client | None = None) -> OptimizerHandle:
@@ -7179,9 +7781,9 @@ class Optimizer(Model, _EmflowOptimizer):
         return OptimizerHandle(data, client=resolved_client, project=project)
 
 
-class Agent(Model, _EmflowAgent):
+class Agent(Model, _FrameworkAgent):
     _operation_name = "act"
-    _emflow_init_mode = "empty"
+    _framework_init_mode = "empty"
 
     @classmethod
     def from_name(cls, project: str, name: str, *, client: Client | None = None) -> AgentHandle:
@@ -7192,8 +7794,8 @@ class Agent(Model, _EmflowAgent):
         return AgentHandle(data, client=resolved_client, project=project)
 
 
-class Simulator(Model, _EmflowSimulator):
-    _emflow_init_mode = "skip"
+class Simulator(Model, _FrameworkSimulator):
+    _framework_init_mode = "skip"
     _not_deployable_message = SIMULATOR_NOT_DEPLOYABLE_ERROR
 
 
@@ -7213,8 +7815,12 @@ class Step(Function):
         function_id: str | None = None,
         data: dict[str, Any] | None = None,
         retries: int = 0,
+        retry_backoff: int | float | None = None,
         timeout_seconds: int | float | None = None,
         cache: bool = False,
+        cpu: float | int | str | None = None,
+        memory: int | float | str | None = None,
+        runtime: str = "job",
     ) -> None:
         super().__init__(
             fn,
@@ -7239,11 +7845,32 @@ class Step(Function):
         )
         if retries < 0:
             raise ValueError("retries must be greater than or equal to 0")
+        if retry_backoff is not None and retry_backoff < 0:
+            raise ValueError("retry_backoff must be greater than or equal to 0")
         if timeout_seconds is not None and timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than 0")
+        if runtime not in ("job", "service"):
+            raise ValueError("runtime must be 'job' or 'service'")
         self.retries = retries
         self.timeout_seconds = timeout_seconds
         self.cache = cache
+        self.runtime = runtime
+        # How a failed attempt is retried on an engine that retries per step:
+        # the wait before the second attempt doubles each time, up to five minutes.
+        backoff = float(retry_backoff) if retry_backoff is not None else 0.0
+        self.retry_policy: dict[str, Any] = {
+            "retries": retries,
+            "backoff_seconds": backoff,
+            "backoff_multiplier": 2.0 if backoff else 1.0,
+            "max_backoff_seconds": max(backoff, min(backoff * 16, 300.0)) if backoff else 0.0,
+        }
+        # The step's own container size (the Cloud Workflows engine runs each
+        # step in its own); the workflow's `resources` is the inherited layer.
+        self.own_resources: dict[str, Any] = {}
+        if cpu is not None:
+            self.own_resources["cpu"] = str(cpu)
+        if memory is not None:
+            self.own_resources["memory"] = str(memory)
         self.resources: dict[str, Any] = {}
 
     def deploy(self, **_kwargs: Any) -> Step:
@@ -7289,6 +7916,90 @@ class Step(Function):
         if self.fn is None:
             raise RebaseWorkflowError("remote step handles cannot be called locally; use .remote(...)")
         return self.fn(*args, **kwargs)
+
+    def after(self, *promises: Any) -> Callable[..., StepPromise]:
+        """Order this step after other steps whose output it does not read:
+        ``notify.after(write_db())(summary=s)``. Deploy-time only."""
+        keys: list[str] = []
+        for promise in promises:
+            if not isinstance(promise, StepPromise):
+                raise RebaseWorkflowError("step.after takes the results of other step calls")
+            keys.append(promise.node_key)
+
+        def call(*args: Any, **kwargs: Any) -> StepPromise:
+            trace = _current_trace()
+            if trace is None:
+                raise RebaseWorkflowError("step.after is only meaningful inside a workflow body")
+            return trace.record_step(self, args, kwargs, ordering=tuple(keys))
+
+        return call
+
+    def when(self, condition: Any, *, equals: Any = _UNSET) -> Callable[..., StepPromise]:
+        """Run this step only when ``condition`` (a step output or workflow
+        parameter) is truthy, or equal to ``equals``; otherwise it is skipped
+        and its output reads as None. Deploy-time only."""
+        spec = _condition_binding(condition, equals=equals)
+
+        def call(*args: Any, **kwargs: Any) -> StepPromise:
+            trace = _current_trace()
+            if trace is None:
+                raise RebaseWorkflowError("step.when is only meaningful inside a workflow body")
+            return trace.record_step(self, args, kwargs, condition={**spec, "negate": False})
+
+        return call
+
+    def map(  # type: ignore[override]
+        self,
+        items: Any,
+        *,
+        parameter: str | None = None,
+        kwargs: dict[str, Any] | None = None,
+        max_concurrency: int | None = None,
+        ordered: bool = True,
+        return_exceptions: bool = False,
+        timeout: float | None = None,
+        **bound: Any,
+    ) -> Any:
+        """Inside a workflow body: one step node that runs once per item of
+        ``items`` (another step's output, a workflow parameter, or a literal
+        list), side by side up to ``max_concurrency``, with ``bound`` as the
+        other arguments; its output is the list of the items' results. Outside
+        a body it is ``Function.map``, the runtime fan-out."""
+        trace = _current_trace()
+        if trace is None:
+            return Function.map(
+                self,
+                items,
+                parameter=parameter,
+                kwargs={**(kwargs or {}), **bound} or None,
+                max_concurrency=max_concurrency,
+                ordered=ordered,
+                return_exceptions=return_exceptions,
+                timeout=timeout,
+            )
+        mapped = parameter or self._infer_mapped_parameter(set(kwargs or {}) | set(bound))
+        return trace.record_map(
+            self, items, parameter=mapped, kwargs={**(kwargs or {}), **bound}, max_concurrency=max_concurrency
+        )
+
+    def _infer_mapped_parameter(self, given: set[str]) -> str:
+        """The one parameter the mapped item fills: whatever the body did not
+        pass by name. Two candidates need an explicit ``parameter=``."""
+        if self.fn is None:
+            raise RebaseWorkflowError("parameter is required to map a remote step handle")
+        parameters = inspect.signature(self.fn).parameters
+        candidates = [name for name in parameters if name not in given]
+        # A parameter with a default is not what the item fills, unless it is
+        # the only one left.
+        required = [name for name in candidates if parameters[name].default is inspect.Parameter.empty]
+        if len(required) == 1:
+            return required[0]
+        if len(candidates) == 1:
+            return candidates[0]
+        raise RebaseWorkflowError(
+            f"step {self.name!r}.map: say which parameter takes each item (parameter=...); "
+            f"candidates: {', '.join(candidates) or 'none'}"
+        )
 
     def submit(self, *args: Any, **kwargs: Any) -> Run:
         return self.spawn(**self._parameters_from_call(args, kwargs))
@@ -7498,6 +8209,16 @@ class Workflow:
         _trace_stack.append(trace)
         try:
             result = self.fn(**self._trace_arguments())
+        except RebaseWorkflowError as exc:
+            if isinstance(exc, _RuntimeBranchingError):
+                raise RebaseWorkflowError(
+                    "Could not compile a static step graph for this workflow. Rebase step workflows support "
+                    "direct step calls and literal containers at deployment time; put runtime branching inside "
+                    "a step function."
+                ) from exc
+            # Already says what is wrong with the body (a map over the wrong
+            # thing, a condition on a literal): keep the specific message.
+            raise
         except Exception as exc:
             if trace.nodes or self._references_step():
                 raise RebaseWorkflowError(
@@ -7512,8 +8233,7 @@ class Workflow:
         if not trace.nodes:
             return None
         return {
-            "schema_version": 1,
-            "engine": "prefect",
+            "schema_version": 2,
             "nodes": trace.nodes,
             "return_binding": _binding_for(result),
         }

@@ -2,9 +2,114 @@
 
 ## Unreleased
 
+### Changed
+
+- **`rebase setup` reuses the profile that is already signed in instead of
+  minting one per workspace.** The sign-in session is one file per machine, so
+  every session profile on the same API URL was the same identity under a
+  different name -- `rebase setup --profile uk-signal` for one workspace and
+  `--profile prod` for another left three identical rows in `rebase profile
+  list`. Without `--profile`, setup and `rebase workspace create` now find the
+  profile already signed in on that API (the active one when it qualifies) and
+  only move its workspace selection; `--profile <name>` still creates a separate
+  profile on purpose, with a hint when one on the same API already exists.
+  `rebase profile list` gained an API column so duplicates read as duplicates,
+  and `rebase profile delete <name>` removes a profile you no longer want.
+- **`rebase profile list` no longer shows a workspace per profile.** A profile is an
+  identity on a backend (credential + API URL); the workspace it targets is a
+  selection that credential moves across every workspace it can reach, so the
+  Workspace and Workspace ID columns read as a binding that does not exist. The
+  table now shows the identity the credential signs in as (the session's email;
+  an API key's owner is not stored locally) and points at `rebase workspace` for
+  memberships and the current selection. The API URL column is gone too:
+  `rebase profile show` has it. `--json` keeps `workspace`, `workspace_id` and
+  `api_url` and gains `identity`.
+
+### Added
+
+- **The SDK builds on sdflow.** `rebase.Predictor`, `Optimizer`, `Agent` and `Simulator`
+  subclass sdflow's model classes, `rebase.modeling` re-exports sdflow, the `modeling`
+  extra installs `sdflow>=0.1,<0.2` from PyPI, and a model image whose dependencies name
+  no framework now gets sdflow instead of a pinned emflow git commit. emflow is still
+  accepted everywhere for one release: an emflow install is used when sdflow is absent,
+  and a dependency naming emflow is left alone. The hosted hillclimb engine keeps the
+  `emflow://` target scheme until it moves.
+- **Problems load through sdflow when it is installed.** `rb.Problem.load()` and the
+  provenance recorded with a registration or a score use sdflow, emflow's domain-neutral
+  successor, and fall back to emflow; the source now says `framework` and
+  `framework_version` instead of `emflow_version`.
+- **Scores: a problem version keeps its leaderboard.** `rb.Problem.from_name("icing:se1").record(result)`
+  appends an `emflow.evaluate` result -- model, split, metric, score, origins,
+  analyzer stats, git metadata -- to the problem version whose fingerprint matches
+  the spec the process loaded; a run against an unregistered spec is refused
+  rather than attached to the latest version. `problem.scores(...)` and
+  `rebase problem scores icing:se1` read them back, best per model and split by
+  default, `--all` for every run, `--version N` for another version.
+- **`rb.Problem` and `@project.problem(...)`: problems are workspace resources
+  registered by `rebase deploy`.** A problem is the verifiable target a model is
+  scored against -- an emflow `Problem` with its schedule, splits and objective.
+  Declare one on a project from a factory and deploying registers its spec; the
+  platform versions it by fingerprint (objective, schedule, splits, reference
+  scores -- not the description), so an unchanged spec re-registers as the same
+  version and a moved holdout mints the next. The registering project is kept as
+  provenance, not ownership: every project in the workspace scores against the
+  same `icing:se1 v2`. `rebase problem list|get|versions|delete` read and manage
+  what is registered; `rb.Problem.from_name("icing:se1").load()` returns the
+  emflow object through emflow's `emflow.problems` entry-point group. New
+  permissions `problems:read` (Viewers and up) and `problems:write` (Developers
+  and up).
+
+### Added
+
+- **Step graphs follow the data.** A workflow body now compiles to a graph whose
+  edges are the outputs each step reads (schema 2), so steps that pass nothing
+  between them are independent and an engine that can run them side by side does.
+  `step.after(other())(...)` orders a step without a data edge, `step.map(items, ...)`
+  runs a step once per item of another step's output (or a workflow parameter, or a
+  literal list), `step.when(cond)(...)` runs a step only when a step output or
+  workflow parameter is truthy (`equals=` to compare), and `rb.when(cond, then=a(...),
+  otherwise=b(...))` picks one of two step calls. Steps take `retry_backoff`, `cpu`,
+  `memory` and `runtime` of their own.
+- **`rebase workflow engine set <name> --to runner|cloud_workflows` and `engine show`.**
+  Which engine executes a workflow's step graph: the in-process runner, or the Cloud
+  Workflows engine, which runs each step in its own container with its own retries
+  and size, independent steps side by side. Operational, like pause: no new version,
+  and runs in flight finish on the engine they started on. The workspace must allow
+  it (`rebase workspace compute-policy set --cloud-workflows`). Needs a platform with
+  `POST /workflows/{id}/engine`.
+- **`rebase workflow graph render <name> [--format plan|yaml]`.** What the Cloud
+  Workflows engine would run for the workflow: the levels of steps that run side by
+  side with each step's retry and timeout numbers, or the program that interprets
+  them. Read-only.
+
+### Changed
+
+- Step graphs are schema 2 (`schema_version: 2`, no `engine` key). Two steps with no
+  data between them are no longer forced into sequence; a body that relied on call
+  order alone for ordering should say so with `step.after`.
+
+- **`rebase workflow schedule backend set <name> --to prefect|cloud_tasks` and `backend show`.**
+  Which path fires a workflow's cron: Prefect, or the push-based `cloud_tasks` path the
+  platform runs next to it while it is evaluated. Operational, like pause: no new
+  version. The platform refuses `cloud_tasks` unless the workspace allows it
+  (`rebase workspace compute-policy set --cloud-tasks-schedules`), the workflow is
+  job-mode, and its cron reads the same on both scheduling engines. `schedule show`
+  and `schedule list` now say which path a workflow is on, and `schedule show` reports
+  the newest scheduled run's slot and how many seconds after the slot it was created,
+  the same measure on either path. Needs a platform with
+  `POST /workflows/{id}/schedule/backend`.
+
+### Added
+
+- `rebase app instances <name> --project <project>` shows the instances serving a deployed ASGI app — billed active/idle counts from the platform's metrics, each instance's start, readiness and request count from its container log stream, and the recent container events — and follows a cold start live with `--watch`. `rebase app list` and `rebase app get` list and inspect deployed apps without creating a project as a side effect. `Client.get_asgi_app` and `Client.get_asgi_app_instances` back them.
 - Select workflows within a project with `rebase deploy --only` or `Project.deploy(only=...)`, including required shared steps.
 - Skip unchanged workflows and shared steps using backend batch comparison, report `unchanged`, and reconcile fresh state on re-runs. Older backends retain the existing write path.
+- `rebase workflow schedule show` and the TUI workflows table show scheduled firings waiting for a free run slot (`pending_firings`), which the backend now queues instead of dropping when the workspace is at its concurrency cap (#36).
 - Add opt-in bounded workflow write concurrency with `--jobs` / `jobs`, after serial preparation and shared-step resolution. In-flight outcomes remain visible on failure or interruption.
+- The TUI workspace switcher switches on enter on a workspace, opening the environment last used there (or `dev`), instead of waiting for its environments to load; Tab down to pick another environment. The environments table shows `loading…` or why the list failed, keeps each workspace's environments for the session (`r` refetches), and fetches only for the row the cursor rests on.
+- Quitting the TUI hands the terminal back at once. Loads still waiting on the platform used to hold the process open until they answered or timed out (up to 30 s, or five minutes inside `asyncio.run`), and Ctrl-C then printed a threading traceback; the goodbye request now gets 0.5 s.
+- The TUI buckets table opens with each bucket's size and object count (`Bucket | Size | Objects | URI | Created`), from the `size_bytes` and `object_count` the platform now reports. Both are storage's daily sample, so up to a day old, and `-` for a bucket younger than its first sample or against a platform that does not report them. The `Updated` column is gone: it was the bucket record's, not its data's.
+- A request the platform refuses with 429 and a `Retry-After` is waited out and sent again, up to four times and never longer than a minute per wait, writes included: a 429 did no work. The bucket data routes (signed URLs, object listing, stat, delete) are now budgeted per workspace on the platform, so a job over budget is slowed rather than failed.
 
 ## 0.10.0 — 2026-09-22
 

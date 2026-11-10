@@ -52,6 +52,7 @@ from rebase.client import (
     OnWorkflow,
     Optimizer,
     Predictor,
+    Problem,
     Project,
     RebaseWorkflowError,
     Run,
@@ -77,6 +78,7 @@ from rebase.config import (
     active_platform,
     add_search_path,
     config_path,
+    delete_profile,
     editor_settings,
     find_local_config,
     list_profiles,
@@ -291,6 +293,13 @@ environment_app = typer.Typer(
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
+app_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Inspect deployed ASGI apps and the instances serving them.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
 endpoint_app = typer.Typer(
     add_completion=False,
     cls=AlphabeticalTyperGroup,
@@ -386,6 +395,8 @@ KNOWN_PERMISSIONS = frozenset(
         "datasets:read",
         "datasets:write",
         "datasets:signal",
+        "problems:read",
+        "problems:write",
         "shell:execute",
         "asgi:source_token",
     }
@@ -1088,11 +1099,11 @@ def _deploy_file(
         attached = {
             id(item)
             for _, candidate in projects
-            for item in (*candidate._functions, *candidate._workflows, *candidate._asgi_apps)
+            for item in (*candidate._functions, *candidate._workflows, *candidate._asgi_apps, *candidate._problems)
         }
         orphans = sorted(
             item_name
-            for item_name, item in _unique_named_objects(module, (Workflow, Function, ASGIApp, Model))
+            for item_name, item in _unique_named_objects(module, (Workflow, Function, ASGIApp, Model, Problem))
             if not isinstance(item, Step) and id(item) not in attached
         )
         if orphans:
@@ -1122,6 +1133,9 @@ def _deploy_file(
                 endpoint_url = _deployed_endpoint_url(asgi_app)
                 if endpoint_url is not None:
                     deployed.append(("asgi_app", asgi_app.name or "-", asgi_app.id, endpoint_url))
+            for problem in project._problems:
+                label = f"{problem.name} v{problem.version_number}" if problem.version_number else problem.name
+                deployed.append(("problem", label, problem.version_id))
         return deployed
     if all_projects and selected_names:
         raise RebaseWorkflowError(f"No matching Rebase project found for: {', '.join(sorted(selected_names))}")
@@ -1489,12 +1503,21 @@ def _profile_credential_label(profile_data: dict[str, Any], *, has_auth_session:
     return "none"
 
 
+def _profile_identity(profile_data: dict[str, Any], *, has_auth_session: bool, auth_email: str | None) -> str | None:
+    """Who the credential signs in as, when that is known locally: the
+    session's email. An API key's owner is not stored with it."""
+    if profile_data.get("api_key"):
+        return None
+    return auth_email if has_auth_session else None
+
+
 def _profile_summary(
     name: str,
     profile_data: dict[str, Any],
     *,
     active_profile: str,
     has_auth_session: bool,
+    auth_email: str | None = None,
 ) -> dict[str, Any]:
     return {
         "active": name == active_profile,
@@ -1504,6 +1527,7 @@ def _profile_summary(
         "api_url": _profile_api_url(profile_data),
         "has_api_key": bool(profile_data.get("api_key")),
         "credential": _profile_credential_label(profile_data, has_auth_session=has_auth_session),
+        "identity": _profile_identity(profile_data, has_auth_session=has_auth_session, auth_email=auth_email),
     }
 
 
@@ -1512,7 +1536,15 @@ def _profiles_table(
     *,
     active_profile: str,
     has_auth_session: bool,
+    auth_email: str | None = None,
 ) -> Table:
+    """One row per profile: an identity on a backend, so the columns are exactly
+    what can differ between identities -- the credential, who it signs in as and
+    the API it talks to. Two rows that read the same are the same identity twice.
+    The workspace a profile currently selects is deliberately not a column: it is
+    a cursor the credential moves across every workspace it can reach (`rebase
+    workspace` lists those), and printing it beside the credential read as a
+    binding."""
     table = Table(
         title="Profiles",
         box=box.ASCII,
@@ -1523,28 +1555,32 @@ def _profiles_table(
     )
     table.add_column("Active", justify="center", no_wrap=True, style="rebase.active")
     table.add_column("Profile")
-    table.add_column("Workspace", overflow="fold")
-    table.add_column("Workspace ID", style="rebase.muted", overflow="fold")
-    table.add_column("API URL", overflow="fold")
     table.add_column("Credential", no_wrap=True)
+    table.add_column("Identity", overflow="fold")
+    table.add_column("API", overflow="fold")
     for profile_name, profile_data in sorted(profiles.items()):
         summary = _profile_summary(
             profile_name,
             profile_data,
             active_profile=active_profile,
             has_auth_session=has_auth_session,
+            auth_email=auth_email,
         )
         style = "rebase.active" if summary["active"] else None
         table.add_row(
             "*" if summary["active"] else "",
             profile_name,
-            summary["workspace"],
-            summary["workspace_id"],
-            summary["api_url"],
             summary["credential"],
+            summary["identity"] or "-",
+            _api_label(summary["api_url"]),
             style=style,
         )
     return table
+
+
+def _api_label(api_url: str) -> str:
+    """The hosted platform by name; anything else by its URL, since that is the difference."""
+    return "hosted" if api_url.rstrip("/") == DEFAULT_SERVER_URL else api_url
 
 
 def _profile_show_data(profile: str | None = None) -> dict[str, Any]:
@@ -2127,6 +2163,24 @@ def _resolve_target_selector(
     raise RebaseWorkflowError(f"{target_type} not found: {project_name}/{name}")
 
 
+def _resolve_asgi_app_selector(
+    client: Client,
+    name: str | None,
+    *,
+    asgi_app_id: str | None = None,
+    project_name: str | None = None,
+) -> dict[str, Any]:
+    return _resolve_target_selector(
+        client,
+        name,
+        target_id=asgi_app_id,
+        project_name=project_name,
+        target_type="app",
+        get_by_id=client.get_asgi_app,
+        list_by_project=lambda project_id: client.list_asgi_apps(project_id=project_id),
+    )
+
+
 def _resolve_function_selector(
     client: Client,
     name: str | None,
@@ -2198,7 +2252,14 @@ def _list_project_targets(
 
 @app.command("setup")
 def setup_command(
-    profile: Annotated[str, typer.Option("--profile", "-p", help="Credential profile name.")] = DEFAULT_PROFILE,
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            "-p",
+            help="Credential profile name. Defaults to the profile already signed in on this API, else 'default'.",
+        ),
+    ] = None,
     api_key: Annotated[str | None, typer.Option("--api-key", hidden=True)] = None,
     api_url: Annotated[
         str | None,
@@ -2280,6 +2341,7 @@ def setup_command(
         except Exception as exc:
             raise RebaseWorkflowError(f"could not verify API key against {verify_url}: {exc}") from exc
 
+    profile = profile or DEFAULT_PROFILE
     path = write_profile(api_key=api_key, profile=profile, api_url=api_url, workspace=workspace)
     console.print(f"Saved Rebase credentials for profile '[rebase.value]{profile}[/rebase.value]'")
     console.print(f"[rebase.muted]{path}[/rebase.muted]")
@@ -2509,6 +2571,7 @@ def _profile_list_data() -> dict[str, Any]:
                 profile_data,
                 active_profile=active_profile,
                 has_auth_session=auth["exists"],
+                auth_email=auth.get("email"),
             )
             for profile_name, profile_data in sorted(profiles.items())
         ],
@@ -2555,12 +2618,18 @@ def profile_list_command(
         _print_json(data)
         return
     profiles = list_profiles()
+    auth = data.get("auth", {})
     console.print(
         _profiles_table(
             profiles,
             active_profile=data["active_profile"],
-            has_auth_session=bool(data.get("auth", {}).get("exists")),
+            has_auth_session=bool(auth.get("exists")),
+            auth_email=auth.get("email"),
         )
+    )
+    console.print(
+        "[rebase.muted]A profile is an identity; the workspace it targets is a selection. "
+        "`rebase workspace` lists the workspaces the active profile can reach and which one is selected.[/rebase.muted]"
     )
 
 
@@ -2577,6 +2646,26 @@ def profile_show_command(
 def profile_switch_command(profile: Annotated[str, typer.Argument(help="Profile name.")]) -> None:
     """Switch the active local Rebase CLI profile."""
     _switch_profile(profile)
+
+
+@profile_app.command("delete")
+def profile_delete_command(
+    profile: Annotated[str, typer.Argument(help="Profile name.")],
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Delete a local profile. The stored sign-in session and the workspace are untouched."""
+    if profile not in list_profiles():
+        raise RebaseWorkflowError(f"unknown profile: {profile}")
+    if not yes and not typer.confirm(f"Delete local profile '{profile}'?"):
+        raise typer.Abort()
+    try:
+        path = delete_profile(profile)
+    except ValueError as exc:
+        raise RebaseWorkflowError(
+            f"'{profile}' is the active profile. `rebase profile switch <other>` first, then delete it."
+        ) from exc
+    console.print(f"Deleted profile '[rebase.value]{profile}[/rebase.value]'")
+    console.print(f"[rebase.muted]{path}[/rebase.muted]")
 
 
 @profile_app.command("link")
@@ -2664,7 +2753,14 @@ def workspace_create_command(
         str | None,
         typer.Argument(help="Workspace handle to create."),
     ] = None,
-    profile: Annotated[str, typer.Option("--profile", "-p", help="Credential profile name.")] = DEFAULT_PROFILE,
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            "-p",
+            help="Credential profile name. Defaults to the profile already signed in on this API, else 'default'.",
+        ),
+    ] = None,
     api_url: Annotated[
         str | None,
         typer.Option(
@@ -3136,6 +3232,8 @@ COMPUTE_POLICY_DETAIL_KEYS = [
     "max_cloud_run_memory_mib",
     "cloud_run_enabled",
     "gpu_allowed",
+    "cloud_tasks_schedules_enabled",
+    "cloud_workflows_enabled",
     "updated_at",
 ]
 
@@ -3191,6 +3289,25 @@ def workspace_compute_policy_set_command(
         int | None,
         typer.Option("--max-memory-mib", help="Ceiling for a target's memory, in MiB (1024 = 1 GiB)."),
     ] = None,
+    cloud_tasks_schedules: Annotated[
+        bool | None,
+        typer.Option(
+            "--cloud-tasks-schedules/--no-cloud-tasks-schedules",
+            "-c",
+            help=(
+                "Whether the workspace's job-mode workflows may be moved to the push-based cloud_tasks "
+                "scheduling path (rebase workflow schedule backend set)."
+            ),
+        ),
+    ] = None,
+    cloud_workflows: Annotated[
+        bool | None,
+        typer.Option(
+            "--cloud-workflows/--no-cloud-workflows",
+            "-w",
+            help="Allow (or forbid) the workspace's step workflows on the Cloud Workflows engine.",
+        ),
+    ] = None,
     json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
     """Update the workspace's compute limits.
@@ -3209,10 +3326,13 @@ def workspace_compute_policy_set_command(
         and max_concurrency is None
         and max_cpu_milli is None
         and max_memory_mib is None
+        and cloud_tasks_schedules is None
+        and cloud_workflows is None
     ):
         raise RebaseWorkflowError(
             "nothing to update; pass --max-run-timeout-seconds, --max-concurrent-runs, "
-            "--max-instances, --max-concurrency, --max-cpu-milli, or --max-memory-mib"
+            "--max-instances, --max-concurrency, --max-cpu-milli, --max-memory-mib, "
+            "--cloud-tasks-schedules/--no-cloud-tasks-schedules, or --cloud-workflows/--no-cloud-workflows"
         )
     kwargs: dict[str, Any] = {}
     if max_run_timeout_seconds is not None:
@@ -3229,6 +3349,10 @@ def workspace_compute_policy_set_command(
         kwargs["max_cloud_run_cpu_milli"] = max_cpu_milli
     if max_memory_mib is not None:
         kwargs["max_cloud_run_memory_mib"] = max_memory_mib
+    if cloud_tasks_schedules is not None:
+        kwargs["cloud_tasks_schedules_enabled"] = cloud_tasks_schedules
+    if cloud_workflows is not None:
+        kwargs["cloud_workflows_enabled"] = cloud_workflows
     policy = Client().update_workspace_compute_policy(**kwargs)
     if json_output:
         _print_json(policy)
@@ -4591,10 +4715,217 @@ dataset_app.add_typer(freshness_app, name="freshness")
 dataset_app.add_typer(contract_app, name="contract")
 
 
+problem_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Problems: verifiable targets registered from sdflow problem factories by `rebase deploy`.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+PROBLEM_DETAIL_KEYS = ["name", "id", "description", "version_count", "workspace_id", "created_at", "updated_at"]
+
+
+def _problem_spec_summary(spec: dict[str, Any] | None) -> dict[str, str]:
+    """The few spec fields worth a table column: objective, horizon, splits."""
+    spec = spec or {}
+    objective = spec.get("objective") or {}
+    schedule = spec.get("schedule") or {}
+    splits = spec.get("splits") or {}
+
+    def _day(value: Any) -> str:
+        return str(value)[:10] if value else "-"
+
+    def _period(period: Any) -> str:
+        if not isinstance(period, list) or len(period) != 2:
+            return "-"
+        return f"{_day(period[0])} .. {_day(period[1])}"
+
+    horizon = "-"
+    if schedule.get("kind") == "regular":
+        horizon = f"{schedule.get('origin_freq') or '?'} -> {schedule.get('cover_end') or '?'}"
+    elif schedule.get("kind") == "explicit":
+        horizon = f"{schedule.get('n_origins')} origins"
+    return {
+        "objective": str(objective.get("metric") or "-"),
+        "horizon": horizon,
+        "train_end": _day(splits.get("train_end")),
+        "validation": _period(splits.get("validation")),
+        "holdout": _period(splits.get("holdout")),
+    }
+
+
+def _problem_table(title: str) -> Table:
+    return Table(
+        title=title,
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+
+
+@problem_app.command("list")
+def problem_list_command(
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List problems in the active workspace with their latest version."""
+    problems = Client().list_problems()
+    if json_output:
+        _print_json(problems)
+        return
+    table = _problem_table("Problems")
+    table.add_column("Name", style="rebase.value", no_wrap=True)
+    table.add_column("Version", style="rebase.muted")
+    table.add_column("Objective")
+    table.add_column("Horizon")
+    table.add_column("Holdout")
+    table.add_column("Updated", style="rebase.muted")
+    for problem in problems:
+        latest = problem.get("latest_version") or {}
+        summary = _problem_spec_summary(latest.get("spec"))
+        table.add_row(
+            str(problem.get("name", "-")),
+            f"v{latest['version_number']}" if latest.get("version_number") else "-",
+            summary["objective"],
+            summary["horizon"],
+            summary["holdout"],
+            _format_value(problem.get("updated_at")),
+        )
+    console.print(table)
+
+
+@problem_app.command("get")
+def problem_get_command(
+    name: Annotated[str, typer.Argument(help="Problem name, e.g. 'icing:se1'.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show a problem and the spec of its latest version."""
+    problem = Client().get_problem(name)
+    if json_output:
+        _print_json(problem)
+        return
+    console.print(_detail_table("Problem", problem, preferred_keys=PROBLEM_DETAIL_KEYS))
+    latest = problem.get("latest_version")
+    if latest:
+        details: dict[str, Any] = {
+            "version": f"v{latest.get('version_number')}",
+            "fingerprint": latest.get("fingerprint"),
+        }
+        details.update(_problem_spec_summary(latest.get("spec")))
+        source = latest.get("source") or {}
+        for key in ("project", "module", "git_commit_sha", "framework", "framework_version", "emflow_version"):
+            if source.get(key):
+                details[key] = source[key]
+        console.print(_detail_table("Latest Version", details))
+
+
+@problem_app.command("versions")
+def problem_versions_command(
+    name: Annotated[str, typer.Argument(help="Problem name, e.g. 'icing:se1'.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List every version of a problem, oldest first."""
+    versions = Client().list_problem_versions(name)
+    if json_output:
+        _print_json(versions)
+        return
+    table = _problem_table(f"Versions of {name}")
+    table.add_column("Version", style="rebase.value", no_wrap=True)
+    table.add_column("Fingerprint", style="rebase.muted")
+    table.add_column("Objective")
+    table.add_column("Train End")
+    table.add_column("Validation")
+    table.add_column("Holdout")
+    table.add_column("Project", style="rebase.muted")
+    table.add_column("Created", style="rebase.muted")
+    for version in versions:
+        summary = _problem_spec_summary(version.get("spec"))
+        source = version.get("source") or {}
+        table.add_row(
+            f"v{version.get('version_number')}",
+            str(version.get("fingerprint") or "")[:12],
+            summary["objective"],
+            summary["train_end"],
+            summary["validation"],
+            summary["holdout"],
+            str(source.get("project") or "-"),
+            _format_value(version.get("created_at")),
+        )
+    console.print(table)
+
+
+@problem_app.command("scores")
+def problem_scores_command(
+    name: Annotated[str, typer.Argument(help="Problem name, e.g. 'icing:se1'.")],
+    all_runs: Annotated[
+        bool, typer.Option("--all", "-a", help="Every recorded run, not only the best per model and split.")
+    ] = False,
+    version: Annotated[
+        int | None, typer.Option("--version", "-v", help="Problem version; defaults to the latest.")
+    ] = None,
+    split: Annotated[
+        str | None, typer.Option("--split", "-s", help="Only this split, e.g. validation or holdout.")
+    ] = None,
+    model: Annotated[str | None, typer.Option("--model", "-m", help="Only this model name.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """The leaderboard of a problem version: recorded backtest scores, best per model and split."""
+    scores = Client().list_problem_scores(name, version=version, split=split, model=model, best=not all_runs)
+    if json_output:
+        _print_json(scores)
+        return
+    if not scores:
+        console.print(f"No scores recorded on {name}. Record one with `rb.Problem.from_name({name!r}).record(result)`.")
+        return
+    version_number = scores[0].get("version_number")
+    table = _problem_table(f"Scores on {name} v{version_number}" + ("" if all_runs else " (best per model and split)"))
+    table.add_column("Split", no_wrap=True)
+    table.add_column("Model", style="rebase.value")
+    table.add_column("Score", justify="right", no_wrap=True)
+    table.add_column("Metric", style="rebase.muted")
+    table.add_column("Origins", justify="right")
+    table.add_column("Skill", justify="right", style="rebase.muted")
+    table.add_column("Commit", style="rebase.muted", no_wrap=True)
+    table.add_column("Recorded", style="rebase.muted")
+    for score in scores:
+        stats = score.get("stats") or {}
+        skill = stats.get("PersistenceSkill.skill")
+        source = score.get("source") or {}
+        sha = str(source.get("git_commit_sha") or "")[:7]
+        table.add_row(
+            str(score.get("split") or "-"),
+            str(score.get("model") or "-"),
+            f"{float(score['score']):.4g}" if score.get("score") is not None else "-",
+            str(score.get("metric") or "-"),
+            str(score.get("n_origins") if score.get("n_origins") is not None else "-"),
+            f"{float(skill):.2f}" if isinstance(skill, (int, float)) else "-",
+            (sha + ("*" if source.get("git_dirty") else "")) or "-",
+            _format_value(score.get("created_at")),
+        )
+    console.print(table)
+    if not all_runs:
+        console.print("[rebase.muted]`--all` lists every run; `--version N` another problem version.[/rebase.muted]")
+
+
+@problem_app.command("delete")
+def problem_delete_command(
+    name: Annotated[str, typer.Argument(help="Problem name, e.g. 'icing:se1'.")],
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
+) -> None:
+    """Delete a problem and all of its versions."""
+    if not yes and not typer.confirm(f"Delete problem {name} and all its versions?"):
+        raise typer.Abort()
+    result = Client().delete_problem(name)
+    console.print(f"Deleted problem [rebase.value]{result.get('deleted', name)}[/]")
+
+
 app.add_typer(secret_app, name="secret")
 app.add_typer(volume_app, name="volume")
 app.add_typer(bucket_app, name="bucket")
 app.add_typer(dataset_app, name="dataset")
+app.add_typer(problem_app, name="problem")
 
 
 @api_key_app.command("list")
@@ -5229,6 +5560,300 @@ def function_resume_command(
 app.add_typer(function_app, name="function")
 
 
+# ---- ASGI apps
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _ago(value: Any, *, now: datetime) -> str:
+    moment = _parse_iso(value)
+    if moment is None:
+        return "-"
+    seconds = max(0, int((now - moment).total_seconds()))
+    if seconds < 90:
+        return f"{seconds}s ago"
+    if seconds < 5400:
+        return f"{seconds // 60}m ago"
+    return f"{seconds // 3600}h ago"
+
+
+def _duration(start: Any, end: Any) -> str:
+    first, second = _parse_iso(start), _parse_iso(end)
+    if first is None or second is None:
+        return "-"
+    return f"{(second - first).total_seconds():.0f}s"
+
+
+def _short_revision(value: Any, service_name: str | None) -> str:
+    if not isinstance(value, str):
+        return "-"
+    if service_name and value.startswith(f"{service_name}-"):
+        return value[len(service_name) + 1 :]
+    return value
+
+
+def _asgi_app_table(apps: list[dict[str, Any]]) -> Table:
+    table = Table(
+        title="Apps",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Name", style="rebase.value")
+    table.add_column("ID", style="rebase.muted")
+    table.add_column("Enabled")
+    table.add_column("Service", style="rebase.muted")
+    table.add_column("URL path", style="rebase.muted")
+    for app_data in apps:
+        table.add_row(
+            _format_value(app_data.get("name")),
+            _format_value(app_data.get("id")),
+            _format_value(app_data.get("enabled")),
+            _format_value(app_data.get("cloud_run_service_name")),
+            _format_value(app_data.get("url_path")),
+        )
+    return table
+
+
+def _instances_header(data: dict[str, Any], *, now: datetime) -> Text:
+    counts = data.get("counts") if isinstance(data.get("counts"), dict) else {}
+    text = Text()
+    text.append("Service ", style="rebase.muted")
+    text.append(str(data.get("service_name") or "-"), style="rebase.value")
+    if counts.get("source") == "cloud_monitoring":
+        text.append("   billed instances: ", style="rebase.muted")
+        text.append(f"{counts.get('active', 0)} active", style="rebase.value")
+        text.append(", ", style="rebase.muted")
+        text.append(f"{counts.get('idle', 0)} idle", style="rebase.value")
+        text.append(f"   (metric {_ago(counts.get('as_of'), now=now)}, lags ~1-2 min)", style="rebase.muted")
+    else:
+        text.append("   billed instances: unknown", style="rebase.muted")
+        if counts.get("message"):
+            text.append(f" — {counts['message']}", style="rebase.muted")
+    return text
+
+
+def _instances_table(data: dict[str, Any], *, now: datetime) -> Table:
+    service_name = data.get("service_name") if isinstance(data.get("service_name"), str) else None
+    window = data.get("window_seconds")
+    table = Table(
+        title=f"Instances seen in the last {window}s" if window else "Instances",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Instance", style="rebase.value")
+    table.add_column("Revision", style="rebase.muted")
+    table.add_column("Status")
+    table.add_column("Started")
+    table.add_column("Ready in")
+    table.add_column("Requests", justify="right")
+    table.add_column("Last seen")
+    instances = data.get("instances") if isinstance(data.get("instances"), list) else []
+    for inst in instances:
+        if not isinstance(inst, dict):
+            continue
+        status = str(inst.get("status") or "-")
+        style = {"starting": "rebase.warning", "serving": "rebase.success", "stopped": "rebase.muted"}.get(status, "")
+        table.add_row(
+            str(inst.get("instance_id") or "-")[:12],
+            _short_revision(inst.get("revision_name"), service_name),
+            Text(status, style=style),
+            _ago(inst.get("started_at") or inst.get("first_seen"), now=now),
+            _duration(inst.get("started_at"), inst.get("ready_at")),
+            str(inst.get("requests", 0)),
+            _ago(inst.get("last_seen"), now=now),
+        )
+    if not instances:
+        table.add_row(
+            Text("none — the service is scaled to zero or quiet", style="rebase.muted"), "", "", "", "", "", ""
+        )
+    return table
+
+
+def _events_table(events: list[dict[str, Any]], *, service_name: str | None, title: str) -> Table:
+    table = Table(
+        title=title,
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        show_header=True,
+        title_style="rebase.title",
+    )
+    table.add_column("Time", style="rebase.muted")
+    table.add_column("Instance", style="rebase.muted")
+    table.add_column("Kind")
+    table.add_column("Message", overflow="fold")
+    for event in events:
+        moment = _parse_iso(event.get("timestamp"))
+        kind = str(event.get("kind") or "-")
+        style = {"system": "rebase.warning", "request": "rebase.value", "log": ""}.get(kind, "")
+        table.add_row(
+            moment.astimezone().strftime("%H:%M:%S") if moment else "-",
+            str(event.get("instance_id") or "-")[:12],
+            Text(kind, style=style),
+            str(event.get("message") or ""),
+        )
+    return table
+
+
+def _instances_view(data: dict[str, Any], events: list[dict[str, Any]], *, now: datetime, max_events: int) -> Group:
+    service_name = data.get("service_name") if isinstance(data.get("service_name"), str) else None
+    parts: list[Any] = [_instances_header(data, now=now), _instances_table(data, now=now)]
+    if data.get("message"):
+        parts.append(Text(str(data["message"]), style="rebase.warning"))
+    parts.append(
+        _events_table(
+            events[-max_events:], service_name=service_name, title=f"Last {min(len(events), max_events)} events"
+        )
+    )
+    return Group(*parts)
+
+
+@app_app.command("list")
+def app_list_command(
+    project: Annotated[str, typer.Option("--project", "-p", help="Project name.")],
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """List the ASGI apps deployed in a project."""
+    client = Client()
+    project_data = _resolve_project_by_name(client, project)
+    apps = client.list_asgi_apps(project_id=str(project_data["id"]))
+    if json_output:
+        _print_json(apps)
+        return
+    console.print(_asgi_app_table(apps))
+
+
+@app_app.command("get")
+def app_get_command(
+    name: Annotated[str | None, typer.Argument(help="App name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    asgi_app_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact app ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show an ASGI app's metadata."""
+    client = Client()
+    app_data = _resolve_asgi_app_selector(client, name, asgi_app_id=asgi_app_id, project_name=project)
+    if json_output:
+        _print_json(app_data)
+        return
+    console.print(
+        _detail_table(
+            "App",
+            app_data,
+            preferred_keys=[
+                "name",
+                "id",
+                "project_id",
+                "workspace_id",
+                "description",
+                "entrypoint",
+                "base_path",
+                "url_path",
+                "auth",
+                "enabled",
+                "cloud_run_min_instances",
+                "cloud_run_max_instances",
+                "cloud_run_concurrency",
+                "cloud_run_cpu",
+                "cloud_run_memory",
+                "cloud_run_timeout_seconds",
+                "cloud_run_service_name",
+                "cloud_run_url",
+                "current_version_id",
+                "created_at",
+                "updated_at",
+            ],
+        )
+    )
+
+
+@app_app.command("instances")
+def app_instances_command(
+    name: Annotated[str | None, typer.Argument(help="App name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    asgi_app_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact app ID.")] = None,
+    window_seconds: Annotated[
+        int, typer.Option("--window", "-w", help="List instances seen in the last N seconds.", min=10, max=3600)
+    ] = 120,
+    include_requests: Annotated[
+        bool, typer.Option("--requests/--no-requests", help="Show the app's request log among the events.")
+    ] = True,
+    watch: Annotated[bool, typer.Option("--watch", help="Keep polling and redraw until Ctrl-C.")] = False,
+    poll_interval: Annotated[
+        float, typer.Option("--poll-interval", help="Seconds between polls with --watch.", min=1.0)
+    ] = 3.0,
+    max_events: Annotated[int, typer.Option("--events", help="How many recent events to show.", min=1)] = 15,
+    json_output: Annotated[
+        bool, typer.Option("--json", "-j", help="Print machine-readable JSON output (one object per poll).")
+    ] = False,
+) -> None:
+    """Show the instances serving an ASGI app, and what they are doing.
+
+    Billed instance counts come from the platform's metrics (a minute or two
+    behind); the instance list and events come from the containers' own log
+    stream, seconds behind. With --watch the view redraws every poll, so a cold
+    start can be followed from "Starting new instance" to the first served request.
+    """
+    client = Client()
+    app_data = _resolve_asgi_app_selector(client, name, asgi_app_id=asgi_app_id, project_name=project)
+    app_id = str(app_data["id"])
+
+    def fetch(since: str | None) -> dict[str, Any]:
+        return client.get_asgi_app_instances(
+            app_id, since=since, window_seconds=window_seconds, include_requests=include_requests
+        )
+
+    data = fetch(None)
+    if json_output and not watch:
+        _print_json(data)
+        return
+
+    events: list[dict[str, Any]] = [e for e in data.get("events", []) if isinstance(e, dict)]
+    since = data.get("next_since") if isinstance(data.get("next_since"), str) else None
+    if not watch:
+        console.print(_instances_view(data, events, now=datetime.now(UTC), max_events=max_events))
+        return
+
+    if json_output:
+        _print_json(data)
+        while True:
+            time.sleep(poll_interval)
+            data = fetch(since)
+            since = data.get("next_since") if isinstance(data.get("next_since"), str) else since
+            _print_json(data)
+
+    with Live(
+        _instances_view(data, events, now=datetime.now(UTC), max_events=max_events),
+        console=console,
+        refresh_per_second=4,
+        transient=False,
+    ) as live:
+        while True:
+            time.sleep(poll_interval)
+            data = fetch(since)
+            new_events = [e for e in data.get("events", []) if isinstance(e, dict)]
+            events = (events + new_events)[-max(max_events, 200) :]
+            since = data.get("next_since") if isinstance(data.get("next_since"), str) else since
+            live.update(_instances_view(data, events, now=datetime.now(UTC), max_events=max_events), refresh=True)
+
+
+app.add_typer(app_app, name="app")
+
+
 @workflow_app.command("list")
 def workflow_list_command(
     project: Annotated[str | None, typer.Option("--project", "-p", help="Filter by project name.")] = None,
@@ -5326,8 +5951,13 @@ SCHEDULE_DETAIL_KEYS = [
     "paused",
     "paused_until",
     "next_run_at",
+    "backend",
+    "last_fired_at",
+    "last_fire_latency_seconds",
     "last_skipped_at",
     "last_skip_reason",
+    "pending_firings",
+    "oldest_pending_fired_at",
     "workflow_id",
     "version_id",
 ]
@@ -5335,7 +5965,7 @@ SCHEDULE_DETAIL_KEYS = [
 
 def _schedule_detail(workflow: dict[str, Any], schedule_data: dict[str, Any]) -> dict[str, Any]:
     schedule = schedule_data.get("schedule") or {}
-    return {
+    detail = {
         "workflow": workflow.get("name"),
         "cron": schedule.get("cron"),
         "timezone": schedule.get("timezone"),
@@ -5346,6 +5976,12 @@ def _schedule_detail(workflow: dict[str, Any], schedule_data: dict[str, Any]) ->
         "paused": schedule_data.get("paused", False),
         "paused_until": schedule_data.get("paused_until"),
         "next_run_at": schedule_data.get("next_run_at"),
+        # Which path fires the cron (prefect, or the push-based cloud_tasks path),
+        # and the newest scheduled run: its slot and how many seconds after the
+        # slot its run was created -- the same measure on both paths.
+        "backend": schedule_data.get("schedule_backend", "prefect"),
+        "last_fired_at": schedule_data.get("last_fired_at"),
+        "last_fire_latency_seconds": schedule_data.get("last_fire_latency_seconds"),
         # The last fire the runner skipped and why. A skip creates no run, so
         # this is what separates "ended as declared" from "stopped firing".
         "last_skipped_at": schedule_data.get("last_skipped_at"),
@@ -5353,6 +5989,12 @@ def _schedule_detail(workflow: dict[str, Any], schedule_data: dict[str, Any]) ->
         "workflow_id": schedule_data.get("workflow_id"),
         "version_id": schedule_data.get("version_id"),
     }
+    # Cron slots deferred at the workspace's concurrency cap and still waiting
+    # for a slot. Shown only when there are some: an empty queue is the norm.
+    if schedule_data.get("pending_firings"):
+        detail["pending_firings"] = schedule_data["pending_firings"]
+        detail["oldest_pending_fired_at"] = schedule_data.get("oldest_pending_fired_at")
+    return detail
 
 
 def _require_schedule(client: Client, workflow: dict[str, Any]) -> dict[str, Any]:
@@ -5695,6 +6337,7 @@ def workflow_schedule_list_command(
     table.add_column("Timezone")
     table.add_column("Status")
     table.add_column("Next run")
+    table.add_column("Backend")
     table.add_column("ID", style="rebase.muted")
     for workflow in scheduled:
         schedule = workflow.get("schedule") or {}
@@ -5704,10 +6347,188 @@ def workflow_schedule_list_command(
             _format_value(schedule.get("timezone")),
             _workflow_schedule_status(workflow),
             _format_value(workflow.get("next_run_at")),
+            str(workflow.get("schedule_backend") or "prefect"),
             str(workflow.get("id", "-")),
         )
     console.print(table)
 
+
+SCHEDULE_BACKENDS = ("prefect", "cloud_tasks")
+
+schedule_backend_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Which path fires a workflow's cron: prefect, or the push-based cloud_tasks path.",
+)
+
+
+@schedule_backend_app.command("show")
+def workflow_schedule_backend_show_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show which path fires the workflow's cron, and its latest fire's latency."""
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    schedule_data = _require_schedule(client, workflow)
+    if json_output:
+        _print_json(schedule_data)
+        return
+    detail = _schedule_detail(workflow, schedule_data)
+    console.print(_detail_table("Schedule Backend", detail, preferred_keys=SCHEDULE_DETAIL_KEYS))
+
+
+@schedule_backend_app.command("set")
+def workflow_schedule_backend_set_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    backend: Annotated[str, typer.Option("--to", "-t", help="prefect or cloud_tasks.")] = "",
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Move a workflow's cron between the two scheduling paths: --to prefect | cloud_tasks.
+
+    cloud_tasks is the push-based path being evaluated next to Prefect: the workspace
+    must allow it (rebase workspace compute-policy set --cloud-tasks-schedules), the
+    workflow must be job-mode, and its cron must read the same on both engines. The
+    switch is operational, like pause: no new version. prefect puts it back.
+    """
+    if backend not in SCHEDULE_BACKENDS:
+        raise RebaseWorkflowError(f"--to must be one of {', '.join(SCHEDULE_BACKENDS)}, not {backend!r}")
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    _require_schedule(client, workflow)
+    client.set_workflow_schedule_backend(str(workflow["id"]), backend)
+    refreshed = client.get_workflow_schedule(str(workflow["id"]))
+    if json_output:
+        _print_json(refreshed)
+        return
+    console.print(
+        _detail_table(
+            "Schedule Backend Set", _schedule_detail(workflow, refreshed), preferred_keys=SCHEDULE_DETAIL_KEYS
+        )
+    )
+
+
+schedule_app.add_typer(schedule_backend_app, name="backend")
+
+EXECUTION_ENGINES = ("runner", "cloud_workflows")
+ENGINE_DETAIL_KEYS = ("workflow", "execution_engine", "mode", "workflow_id", "current_version_id")
+
+engine_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="Which engine executes a workflow's step graph: runner, or the Cloud Workflows engine.",
+)
+
+
+def _engine_detail(workflow: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "workflow": workflow.get("name"),
+        "execution_engine": workflow.get("execution_engine", "runner"),
+        "mode": workflow.get("mode"),
+        "workflow_id": workflow.get("id"),
+        "current_version_id": workflow.get("current_version_id"),
+    }
+
+
+@engine_app.command("show")
+def workflow_engine_show_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show which engine executes the workflow's step graph."""
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    if json_output:
+        _print_json(_engine_detail(workflow))
+        return
+    console.print(_detail_table("Execution Engine", _engine_detail(workflow), preferred_keys=ENGINE_DETAIL_KEYS))
+
+
+@engine_app.command("set")
+def workflow_engine_set_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    engine: Annotated[str, typer.Option("--to", "-t", help="runner or cloud_workflows.")] = "",
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Move a workflow's step graph between the engines: --to runner | cloud_workflows.
+
+    cloud_workflows runs each step in its own container, independent steps side
+    by side, with per-step retries and resources; the workspace must allow it
+    (rebase workspace compute-policy set --cloud-workflows) and the workflow must
+    be a job-mode step workflow. Operational, like pause: no new version, and
+    runs in flight finish on the engine they started on. runner puts it back.
+    """
+    if engine not in EXECUTION_ENGINES:
+        raise RebaseWorkflowError(f"--to must be one of {', '.join(EXECUTION_ENGINES)}, not {engine!r}")
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    updated = client.set_workflow_execution_engine(str(workflow["id"]), engine)
+    if json_output:
+        _print_json(_engine_detail(updated))
+        return
+    console.print(_detail_table("Execution Engine Set", _engine_detail(updated), preferred_keys=ENGINE_DETAIL_KEYS))
+
+
+workflow_app.add_typer(engine_app, name="engine")
+
+graph_app = typer.Typer(
+    add_completion=False,
+    cls=AlphabeticalTyperGroup,
+    help="A workflow's step graph as the engines see it.",
+)
+
+
+@graph_app.command("render")
+def workflow_graph_render_command(
+    name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
+    project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
+    workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
+    version_id: Annotated[str | None, typer.Option("--version", "-v", help="A version other than the current.")] = None,
+    output_format: Annotated[str, typer.Option("--format", "-f", help="plan (default) or yaml.")] = "plan",
+    json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
+) -> None:
+    """Show what the Cloud Workflows engine would run for the workflow: the
+    levels of steps that run side by side and each step's retry and timeout
+    numbers (--format plan), or the program that interprets them (--format
+    yaml). Read-only: nothing is deployed or executed."""
+    if output_format not in ("plan", "yaml"):
+        raise RebaseWorkflowError(f"--format must be plan or yaml, not {output_format!r}")
+    client = Client()
+    workflow = _resolve_workflow_selector(client, name, workflow_id=workflow_id, project_name=project)
+    rendered = client.get_workflow_graph_plan(str(workflow["id"]), version_id=version_id)
+    if json_output:
+        _print_json(rendered)
+        return
+    if output_format == "yaml":
+        console.print(rendered.get("program_yaml", ""), markup=False, highlight=False)
+        return
+    plan = rendered.get("plan") or {}
+    console.print(
+        f"{workflow.get('name')}  engine={rendered.get('execution_engine')}  "
+        f"version={rendered.get('version_id')}  deadline={plan.get('deadline_seconds')}s  "
+        f"concurrency={plan.get('concurrency')}"
+    )
+    nodes = plan.get("nodes") or {}
+    for index, level in enumerate(plan.get("levels") or [], start=1):
+        console.print(f"level {index}:")
+        for key in level:
+            node = nodes.get(key) or {}
+            kind = node.get("kind", "step")
+            extra = f"  retries={node.get('retries', 0)}  timeout={node.get('timeout_seconds')}s"
+            if node.get("backoff_seconds"):
+                extra += f"  backoff={node.get('backoff_seconds')}s"
+            console.print(f"  {key}{'  [' + kind + ']' if kind != 'step' else ''}{extra}", markup=False)
+
+
+workflow_app.add_typer(graph_app, name="graph")
 
 trigger_app = typer.Typer(
     add_completion=False,

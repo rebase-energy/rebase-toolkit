@@ -9,7 +9,7 @@ credentials as environment variables (via ``secrets=``/``env=`` on functions, mo
 workflows). Nothing about the warehouse touches the Rebase control plane; the toolkit only
 provides a uniform ``read``/``read_bitemporal``/``write`` surface plus a leakage-safe
 bitemporal mapping so that data pulled from a warehouse can be backtested honestly with
-``emflow``.
+``sdflow``.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ class BitemporalSpec:
 
     Every observation in a backtest carries two timestamps: the ``valid_time`` (the target /
     event time the row describes) and the ``knowledge_time`` (the moment the row became
-    knowable). ``emflow`` uses ``knowledge_time`` to make leakage *structurally impossible* —
+    knowable). ``sdflow`` uses ``knowledge_time`` to make leakage *structurally impossible* —
     a model physically cannot read a row whose ``knowledge_time`` is after the forecast origin.
 
     A raw warehouse table usually only has a target timestamp, so you must declare how to
@@ -125,7 +125,7 @@ def apply_bitemporal(df: Frame, spec: BitemporalSpec) -> Frame:
     """Normalise ``df`` in place to canonical ``valid_time``/``knowledge_time`` columns.
 
     Returns the same DataFrame with ``valid_time`` (renamed from ``spec.valid_time``) and a
-    populated ``knowledge_time`` column, ready to hand to ``emflow``.
+    populated ``knowledge_time`` column, ready to hand to ``sdflow``.
     """
 
     import pandas as pd
@@ -378,7 +378,7 @@ class DataSource(ABC):
     def read_bitemporal(self, query: str, spec: BitemporalSpec, *, params: Any | None = None) -> Frame:
         """Run ``query`` and normalise it to canonical ``valid_time``/``knowledge_time`` columns.
 
-        The returned frame is ready to feed to ``emflow`` for a leakage-safe backtest.
+        The returned frame is ready to feed to ``sdflow`` for a leakage-safe backtest.
         During a replay run, rows whose ``knowledge_time`` is after the replay's
         knowledge-time bound are filtered out, so the run sees exactly what the
         original run could have seen.

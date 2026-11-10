@@ -37,7 +37,7 @@ huggingface = [
     "huggingface-hub>=1.20.1",
 ]
 modeling = [
-    "emflow>=0.3.1,<0.4",
+    "sdflow>=0.1,<0.2",
 ]
 hillclimb = [
     "hillclimb[emflow]>=0.3,<0.4",
@@ -72,7 +72,7 @@ sources = [
 # snowflake-connector-python allows pandas 3 yet, so the two cannot coexist in
 # one environment. Install "rebase-toolkit[snowflake]" separately if you need it.
 all = [
-    "emflow>=0.3.1,<0.4",
+    "sdflow>=0.1,<0.2",
     "energydatamodel",
     "huggingface-hub>=1.20.1",
     "hillclimb[emflow]>=0.3,<0.4",
