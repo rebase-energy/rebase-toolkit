@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -5004,8 +5005,14 @@ def api_key_revoke_command(
 ) -> None:
     """Revoke a workspace API key."""
     client = Client()
-    api_key = _resolve_api_key_selector(client.list_api_keys(), selector)
-    revoked = client.revoke_api_key(str(api_key["id"]))
+    # A full key id needs no lookup. Resolving it through the list anyway made
+    # revoke fail whenever listing did — on a workspace with hundreds of thousands
+    # of per-run keys the list times out (503), and no key could be revoked at all.
+    try:
+        api_key_id = str(uuid.UUID(selector))
+    except ValueError:
+        api_key_id = str(_resolve_api_key_selector(client.list_api_keys(), selector)["id"])
+    revoked = client.revoke_api_key(api_key_id)
     if json_output:
         _print_json(revoked)
         return
