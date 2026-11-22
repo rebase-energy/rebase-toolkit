@@ -3918,6 +3918,26 @@ def test_api_key_revoke_resolves_id_prefix_and_unique_name(monkeypatch, capsys) 
     assert "Revoked API Key" in output
 
 
+def test_api_key_revoke_by_full_id_does_not_list_keys(monkeypatch, capsys) -> None:
+    key_id = "c09d840c-d5a3-4f10-9d08-5c4e7a4be6d1"
+    revoked_ids: list[str] = []
+
+    def listing_is_down(self: Client) -> list[dict[str, Any]]:
+        raise RebaseWorkflowError("Service Unavailable")
+
+    def fake_revoke_api_key(self: Client, api_key_id: str) -> dict[str, Any]:
+        revoked_ids.append(api_key_id)
+        return {"id": api_key_id, "name": "watchdog-runner", "key_prefix": "rb_6333", "enabled": False}
+
+    monkeypatch.setattr(Client, "list_api_keys", listing_is_down)
+    monkeypatch.setattr(Client, "revoke_api_key", fake_revoke_api_key)
+
+    assert main(["api-key", "revoke", key_id.upper()]) == 0
+
+    assert revoked_ids == [key_id]
+    assert "Revoked API Key" in capsys.readouterr().out
+
+
 def test_api_key_revoke_errors_on_ambiguous_selector(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         Client,
