@@ -75,7 +75,7 @@ from rebase.public import (
     workflow,
     workspace,
 )
-from rebase.runtime import RunContext, current_run
+from rebase.runtime import RunContext, current_run, worker_state
 from rebase.stitch import Exclude, Layer, StitchError, stitch
 from rebase.tasks import Task, TaskReportingError, task
 from rebase.timing import Duration, ForecastWindow
@@ -171,4 +171,5 @@ __all__ = [
     "update_workspace",
     "workspace",
     "workflow",
+    "worker_state",
 ]

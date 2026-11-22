@@ -27,6 +27,18 @@
 
 ### Added
 
+- **Warm-pool options: `setup=`, `priority=` and `reuse=`.** `@project.function(setup=hook)`
+  and `@project.step(setup=hook)` name a module-level, argument-free function in the same
+  file that runs once per worker process to prepare what every call shares (imports,
+  read-only data, a loaded model); `rb.worker_state()` returns its value, from the pool
+  worker on the platform and from the hook itself, run once per process, under `rebase
+  run --local` or a direct call. `priority="interactive" | "standard" | "batch"` picks the
+  queue a call waits in, and `reuse=True | False` on `Function.map` and `step.map` says
+  whether the items of one map share worker processes. A function ships `setup` (as
+  `{"source", "entrypoint"}`) and `priority` in its definition, a step in its step-graph
+  node, a map its `reuse` in the map request or node -- each only when declared, so an
+  unchanged file still deploys as `unchanged` against an API that does not know them.
+  `rebase deploy --plan` lists what each function, step and map node declares.
 - **The SDK builds on sdflow.** `rebase.Predictor`, `Optimizer`, `Agent` and `Simulator`
   subclass sdflow's model classes, `rebase.modeling` re-exports sdflow, the `modeling`
   extra installs `sdflow>=0.1,<0.2` from PyPI, and a model image whose dependencies name

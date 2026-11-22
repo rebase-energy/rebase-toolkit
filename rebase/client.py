@@ -50,7 +50,7 @@ from rebase.deployment import (
     _target_context,
 )
 from rebase.image import DEFAULT_PYTHON_VERSION, Image
-from rebase.runtime import current_run
+from rebase.runtime import _call_locally, current_run
 from rebase.source_bundle import SourceBundle, build_source_bundle
 
 _framework_models = framework_models()
@@ -763,6 +763,9 @@ EXECUTION_MODES = ("interactive", "job")
 ISOLATIONS = ("shared", "dedicated")
 DEFAULT_MODE: ExecutionMode = "interactive"
 DEFAULT_ISOLATION: Isolation = "shared"
+# The queue a call waits in on the warm pool: "batch" may wait for idle capacity.
+Priority = str
+PRIORITIES = ("interactive", "standard", "batch")
 
 # Deprecated compatibility names. New code should use mode/isolation.
 RunType = str
@@ -828,6 +831,71 @@ def _validate_run_type(run_type: RunType, target_type: str = "function") -> RunT
 def _reject_legacy_backend(backend: Any) -> None:
     if backend is not None:
         raise ValueError(LEGACY_BACKEND_REMOVED_ERROR)
+
+
+# setup=, priority= and reuse= are sent only when declared: request schemas of
+# older APIs forbid unknown fields, and a definition must not read as changed on
+# every deploy because of a key the server neither stores nor echoes.
+
+
+def _validate_priority(priority: Priority | None) -> Priority | None:
+    if priority is not None and priority not in PRIORITIES:
+        raise ValueError("priority must be 'interactive', 'standard' or 'batch'")
+    return priority
+
+
+def _validate_reuse(reuse: bool | None) -> bool | None:
+    if reuse is not None and not isinstance(reuse, bool):
+        raise RebaseWorkflowError(f"reuse must be True, False or None; got {type(reuse).__name__}")
+    return reuse
+
+
+def _setup_spec_for(setup: Any, *, fn: Callable[..., Any] | None, target: str) -> dict[str, str]:
+    """Check a setup hook where it is declared and return its wire form.
+
+    The hook runs once per worker process, before the calls it prepares, and is
+    shipped the way a function body is: the text of one module-level ``def``,
+    named by ``entrypoint``. So it must be that, take no arguments, and not be a
+    Rebase target that would be registered on its own.
+    """
+    owner = f"{target} {fn.__name__!r}" if isinstance(fn, FunctionType) else target
+    if isinstance(setup, (Function, Workflow, ASGIApp, Model)):
+        name = getattr(setup, "name", None) or type(setup).__name__
+        raise TypeError(
+            f"setup for {owner} is the Rebase target {name!r}; a setup hook is a plain function that is not "
+            "registered itself, so remove its decorator"
+        )
+    if inspect.ismethod(setup):
+        raise TypeError(f"setup for {owner} must be a module-level function, not a method")
+    if not isinstance(setup, FunctionType):
+        raise TypeError(f"setup for {owner} must be a function defined with def; got {type(setup).__name__}")
+    name = setup.__name__
+    if name == "<lambda>":
+        raise TypeError(f"setup for {owner} must be a function defined with def, not a lambda")
+    if "<locals>" in setup.__qualname__:
+        raise TypeError(f"setup hook {name!r} must be defined at module level, not inside another function")
+    if "." in setup.__qualname__:
+        raise TypeError(f"setup hook {setup.__qualname__!r} must be a module-level function, not a method")
+    if inspect.iscoroutinefunction(setup) or inspect.isasyncgenfunction(setup):
+        raise TypeError(f"setup hook {name!r} is async; async setup hooks are not supported yet")
+    required = [
+        parameter.name
+        for parameter in inspect.signature(setup).parameters.values()
+        if parameter.default is inspect.Parameter.empty
+        and parameter.kind not in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}
+    ]
+    if required:
+        raise TypeError(f"setup hook {name!r} must take no arguments; it requires {', '.join(required)}")
+    if isinstance(fn, FunctionType) and setup.__module__ != fn.__module__:
+        raise TypeError(f"setup hook {name!r} must be defined in the same file as {owner}")
+    source = _source_for(setup, target=f"setup hook {name!r}")
+    try:
+        defines = any(isinstance(node, ast.FunctionDef) and node.name == name for node in ast.parse(source).body)
+    except SyntaxError:
+        defines = False
+    if not defines:
+        raise RebaseWorkflowError(f"Could not extract the source of setup hook {name!r} as one module-level def.")
+    return {"source": source, "entrypoint": name}
 
 
 def _cloud_run_cpu_value(value: float | int | str | None) -> str | None:
@@ -2762,6 +2830,11 @@ class _WorkflowTrace:
             "resource_policy": {**(step.resources or {}), **step.own_resources},
             "runtime": step.runtime,
         }
+        # Only when declared, so a graph without them is the graph deployed before.
+        if step.setup_spec is not None:
+            node["setup"] = dict(step.setup_spec)
+        if step.priority is not None:
+            node["priority"] = step.priority
         if condition is not None:
             node["condition"] = condition
         if self.ephemeral:
@@ -2804,6 +2877,7 @@ class _WorkflowTrace:
         parameter: str,
         kwargs: dict[str, Any],
         max_concurrency: int | None,
+        reuse: bool | None = None,
     ) -> StepPromise:
         function_version_id = self._check_step(step)
         if not isinstance(items, (StepPromise, _WorkflowParameter, list, tuple)):
@@ -2832,6 +2906,8 @@ class _WorkflowTrace:
             if max_concurrency < 1:
                 raise RebaseWorkflowError("max_concurrency must be at least 1")
             node["max_concurrency"] = int(max_concurrency)
+        if _validate_reuse(reuse) is not None:
+            node["reuse"] = reuse
         self.nodes.append(node)
         return StepPromise(node["node_key"])
 
@@ -4709,6 +4785,8 @@ class Client:
         git_tag: str | None = None,
         git_dirty: bool | None = None,
         build: dict[str, Any] | None = None,
+        setup: dict[str, Any] | None = None,
+        priority: Priority | None = None,
     ) -> dict[str, Any]:
         environment = _resolve_environment(self, environment)
         project_id = self._ensure_project_in_environment(project, environment)["id"]
@@ -4746,6 +4824,11 @@ class Client:
         # so an unconditional "buckets" would 422 every deploy from this client.
         if buckets:
             payload["buckets"] = buckets
+        # The same rule for the warm-pool options: only when declared.
+        if setup is not None:
+            payload["setup"] = setup
+        if priority is not None:
+            payload["priority"] = _validate_priority(priority)
         if build:
             payload["build"] = build
         if _report_context.get() is not None:
@@ -4788,11 +4871,18 @@ class Client:
         git_tag: str | None = None,
         git_dirty: bool | None = None,
         build: dict[str, Any] | None = None,
+        setup: dict[str, Any] | None | object = _UNSET,
+        priority: Priority | None | object = _UNSET,
     ) -> dict[str, Any]:
         execution_payload: dict[str, Any] = {}
         if mode is not None or isolation is not None or run_type is not None:
             resolved_mode, resolved_isolation = _validate_execution(mode, isolation, run_type=run_type)
             execution_payload = {"mode": resolved_mode, "isolation": resolved_isolation}
+        # Omitted unless given; an explicit None clears a stored value.
+        if setup is not _UNSET:
+            execution_payload["setup"] = setup
+        if priority is not _UNSET:
+            execution_payload["priority"] = _validate_priority(cast(Priority | None, priority))
         payload = {
             key: value
             for key, value in {
@@ -4850,6 +4940,7 @@ class Client:
         ordered: bool = True,
         return_exceptions: bool = False,
         timeout: float | None = None,
+        reuse: bool | None = None,
     ) -> Iterator[dict[str, Any]]:
         payload: dict[str, Any] = {
             "items": items,
@@ -4862,6 +4953,9 @@ class Client:
             payload["max_concurrency"] = max_concurrency
         if timeout is not None:
             payload["timeout_seconds"] = timeout
+        # Whether items may share worker processes; sent only when chosen.
+        if _validate_reuse(reuse) is not None:
+            payload["reuse"] = reuse
         # A map issued from inside a run is that run's tasks, and the platform can only
         # know it from here — the batch is created by this request. Absent on a laptop,
         # where the batch legitimately belongs to no run.
@@ -6448,6 +6542,8 @@ class Project:
         endpoint: EndpointConfig | dict[str, Any] | None = None,
         deploy_source: str | None = None,
         backend: str | None = None,
+        setup: Callable[[], Any] | None = None,
+        priority: Priority | None = None,
     ) -> Callable[[Callable[..., Any]], Function]:
         _reject_legacy_backend(backend)
 
@@ -6476,6 +6572,8 @@ class Project:
                 deploy_source=deploy_source if deploy_source is not None else self.deploy_source,
                 project_source_mode=self.source_mode,
                 client=self._client,
+                setup=setup,
+                priority=priority,
             )
             self._functions.append(function)
             return function
@@ -6549,6 +6647,8 @@ class Project:
         memory: int | float | str | None = None,
         runtime: str = "job",
         deploy_source: str | None = None,
+        setup: Callable[[], Any] | None = None,
+        priority: Priority | None = None,
     ) -> Callable[[Callable[..., Any]], Step]:
         def decorator(fn: Callable[..., Any]) -> Step:
             step = Step(
@@ -6568,6 +6668,8 @@ class Project:
                 cpu=cpu,
                 memory=memory,
                 runtime=runtime,
+                setup=setup,
+                priority=priority,
             )
             self._steps.append(step)
             self._functions.append(step)
@@ -6852,12 +6954,20 @@ class Function:
         function_id: str | None = None,
         data: dict[str, Any] | None = None,
         backend: str | None = None,
+        setup: Callable[[], Any] | None = None,
+        priority: Priority | None = None,
     ) -> None:
         _reject_legacy_backend(backend)
         self.fn = fn
         self.project = project
         self.description = description
         self.enabled = enabled
+        # Runs once per worker process; rb.worker_state() returns what it returned.
+        self.setup = setup
+        self.setup_spec: dict[str, str] | None = (
+            _setup_spec_for(setup, fn=fn, target=type(self).__name__.lower()) if setup is not None else None
+        )
+        self.priority: Priority | None = _validate_priority(priority)
         self.env = dict(env or (data.get("env") if data else None) or {})
         # Kept unresolved (Secret handles or an {ENV: ref} map) until deploy needs a client.
         self.secrets = secrets if secrets is not None else dict((data.get("secrets") if data else None) or {})
@@ -6931,6 +7041,18 @@ class Function:
     def _source_metadata_for_deploy(self, deploy_source: str | None = None) -> dict[str, Any]:
         return _target_source_metadata_for_deploy(self, deploy_source)
 
+    def _pool_options(self, existing: dict[str, Any] | None) -> dict[str, Any]:
+        """`setup` and `priority` for the definition write: what is declared, plus an
+        explicit null to clear one the stored definition still echoes. A key the
+        server does not echo is never sent undeclared."""
+        options: dict[str, Any] = {}
+        for key, value in (("setup", self.setup_spec), ("priority", self.priority)):
+            if value is not None:
+                options[key] = value
+            elif existing is not None and existing.get(key) is not None:
+                options[key] = None
+        return options
+
     @_environment_scoped_deploy
     def deploy(
         self, *, replace: bool = False, deploy_source: str | None = None, environment: str | None = None
@@ -6976,6 +7098,7 @@ class Function:
                 endpoint=self.endpoint,
                 build=build,
                 environment=environment,
+                **self._pool_options(existing),
                 **source_metadata,
             )
             self.id = function["id"]
@@ -7004,6 +7127,7 @@ class Function:
             endpoint=self.endpoint,
             build=build,
             environment=environment,
+            **self._pool_options(None),
             **source_metadata,
         )
         self.id = function["id"]
@@ -7061,7 +7185,16 @@ class Function:
         ordered: bool = True,
         return_exceptions: bool = False,
         timeout: float | None = None,
+        reuse: bool | None = None,
     ) -> Iterator[dict[str, Any] | RebaseWorkflowError]:
+        """Run the function once per item on the platform and yield the results.
+
+        ``reuse=True`` lets items of this call share worker processes, so state one
+        item leaves behind (module globals, caches) is visible to later items of
+        the same call; that is what makes very short items cheap. ``reuse=False``
+        asks for a clean process per item. Unset, the platform decides.
+        """
+        _validate_reuse(reuse)
         item_list = list(items)
         if not item_list:
             raise RebaseWorkflowError("Function.map requires at least one item")
@@ -7081,6 +7214,7 @@ class Function:
             ordered=ordered,
             return_exceptions=return_exceptions,
             timeout=timeout,
+            reuse=reuse,
         )
         if not ordered:
             for event in events:
@@ -7127,7 +7261,7 @@ class Function:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if self.fn is None:
             raise RebaseWorkflowError("remote function handles cannot be called locally; use .remote(...)")
-        return self.fn(*args, **kwargs)
+        return _call_locally(str(self.name), self.setup, self.fn, *args, **kwargs)
 
 
 MODEL_NOT_DIRECTLY_DEPLOYABLE_ERROR = (
@@ -7821,6 +7955,8 @@ class Step(Function):
         cpu: float | int | str | None = None,
         memory: int | float | str | None = None,
         runtime: str = "job",
+        setup: Callable[[], Any] | None = None,
+        priority: Priority | None = None,
     ) -> None:
         super().__init__(
             fn,
@@ -7842,6 +7978,8 @@ class Step(Function):
             client=client,
             function_id=function_id,
             data=data,
+            setup=setup,
+            priority=priority,
         )
         if retries < 0:
             raise ValueError("retries must be greater than or equal to 0")
@@ -7879,6 +8017,11 @@ class Step(Function):
             "Use rb.deploy(workflow) instead of deploying steps directly."
         )
 
+    def _pool_options(self, existing: dict[str, Any] | None) -> dict[str, Any]:
+        # A step's setup and priority travel in its node of the workflow's step
+        # graph, not in the function definition the step is registered as.
+        return {}
+
     def _deploy_for_workflow(
         self,
         *,
@@ -7915,7 +8058,7 @@ class Step(Function):
             return trace.record_step(self, args, kwargs)
         if self.fn is None:
             raise RebaseWorkflowError("remote step handles cannot be called locally; use .remote(...)")
-        return self.fn(*args, **kwargs)
+        return _call_locally(str(self.name), self.setup, self.fn, *args, **kwargs)
 
     def after(self, *promises: Any) -> Callable[..., StepPromise]:
         """Order this step after other steps whose output it does not read:
@@ -7958,13 +8101,16 @@ class Step(Function):
         ordered: bool = True,
         return_exceptions: bool = False,
         timeout: float | None = None,
+        reuse: bool | None = None,
         **bound: Any,
     ) -> Any:
         """Inside a workflow body: one step node that runs once per item of
         ``items`` (another step's output, a workflow parameter, or a literal
         list), side by side up to ``max_concurrency``, with ``bound`` as the
         other arguments; its output is the list of the items' results. Outside
-        a body it is ``Function.map``, the runtime fan-out."""
+        a body it is ``Function.map``, the runtime fan-out. ``reuse`` says
+        whether the items may share worker processes (see ``Function.map``)."""
+        _validate_reuse(reuse)
         trace = _current_trace()
         if trace is None:
             return Function.map(
@@ -7976,10 +8122,16 @@ class Step(Function):
                 ordered=ordered,
                 return_exceptions=return_exceptions,
                 timeout=timeout,
+                reuse=reuse,
             )
         mapped = parameter or self._infer_mapped_parameter(set(kwargs or {}) | set(bound))
         return trace.record_map(
-            self, items, parameter=mapped, kwargs={**(kwargs or {}), **bound}, max_concurrency=max_concurrency
+            self,
+            items,
+            parameter=mapped,
+            kwargs={**(kwargs or {}), **bound},
+            max_concurrency=max_concurrency,
+            reuse=reuse,
         )
 
     def _infer_mapped_parameter(self, given: set[str]) -> str:

@@ -20,6 +20,7 @@ from rebase.client import (
     OptimizerHandle,
     Predictor,
     PredictorHandle,
+    Priority,
     Project,
     RebaseWorkflowError,
     RunType,
@@ -108,6 +109,8 @@ def function(
     endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
     backend: str | None = None,
+    setup: Callable[[], Any] | None = None,
+    priority: Priority | None = None,
 ) -> Callable[[Callable[..., Any]], Function]: ...
 
 
@@ -136,6 +139,8 @@ def function(
     endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
     backend: str | None = None,
+    setup: Callable[[], Any] | None = None,
+    priority: Priority | None = None,
 ) -> Function: ...
 
 
@@ -163,6 +168,8 @@ def function(
     endpoint: EndpointConfig | dict[str, Any] | None = None,
     deploy_source: str | None = None,
     backend: str | None = None,
+    setup: Callable[[], Any] | None = None,
+    priority: Priority | None = None,
 ) -> Callable[[Callable[..., Any]], Function] | Function:
     def decorator(callable_: Callable[..., Any]) -> Function:
         return Function(
@@ -188,6 +195,8 @@ def function(
             enabled=enabled,
             endpoint=endpoint,
             deploy_source=deploy_source,
+            setup=setup,
+            priority=priority,
         )
 
     if fn is not None:
@@ -312,6 +321,8 @@ def step(
     timeout_seconds: int | float | None = None,
     cache: bool = False,
     deploy_source: str | None = None,
+    setup: Callable[[], Any] | None = None,
+    priority: Priority | None = None,
 ) -> Callable[[Callable[..., Any]], Step]: ...
 
 
@@ -328,6 +339,8 @@ def step(
     timeout_seconds: int | float | None = None,
     cache: bool = False,
     deploy_source: str | None = None,
+    setup: Callable[[], Any] | None = None,
+    priority: Priority | None = None,
 ) -> Step: ...
 
 
@@ -343,6 +356,8 @@ def step(
     timeout_seconds: int | float | None = None,
     cache: bool = False,
     deploy_source: str | None = None,
+    setup: Callable[[], Any] | None = None,
+    priority: Priority | None = None,
 ) -> Callable[[Callable[..., Any]], Step] | Step:
     def decorator(callable_: Callable[..., Any]) -> Step:
         return Step(
@@ -356,6 +371,8 @@ def step(
             timeout_seconds=timeout_seconds,
             cache=cache,
             deploy_source=deploy_source,
+            setup=setup,
+            priority=priority,
         )
 
     if fn is not None:

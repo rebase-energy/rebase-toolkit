@@ -1176,6 +1176,70 @@ def _deploy_file(
     return deployed
 
 
+def _execution_option_rows(
+    module: ModuleType, object_names: Iterable[str] | None, only: list[str] | None
+) -> list[tuple[str, str, str, str, str]]:
+    """(type, target, setup, priority, reuse) for each function, step and map node
+    a deploy of `module` would write that declares any of them; selected as
+    `_deploy_file` selects. Workflows are traced as an ephemeral run traces them,
+    which needs no deployed step."""
+    selected = set(object_names or [])
+
+    def chosen(variable: str, item: Any) -> bool:
+        return not selected or variable in selected or getattr(item, "name", None) in selected
+
+    functions: list[Function] = []
+    workflows: list[Workflow] = []
+    projects = _unique_named_objects(module, (Project,))
+    if projects:
+        for variable, project in projects:
+            if chosen(variable, project):
+                if only is None:
+                    functions.extend(item for item in project._functions if not isinstance(item, Step))
+                workflows.extend(project._selected_workflows(only))
+    else:
+        for variable, item in _unique_named_objects(module, (Workflow, Function)):
+            if not isinstance(item, Step) and chosen(variable, item):
+                (workflows if isinstance(item, Workflow) else functions).append(item)
+    steps: dict[int, Step] = {}
+    for workflow in workflows:
+        for step in workflow._collect_steps():
+            steps.setdefault(id(step), step)
+
+    def label(target: Any) -> str:
+        return f"{target.project}/{target.name}" if target.project else str(target.name)
+
+    rows: list[tuple[str, str, str, str, str]] = []
+    for kind, targets in (("function", functions), ("step", list(steps.values()))):
+        for target in targets:
+            if target.setup_spec is not None or target.priority is not None:
+                setup = target.setup_spec["entrypoint"] if target.setup_spec else ""
+                rows.append((kind, label(target), setup, target.priority or "", ""))
+    for workflow in workflows:
+        for node in (workflow._build_step_graph(ephemeral=True) or {}).get("nodes", []):
+            if node.get("kind") == "map" and "reuse" in node:
+                rows.append(("map", f"{label(workflow)}/{node['node_key']}", "", "", str(node["reuse"])))
+    return rows
+
+
+def _print_execution_options(file: Path, object_names: Iterable[str] | None, only: list[str] | None) -> None:
+    rows = _execution_option_rows(_load_module(file), object_names, only)
+    if not rows:
+        return
+    table = Table(
+        title="Execution options",
+        box=box.ASCII,
+        border_style="rebase.border",
+        header_style="rebase.title",
+        title_style="rebase.title",
+    )
+    for column in ("Type", "Target", "Setup", "Priority", "Reuse"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(*(Text(cell) for cell in row))
+    console.print(table)
+
+
 def _environment_policy(client: Client, environment: str) -> dict[str, Any]:
     for policy in client.list_environment_policies():
         if policy.get("environment") == environment:
@@ -7190,6 +7254,7 @@ def deploy_command(
                     },
                 )
             )
+            _print_execution_options(file, name, only)
             return
         intent = _create_gitops_intent_for_deploy(
             client,
@@ -7213,6 +7278,7 @@ def deploy_command(
                 },
             )
         )
+        _print_execution_options(file, name, only)
         return
     # Stream raw build output while any image builds — without this a first
     # deploy of a new image is a silent blocking call of up to 30 minutes.

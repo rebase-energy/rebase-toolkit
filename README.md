@@ -293,6 +293,63 @@ project.deploy()
 print(forecast.remote(site_id="site-001"))
 ```
 
+## Warm Pool Options
+
+On the warm pool a call runs as a forked process inside a pod that is already up.
+Three options shape that. Each is sent only when you set it, so a definition
+without them deploys exactly as before. An API that predates them rejects them on
+functions and maps and ignores them on steps.
+
+`setup=` on `@project.function` or `@project.step` names a module-level function in
+the same file that takes no arguments. It runs once per worker process, not once
+per call, to prepare what every call can share: imports, read-only data, a loaded
+model. `rb.worker_state()` returns what it returned:
+
+```python
+image = rb.Image.python("3.13").uv_pip_install("joblib", "scikit-learn")
+
+
+def load_model():
+    import joblib
+
+    return joblib.load("/models/icing.joblib")
+
+
+@project.function(image=image, setup=load_model)
+def predict(features: list[float]) -> dict:
+    import rebase as rb
+
+    return {"icing": rb.worker_state().predict([features]).tolist()}
+```
+
+The hook runs without the call's variables and secrets, so keep clients and
+credentials in the call, and treat the state as read-only: later calls in the same
+process see it. `rebase run --local` and a direct `predict(...)` call run the hook
+once per process, on the first call that asks for the state.
+
+`priority=` on a function or step is `"interactive"`, `"standard"` or `"batch"`;
+batch work may wait for idle capacity:
+
+```python
+@project.step(priority="batch")
+def backfill_day(day: str) -> dict:
+    return {"day": day}
+```
+
+`reuse=True` on `Function.map` or `step.map` lets the items of one map call share
+worker processes, so what one item leaves behind (module globals, caches) is
+visible to later items of the same call; that is what makes very short items cheap.
+`reuse=False` asks for a clean process per item:
+
+```python
+@project.workflow()
+def backfill(days: list[str]) -> list:
+    return backfill_day.map(days, reuse=True)
+```
+
+`rebase deploy file.py --plan` lists the setup hook, priority and reuse that each
+function, step and map node declares.
+
 ## Tasks
 
 Use `rb.task` to report named units of work inside a function or workflow. The
