@@ -6478,7 +6478,7 @@ def workflow_schedule_backend_set_command(
 
 schedule_app.add_typer(schedule_backend_app, name="backend")
 
-EXECUTION_ENGINES = ("runner", "cloud_workflows")
+EXECUTION_ENGINES = ("runner", "cloud_workflows", "pool")
 ENGINE_DETAIL_KEYS = ("workflow", "execution_engine", "mode", "workflow_id", "current_version_id")
 
 engine_app = typer.Typer(
@@ -6517,12 +6517,12 @@ def workflow_engine_show_command(
 @engine_app.command("set")
 def workflow_engine_set_command(
     name: Annotated[str | None, typer.Argument(help="Workflow name. Omit when using --id.")] = None,
-    engine: Annotated[str, typer.Option("--to", "-t", help="runner or cloud_workflows.")] = "",
+    engine: Annotated[str, typer.Option("--to", "-t", help="runner, cloud_workflows or pool.")] = "",
     project: Annotated[str | None, typer.Option("--project", "-p", help="Project name for name-based lookup.")] = None,
     workflow_id: Annotated[str | None, typer.Option("--id", "-i", help="Exact workflow ID.")] = None,
     json_output: Annotated[bool, typer.Option("--json", "-j", help="Print machine-readable JSON output.")] = False,
 ) -> None:
-    """Move a workflow's step graph between the engines: --to runner | cloud_workflows.
+    """Move a workflow's step graph between the engines: --to runner | cloud_workflows | pool.
 
     cloud_workflows runs each step in its own container, independent steps side
     by side, with per-step retries and resources; the workspace must allow it
