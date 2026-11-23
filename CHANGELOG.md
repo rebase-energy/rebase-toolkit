@@ -27,6 +27,12 @@
 
 ### Added
 
+- **`Function.map(..., priority=...)` and `step.map(..., priority=...)` run one map at
+  another priority.** `"batch"`, `"standard"` or `"interactive"` overrides the declared
+  priority for that map only, and `None` (the default) keeps it. The value is checked before
+  any request and is sent as `priority` in the map request (or set on that map's step-graph
+  node inside a workflow body) only when given. Batch maps fill idle pool capacity: spare
+  CPU only, they yield to scheduled work and are refused after 600 s without a slot.
 - **Warm-pool options: `setup=`, `priority=` and `reuse=`.** `@project.function(setup=hook)`
   and `@project.step(setup=hook)` name a module-level, argument-free function in the same
   file that runs once per worker process to prepare what every call shares (imports,

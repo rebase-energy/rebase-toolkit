@@ -350,6 +350,37 @@ def backfill(days: list[str]) -> list:
 `rebase deploy file.py --plan` lists the setup hook, priority and reuse that each
 function, step and map node declares.
 
+### Batch work
+
+Use `priority="batch"` for work that can wait: backfills, re-parsing archives,
+training, recomputing history. On the warm pool, batch work:
+
+- runs only on CPU that scheduled work leaves free and never adds a sandbox;
+- yields to scheduled work within seconds;
+- waits up to 600 s for a free slot, and is then refused;
+- after its machine is lost, is run again only in workspaces that allow replays.
+
+Declare it on the function or step, or pass `priority=` to one map call
+(`Function.map` or `step.map`) to override the declared priority for that call
+only; `None` keeps the declared one. Off the warm pool, priority changes nothing.
+
+```python
+@project.function()
+def reparse(path: str) -> dict:
+    import json
+
+    with open(path) as handle:
+        return {"path": path, "rows": len(json.load(handle))}
+
+
+paths = [f"/data/raw/2026-11-{day:02d}.json" for day in range(1, 31)]
+for result in reparse.map(paths, priority="batch", reuse=True, return_exceptions=True):
+    print(result)
+```
+
+With `return_exceptions=True`, an item that was refused comes back as an error
+instead of ending the loop.
+
 ## Tasks
 
 Use `rb.task` to report named units of work inside a function or workflow. The

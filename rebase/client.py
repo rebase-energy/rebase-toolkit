@@ -2878,6 +2878,7 @@ class _WorkflowTrace:
         kwargs: dict[str, Any],
         max_concurrency: int | None,
         reuse: bool | None = None,
+        priority: Priority | None = None,
     ) -> StepPromise:
         function_version_id = self._check_step(step)
         if not isinstance(items, (StepPromise, _WorkflowParameter, list, tuple)):
@@ -2908,6 +2909,13 @@ class _WorkflowTrace:
             node["max_concurrency"] = int(max_concurrency)
         if _validate_reuse(reuse) is not None:
             node["reuse"] = reuse
+        # This map's own priority wins over the step's declared one, for this node only.
+        if priority is not None:
+            if priority not in PRIORITIES:
+                raise RebaseWorkflowError(
+                    f"step {step.name!r}.map: priority must be 'interactive', 'standard' or 'batch'"
+                )
+            node["priority"] = priority
         self.nodes.append(node)
         return StepPromise(node["node_key"])
 
@@ -4941,7 +4949,9 @@ class Client:
         return_exceptions: bool = False,
         timeout: float | None = None,
         reuse: bool | None = None,
+        priority: Priority | None = None,
     ) -> Iterator[dict[str, Any]]:
+        _validate_priority(priority)
         payload: dict[str, Any] = {
             "items": items,
             "parameter": parameter,
@@ -4956,6 +4966,9 @@ class Client:
         # Whether items may share worker processes; sent only when chosen.
         if _validate_reuse(reuse) is not None:
             payload["reuse"] = reuse
+        # This map's queue priority; unset, the function's declared one applies.
+        if priority is not None:
+            payload["priority"] = priority
         # A map issued from inside a run is that run's tasks, and the platform can only
         # know it from here — the batch is created by this request. Absent on a laptop,
         # where the batch legitimately belongs to no run.
@@ -7186,6 +7199,7 @@ class Function:
         return_exceptions: bool = False,
         timeout: float | None = None,
         reuse: bool | None = None,
+        priority: Priority | None = None,
     ) -> Iterator[dict[str, Any] | RebaseWorkflowError]:
         """Run the function once per item on the platform and yield the results.
 
@@ -7193,8 +7207,13 @@ class Function:
         item leaves behind (module globals, caches) is visible to later items of
         the same call; that is what makes very short items cheap. ``reuse=False``
         asks for a clean process per item. Unset, the platform decides.
+
+        ``priority`` (``"interactive"``, ``"standard"`` or ``"batch"``) overrides the
+        function's declared priority for this map only; None keeps the declared one.
+        ``"batch"`` runs only on CPU that scheduled work leaves free.
         """
         _validate_reuse(reuse)
+        _validate_priority(priority)
         item_list = list(items)
         if not item_list:
             raise RebaseWorkflowError("Function.map requires at least one item")
@@ -7215,6 +7234,7 @@ class Function:
             return_exceptions=return_exceptions,
             timeout=timeout,
             reuse=reuse,
+            priority=priority,
         )
         if not ordered:
             for event in events:
@@ -8102,6 +8122,7 @@ class Step(Function):
         return_exceptions: bool = False,
         timeout: float | None = None,
         reuse: bool | None = None,
+        priority: Priority | None = None,
         **bound: Any,
     ) -> Any:
         """Inside a workflow body: one step node that runs once per item of
@@ -8109,7 +8130,8 @@ class Step(Function):
         list), side by side up to ``max_concurrency``, with ``bound`` as the
         other arguments; its output is the list of the items' results. Outside
         a body it is ``Function.map``, the runtime fan-out. ``reuse`` says
-        whether the items may share worker processes (see ``Function.map``)."""
+        whether the items may share worker processes and ``priority`` overrides
+        the step's declared priority for this map only (see ``Function.map``)."""
         _validate_reuse(reuse)
         trace = _current_trace()
         if trace is None:
@@ -8123,6 +8145,7 @@ class Step(Function):
                 return_exceptions=return_exceptions,
                 timeout=timeout,
                 reuse=reuse,
+                priority=priority,
             )
         mapped = parameter or self._infer_mapped_parameter(set(kwargs or {}) | set(bound))
         return trace.record_map(
@@ -8132,6 +8155,7 @@ class Step(Function):
             kwargs={**(kwargs or {}), **bound},
             max_concurrency=max_concurrency,
             reuse=reuse,
+            priority=priority,
         )
 
     def _infer_mapped_parameter(self, given: set[str]) -> str:

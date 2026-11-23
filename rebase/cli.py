@@ -1218,8 +1218,9 @@ def _execution_option_rows(
                 rows.append((kind, label(target), setup, target.priority or "", ""))
     for workflow in workflows:
         for node in (workflow._build_step_graph(ephemeral=True) or {}).get("nodes", []):
-            if node.get("kind") == "map" and "reuse" in node:
-                rows.append(("map", f"{label(workflow)}/{node['node_key']}", "", "", str(node["reuse"])))
+            if node.get("kind") == "map" and ("reuse" in node or "priority" in node):
+                reuse = str(node["reuse"]) if "reuse" in node else ""
+                rows.append(("map", f"{label(workflow)}/{node['node_key']}", "", node.get("priority", ""), reuse))
     return rows
 
 

@@ -256,6 +256,97 @@ def test_map_requests_carry_reuse_only_when_chosen(monkeypatch, reuse) -> None:
         assert payload.get("reuse") == reuse
 
 
+def _ndjson(*events: dict[str, Any]) -> requests.Response:
+    result = requests.Response()
+    result.status_code = 200
+    result._content = "\n".join(json.dumps(event) for event in events).encode()
+    result._content_consumed = True  # read from _content; there is no raw stream to close
+    return result
+
+
+@pytest.mark.parametrize("priority", [None, "batch", "standard", "interactive"])
+def test_map_requests_carry_priority_only_when_chosen(client, monkeypatch, priority) -> None:
+    bodies: list[dict[str, Any]] = []
+
+    def http(self: rb.Client, method: str, path: str, **kwargs: Any) -> requests.Response:
+        assert (method, path, kwargs["stream"]) == ("POST", "/functions/f/map", True)
+        bodies.append(kwargs["json"])
+        return _ndjson(
+            {"type": "item", "index": 1, "status": "succeeded", "result": {"value": 4}},
+            {"type": "item", "index": 0, "status": "succeeded", "result": {"value": 1}},
+            {"type": "summary", "status": "succeeded"},
+        )
+
+    monkeypatch.setattr(rb.Client, "_http_request", http)
+    # Declared batch: None keeps it by sending nothing, and the API applies the declared one.
+    function = rb.Function(square, project="default", client=client, function_id="f", priority="batch")
+    step = rb.Step(square, project="default", client=client, function_id="f", priority="batch")
+
+    assert list(function.map([1, 2], priority=priority)) == [{"value": 1}, {"value": 4}]  # in input order
+    assert list(function.map([1, 2], priority=priority, ordered=False)) == [{"value": 4}, {"value": 1}]
+    assert list(step.map([1, 2], priority=priority)) == [{"value": 1}, {"value": 4}]  # outside a body
+    events = list(client.run_function_map("f", items=[1, 2], parameter="x", priority=priority))
+    assert [event["type"] for event in events] == ["item", "item", "summary"]
+    assert len(bodies) == 4
+    for body in bodies:
+        assert ("priority" in body) == (priority is not None)
+        assert body.get("priority") == priority
+
+
+def test_a_bad_map_priority_is_refused_before_any_request(client, monkeypatch) -> None:
+    # The client fixture fails the test on any HTTP request; the function is not even
+    # deployed, so getting past validation would first try a deploy.
+    function = rb.Function(square, project="default", client=client)
+    step = rb.Step(square, project="default", client=client)
+    urgent: Any = "urgent"
+    message = "priority must be 'interactive', 'standard' or 'batch'"
+    with pytest.raises(ValueError, match=message):
+        list(function.map([1], priority=urgent))
+    with pytest.raises(ValueError, match=message):
+        list(function.map([1], priority=urgent, ordered=False))
+    with pytest.raises(ValueError, match=message):
+        list(step.map([1], priority=urgent))
+    with pytest.raises(ValueError, match=message):
+        list(client.run_function_map("f", items=[1], parameter="x", priority=urgent))
+
+    def build(project: Any) -> None:
+        @project.step(name="each")
+        def each(site: str) -> dict:
+            return {"site": site}
+
+        @project.workflow(name="w")
+        def w(sites: list) -> list:
+            return each.map(sites, priority=urgent)
+
+    with pytest.raises(rb.RebaseWorkflowError, match=f"step 'each'.map: {message}"):
+        _compiled_graph(monkeypatch, build)
+
+
+def test_a_map_priority_overrides_the_steps_declared_one_for_that_node_only(monkeypatch) -> None:
+    def build(project: Any) -> None:
+        @project.step(name="each", priority="interactive")
+        def each(site: str) -> dict:
+            return {"site": site}
+
+        @project.step(name="plain")
+        def plain(site: str) -> dict:
+            return {"site": site}
+
+        @project.workflow(name="w")
+        def w(sites: list) -> dict:
+            return {
+                "backfill": each.map(sites, priority="batch", reuse=True),
+                "live": each.map(sites),
+                "one": each("x"),
+                "plain": plain.map(sites, priority="batch"),
+            }
+
+    nodes = {node["node_key"]: node for node in _compiled_graph(monkeypatch, build)["nodes"]}
+    assert (nodes["each"]["priority"], nodes["each"]["reuse"]) == ("batch", True)
+    assert nodes["each_2"]["priority"] == "interactive" and nodes["each_3"]["priority"] == "interactive"
+    assert nodes["plain"]["priority"] == "batch"
+
+
 def test_update_function_sends_setup_and_priority_only_when_given(client, monkeypatch) -> None:
     bodies: list[dict[str, Any]] = []
     patch_client_http(monkeypatch, lambda method, url, **kwargs: bodies.append(kwargs["json"]) or response({"id": "f"}))
@@ -645,6 +736,7 @@ def test_deploy_plan_shows_declared_execution_options(client, monkeypatch, tmp_p
     assert "interactive" in row("fleet/predict")
     assert "step" in row("fleet/score") and "warm" in row("fleet/score")
     assert "map" in row("fleet/nightly/score") and "True" in row("fleet/nightly/score")
+    assert "interactive" in row("fleet/nightly/score")  # the map node's priority
 
 
 def test_deploy_plan_without_options_prints_only_the_plan(client, monkeypatch, tmp_path, capsys) -> None:
